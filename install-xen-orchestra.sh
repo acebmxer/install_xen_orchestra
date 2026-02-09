@@ -2,249 +2,223 @@
 set -euo pipefail
 
 # install-xen-orchestra.sh
-# Installer for Xen Orchestra (from sources) on Ubuntu 24.04/24.04.3
-# - Intended to be run as a regular user (NOT as root). Uses sudo for privileged operations.
-# - Installs prerequisites, Node.js (20.x), enables Yarn via corepack, builds XO from sources.
-# - Creates a self-signed certificate and configures nginx as SSL terminator on 443.
-# - Runs XO as the user who started this script (systemd service with User=...)
-# - Supports: --dir PATH  (install location, default: $HOME/xen-orchestra)
-#             --domain NAME (cert CN / nginx server_name, default: hostname)
-#             --update     (compare remote commit on GitHub; update only if remote newer)
+# Usage: ./install-xen-orchestra.sh [--update]
+# - Must NOT be run as root. The script will use sudo when needed.
 
-XO_DIR="${HOME}/xen-orchestra"
-DOMAIN="$(hostname -f || echo localhost)"
-DO_UPDATE=0
+SCRIPT_NAME=$(basename "$0")
 
-usage() {
-	cat <<EOF
-Usage: $0 [--dir /path/to/xen-orchestra] [--domain example.com] [--update]
-  Run as a normal user (not root). The script will use sudo for operations that require
-  elevated privileges. The invoking user will own the installation and the service will
-  run as that user.
-EOF
-}
-
-while [[ $# -gt 0 ]]; do
-	case "$1" in
-		--dir) XO_DIR="$2"; shift 2;;
-		--domain) DOMAIN="$2"; shift 2;;
-		--update) DO_UPDATE=1; shift 1;;
-		-h|--help) usage; exit 0;;
-		*) echo "Unknown arg: $1"; usage; exit 1;;
-	esac
-done
-
-if [[ $(id -u) -eq 0 ]]; then
-	echo "Do NOT run this script as root. Run it as the user who should own Xen Orchestra." >&2
+if [ "$(id -u)" -eq 0 ]; then
+	echo "Do NOT run $SCRIPT_NAME as root. Run it as a regular user with sudo privileges." >&2
 	exit 1
 fi
 
-# The user who started the script (when using sudo, SUDO_USER will be set). Prefer SUDO_USER.
-RUN_AS_USER="${SUDO_USER:-${USER}}"
-RUN_AS_HOME="$(eval echo ~"${RUN_AS_USER}")"
+# Determine the invoking user (supports sudo invocation)
+if [ -n "${SUDO_USER-}" ]; then
+	RUN_USER="$SUDO_USER"
+else
+	RUN_USER="$USER"
+fi
 
-echo "Install location: $XO_DIR"
-echo "Domain for TLS: $DOMAIN"
-echo "Installing as user: $RUN_AS_USER (home: $RUN_AS_HOME)"
+RUN_HOME=$(eval echo "~$RUN_USER")
+XO_DIR="$RUN_HOME/xen-orchestra"
+XO_SERVER_DIR="$XO_DIR/packages/xo-server"
+CONFIG_DIR="$RUN_HOME/.config/xo-server"
+CERT_DIR="$CONFIG_DIR/certs"
 
-# Ensure sudo is available and ask for the credential up-front
+UPDATE_ONLY=false
+if [ "${1-}" = "--update" ]; then
+	UPDATE_ONLY=true
+fi
+
+echo "Running as user: $RUN_USER (home: $RUN_HOME)"
+
+# Ensure sudo is available
 if ! command -v sudo >/dev/null 2>&1; then
-	echo "sudo is required but not installed. Please install sudo and re-run as a regular user." >&2
+	echo "sudo not found - please install sudo and re-run this script." >&2
 	exit 1
 fi
-sudo -v
 
-export DEBIAN_FRONTEND=noninteractive
-
-echo "Updating apt and installing base packages (this may take a few minutes)..."
+echo "Updating apt and installing base packages (this requires your sudo password)..."
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-	ca-certificates curl gnupg lsb-release software-properties-common \
-	git build-essential python3 python3-dev pkg-config libssl-dev \
-	openssl ufw lsof socat redis-server
+	build-essential redis-server libpng-dev git python3-minimal libvhdi-utils lvm2 cifs-utils nfs-common ntfs-3g openssl ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common libcap2-bin
 
-echo "Ensure common services (apache2/httpd/caddy) aren't blocking ports 80/443"
-for svc in apache2 httpd caddy; do
-	if sudo systemctl is-active --quiet "$svc"; then
-		echo "Stopping system service: $svc"
+# Ensure Redis is enabled and running
+sudo systemctl enable --now redis.service
+if ! sudo -n true 2>/dev/null; then
+	echo "Warning: sudo may prompt for password during the run (that's expected)."
+fi
+
+# Stop common web servers if they occupy ports 80/443 to free them
+echo "Checking ports 80/443 and stopping common services if needed..."
+for svc in apache2 nginx caddy httpd; do
+	if sudo systemctl is-active --quiet "$svc" 2>/dev/null; then
+		echo "Stopping $svc to free ports 80/443..."
 		sudo systemctl stop "$svc" || true
+		sudo systemctl disable "$svc" || true
 	fi
 done
 
-# kill any process still listening on 80/443 that isn't a systemd-managed webserver
-while sudo lsof -iTCP:80 -sTCP:LISTEN -Pn -t >/dev/null 2>&1; do
-	PIDS=$(sudo lsof -iTCP:80 -sTCP:LISTEN -Pn -t || true)
-	echo "Found processes listening on :80: $PIDS -- attempting graceful stop, then kill"
-	for p in $PIDS; do
-		sudo kill "$p" || sudo kill -9 "$p" || true
-	done
-	sleep 1
-done
-while sudo lsof -iTCP:443 -sTCP:LISTEN -Pn -t >/dev/null 2>&1; do
-	PIDS=$(sudo lsof -iTCP:443 -sTCP:LISTEN -Pn -t || true)
-	echo "Found processes listening on :443: $PIDS -- attempting graceful stop, then kill"
-	for p in $PIDS; do
-		sudo kill "$p" || sudo kill -9 "$p" || true
-	done
-	sleep 1
+check_port_free() {
+	local port=$1
+	if ss -ltn "sport = :$port" | grep -q LISTEN; then
+		return 1
+	fi
+	return 0
+}
+
+for p in 80 443; do
+	if ! check_port_free "$p"; then
+		echo "Port $p is in use. Please free it and re-run the script." >&2
+		echo "You may re-run after stopping services that bind to these ports." >&2
+		exit 1
+	fi
 done
 
-echo "Installing Node.js 20.x (NodeSource) and enabling Yarn via corepack"
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-if command -v corepack >/dev/null 2>&1; then
-	sudo corepack enable || true
-	sudo corepack prepare yarn@stable --activate || true
-else
-	sudo npm install -g yarn || true
+# Install Node.js (LTS v20.x) via NodeSource if node not present or old
+if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v//;s/\..*//')" -lt 20 ]; then
+	echo "Installing Node.js LTS (20.x)..."
+	curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+	sudo apt-get install -y nodejs
 fi
 
-echo "Creating/installing into $XO_DIR (owned by $RUN_AS_USER)"
-sudo mkdir -p "$XO_DIR"
-sudo chown -R "$RUN_AS_USER":"$RUN_AS_USER" "$XO_DIR"
+# Enable corepack (provides yarn) and activate yarn for the user
+echo "Enabling corepack and preparing yarn for $RUN_USER..."
+sudo -u "$RUN_USER" corepack enable || true
+sudo -u "$RUN_USER" corepack prepare yarn@stable --activate || true
 
-cd "$RUN_AS_HOME"
-
-if [[ -d "$XO_DIR/.git" ]]; then
-	echo "xen-orchestra already cloned in $XO_DIR"
-	cd "$XO_DIR"
-	# Ensure remote exists
-	sudo -u "$RUN_AS_USER" git remote set-url origin https://github.com/vatesfr/xen-orchestra.git || true
-else
-	echo "Cloning xen-orchestra into $XO_DIR"
-	sudo -u "$RUN_AS_USER" git clone https://github.com/vatesfr/xen-orchestra.git "$XO_DIR"
-	cd "$XO_DIR"
+# Give node the capability to bind to low ports (443) without root.
+NODE_PATH=$(command -v node || true)
+if [ -n "$NODE_PATH" ]; then
+	echo "Granting node the ability to bind privileged ports (setcap)..."
+	sudo setcap 'cap_net_bind_service=+ep' "$NODE_PATH" || true
 fi
 
-if [[ $DO_UPDATE -eq 1 ]]; then
-	echo "--update requested: comparing local commit with remote..."
-	sudo -u "$RUN_AS_USER" git fetch origin --quiet
-	LOCAL=$(sudo -u "$RUN_AS_USER" git rev-parse HEAD)
-	REMOTE=$(sudo -u "$RUN_AS_USER" git rev-parse origin/HEAD || sudo -u "$RUN_AS_USER" git ls-remote origin HEAD | awk '{print $1}')
-	echo "Local:  $LOCAL"
-	echo "Remote: $REMOTE"
-	if [[ "$LOCAL" == "$REMOTE" ]]; then
-		echo "Already up-to-date with origin. No update needed.";
+# Clone or update the repository
+if [ ! -d "$XO_DIR/.git" ]; then
+	echo "Cloning xen-orchestra into $XO_DIR..."
+	sudo -u "$RUN_USER" git clone -b master https://github.com/vatesfr/xen-orchestra "$XO_DIR"
+	sudo chown -R "$RUN_USER":"$RUN_USER" "$XO_DIR"
+else
+	echo "xen-orchestra already exists at $XO_DIR"
+fi
+
+if [ "$UPDATE_ONLY" = true ]; then
+	echo "--update requested: checking remote commit..."
+	cd "$XO_DIR"
+	LOCAL_COMMIT=$(git rev-parse HEAD)
+	REMOTE_COMMIT=$(git ls-remote https://github.com/vatesfr/xen-orchestra.git refs/heads/master | awk '{print $1}')
+	echo "Local: $LOCAL_COMMIT\nRemote: $REMOTE_COMMIT"
+	if [ "$LOCAL_COMMIT" = "$REMOTE_COMMIT" ]; then
+		echo "Already up to date. No update needed."
 		exit 0
 	else
-		echo "Update available: pulling changes and rebuilding..."
-		sudo -u "$RUN_AS_USER" git pull --ff-only origin || sudo -u "$RUN_AS_USER" git fetch --all && sudo -u "$RUN_AS_USER" git reset --hard origin/HEAD
+		echo "Remote is different: performing update..."
+		sudo -u "$RUN_USER" git -C "$XO_DIR" fetch --all
+		sudo -u "$RUN_USER" git -C "$XO_DIR" reset --hard origin/master
+		sudo -u "$RUN_USER" bash -lc "cd $XO_DIR && yarn && yarn build"
+		echo "Restarting xo-server systemd service if present..."
+		sudo systemctl daemon-reload || true
+		sudo systemctl restart xo-server || true
+		echo "Update completed."
+		exit 0
 	fi
 fi
 
-echo "Installing dependencies (yarn) and building xen-orchestra as $RUN_AS_USER"
-cd "$XO_DIR"
-sudo -u "$RUN_AS_USER" bash -lc 'yarn --network-concurrency 1'
-sudo -u "$RUN_AS_USER" bash -lc 'yarn build'
+# Install dependencies and build
+echo "Installing yarn dependencies and building xen-orchestra (this may take a while)..."
+sudo -u "$RUN_USER" bash -lc "cd '$XO_DIR' && yarn"
+sudo -u "$RUN_USER" bash -lc "cd '$XO_DIR' && yarn build"
 
-SSL_DIR="/etc/ssl/xen-orchestra"
-sudo mkdir -p "$SSL_DIR"
-CERT_FILE="$SSL_DIR/selfsigned.crt"
-KEY_FILE="$SSL_DIR/selfsigned.key"
+# Prepare configuration and certificates
+echo "Creating configuration and TLS certificates..."
+sudo -u "$RUN_USER" mkdir -p "$CONFIG_DIR"
+sudo -u "$RUN_USER" mkdir -p "$CERT_DIR"
 
-if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
-	echo "Found existing certs at $CERT_FILE and $KEY_FILE"
-else
-	echo "Generating self-signed certificate for $DOMAIN"
+CERT_KEY="$CERT_DIR/xo.key.pem"
+CERT_CRT="$CERT_DIR/xo.crt.pem"
+
+if [ ! -f "$CERT_KEY" ] || [ ! -f "$CERT_CRT" ]; then
+	echo "Generating self-signed certificate for Xen Orchestra..."
 	sudo openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-		-keyout "$KEY_FILE" -out "$CERT_FILE" \
-		-subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN,IP:127.0.0.1"
-	sudo chmod 644 "$CERT_FILE"
-	sudo chmod 600 "$KEY_FILE"
+		-keyout "$CERT_KEY" -out "$CERT_CRT" \
+		-subj "/C=US/ST=State/L=City/O=XO/OU=XO/CN=$(hostname -f)"
+	sudo chown -R "$RUN_USER":"$RUN_USER" "$CONFIG_DIR"
+	sudo chmod 700 "$CONFIG_DIR"
+	sudo chmod 600 "$CERT_KEY"
+	sudo chmod 644 "$CERT_CRT"
 fi
 
-# Ensure the XO user can read the private key and cert
-sudo chown -R "$RUN_AS_USER":"$RUN_AS_USER" "$SSL_DIR"
-
-# Write XO server config so it listens on 80 and 443 directly and uses our certs
-sudo mkdir -p /etc/xo-server
-sudo tee /etc/xo-server/config.toml >/dev/null <<EOF
-# Generated by install-xen-orchestra.sh
+# Create a minimal config.toml that enables HTTP (80) and HTTPS (443)
+echo "Writing configuration file to $CONFIG_DIR/config.toml"
+cat > /tmp/xo-server-config.toml <<EOF
+# Auto-generated by install-xen-orchestra.sh
 [http]
 redirectToHttps = true
 
 [[http.listen]]
-hostname = '0.0.0.0'
+hostname = "0.0.0.0"
 port = 80
 
 [[http.listen]]
-hostname = '0.0.0.0'
+hostname = "0.0.0.0"
 port = 443
 autoCert = false
-cert = '$CERT_FILE'
-key = '$KEY_FILE'
-
-# Public URL (optional)
-publicUrl = 'https://$DOMAIN'
-
-[redis]
-uri = 'redis://localhost:6379/0'
-
+cert = "$CERT_CRT"
+key = "$CERT_KEY"
 EOF
 
-sudo chown -R "$RUN_AS_USER":"$RUN_AS_USER" /etc/xo-server || true
+sudo mv /tmp/xo-server-config.toml "$CONFIG_DIR/config.toml"
+sudo chown "$RUN_USER":"$RUN_USER" "$CONFIG_DIR/config.toml"
+sudo chmod 600 "$CONFIG_DIR/config.toml"
 
-echo "Configuring firewall to allow 80 and 443 (ufw)"
-if command -v ufw >/dev/null 2>&1; then
-	sudo ufw allow 22/tcp || true
-	sudo ufw allow 80/tcp || true
-	sudo ufw allow 443/tcp || true
-	if sudo ufw status | grep -q "Status: inactive"; then
-		sudo ufw --force enable
-	fi
-else
-	echo "ufw not installed; skipping firewall configuration." >&2
-fi
+# Ensure ownership of repo and config
+sudo chown -R "$RUN_USER":"$RUN_USER" "$XO_DIR" "$CONFIG_DIR"
 
-SERVICE_FILE="/etc/systemd/system/xen-orchestra.service"
+# Create a systemd service to run xo-server as the invoking user
+SERVICE_FILE=/etc/systemd/system/xo-server.service
+echo "Creating systemd service $SERVICE_FILE"
 sudo tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
-Description=Xen Orchestra (from sources)
-After=network.target redis.service
+Description=XO Server
+After=network-online.target
 
 [Service]
+Environment="DEBUG=xo:main"
 Type=simple
-User=$RUN_AS_USER
-Group=$RUN_AS_USER
-WorkingDirectory=$XO_DIR/packages/xo-server
-Environment=NODE_ENV=production
-ExecStart=/usr/bin/node $XO_DIR/packages/xo-server/dist/cli.mjs
+User=$RUN_USER
+Group=$RUN_USER
+WorkingDirectory=$XO_SERVER_DIR
+ExecStart=$(command -v node) $XO_SERVER_DIR/dist/cli.mjs
 Restart=always
 RestartSec=5
+SyslogIdentifier=xo-server
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now xen-orchestra.service
+sudo systemctl enable --now xo-server
 
-echo "Starting completed. Service: xen-orchestra.service (running as $RUN_AS_USER)"
+echo "Waiting for xo-server to become active..."
+for i in {1..30}; do
+	if sudo systemctl is-active --quiet xo-server; then
+		# quick HTTP check
+		if curl -k --max-time 3 https://127.0.0.1/ >/dev/null 2>&1; then
+			echo "Xen Orchestra is up and responding over HTTPS."
+			break
+		fi
+	fi
+	sleep 2
+	if [ "$i" -eq 30 ]; then
+		echo "Timed out waiting for xo-server to start. Check 'systemctl status xo-server' for details." >&2
+		exit 1
+	fi
+done
 
-echo "Basic verification:"
-echo " - service status:"
-sudo systemctl status --no-pager xen-orchestra.service || true
-echo " - ports listening (80/443):"
-sudo ss -tlnp | grep -E ':80|:443' || true
-
-cat <<FINISH
-Done.
-
-- Xen Orchestra installed at: $XO_DIR (owner: $RUN_AS_USER)
-- Nginx is configured to terminate TLS on 443 using self-signed certs at:
-  - $CERT_FILE
-  - $KEY_FILE
-- xen-orchestra systemd service: $SERVICE_FILE (runs as $RUN_AS_USER)
-
-If you passed --update the script compared the local commit with remote and updated only if
-the remote had newer commits.
-
-Next steps you may want to run as $RUN_AS_USER:
-  - View logs: sudo journalctl -u xen-orchestra -f
-  - Rebuild: cd $XO_DIR && yarn && yarn build
-
-Visit: https://$DOMAIN/ (accept the self-signed certificate in your browser)
-FINISH
+echo "Installation and service setup complete. Xen Orchestra should be available on ports 80 and 443 (HTTPS)."
+echo "Default web UI credentials (if first time) are: admin@admin.net / admin"
 
 exit 0
+
