@@ -18,7 +18,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 ### 1. Clone this repository
 
 ```bash
-git clone https://github.com/yourusername/install_xen_orchestra.git
+git clone https://github.com/acebmxer/install_xen_orchestra.git
 cd install_xen_orchestra
 ```
 
