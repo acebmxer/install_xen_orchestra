@@ -1,329 +1,371 @@
 #!/bin/bash
 #
-# Xen Orchestra Installation Script for Ubuntu 24.04.3
-# This script installs Xen Orchestra from source with all dependencies
-# and configures it to run on ports 80 and 443 with SSL
+# Xen Orchestra Installation Script
+# Based on: https://docs.xen-orchestra.com/installation#from-the-sources
 #
-# Usage:
-#   ./install-xen-orchestra.sh          - Fresh installation
-#   ./install-xen-orchestra.sh --upgrade - Upgrade existing installation
+# This script installs Xen Orchestra from source with:
+# - Node.js 20 LTS
+# - Self-signed SSL certificate
+# - Direct ports 80/443 (no proxy)
+# - Systemd service management
+# - Update functionality with backup management
 #
 
-set -e  # Exit on error
+set -e
 
-# Color codes for output
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
+SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
+
+# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Installation paths
-XO_DIR="/opt/xen-orchestra"
-CONFIG_DIR="$XO_DIR/packages/xo-server"
-SSL_DIR="/etc/xo-ssl"
-
-# Log function
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1"
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    exit 1
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
-warn() {
+log_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-   error "This script must be run as root (use sudo)"
-fi
-
-# Function to generate self-signed SSL certificate
-generate_ssl_certificate() {
-    log "Generating self-signed SSL certificate..."
-    
-    # Create SSL directory if it doesn't exist
-    mkdir -p "$SSL_DIR"
-    
-    # Get server hostname and IP
-    SERVER_HOSTNAME=$(hostname -f)
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-    
-    # Generate private key
-    openssl genrsa -out "$SSL_DIR/key.pem" 2048 2>/dev/null
-    
-    # Generate certificate signing request and self-signed certificate
-    openssl req -new -x509 -key "$SSL_DIR/key.pem" -out "$SSL_DIR/cert.pem" -days 3650 \
-        -subj "/C=US/ST=State/L=City/O=Xen Orchestra/OU=IT/CN=$SERVER_HOSTNAME" \
-        -addext "subjectAltName=DNS:$SERVER_HOSTNAME,DNS:localhost,IP:$SERVER_IP" 2>/dev/null
-    
-    # Set proper permissions
-    chmod 600 "$SSL_DIR/key.pem"
-    chmod 644 "$SSL_DIR/cert.pem"
-    chown -R xo:xo "$SSL_DIR"
-    
-    log "SSL certificate generated successfully"
-    log "Certificate: $SSL_DIR/cert.pem"
-    log "Private key: $SSL_DIR/key.pem"
-    log "Valid for: 10 years"
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Function to check if ports are available
-check_ports() {
-    log "Checking if ports 80 and 443 are available..."
-    
-    for port in 80 443; do
-        if netstat -tuln 2>/dev/null | grep -q ":$port " || ss -tuln 2>/dev/null | grep -q ":$port "; then
-            warn "Port $port appears to be in use"
-            read -p "Do you want to continue anyway? (y/n) " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                error "Installation cancelled. Please free port $port and try again."
+# Check if running as root/sudo and refuse
+check_not_root() {
+    if [[ $EUID -eq 0 ]]; then
+        log_error "=============================================="
+        log_error "Do NOT run this script as root or with sudo!"
+        log_error "Run as a normal user - the script will use sudo"
+        log_error "internally for commands that require privileges."
+        log_error "=============================================="
+        exit 1
+    fi
+}
+
+# Check if sudo is available and user has sudo privileges
+check_sudo() {
+    if ! command -v sudo &> /dev/null; then
+        log_error "sudo is not installed. Please install sudo first."
+        exit 1
+    fi
+
+    if ! sudo -v &> /dev/null; then
+        log_error "You need sudo privileges to run this script."
+        log_error "Please ensure your user is in the sudoers file."
+        exit 1
+    fi
+}
+
+# Load configuration
+load_config() {
+    # Check if config file exists, if not copy from sample
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        if [[ -f "$SAMPLE_CONFIG" ]]; then
+            log_info "Configuration file not found. Creating from sample..."
+            cp "$SAMPLE_CONFIG" "$CONFIG_FILE"
+            log_success "Created $CONFIG_FILE from sample-xo-config.cfg"
+            log_info "Please review the configuration before proceeding."
+        else
+            log_error "Neither xo-config.cfg nor sample-xo-config.cfg found!"
+            exit 1
+        fi
+    fi
+
+    # Source the configuration
+    source "$CONFIG_FILE"
+
+    # Set defaults if not specified
+    HTTP_PORT=${HTTP_PORT:-80}
+    HTTPS_PORT=${HTTPS_PORT:-443}
+    INSTALL_DIR=${INSTALL_DIR:-/opt/xen-orchestra}
+    SSL_CERT_DIR=${SSL_CERT_DIR:-/etc/ssl/xo}
+    SSL_CERT_FILE=${SSL_CERT_FILE:-xo-cert.pem}
+    SSL_KEY_FILE=${SSL_KEY_FILE:-xo-key.pem}
+    GIT_BRANCH=${GIT_BRANCH:-master}
+    BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
+    BACKUP_KEEP=${BACKUP_KEEP:-5}
+    NODE_VERSION=${NODE_VERSION:-20}
+    SERVICE_USER=${SERVICE_USER:-xo}
+    DEBUG_MODE=${DEBUG_MODE:-false}
+}
+
+# Detect package manager
+detect_package_manager() {
+    if command -v apt-get &> /dev/null; then
+        PKG_MANAGER="apt"
+        PKG_INSTALL="sudo apt-get install -y"
+        PKG_UPDATE="sudo apt-get update"
+    elif command -v dnf &> /dev/null; then
+        PKG_MANAGER="dnf"
+        PKG_INSTALL="sudo dnf install -y"
+        PKG_UPDATE="sudo dnf makecache"
+    elif command -v yum &> /dev/null; then
+        PKG_MANAGER="yum"
+        PKG_INSTALL="sudo yum install -y"
+        PKG_UPDATE="sudo yum makecache"
+    else
+        log_error "No supported package manager found (apt, dnf, yum)"
+        exit 1
+    fi
+    log_info "Detected package manager: $PKG_MANAGER"
+}
+
+# Install system dependencies
+install_dependencies() {
+    log_info "Installing system dependencies..."
+
+    $PKG_UPDATE
+
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        $PKG_INSTALL build-essential redis-server libpng-dev git python3-minimal \
+            libvhdi-utils lvm2 cifs-utils nfs-common ntfs-3g openssl curl ca-certificates gnupg
+    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+        # Check if it's RHEL 10+ or similar where Redis is replaced by Valkey
+        if [[ "$PKG_MANAGER" == "dnf" ]]; then
+            # Try to install Redis first, fall back to Valkey
+            if ! $PKG_INSTALL redis 2>/dev/null; then
+                log_info "Redis not available, installing Valkey as replacement..."
+                sudo dnf install -y epel-release || true
+                sudo dnf config-manager --enable devel || true
+                $PKG_INSTALL valkey valkey-compat-redis
             fi
         else
-            log "Port $port is available"
+            $PKG_INSTALL redis
         fi
-    done
+        $PKG_INSTALL libpng-devel git lvm2 cifs-utils make automake gcc gcc-c++ \
+            nfs-utils ntfs-3g openssl curl
+    fi
+
+    log_success "System dependencies installed"
 }
 
-# Function to upgrade Xen Orchestra
-upgrade_xo() {
-    log "Starting Xen Orchestra upgrade process..."
-    
-    if [ ! -d "$XO_DIR" ]; then
-        error "Xen Orchestra is not installed at $XO_DIR. Run without --upgrade to install."
+# Install Node.js 20 LTS
+install_nodejs() {
+    log_info "Installing Node.js ${NODE_VERSION} LTS..."
+
+    # Check if Node.js is already installed with correct version
+    if command -v node &> /dev/null; then
+        CURRENT_NODE=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
+        if [[ "$CURRENT_NODE" == "$NODE_VERSION" ]]; then
+            log_info "Node.js ${NODE_VERSION} is already installed: $(node -v)"
+            return 0
+        else
+            log_warning "Node.js $(node -v) is installed, but version ${NODE_VERSION} is required"
+        fi
     fi
-    
-    # Stop the service
-    log "Stopping Xen Orchestra service..."
-    systemctl stop xo-server.service || warn "Service was not running"
-    
-    # Backup current installation
-    BACKUP_DIR="/opt/xo-backup-$(date +%Y%m%d-%H%M%S)"
-    log "Creating backup at $BACKUP_DIR..."
-    cp -a "$XO_DIR" "$BACKUP_DIR"
-    
-    # Backup configuration
-    if [ -f "$CONFIG_DIR/.xo-server.toml" ]; then
-        cp "$CONFIG_DIR/.xo-server.toml" "$CONFIG_DIR/.xo-server.toml.backup.$(date +%Y%m%d-%H%M%S)"
+
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        # Install Node.js via NodeSource
+        curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+        curl -fsSL https://rpm.nodesource.com/setup_${NODE_VERSION}.x | sudo -E bash -
+        $PKG_INSTALL nodejs
     fi
-    
-    cd "$XO_DIR"
-    
-    # Pull latest changes
-    log "Pulling latest changes from repository..."
-    sudo -H -u xo git pull || error "Failed to pull latest changes"
-    
-    # Clean and reinstall dependencies
-    log "Cleaning old dependencies..."
-    sudo -H -u xo yarn cache clean
-    
-    log "Installing updated dependencies..."
-    if ! sudo -H -u xo yarn install --ignore-engines; then
-        error "Failed to install dependencies. Backup available at $BACKUP_DIR"
+
+    log_success "Node.js installed: $(node -v)"
+}
+
+# Install Yarn
+install_yarn() {
+    log_info "Installing Yarn..."
+
+    if command -v yarn &> /dev/null; then
+        log_info "Yarn is already installed: $(yarn -v)"
+        return 0
     fi
-    
-    # Rebuild
-    log "Rebuilding Xen Orchestra..."
-    if ! sudo -H -u xo yarn build; then
-        error "Failed to build Xen Orchestra. Backup available at $BACKUP_DIR"
+
+    sudo npm install -g yarn
+
+    log_success "Yarn installed: $(yarn -v)"
+}
+
+# Create service user if needed
+create_service_user() {
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            log_info "Creating service user: $SERVICE_USER"
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+            log_success "Service user created: $SERVICE_USER"
+        else
+            log_info "Service user $SERVICE_USER already exists"
+        fi
     fi
-    
-    # Verify the build
-    if [ ! -f "$XO_DIR/packages/xo-server/dist/cli.mjs" ]; then
-        error "Build verification failed. Backup available at $BACKUP_DIR"
+}
+
+# Start and enable Redis
+setup_redis() {
+    log_info "Setting up Redis..."
+
+    # Try redis-server first, then valkey
+    if systemctl list-unit-files | grep -q redis; then
+        sudo systemctl enable redis-server || sudo systemctl enable redis || true
+        sudo systemctl start redis-server || sudo systemctl start redis || true
+    elif systemctl list-unit-files | grep -q valkey; then
+        sudo systemctl enable valkey
+        sudo systemctl start valkey
     fi
-    
-    log "Build verification successful"
-    
-    # Restart the service
-    log "Starting Xen Orchestra service..."
-    systemctl start xo-server.service
-    
-    # Wait for service to start
-    sleep 5
-    
-    if systemctl is-active --quiet xo-server.service; then
-        log "Xen Orchestra upgrade completed successfully!"
-        log "Backup of previous version: $BACKUP_DIR"
-        echo ""
-        echo "=========================================="
-        echo -e "${GREEN}Upgrade Complete!${NC}"
-        echo "=========================================="
-        echo "Previous version backed up to: $BACKUP_DIR"
-        echo "You can remove the backup once you verify everything works."
-        echo ""
+
+    # Verify Redis is running
+    if redis-cli ping | grep -q PONG; then
+        log_success "Redis is running"
     else
-        error "Service failed to start after upgrade. Check logs with: journalctl -u xo-server -n 50"
+        log_error "Redis is not responding"
+        exit 1
     fi
-    
-    exit 0
 }
 
-# Check for upgrade flag
-if [ "$1" == "--upgrade" ]; then
-    upgrade_xo
-fi
+# Clone or update Xen Orchestra repository
+clone_repository() {
+    log_info "Setting up Xen Orchestra repository..."
 
-log "Starting Xen Orchestra installation on Ubuntu 24.04.3"
+    if [[ -d "$INSTALL_DIR" ]]; then
+        log_info "Installation directory exists. Use --update to update."
+        return 0
+    fi
 
-# Check ports before installation
-check_ports
+    sudo mkdir -p "$(dirname "$INSTALL_DIR")"
 
-# Update system
-log "Updating system packages..."
-apt-get update
-apt-get upgrade -y
+    log_info "Cloning Xen Orchestra (branch: $GIT_BRANCH)..."
+    sudo git clone -b "$GIT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
 
-# Install required dependencies including OpenSSL and net-tools
-log "Installing system dependencies..."
-apt-get install -y \
-    build-essential \
-    redis-server \
-    libpng-dev \
-    git \
-    python3-minimal \
-    libvhdi-utils \
-    lvm2 \
-    cifs-utils \
-    curl \
-    wget \
-    gnupg \
-    software-properties-common \
-    nfs-common \
-    openssl \
-    net-tools
+    # Set ownership if service user is defined
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+    fi
 
-# Install Node.js 20.x (LTS)
-log "Installing Node.js 20.x..."
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
-
-# Verify Node.js and npm installation
-log "Node.js version: $(node --version)"
-log "npm version: $(npm --version)"
-
-# Install Yarn package manager
-log "Installing Yarn..."
-npm install --global yarn
-
-# Create xo user if it doesn't exist
-if ! id "xo" &>/dev/null; then
-    log "Creating 'xo' user..."
-    useradd -m -s /bin/bash xo
-fi
-
-# Create installation directory
-log "Creating installation directory: $XO_DIR"
-mkdir -p "$XO_DIR"
-
-# Set ownership of the directory to xo user before cloning
-chown xo:xo "$XO_DIR"
-
-# Clone Xen Orchestra repository
-log "Cloning Xen Orchestra repository..."
-if [ -d "$XO_DIR/.git" ]; then
-    warn "Git repository already exists, pulling latest changes..."
-    cd "$XO_DIR"
-    sudo -u xo git pull
-else
-    sudo -H -u xo git clone -b master https://github.com/vatesfr/xen-orchestra "$XO_DIR"
-fi
-
-cd "$XO_DIR"
-
-# Install dependencies
-log "Installing Xen Orchestra dependencies (this may take a while)..."
-if ! sudo -H -u xo yarn install --ignore-engines; then
-    error "Failed to install dependencies. Check logs above for details."
-fi
+    log_success "Repository cloned to $INSTALL_DIR"
+}
 
 # Build Xen Orchestra
-log "Building Xen Orchestra..."
-if ! sudo -H -u xo yarn build; then
-    error "Failed to build Xen Orchestra. Check logs above for details."
-fi
+build_xo() {
+    log_info "Building Xen Orchestra (this may take a while)..."
 
-# Verify the build was successful
-if [ ! -f "$XO_DIR/packages/xo-server/dist/cli.mjs" ]; then
-    error "Build verification failed: xo-server binary not found"
-fi
+    # Run as service user if defined
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && yarn && yarn build"
+    else
+        sudo bash -c "cd '$INSTALL_DIR' && yarn && yarn build"
+    fi
 
-log "Build verification successful"
+    log_success "Xen Orchestra built successfully"
+}
 
-# Generate SSL certificate
-generate_ssl_certificate
+# Generate self-signed SSL certificate
+generate_ssl_certificate() {
+    log_info "Generating self-signed SSL certificate..."
 
-# Create configuration directory
-log "Creating configuration..."
+    sudo mkdir -p "$SSL_CERT_DIR"
 
-# Backup existing config if it exists
-if [ -f "$CONFIG_DIR/.xo-server.toml" ]; then
-    warn "Existing configuration found, creating backup..."
-    cp "$CONFIG_DIR/.xo-server.toml" "$CONFIG_DIR/.xo-server.toml.backup.$(date +%Y%m%d-%H%M%S)"
-fi
+    if [[ -f "${SSL_CERT_DIR}/${SSL_CERT_FILE}" ]] && [[ -f "${SSL_CERT_DIR}/${SSL_KEY_FILE}" ]]; then
+        log_info "SSL certificates already exist. Skipping generation."
+        return 0
+    fi
 
-# Create configuration file with both HTTP and HTTPS
-cat > "$CONFIG_DIR/.xo-server.toml" << EOF
+    sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "${SSL_CERT_DIR}/${SSL_KEY_FILE}" \
+        -out "${SSL_CERT_DIR}/${SSL_CERT_FILE}" \
+        -subj "/C=US/ST=State/L=City/O=Organization/OU=IT/CN=xen-orchestra"
+
+    # Set permissions
+    sudo chmod 600 "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
+    sudo chmod 644 "${SSL_CERT_DIR}/${SSL_CERT_FILE}"
+
+    # Set ownership if service user is defined
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
+    fi
+
+    log_success "SSL certificates generated in $SSL_CERT_DIR"
+}
+
+# Configure Xen Orchestra
+configure_xo() {
+    log_info "Configuring Xen Orchestra..."
+
+    local XO_CONFIG_FILE="/etc/xo-server/config.toml"
+
+    # Create config directory
+    sudo mkdir -p /etc/xo-server
+
+    # Create configuration file
+    sudo tee "$XO_CONFIG_FILE" > /dev/null << EOF
 # Xen Orchestra Server Configuration
+# Generated by install script
 
-# HTTP listen address and port
-[http]
-  listen = [
-    { port = 80 }
-  ]
+# HTTP settings - listen directly on ports
+[[http.listen]]
+port = ${HTTP_PORT}
 
-# HTTPS configuration with self-signed certificate
-[https]
-  listen = [
-    { port = 443, cert = '$SSL_DIR/cert.pem', key = '$SSL_DIR/key.pem' }
-  ]
+# HTTPS settings with self-signed certificate
+[[http.listen]]
+port = ${HTTPS_PORT}
+cert = "${SSL_CERT_DIR}/${SSL_CERT_FILE}"
+key = "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
 
-# Redis server for session management and cache
-[redis]
-  uri = 'redis://localhost:6379/0'
-
-# Default admin account (change password after first login!)
-# Username: admin@admin.net
-# Password: admin
-
+# Use sudo for NFS mounts (required for non-root user)
+useSudo = true
 EOF
 
-chown xo:xo "$CONFIG_DIR/.xo-server.toml"
+    # Set ownership if service user is defined
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
+    fi
 
-# Configure Redis to start on boot
-log "Configuring Redis..."
-systemctl enable redis-server
-systemctl start redis-server
+    log_success "Configuration written to $XO_CONFIG_FILE"
+}
 
-# Create systemd service file
-log "Creating systemd service..."
-cat > /etc/systemd/system/xo-server.service << EOF
+# Create systemd service
+create_systemd_service() {
+    log_info "Creating systemd service..."
+
+    local NODE_PATH=$(which node)
+    local EXEC_USER="${SERVICE_USER:-root}"
+    local XO_SERVER_PATH="${INSTALL_DIR}/packages/xo-server/dist/cli.mjs"
+    local DEBUG_ENV=""
+
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        DEBUG_ENV="DEBUG=xo:main"
+    fi
+
+    sudo tee /etc/systemd/system/xo-server.service > /dev/null << EOF
 [Unit]
 Description=Xen Orchestra Server
-After=network.target redis-server.service
-Requires=redis-server.service
+After=network-online.target redis.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=xo
-Group=xo
-WorkingDirectory=$XO_DIR/packages/xo-server
-ExecStart=/usr/bin/node --experimental-modules ./dist/cli.mjs
+User=${EXEC_USER}
+Environment="${DEBUG_ENV}"
+Environment="NODE_ENV=production"
+WorkingDirectory=${INSTALL_DIR}/packages/xo-server
+ExecStart=${NODE_PATH} ${XO_SERVER_PATH}
 Restart=always
 RestartSec=10
-StandardOutput=journal
-StandardError=journal
 SyslogIdentifier=xo-server
 
-# Security settings
+# Security hardening
 NoNewPrivileges=true
-PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=${INSTALL_DIR}
+ReadWritePaths=/var/lib/xo-server
+ReadWritePaths=/tmp
+ReadWritePaths=/etc/xo-server
 
-# Allow binding to privileged ports (80, 443)
+# Allow binding to privileged ports
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
@@ -331,90 +373,245 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 EOF
 
-# Set proper permissions
-chown -R xo:xo "$XO_DIR"
-
-# Configure firewall if UFW is active
-if command -v ufw &> /dev/null; then
-    if ufw status | grep -q "Status: active"; then
-        log "Configuring UFW firewall..."
-        ufw allow 80/tcp comment 'Xen Orchestra HTTP'
-        ufw allow 443/tcp comment 'Xen Orchestra HTTPS'
-        log "Firewall rules added for ports 80 and 443"
+    # Create data directory
+    sudo mkdir -p /var/lib/xo-server
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo chown "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
     fi
-fi
 
-# Reload systemd and enable service
-log "Enabling Xen Orchestra service..."
-systemctl daemon-reload
-systemctl enable xo-server.service
+    # Reload systemd and enable service
+    sudo systemctl daemon-reload
+    sudo systemctl enable xo-server
+
+    log_success "Systemd service created and enabled"
+}
+
+# Configure sudo for non-root user
+configure_sudo() {
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        log_info "Configuring sudo for NFS mounts..."
+
+        local SUDOERS_FILE="/etc/sudoers.d/xo-server"
+
+        sudo tee "$SUDOERS_FILE" > /dev/null << EOF
+# Allow xo-server user to mount/unmount without password
+${SERVICE_USER} ALL=(root) NOPASSWD: /bin/mount, /bin/umount, /bin/findmnt
+EOF
+
+        sudo chmod 440 "$SUDOERS_FILE"
+        log_success "Sudo configured for ${SERVICE_USER}"
+    fi
+}
+
+# Get current installed commit
+get_installed_commit() {
+    if [[ -d "$INSTALL_DIR/.git" ]]; then
+        # Run as service user to avoid git's dubious ownership check
+        if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+            sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null
+        else
+            git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null
+        fi
+    else
+        echo ""
+    fi
+}
+
+# Get remote commit
+get_remote_commit() {
+    git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/"$GIT_BRANCH" 2>/dev/null | cut -f1
+}
+
+# Create backup
+create_backup() {
+    log_info "Creating backup of current installation..."
+
+    sudo mkdir -p "$BACKUP_DIR"
+
+    local TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    local BACKUP_NAME="xo-backup-${TIMESTAMP}"
+    local BACKUP_PATH="${BACKUP_DIR}/${BACKUP_NAME}"
+
+    # Create backup (excluding node_modules to save space)
+    sudo cp -r "$INSTALL_DIR" "$BACKUP_PATH"
+    sudo rm -rf "${BACKUP_PATH}/node_modules"
+
+    log_success "Backup created: $BACKUP_PATH"
+
+    # Purge old backups, keep only the latest BACKUP_KEEP
+    log_info "Cleaning old backups (keeping ${BACKUP_KEEP})..."
+    ls -dt "${BACKUP_DIR}"/xo-backup-* 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) | sudo xargs -r rm -rf
+
+    log_success "Old backups cleaned"
+}
+
+# Update Xen Orchestra
+update_xo() {
+    log_info "Checking for updates..."
+
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        log_error "Xen Orchestra is not installed. Run without --update first."
+        exit 1
+    fi
+
+    local INSTALLED_COMMIT=$(get_installed_commit)
+    local REMOTE_COMMIT=$(get_remote_commit)
+
+    if [[ -z "$INSTALLED_COMMIT" ]]; then
+        log_error "Could not determine installed commit"
+        exit 1
+    fi
+
+    if [[ -z "$REMOTE_COMMIT" ]]; then
+        log_error "Could not fetch remote commit"
+        exit 1
+    fi
+
+    log_info "Installed commit: ${INSTALLED_COMMIT:0:12}"
+    log_info "Remote commit:    ${REMOTE_COMMIT:0:12}"
+
+    if [[ "$INSTALLED_COMMIT" == "$REMOTE_COMMIT" ]]; then
+        log_success "Already up to date. No update needed."
+        exit 0
+    fi
+
+    log_info "New version available. Proceeding with update..."
+
+    # Stop service
+    log_info "Stopping xo-server service..."
+    sudo systemctl stop xo-server || true
+
+    # Create backup
+    create_backup
+
+    # Update repository
+    log_info "Pulling latest changes..."
+
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" checkout .
+        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" pull --ff-only
+    else
+        sudo git -C "$INSTALL_DIR" checkout .
+        sudo git -C "$INSTALL_DIR" pull --ff-only
+    fi
+
+    # Rebuild
+    build_xo
+
+    # Start service
+    log_info "Starting xo-server service..."
+    sudo systemctl start xo-server
+
+    log_success "Update completed successfully!"
+    log_info "New commit: $(get_installed_commit | cut -c1-12)"
+}
 
 # Start the service
-log "Starting Xen Orchestra..."
-systemctl start xo-server.service
+start_service() {
+    log_info "Starting xo-server service..."
+    sudo systemctl start xo-server
 
-# Wait a moment for the service to start
-sleep 5
+    # Wait a moment for the service to start
+    sleep 3
 
-# Check service status
-if systemctl is-active --quiet xo-server.service; then
-    log "Xen Orchestra service is running!"
-else
-    error "Xen Orchestra service failed to start. Check logs with: journalctl -u xo-server -n 50"
-fi
+    if systemctl is-active --quiet xo-server; then
+        log_success "xo-server is running"
+    else
+        log_warning "xo-server may have failed to start. Check: sudo systemctl status xo-server"
+    fi
+}
 
-# Get server IP address
-SERVER_IP=$(hostname -I | awk '{print $1}')
-SERVER_HOSTNAME=$(hostname -f)
+# Print installation summary
+print_summary() {
+    echo ""
+    echo "=============================================="
+    log_success "Xen Orchestra Installation Complete!"
+    echo "=============================================="
+    echo ""
+    echo "Configuration:"
+    echo "  - HTTP Port:     ${HTTP_PORT}"
+    echo "  - HTTPS Port:    ${HTTPS_PORT}"
+    echo "  - Install Dir:   ${INSTALL_DIR}"
+    echo "  - SSL Cert Dir:  ${SSL_CERT_DIR}"
+    echo "  - Git Branch:    ${GIT_BRANCH}"
+    echo "  - Service User:  ${SERVICE_USER:-root}"
+    echo ""
+    echo "Access Xen Orchestra:"
+    echo "  - HTTP:  http://$(hostname -I | awk '{print $1}'):${HTTP_PORT}"
+    echo "  - HTTPS: https://$(hostname -I | awk '{print $1}'):${HTTPS_PORT}"
+    echo ""
+    echo "Default Credentials:"
+    echo "  - Username: admin@admin.net"
+    echo "  - Password: admin"
+    echo ""
+    echo "Service Management:"
+    echo "  - Start:   sudo systemctl start xo-server"
+    echo "  - Stop:    sudo systemctl stop xo-server"
+    echo "  - Status:  sudo systemctl status xo-server"
+    echo "  - Logs:    sudo journalctl -u xo-server -f"
+    echo ""
+    echo "To update Xen Orchestra, run:"
+    echo "  $0 --update"
+    echo ""
+    log_warning "Please change the default password immediately!"
+    echo ""
+}
 
-# Print completion message
-echo ""
-echo "=========================================="
-echo -e "${GREEN}Xen Orchestra Installation Complete!${NC}"
-echo "=========================================="
-echo ""
-echo "Access Xen Orchestra at:"
-echo "  HTTP:  http://$SERVER_IP"
-echo "  HTTPS: https://$SERVER_IP"
-echo "  or https://localhost (if on the server)"
-echo ""
-echo -e "${YELLOW}NOTE: You'll see a browser warning about the self-signed certificate.${NC}"
-echo "This is normal. Click 'Advanced' and proceed to continue."
-echo ""
-echo "Default credentials:"
-echo "  Username: admin@admin.net"
-echo "  Password: admin"
-echo ""
-echo -e "${YELLOW}IMPORTANT SECURITY NOTES:${NC}"
-echo "1. Change the default password immediately after login!"
-echo "2. The service is running on both:"
-echo "   - Port 80 (HTTP) - redirects to HTTPS"
-echo "   - Port 443 (HTTPS) - with self-signed certificate"
-echo "3. SSL Certificate details:"
-echo "   - Certificate: $SSL_DIR/cert.pem"
-echo "   - Private key: $SSL_DIR/key.pem"
-echo "   - Valid for: 10 years"
-echo "4. To use a trusted certificate (Let's Encrypt, etc.):"
-echo "   - Replace the files in $SSL_DIR/"
-echo "   - Restart the service: sudo systemctl restart xo-server"
-echo ""
-echo "Useful commands:"
-echo "  Check status:  sudo systemctl status xo-server"
-echo "  View logs:     sudo journalctl -u xo-server -f"
-echo "  Restart:       sudo systemctl restart xo-server"
-echo "  Stop:          sudo systemctl stop xo-server"
-echo ""
-echo "To upgrade Xen Orchestra in the future:"
-echo "  sudo ./install-xen-orchestra.sh --upgrade"
-echo ""
-echo "Or manually:"
-echo "  cd /opt/xen-orchestra"
-echo "  sudo systemctl stop xo-server"
-echo "  sudo -u xo git pull"
-echo "  sudo -u xo yarn install --ignore-engines"
-echo "  sudo -u xo yarn build"
-echo "  sudo systemctl start xo-server"
-echo ""
-echo "=========================================="
+# Main installation function
+install_xo() {
+    log_info "Starting Xen Orchestra installation..."
 
-log "Installation script completed successfully!"
+    check_not_root
+    check_sudo
+    load_config
+    detect_package_manager
+    install_dependencies
+    install_nodejs
+    install_yarn
+    create_service_user
+    setup_redis
+    clone_repository
+    build_xo
+    generate_ssl_certificate
+    configure_xo
+    create_systemd_service
+    configure_sudo
+    start_service
+    print_summary
+}
+
+# Show help
+show_help() {
+    echo "Xen Orchestra Installation Script"
+    echo ""
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --update      Update existing installation"
+    echo "  --help        Show this help message"
+    echo ""
+    echo "Configuration:"
+    echo "  Copy sample-xo-config.cfg to xo-config.cfg and edit as needed."
+    echo "  If xo-config.cfg is not found, it will be created automatically."
+    echo ""
+}
+
+# Main entry point
+main() {
+    case "${1:-}" in
+        --update)
+            check_not_root
+            check_sudo
+            load_config
+            update_xo
+            ;;
+        --help)
+            show_help
+            ;;
+        *)
+            install_xo
+            ;;
+    esac
+}
+
+main "$@"

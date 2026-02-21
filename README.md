@@ -1,233 +1,190 @@
-# Xen Orchestra Installation for Ubuntu 24.04.3
+# Xen Orchestra Installation Script
 
-This installation script sets up Xen Orchestra from source on a fresh Ubuntu Server 24.04.3 installation.
+Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) from source, based on the [official documentation](https://docs.xen-orchestra.com/installation#from-the-sources).
+
+## Features
+
+- Installs all required dependencies and prerequisites
+- Uses Node.js 20 LTS
+- Self-signed SSL certificate generation for HTTPS
+- Direct port binding (80 and 443) - no proxy required
+- Systemd service for automatic startup
+- Update functionality with commit comparison
+- Automatic backups before updates (keeps last 5)
+- Configurable via simple config file
 
 ## Quick Start
 
-1. Make the script executable:
+### 1. Clone this repository
+
 ```bash
-chmod +x install-xen-orchestra.sh
+git clone https://github.com/yourusername/install_xen_orchestra.git
+cd install_xen_orchestra
 ```
 
-2. Run the script as root:
+### 2. Configure the installation
+
+Copy the sample configuration file and customize it:
+
 ```bash
-sudo ./install-xen-orchestra.sh
+cp sample-xo-config.cfg xo-config.cfg
 ```
 
-3. Access Xen Orchestra:
-   - Open a web browser and navigate to: `http://YOUR_SERVER_IP`
-   - Default credentials:
-     - Username: `admin@admin.net`
-     - Password: `admin`
-   - **IMPORTANT**: Change the password immediately after first login!
+Edit `xo-config.cfg` with your preferred settings:
 
-## What Gets Installed
-
-The script installs and configures:
-
-- **Node.js 20.x** (LTS version)
-- **Yarn** package manager
-- **Redis** server (for session management)
-- **Build tools** and system dependencies
-- **Xen Orchestra** from the official GitHub repository
-- **systemd service** for automatic startup
-
-## Port Configuration
-
-- **Port 80 (HTTP)**: Configured and ready to use
-- **Port 443 (HTTPS)**: Requires manual SSL certificate configuration
-
-## Enabling HTTPS (Port 443)
-
-To enable HTTPS support:
-
-1. Obtain SSL certificates (e.g., using Let's Encrypt):
 ```bash
-sudo apt-get install certbot
-sudo certbot certonly --standalone -d your-domain.com
+nano xo-config.cfg
 ```
 
-2. Edit the configuration file:
+> **Note:** If `xo-config.cfg` is not found when running the script, it will automatically be created from `sample-xo-config.cfg` with default settings.
+
+### 3. Run the installation
+
+**Important:** Do NOT run this script with `sudo`. Run as a normal user with sudo privileges - the script will use `sudo` internally for commands that require elevated permissions.
+
 ```bash
-sudo nano /opt/xen-orchestra/packages/xo-server/.xo-server.toml
+./install-xen-orchestra.sh
 ```
 
-3. Uncomment and configure the HTTPS section:
-```toml
-[https]
-  listen = [
-    { port = 443, cert = '/etc/letsencrypt/live/your-domain.com/fullchain.pem', key = '/etc/letsencrypt/live/your-domain.com/privkey.pem' }
-```
+## Configuration Options
 
-4. Restart the service:
-```bash
-sudo systemctl restart xo-server
-```
+The `xo-config.cfg` file supports the following options:
 
-## Service Management
-
-### Check Service Status
-```bash
-sudo systemctl status xo-server
-```
-
-### View Live Logs
-```bash
-sudo journalctl -u xo-server -f
-```
-
-### Restart Service
-```bash
-sudo systemctl restart xo-server
-```
-
-### Stop Service
-```bash
-sudo systemctl stop xo-server
-```
-
-### Start Service
-```bash
-sudo systemctl start xo-server
-```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `HTTP_PORT` | 80 | HTTP port for web interface |
+| `HTTPS_PORT` | 443 | HTTPS port for web interface |
+| `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
+| `SSL_CERT_DIR` | /etc/ssl/xo | SSL certificate directory |
+| `SSL_CERT_FILE` | xo-cert.pem | SSL certificate filename |
+| `SSL_KEY_FILE` | xo-key.pem | SSL private key filename |
+| `GIT_BRANCH` | master | Git branch (master, stable, or tag) |
+| `BACKUP_DIR` | /opt/xo-backups | Backup directory for updates |
+| `BACKUP_KEEP` | 5 | Number of backups to retain |
+| `NODE_VERSION` | 20 | Node.js major version |
+| `SERVICE_USER` | xo | Service user (set empty for root) |
+| `DEBUG_MODE` | false | Enable debug logging |
 
 ## Updating Xen Orchestra
 
-To update to the latest version:
+To update an existing installation:
+
+```bash
+./install-xen-orchestra.sh --update
+```
+
+The update process will:
+
+1. Compare the installed commit with the latest from GitHub
+2. Skip if already up to date
+3. Create a backup of the current installation
+4. Pull the latest changes
+5. Rebuild Xen Orchestra
+6. Restart the service
+
+### Backup Management
+
+- Backups are stored in `BACKUP_DIR` (default: `/opt/xo-backups`)
+- Only the last `BACKUP_KEEP` backups are retained (default: 5)
+- Older backups are automatically purged
+
+## Service Management
+
+After installation, Xen Orchestra runs as a systemd service:
+
+```bash
+# Start the service
+sudo systemctl start xo-server
+
+# Stop the service
+sudo systemctl stop xo-server
+
+# Check status
+sudo systemctl status xo-server
+
+# View logs
+sudo journalctl -u xo-server -f
+```
+
+## Accessing Xen Orchestra
+
+After installation, access the web interface:
+
+- **HTTP:** `http://your-server-ip:80`
+- **HTTPS:** `https://your-server-ip:443`
+
+### Default Credentials
+
+- **Username:** `admin@admin.net`
+- **Password:** `admin`
+
+> **Warning:** Change the default password immediately after first login!
+
+## Switching Branches
+
+To switch to a different branch (e.g., from `master` to `stable`):
+
+1. Edit `xo-config.cfg` and change `GIT_BRANCH`
+2. Manually update the repository:
 
 ```bash
 cd /opt/xen-orchestra
-sudo systemctl stop xo-server
-sudo -u xo git pull
-sudo -u xo yarn install --ignore-engines
-sudo -u xo yarn build
-sudo systemctl start xo-server
+sudo -u xo git fetch origin
+sudo -u xo git checkout stable
+./install-xen-orchestra.sh --update
 ```
+
+## Supported Operating Systems
+
+- **Debian/Ubuntu** (apt-based)
+- **RHEL/CentOS/AlmaLinux/Rocky** (dnf/yum-based)
 
 ## Troubleshooting
 
-### Service Won't Start
+### Service fails to start
 
-Check the logs for errors:
+Check the service logs:
+
 ```bash
-sudo journalctl -u xo-server -n 100
+sudo journalctl -u xo-server -n 50
 ```
 
-Common issues:
-- Redis not running: `sudo systemctl status redis-server`
-- Port already in use: Check if another service is using port 80
-- Permission issues: Ensure `/opt/xen-orchestra` is owned by user `xo`
+### Port binding issues
 
-### Cannot Access Web Interface
+If running as non-root, the service uses `CAP_NET_BIND_SERVICE` to bind to privileged ports. Ensure systemd is configured correctly.
 
-1. Check if the service is running:
+### Build failures
+
+Try cleaning and rebuilding:
+
 ```bash
-sudo systemctl status xo-server
+cd /opt/xen-orchestra
+rm -rf node_modules
+sudo -u xo yarn
+sudo -u xo yarn build
 ```
 
-2. Verify the port is listening:
-```bash
-sudo netstat -tulpn | grep 80
-```
-
-3. Check firewall rules:
-```bash
-sudo ufw status
-```
-
-4. Verify server IP address:
-```bash
-hostname -I
-```
-
-### Redis Connection Issues
+### Redis connection issues
 
 Ensure Redis is running:
-```bash
-sudo systemctl status redis-server
-sudo systemctl restart redis-server
-```
-
-### Build Errors
-
-If you encounter build errors during installation:
-
-1. Ensure you have enough disk space:
-```bash
-df -h
-```
-
-2. Check Node.js version (should be 20.x):
-```bash
-node --version
-```
-
-3. Clear npm cache and retry:
-```bash
-sudo -u xo yarn cache clean
-cd /opt/xen-orchestra
-sudo -u xo yarn install --ignore-engines
-```
-
-## File Locations
-
-- **Installation Directory**: `/opt/xen-orchestra`
-- **Configuration File**: `/opt/xen-orchestra/packages/xo-server/.xo-server.toml`
-- **systemd Service**: `/etc/systemd/system/xo-server.service`
-- **Logs**: `journalctl -u xo-server`
-
-## Security Recommendations
-
-1. **Change Default Password**: Immediately after first login
-2. **Enable HTTPS**: Configure SSL certificates for encrypted connections
-3. **Firewall**: Ensure only necessary ports are open
-4. **Regular Updates**: Keep Xen Orchestra and the system updated
-5. **Backup Configuration**: Regularly backup your `.xo-server.toml` file
-
-## Performance Optimization
-
-For production environments:
-
-1. **Increase Redis memory** (edit `/etc/redis/redis.conf`):
-```
-maxmemory 256mb
-maxmemory-policy allkeys-lru
-```
-
-2. **Configure Node.js memory limits** in the systemd service:
-```
-Environment="NODE_OPTIONS=--max-old-space-size=4096"
-```
-
-3. **Enable log rotation** to prevent disk space issues
-
-## Support and Resources
-
-- **Official Documentation**: https://docs.xen-orchestra.com/
-- **GitHub Repository**: https://github.com/vatesfr/xen-orchestra
-- **Community Forum**: https://xcp-ng.org/forum/
-
-## Important Notes
-
-- This installation method is from source and is NOT officially supported for production use
-- For production environments, consider using XOA (Xen Orchestra Appliance)
-- The default configuration uses HTTP only - configure HTTPS for production
-- Redis is required for session management and must be running
-
-## Uninstallation
-
-To completely remove Xen Orchestra:
 
 ```bash
-sudo systemctl stop xo-server
-sudo systemctl disable xo-server
-sudo rm /etc/systemd/system/xo-server.service
-sudo systemctl daemon-reload
-sudo rm -rf /opt/xen-orchestra
-sudo userdel -r xo
-sudo apt-get remove --purge redis-server
+redis-cli ping
+# Should respond with: PONG
 ```
+
+## Security Considerations
+
+- **No Root:** The script refuses to run as root/sudo and uses sudo internally
+- **Service User:** Runs as dedicated `xo` user by default
+- **SSL:** Self-signed certificate generated automatically
+- **Sudo:** Configured only for NFS mount operations
 
 ## License
 
-Xen Orchestra is licensed under AGPL3. See the official repository for details.
+This installation script is provided as-is. Xen Orchestra itself is licensed under [AGPL-3.0](https://github.com/vatesfr/xen-orchestra/blob/master/LICENSE).
+
+## Credits
+
+- [Xen Orchestra](https://xen-orchestra.com/) by [Vates](https://vates.tech/)
+- [Installation Documentation](https://docs.xen-orchestra.com/installation#from-the-sources)
