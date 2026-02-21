@@ -489,10 +489,14 @@ update_xo() {
 
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" checkout .
-        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" pull --ff-only
+        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" fetch origin
+        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" checkout "$GIT_BRANCH"
+        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" pull --ff-only origin "$GIT_BRANCH"
     else
         sudo git -C "$INSTALL_DIR" checkout .
-        sudo git -C "$INSTALL_DIR" pull --ff-only
+        sudo git -C "$INSTALL_DIR" fetch origin
+        sudo git -C "$INSTALL_DIR" checkout "$GIT_BRANCH"
+        sudo git -C "$INSTALL_DIR" pull --ff-only origin "$GIT_BRANCH"
     fi
 
     # Rebuild
