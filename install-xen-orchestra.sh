@@ -250,8 +250,24 @@ clone_repository() {
 }
 
 # Build Xen Orchestra
+# Usage: build_xo [clean]
+# If "clean" is passed, turbo cache will be cleared first
 build_xo() {
+    local CLEAN_BUILD="${1:-}"
+    
     log_info "Building Xen Orchestra (this may take a while)..."
+
+    # Clear turbo cache if clean build requested
+    if [[ "$CLEAN_BUILD" == "clean" ]]; then
+        log_info "Clearing build cache for clean rebuild..."
+        if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+            sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
+            sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
+        else
+            sudo rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
+            sudo rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
+        fi
+    fi
 
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
@@ -489,14 +505,16 @@ update_xo() {
 
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" checkout .
-        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" pull --ff-only
+        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" fetch origin
+        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
     else
         sudo git -C "$INSTALL_DIR" checkout .
-        sudo git -C "$INSTALL_DIR" pull --ff-only
+        sudo git -C "$INSTALL_DIR" fetch origin
+        sudo git -C "$INSTALL_DIR" checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
     fi
 
-    # Rebuild
-    build_xo
+    # Rebuild with clean cache to ensure fresh build
+    build_xo clean
 
     # Start service
     log_info "Starting xo-server service..."
@@ -593,6 +611,7 @@ show_help() {
     echo "Configuration:"
     echo "  Copy sample-xo-config.cfg to xo-config.cfg and edit as needed."
     echo "  If xo-config.cfg is not found, it will be created automatically."
+    echo "  To switch branches, edit GIT_BRANCH in xo-config.cfg and run --update."
     echo ""
 }
 
