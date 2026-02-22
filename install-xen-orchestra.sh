@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+trap 'log_error "Script failed at line $LINENO. If the service was stopped, run: sudo systemctl start xo-server"' ERR
 #
 # Xen Orchestra Installation Script
 # Based on: https://docs.xen-orchestra.com/installation#from-the-sources
