@@ -10,6 +10,7 @@
 # - Systemd service management
 # - Update functionality with backup management
 # - Restore functionality from named backups
+# - Rebuild functionality (fresh clone + build, preserves settings)
 #
 
 set -e
@@ -666,6 +667,99 @@ update_xo() {
     log_info "New commit: $(get_installed_commit | cut -c1-12)"
 }
 
+# Rebuild Xen Orchestra from scratch on the current branch.
+# Takes a backup first, then does a fresh clone + clean build while
+# leaving user settings (/etc/xo-server, /var/lib/xo-server) untouched.
+rebuild_xo() {
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        log_error "Xen Orchestra is not installed at $INSTALL_DIR."
+        log_error "Run the script without options to perform a fresh install."
+        exit 1
+    fi
+
+    # Detect the currently checked-out branch
+    local CURRENT_BRANCH
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        CURRENT_BRANCH=$(sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$GIT_BRANCH")
+    else
+        CURRENT_BRANCH=$(sudo git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$GIT_BRANCH")
+    fi
+
+    local CURRENT_COMMIT
+    CURRENT_COMMIT=$(get_installed_commit)
+
+    echo ""
+    echo "=============================================="
+    echo "  Xen Orchestra Rebuild"
+    echo "=============================================="
+    echo ""
+    log_info "Current branch:  ${CURRENT_BRANCH}"
+    log_info "Current commit:  ${CURRENT_COMMIT:0:12}"
+    log_info "Install dir:     ${INSTALL_DIR}"
+    echo ""
+    log_warning "This will:"
+    log_warning "  1. Back up the current installation to ${BACKUP_DIR}"
+    log_warning "  2. Remove ${INSTALL_DIR} and do a fresh clone from branch '${CURRENT_BRANCH}'"
+    log_warning "  3. Perform a clean rebuild"
+    log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
+    echo ""
+    echo -n "Continue? [y/N]: "
+    read -r CONFIRM
+
+    if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
+        log_info "Rebuild cancelled."
+        exit 0
+    fi
+
+    # Stop the service before touching anything
+    log_info "Stopping xo-server service..."
+    sudo systemctl stop xo-server || true
+
+    # Backup current installation (node_modules excluded, same as update)
+    create_backup
+
+    # Wipe current installation directory
+    log_info "Removing current installation directory..."
+    sudo rm -rf "$INSTALL_DIR"
+
+    # Fresh clone of the same branch
+    log_info "Cloning Xen Orchestra (branch: ${CURRENT_BRANCH})..."
+    sudo mkdir -p "$(dirname "$INSTALL_DIR")"
+    sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
+
+    # Restore ownership
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+    fi
+
+    # Clean build to ensure no stale artefacts
+    build_xo clean
+
+    # Restart the service
+    log_info "Starting xo-server service..."
+    sudo systemctl start xo-server
+    sleep 3
+
+    local NEW_COMMIT
+    NEW_COMMIT=$(get_installed_commit)
+
+    echo ""
+    echo "=============================================="
+    log_success "Rebuild completed successfully!"
+    echo "=============================================="
+    log_info "Branch:      ${CURRENT_BRANCH}"
+    log_info "New commit:  ${NEW_COMMIT:0:12}"
+
+    if systemctl is-active --quiet xo-server; then
+        log_success "xo-server is running"
+    else
+        log_warning "xo-server may have failed to start. Check: sudo systemctl status xo-server"
+    fi
+
+    log_info "Your settings in /etc/xo-server and /var/lib/xo-server are unchanged."
+    echo ""
+}
+
 # Start the service
 start_service() {
     log_info "Starting xo-server service..."
@@ -755,6 +849,7 @@ show_help() {
     echo "Options:"
     echo "  --update      Update existing installation"
     echo "  --restore     Restore a previous backup interactively"
+    echo "  --rebuild     Fresh clone + clean build on the current branch (backup taken first)"
     echo "  --help        Show this help message"
     echo ""
     echo "Configuration:"
@@ -778,6 +873,12 @@ main() {
             check_sudo
             load_config
             restore_xo
+            ;;
+        --rebuild)
+            check_not_root
+            check_sudo
+            load_config
+            rebuild_xo
             ;;
         --help)
             show_help
