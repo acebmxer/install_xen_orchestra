@@ -11,6 +11,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Systemd service for automatic startup
 - Update functionality with commit comparison
 - Automatic backups before updates (keeps last 5)
+- Interactive restore from any available backup
 - Configurable via simple config file
 
 ## Quick Start
@@ -88,6 +89,45 @@ The update process will:
 - Only the last `BACKUP_KEEP` backups are retained (default: 5)
 - Older backups are automatically purged
 
+## Restoring from Backup
+
+To restore a previous installation:
+
+```bash
+./install-xen-orchestra.sh --restore
+```
+
+The restore process will:
+
+1. List all available backups with their dates and commit hashes
+2. Prompt you to select which backup to restore
+3. Ask for confirmation before making any changes
+4. Stop the running service
+5. Replace the current installation with the selected backup
+6. Rebuild Xen Orchestra (node_modules are excluded from backups to save space)
+7. Restart the service and report the restored commit hash
+
+Example output:
+
+```
+==============================================
+  Available Backups
+==============================================
+
+  [1] xo-backup-20260221_143000  (2026-02-21 14:30:00)  commit: a1b2c3d4e5f6
+  [2] xo-backup-20260220_091500  (2026-02-20 09:15:00)  commit: 9f8e7d6c5b4a
+  [3] xo-backup-20260218_175200  (2026-02-18 17:52:00)  commit: 3c4d5e6f7a8b
+
+Enter the number of the backup to restore [1-3], or 'q' to quit:
+```
+
+After a successful restore the confirmed commit is displayed:
+
+```
+[SUCCESS] Restore completed successfully!
+[INFO]    Restored commit: a1b2c3d4e5f6
+```
+
 ## Service Management
 
 After installation, Xen Orchestra runs as a systemd service:
@@ -110,8 +150,10 @@ sudo journalctl -u xo-server -f
 
 After installation, access the web interface:
 
-- **HTTP:** `http://your-server-ip:80`
-- **HTTPS:** `https://your-server-ip:443`
+- **HTTP:** `http://your-server-ip`
+- **HTTPS:** `https://your-server-ip`
+
+> **Note:** If you changed `HTTP_PORT` or `HTTPS_PORT` in `xo-config.cfg` from the defaults (80/443), append the port to the URL — e.g. `http://your-server-ip:8080`
 
 ### Default Credentials
 
@@ -125,14 +167,13 @@ After installation, access the web interface:
 To switch to a different branch (e.g., from `master` to `stable`):
 
 1. Edit `xo-config.cfg` and change `GIT_BRANCH`
-2. Manually update the repository:
+2. Run the update:
 
 ```bash
-cd /opt/xen-orchestra
-sudo -u xo git fetch origin
-sudo -u xo git checkout stable
 ./install-xen-orchestra.sh --update
 ```
+
+The script will automatically fetch and checkout the new branch during the update process.
 
 ## Supported Operating Systems
 

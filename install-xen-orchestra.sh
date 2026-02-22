@@ -9,6 +9,7 @@
 # - Direct ports 80/443 (no proxy)
 # - Systemd service management
 # - Update functionality with backup management
+# - Restore functionality from named backups
 #
 
 set -e
@@ -461,6 +462,124 @@ create_backup() {
     log_success "Old backups cleaned"
 }
 
+# Restore Xen Orchestra from a backup
+restore_xo() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_error "Backup directory not found: $BACKUP_DIR"
+        exit 1
+    fi
+
+    # Build sorted (newest first) list of backups
+    local BACKUPS=()
+    while IFS= read -r -d '' dir; do
+        BACKUPS+=("$dir")
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -name "xo-backup-*" -type d -print0 2>/dev/null | sort -zr)
+
+    if [[ ${#BACKUPS[@]} -eq 0 ]]; then
+        log_error "No backups found in $BACKUP_DIR"
+        exit 1
+    fi
+
+    echo ""
+    echo "=============================================="
+    echo "  Available Backups"
+    echo "=============================================="
+    echo ""
+
+    local i=1
+    for BACKUP in "${BACKUPS[@]}"; do
+        local BACKUP_NAME
+        BACKUP_NAME=$(basename "$BACKUP")
+        # Read commit hash directly from backup's git repo (backups are owned by root)
+        local BACKUP_COMMIT=""
+        if [[ -d "$BACKUP/.git" ]]; then
+            BACKUP_COMMIT=$(sudo git -C "$BACKUP" rev-parse HEAD 2>/dev/null | cut -c1-12 || true)
+        fi
+        # Parse timestamp from name: xo-backup-YYYYMMDD_HHMMSS
+        local TS="${BACKUP_NAME#xo-backup-}"
+        local DATE="${TS:0:4}-${TS:4:2}-${TS:6:2}"
+        local TIME="${TS:9:2}:${TS:11:2}:${TS:13:2}"
+        if [[ -n "$BACKUP_COMMIT" ]]; then
+            printf "  [%d] %s  (%s %s)  commit: %s\n" "$i" "$BACKUP_NAME" "$DATE" "$TIME" "$BACKUP_COMMIT"
+        else
+            printf "  [%d] %s  (%s %s)\n" "$i" "$BACKUP_NAME" "$DATE" "$TIME"
+        fi
+        ((i++))
+    done
+
+    local TOTAL=$((i - 1))
+    echo ""
+    echo -n "Enter the number of the backup to restore [1-${TOTAL}], or 'q' to quit: "
+    read -r CHOICE
+
+    if [[ "$CHOICE" == "q" ]] || [[ "$CHOICE" == "Q" ]]; then
+        log_info "Restore cancelled."
+        exit 0
+    fi
+
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [[ "$CHOICE" -lt 1 ]] || [[ "$CHOICE" -gt "$TOTAL" ]]; then
+        log_error "Invalid selection: $CHOICE"
+        exit 1
+    fi
+
+    local SELECTED_BACKUP="${BACKUPS[$((CHOICE - 1))]}"
+    local SELECTED_NAME
+    SELECTED_NAME=$(basename "$SELECTED_BACKUP")
+
+    echo ""
+    log_warning "You are about to restore: $SELECTED_NAME"
+    log_warning "This will replace the current installation at $INSTALL_DIR"
+    echo -n "Are you sure? [y/N]: "
+    read -r CONFIRM
+
+    if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
+        log_info "Restore cancelled."
+        exit 0
+    fi
+
+    # Stop the service
+    log_info "Stopping xo-server service..."
+    sudo systemctl stop xo-server || true
+
+    # Remove current installation
+    log_info "Removing current installation..."
+    sudo rm -rf "$INSTALL_DIR"
+
+    # Copy backup into place
+    log_info "Restoring from backup: $SELECTED_NAME"
+    sudo cp -r "$SELECTED_BACKUP" "$INSTALL_DIR"
+
+    # Fix ownership
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+    fi
+
+    # Rebuild — node_modules are excluded from backups
+    log_info "Rebuilding Xen Orchestra (node_modules were excluded from backup)..."
+    build_xo
+
+    # Start the service
+    log_info "Starting xo-server service..."
+    sudo systemctl start xo-server
+    sleep 3
+
+    local RESTORED_COMMIT
+    RESTORED_COMMIT=$(get_installed_commit)
+
+    echo ""
+    echo "=============================================="
+    log_success "Restore completed successfully!"
+    echo "=============================================="
+    log_info "Restored commit: ${RESTORED_COMMIT:0:12}"
+
+    if systemctl is-active --quiet xo-server; then
+        log_success "xo-server is running"
+    else
+        log_warning "xo-server may have failed to start. Check: sudo systemctl status xo-server"
+    fi
+    echo ""
+}
+
 # Update Xen Orchestra
 update_xo() {
     log_info "Checking for updates..."
@@ -555,8 +674,14 @@ print_summary() {
     echo "  - Service User:  ${SERVICE_USER:-root}"
     echo ""
     echo "Access Xen Orchestra:"
-    echo "  - HTTP:  http://$(hostname -I | awk '{print $1}'):${HTTP_PORT}"
-    echo "  - HTTPS: https://$(hostname -I | awk '{print $1}'):${HTTPS_PORT}"
+    local SERVER_IP
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    local HTTP_URL="http://${SERVER_IP}"
+    local HTTPS_URL="https://${SERVER_IP}"
+    [[ "$HTTP_PORT" != "80" ]]   && HTTP_URL="${HTTP_URL}:${HTTP_PORT}"
+    [[ "$HTTPS_PORT" != "443" ]] && HTTPS_URL="${HTTPS_URL}:${HTTPS_PORT}"
+    echo "  - HTTP:  ${HTTP_URL}"
+    echo "  - HTTPS: ${HTTPS_URL}"
     echo ""
     echo "Default Credentials:"
     echo "  - Username: admin@admin.net"
@@ -606,6 +731,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  --update      Update existing installation"
+    echo "  --restore     Restore a previous backup interactively"
     echo "  --help        Show this help message"
     echo ""
     echo "Configuration:"
@@ -623,6 +749,12 @@ main() {
             check_sudo
             load_config
             update_xo
+            ;;
+        --restore)
+            check_not_root
+            check_sudo
+            load_config
+            restore_xo
             ;;
         --help)
             show_help
