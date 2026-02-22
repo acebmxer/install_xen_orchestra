@@ -445,7 +445,7 @@ create_backup() {
 
     sudo mkdir -p "$BACKUP_DIR"
 
-    local TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    local TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
     local BACKUP_NAME="xo-backup-${TIMESTAMP}"
     local BACKUP_PATH="${BACKUP_DIR}/${BACKUP_NAME}"
 
@@ -457,7 +457,20 @@ create_backup() {
 
     # Purge old backups, keep only the latest BACKUP_KEEP
     log_info "Cleaning old backups (keeping ${BACKUP_KEEP})..."
-    ls -dt "${BACKUP_DIR}"/xo-backup-* 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)) | sudo xargs -r rm -rf
+    local ALL_BACKUPS=()
+    while IFS= read -r -d '' dir; do
+        ALL_BACKUPS+=("$dir")
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -name "xo-backup-*" -type d -print0 2>/dev/null | sort -zr)
+
+    local TOTAL_BACKUPS=${#ALL_BACKUPS[@]}
+    if [[ $TOTAL_BACKUPS -gt $BACKUP_KEEP ]]; then
+        local TO_DELETE=$(( TOTAL_BACKUPS - BACKUP_KEEP ))
+        log_info "Removing ${TO_DELETE} old backup(s)..."
+        for (( idx=BACKUP_KEEP; idx<TOTAL_BACKUPS; idx++ )); do
+            log_info "Removing old backup: $(basename "${ALL_BACKUPS[$idx]}")"
+            sudo rm -rf "${ALL_BACKUPS[$idx]}"
+        done
+    fi
 
     log_success "Old backups cleaned"
 }
@@ -486,6 +499,7 @@ restore_xo() {
     echo "=============================================="
     echo ""
 
+    local TOTAL_TO_LIST=${#BACKUPS[@]}
     local i=1
     for BACKUP in "${BACKUPS[@]}"; do
         local BACKUP_NAME
@@ -496,13 +510,22 @@ restore_xo() {
             BACKUP_COMMIT=$(sudo git -C "$BACKUP" rev-parse HEAD 2>/dev/null | cut -c1-12 || true)
         fi
         # Parse timestamp from name: xo-backup-YYYYMMDD_HHMMSS
+        # Format using local system timezone in 12-hour time
         local TS="${BACKUP_NAME#xo-backup-}"
-        local DATE="${TS:0:4}-${TS:4:2}-${TS:6:2}"
-        local TIME="${TS:9:2}:${TS:11:2}:${TS:13:2}"
+        local RAW_DT="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}:${TS:13:2} UTC"
+        local DATETIME
+        DATETIME=$(date -d "$RAW_DT" +"%Y-%m-%d %I:%M:%S %p %Z" 2>/dev/null || echo "${RAW_DT% UTC}")
+        # Label newest and oldest
+        local LABEL=""
+        if [[ $i -eq 1 ]]; then
+            LABEL=" (newest)"
+        elif [[ $i -eq $TOTAL_TO_LIST ]]; then
+            LABEL=" (oldest)"
+        fi
         if [[ -n "$BACKUP_COMMIT" ]]; then
-            printf "  [%d] %s  (%s %s)  commit: %s\n" "$i" "$BACKUP_NAME" "$DATE" "$TIME" "$BACKUP_COMMIT"
+            printf "  [%d] %s  (%s)  commit: %s%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$BACKUP_COMMIT" "$LABEL"
         else
-            printf "  [%d] %s  (%s %s)\n" "$i" "$BACKUP_NAME" "$DATE" "$TIME"
+            printf "  [%d] %s  (%s)%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$LABEL"
         fi
         ((i++))
     done
