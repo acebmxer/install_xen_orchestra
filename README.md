@@ -12,6 +12,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Update functionality with commit comparison
 - Automatic backups before updates (keeps last 5)
 - Interactive restore from any available backup
+- Rebuild functionality — fresh clone + clean build on the current branch, preserves settings
 - Configurable via simple config file
 
 ## Quick Start
@@ -132,6 +133,26 @@ After a successful restore the confirmed commit is displayed:
 [INFO]    Restored commit: a1b2c3d4e5f6
 ```
 
+## Rebuilding Xen Orchestra
+
+If your installation becomes corrupted or broken, use `--rebuild` to do a fresh clone and clean build of your current branch **without losing any settings**:
+
+```bash
+./install-xen-orchestra.sh --rebuild
+```
+
+The rebuild process will:
+
+1. Detect the currently installed branch
+2. Display a summary and ask for confirmation
+3. Stop the running service
+4. Create a backup of the current installation (same as `--update` — saved to `BACKUP_DIR`)
+5. Remove the current `INSTALL_DIR` and do a fresh `git clone` of the same branch
+6. Perform a clean build (turbo cache cleared)
+7. Restart the service and report the new commit hash
+
+> **Note:** Settings stored in `/etc/xo-server` (config.toml) and `/var/lib/xo-server` (databases and state) are **not touched** during a rebuild, so all your connections, users, and configuration are preserved.
+
 ## Service Management
 
 After installation, Xen Orchestra runs as a systemd service:
@@ -200,7 +221,13 @@ If running as non-root, the service uses `CAP_NET_BIND_SERVICE` to bind to privi
 
 ### Build failures
 
-Try cleaning and rebuilding:
+The easiest fix is to use the built-in rebuild command, which takes a backup first:
+
+```bash
+./install-xen-orchestra.sh --rebuild
+```
+
+Or manually:
 
 ```bash
 cd /opt/xen-orchestra
