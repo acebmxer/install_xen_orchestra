@@ -101,7 +101,7 @@ load_config() {
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
     NODE_VERSION=${NODE_VERSION:-20}
-    SERVICE_USER=${SERVICE_USER:-xo}
+    SERVICE_USER=${SERVICE_USER:-}
     DEBUG_MODE=${DEBUG_MODE:-false}
 }
 
@@ -233,18 +233,20 @@ create_service_user() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            sudo useradd -r -m -s /bin/bash -G users "$SERVICE_USER" || true
+            # Create with root group membership for full NFS access
+            sudo useradd -r -m -s /bin/bash -G root,users "$SERVICE_USER" || true
             log_success "Service user created: $SERVICE_USER"
         else
             log_info "Service user $SERVICE_USER already exists"
-            # Add to users group if not already
-            sudo usermod -a -G users "$SERVICE_USER" 2>/dev/null || true
+            # Add to root and users groups for full privileges
+            sudo usermod -a -G root,users "$SERVICE_USER" 2>/dev/null || true
         fi
         
-        # Display UID/GID for reference (useful for NFS configuration)
+        # Display UID/GID for reference
         local XO_UID=$(id -u "$SERVICE_USER" 2>/dev/null || echo "unknown")
         local XO_GID=$(id -g "$SERVICE_USER" 2>/dev/null || echo "unknown")
         log_info "Service user UID:GID is ${XO_UID}:${XO_GID}"
+        log_info "Service user added to root group for NFS access"
     fi
 }
 
@@ -286,7 +288,8 @@ clone_repository() {
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
+        sudo chmod -R g+rwX "$INSTALL_DIR"
     fi
 
     log_success "Repository cloned to $INSTALL_DIR"
@@ -386,7 +389,7 @@ generate_ssl_certificate() {
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
+        sudo chown -R "$SERVICE_USER:root" "$SSL_CERT_DIR"
     fi
 
     log_success "SSL certificates generated in $SSL_CERT_DIR"
@@ -402,9 +405,12 @@ configure_xo() {
     sudo mkdir -p /etc/xo-server
     
     # Create mounts directory with proper permissions
+    # Note: /run/xo-server is tmpfs and will be recreated by systemd on boot
     sudo mkdir -p /run/xo-server/mounts
+    sudo chmod 755 /run/xo-server/mounts
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /run/xo-server
+        sudo chown -R "$SERVICE_USER:root" /run/xo-server
+        sudo chmod 775 /run/xo-server/mounts
     fi
 
     # Create configuration file
@@ -425,12 +431,12 @@ key = "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
 [remoteOptions]
 mountsDir = '/run/xo-server/mounts'
 useSudo = true
-nfsOptions = 'vers=4.1,rw,nolock'
+nfsOptions = 'vers=4.1,rw,nolock,sec=sys'
 EOF
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
+        sudo chown -R "$SERVICE_USER:root" /etc/xo-server
     fi
 
     log_success "Configuration written to $XO_CONFIG_FILE"
@@ -458,9 +464,13 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=${EXEC_USER}
+Group=root
+SupplementaryGroups=root
 Environment="${DEBUG_ENV}"
 Environment="NODE_ENV=production"
 WorkingDirectory=${INSTALL_DIR}/packages/xo-server
+ExecStartPre=/bin/mkdir -p /run/xo-server/mounts
+ExecStartPre=/bin/chmod 775 /run/xo-server/mounts
 ExecStart=${NODE_PATH} ${XO_SERVER_PATH}
 Restart=always
 RestartSec=10
@@ -468,10 +478,11 @@ SyslogIdentifier=xo-server
 
 # Runtime directory
 RuntimeDirectory=xo-server
+RuntimeDirectoryMode=0775
 
 # Allow binding to privileged ports and mounting
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
 
 [Install]
 WantedBy=multi-user.target
@@ -480,7 +491,8 @@ EOF
     # Create data directory
     sudo mkdir -p /var/lib/xo-server
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+        sudo chown "$SERVICE_USER:root" /var/lib/xo-server
+        sudo chmod 775 /var/lib/xo-server
     fi
 
     # Reload systemd and enable service
@@ -493,27 +505,27 @@ EOF
 # Configure sudo for non-root user
 configure_sudo() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        log_info "Configuring sudo for NFS mounts..."
+        log_info "Configuring sudo for ${SERVICE_USER} with root-equivalent privileges..."
 
         local SUDOERS_FILE="/etc/sudoers.d/xo-server"
 
         sudo tee "$SUDOERS_FILE" > /dev/null << EOF
-# Allow xo-server user to mount/unmount without password
+# Allow xo-server user to mount/unmount and manage files with root privileges
 Defaults:${SERVICE_USER} !requiretty
-${SERVICE_USER} ALL=(ALL:ALL) NOPASSWD:SETENV: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt, /sbin/mount.nfs, /usr/sbin/mount.nfs, /sbin/mount.nfs4, /usr/sbin/mount.nfs4, /sbin/umount.nfs, /usr/sbin/umount.nfs, /sbin/umount.nfs4, /usr/sbin/umount.nfs4
+${SERVICE_USER} ALL=(root) NOPASSWD:SETENV: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt, /sbin/mount.nfs, /usr/sbin/mount.nfs, /sbin/mount.nfs4, /usr/sbin/mount.nfs4, /sbin/umount.nfs, /usr/sbin/umount.nfs, /sbin/umount.nfs4, /usr/sbin/umount.nfs4, /bin/mkdir, /usr/bin/mkdir, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown
 EOF
 
         sudo chmod 440 "$SUDOERS_FILE"
         
         # Remove setuid bit from mount.nfs to avoid conflicts with sudo
-        log_info "Ensuring NFS mount helpers use sudo (not setuid)..."
+        log_info "Ensuring NFS mount helpers use sudo..."
         for nfs_mount in /sbin/mount.nfs /usr/sbin/mount.nfs /sbin/mount.nfs4 /usr/sbin/mount.nfs4; do
             if [[ -f "$nfs_mount" ]]; then
                 sudo chmod u-s "$nfs_mount" 2>/dev/null || true
             fi
         done
         
-        log_success "Sudo configured for ${SERVICE_USER}"
+        log_success "Sudo configured for ${SERVICE_USER} with elevated privileges"
     fi
 }
 
@@ -671,7 +683,8 @@ restore_xo() {
 
     # Fix ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
+        sudo chmod -R g+rwX "$INSTALL_DIR"
     fi
 
     # Rebuild — node_modules are excluded from backups
@@ -831,7 +844,8 @@ rebuild_xo() {
 
     # Restore ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
+        sudo chmod -R g+rwX "$INSTALL_DIR"
     fi
 
     # Clean build to ensure no stale artefacts
