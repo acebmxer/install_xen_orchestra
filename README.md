@@ -87,7 +87,8 @@ The update process will:
 
 - Backups are stored in `BACKUP_DIR` (default: `/opt/xo-backups`)
 - Only the last `BACKUP_KEEP` backups are retained (default: 5)
-- Older backups are automatically purged
+- Older backups are automatically purged before each new backup is created
+- When restoring, backups are listed **newest first** — `[1]` is the most recent, `[5]` is the oldest
 
 ## Restoring from Backup
 
@@ -99,7 +100,7 @@ To restore a previous installation:
 
 The restore process will:
 
-1. List all available backups with their dates and commit hashes
+1. List all available backups **newest first** (1 = newest, 5 = oldest) with their dates and commit hashes
 2. Prompt you to select which backup to restore
 3. Ask for confirmation before making any changes
 4. Stop the running service
@@ -114,11 +115,13 @@ Example output:
   Available Backups
 ==============================================
 
-  [1] xo-backup-20260221_143000  (2026-02-21 14:30:00)  commit: a1b2c3d4e5f6
-  [2] xo-backup-20260220_091500  (2026-02-20 09:15:00)  commit: 9f8e7d6c5b4a
-  [3] xo-backup-20260218_175200  (2026-02-18 17:52:00)  commit: 3c4d5e6f7a8b
+  [1] xo-backup-20260221_143000  (2026-02-21 02:30:00 PM)  commit: a1b2c3d4e5f6 (newest)
+  [2] xo-backup-20260220_091500  (2026-02-20 09:15:00 AM)  commit: 9f8e7d6c5b4a
+  [3] xo-backup-20260219_112000  (2026-02-19 11:20:00 AM)  commit: 1a2b3c4d5e6f
+  [4] xo-backup-20260218_175200  (2026-02-18 05:52:00 PM)  commit: 3c4d5e6f7a8b
+  [5] xo-backup-20260217_083000  (2026-02-17 08:30:00 AM)  commit: 7d8e9f0a1b2c (oldest)
 
-Enter the number of the backup to restore [1-3], or 'q' to quit:
+Enter the number of the backup to restore [1-5], or 'q' to quit:
 ```
 
 After a successful restore the confirmed commit is displayed:
