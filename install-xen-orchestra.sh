@@ -445,7 +445,7 @@ create_backup() {
 
     sudo mkdir -p "$BACKUP_DIR"
 
-    local TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    local TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
     local BACKUP_NAME="xo-backup-${TIMESTAMP}"
     local BACKUP_PATH="${BACKUP_DIR}/${BACKUP_NAME}"
 
@@ -512,9 +512,9 @@ restore_xo() {
         # Parse timestamp from name: xo-backup-YYYYMMDD_HHMMSS
         # Format using local system timezone in 12-hour time
         local TS="${BACKUP_NAME#xo-backup-}"
-        local RAW_DT="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}:${TS:13:2}"
+        local RAW_DT="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}:${TS:13:2} UTC"
         local DATETIME
-        DATETIME=$(date -d "$RAW_DT" +"%Y-%m-%d %I:%M:%S %p" 2>/dev/null || echo "$RAW_DT")
+        DATETIME=$(date -d "$RAW_DT" +"%Y-%m-%d %I:%M:%S %p %Z" 2>/dev/null || echo "${RAW_DT% UTC}")
         # Label newest and oldest
         local LABEL=""
         if [[ $i -eq 1 ]]; then
