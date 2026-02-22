@@ -88,6 +88,7 @@ The update process will:
 - Backups are stored in `BACKUP_DIR` (default: `/opt/xo-backups`)
 - Only the last `BACKUP_KEEP` backups are retained (default: 5)
 - Older backups are automatically purged before each new backup is created
+- Backup folder names are timestamped in UTC; dates and times are displayed converted to the local system timezone
 - When restoring, backups are listed **newest first** — `[1]` is the most recent, `[5]` is the oldest
 
 ## Restoring from Backup
@@ -115,11 +116,11 @@ Example output:
   Available Backups
 ==============================================
 
-  [1] xo-backup-20260221_143000  (2026-02-21 02:30:00 PM)  commit: a1b2c3d4e5f6 (newest)
-  [2] xo-backup-20260220_091500  (2026-02-20 09:15:00 AM)  commit: 9f8e7d6c5b4a
-  [3] xo-backup-20260219_112000  (2026-02-19 11:20:00 AM)  commit: 1a2b3c4d5e6f
-  [4] xo-backup-20260218_175200  (2026-02-18 05:52:00 PM)  commit: 3c4d5e6f7a8b
-  [5] xo-backup-20260217_083000  (2026-02-17 08:30:00 AM)  commit: 7d8e9f0a1b2c (oldest)
+  [1] xo-backup-20260221_233000  (2026-02-21 06:30:00 PM EST)  commit: a1b2c3d4e5f6 (newest)
+  [2] xo-backup-20260221_141500  (2026-02-21 09:15:00 AM EST)  commit: 9f8e7d6c5b4a
+  [3] xo-backup-20260220_162000  (2026-02-20 11:20:00 AM EST)  commit: 1a2b3c4d5e6f
+  [4] xo-backup-20260219_225200  (2026-02-19 05:52:00 PM EST)  commit: 3c4d5e6f7a8b
+  [5] xo-backup-20260219_133000  (2026-02-19 08:30:00 AM EST)  commit: 7d8e9f0a1b2c (oldest)
 
 Enter the number of the backup to restore [1-5], or 'q' to quit:
 ```
