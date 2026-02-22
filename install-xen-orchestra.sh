@@ -126,15 +126,43 @@ detect_package_manager() {
     log_info "Detected package manager: $PKG_MANAGER"
 }
 
+# Detect OS distribution
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_ID="${ID}"
+        OS_VERSION_ID="${VERSION_ID}"
+    else
+        OS_ID="unknown"
+        OS_VERSION_ID="unknown"
+    fi
+}
+
 # Install system dependencies
 install_dependencies() {
     log_info "Installing system dependencies..."
 
+    detect_os
     $PKG_UPDATE
 
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        $PKG_INSTALL build-essential redis-server libpng-dev git python3-minimal \
-            libvhdi-utils lvm2 cifs-utils nfs-common ntfs-3g openssl curl ca-certificates gnupg
+        # Common packages for all Debian/Ubuntu
+        local BASE_PACKAGES="apt-transport-https ca-certificates libcap2-bin curl gnupg \
+            build-essential redis-server libpng-dev git python3-minimal \
+            libvhdi-utils lvm2 cifs-utils nfs-common ntfs-3g openssl \
+            dmidecode patch sudo"
+        
+        # Add software-properties-common for Ubuntu
+        if [[ "$OS_ID" == "ubuntu" ]]; then
+            BASE_PACKAGES="$BASE_PACKAGES software-properties-common"
+        fi
+        
+        # Try to install libfuse2t64 (newer systems) or fall back to libfuse2
+        if ! $PKG_INSTALL $BASE_PACKAGES libfuse2t64 2>/dev/null; then
+            log_info "libfuse2t64 not available, trying libfuse2..."
+            $PKG_INSTALL $BASE_PACKAGES libfuse2
+        fi
+        
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
         # Check if it's RHEL 10+ or similar where Redis is replaced by Valkey
         if [[ "$PKG_MANAGER" == "dnf" ]]; then
@@ -149,13 +177,13 @@ install_dependencies() {
             $PKG_INSTALL redis
         fi
         $PKG_INSTALL libpng-devel git lvm2 cifs-utils make automake gcc gcc-c++ \
-            nfs-utils ntfs-3g openssl curl
+            nfs-utils ntfs-3g openssl curl ca-certificates gnupg2 patch sudo dmidecode libcap fuse-libs
     fi
 
     log_success "System dependencies installed"
 }
 
-# Install Node.js 20 LTS
+# Install Node.js 20 LTS (includes npm v10)
 install_nodejs() {
     log_info "Installing Node.js ${NODE_VERSION} LTS..."
 
@@ -164,6 +192,9 @@ install_nodejs() {
         CURRENT_NODE=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
         if [[ "$CURRENT_NODE" == "$NODE_VERSION" ]]; then
             log_info "Node.js ${NODE_VERSION} is already installed: $(node -v)"
+            if command -v npm &> /dev/null; then
+                log_info "npm is available: $(npm -v)"
+            fi
             return 0
         else
             log_warning "Node.js $(node -v) is installed, but version ${NODE_VERSION} is required"
@@ -171,7 +202,7 @@ install_nodejs() {
     fi
 
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        # Install Node.js via NodeSource
+        # Install Node.js via NodeSource (includes npm)
         curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | sudo -E bash -
         sudo apt-get install -y nodejs
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
@@ -180,6 +211,7 @@ install_nodejs() {
     fi
 
     log_success "Node.js installed: $(node -v)"
+    log_success "npm installed: $(npm -v)"
 }
 
 # Install Yarn
@@ -201,11 +233,18 @@ create_service_user() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+            sudo useradd -r -m -s /bin/bash -G users "$SERVICE_USER" || true
             log_success "Service user created: $SERVICE_USER"
         else
             log_info "Service user $SERVICE_USER already exists"
+            # Add to users group if not already
+            sudo usermod -a -G users "$SERVICE_USER" 2>/dev/null || true
         fi
+        
+        # Display UID/GID for reference (useful for NFS configuration)
+        local XO_UID=$(id -u "$SERVICE_USER" 2>/dev/null || echo "unknown")
+        local XO_GID=$(id -g "$SERVICE_USER" 2>/dev/null || echo "unknown")
+        log_info "Service user UID:GID is ${XO_UID}:${XO_GID}"
     fi
 }
 
@@ -254,12 +293,51 @@ clone_repository() {
 }
 
 # Build Xen Orchestra
+# Ensure swap space exists to prevent OOM during builds
+ensure_swap_space() {
+    local MIN_SWAP_MB=2048
+    local SWAP_FILE="/swapfile"
+    
+    # Check current swap
+    local CURRENT_SWAP=$(free -m | awk '/^Swap:/ {print $2}')
+    
+    if [[ $CURRENT_SWAP -ge $MIN_SWAP_MB ]]; then
+        log_info "Sufficient swap space available: ${CURRENT_SWAP}MB"
+        return 0
+    fi
+    
+    log_warning "Insufficient swap space (${CURRENT_SWAP}MB). Creating ${MIN_SWAP_MB}MB swap file..."
+    
+    # Check if swap file already exists
+    if [[ -f "$SWAP_FILE" ]]; then
+        log_info "Removing existing swap file..."
+        sudo swapoff "$SWAP_FILE" 2>/dev/null || true
+        sudo rm -f "$SWAP_FILE"
+    fi
+    
+    # Create swap file
+    sudo fallocate -l ${MIN_SWAP_MB}M "$SWAP_FILE" 2>/dev/null || sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$MIN_SWAP_MB status=progress
+    sudo chmod 600 "$SWAP_FILE"
+    sudo mkswap "$SWAP_FILE"
+    sudo swapon "$SWAP_FILE"
+    
+    # Make it persistent across reboots
+    if ! grep -q "$SWAP_FILE" /etc/fstab 2>/dev/null; then
+        echo "$SWAP_FILE none swap sw 0 0" | sudo tee -a /etc/fstab > /dev/null
+    fi
+    
+    log_success "Swap space created: ${MIN_SWAP_MB}MB"
+}
+
 # Usage: build_xo [clean]
 # If "clean" is passed, turbo cache will be cleared first
 build_xo() {
     local CLEAN_BUILD="${1:-}"
     
     log_info "Building Xen Orchestra (this may take a while)..."
+
+    # Ensure swap space exists to prevent OOM
+    ensure_swap_space
 
     # Clear turbo cache if clean build requested
     if [[ "$CLEAN_BUILD" == "clean" ]]; then
@@ -273,11 +351,14 @@ build_xo() {
         fi
     fi
 
+    # Set Node.js memory limits and limit parallel builds to prevent OOM
+    local BUILD_ENV="NODE_OPTIONS='--max-old-space-size=4096' TURBO_REMOTE_CACHE_READ_ONLY=1"
+    
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && yarn && yarn build"
+        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
     else
-        sudo bash -c "cd '$INSTALL_DIR' && yarn && yarn build"
+        sudo bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
     fi
 
     log_success "Xen Orchestra built successfully"
@@ -319,6 +400,12 @@ configure_xo() {
 
     # Create config directory
     sudo mkdir -p /etc/xo-server
+    
+    # Create mounts directory with proper permissions
+    sudo mkdir -p /run/xo-server/mounts
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /run/xo-server
+    fi
 
     # Create configuration file
     sudo tee "$XO_CONFIG_FILE" > /dev/null << EOF
@@ -335,8 +422,10 @@ port = ${HTTPS_PORT}
 cert = "${SSL_CERT_DIR}/${SSL_CERT_FILE}"
 key = "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
 
-# Use sudo for NFS mounts (required for non-root user)
+[remoteOptions]
+mountsDir = '/run/xo-server/mounts'
 useSudo = true
+nfsOptions = 'vers=4.1,rw,nolock'
 EOF
 
     # Set ownership if service user is defined
@@ -377,17 +466,12 @@ Restart=always
 RestartSec=10
 SyslogIdentifier=xo-server
 
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=${INSTALL_DIR}
-ReadWritePaths=/var/lib/xo-server
-ReadWritePaths=/tmp
-ReadWritePaths=/etc/xo-server
+# Runtime directory
+RuntimeDirectory=xo-server
 
-# Allow binding to privileged ports
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Allow binding to privileged ports and mounting
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
 
 [Install]
 WantedBy=multi-user.target
@@ -415,10 +499,20 @@ configure_sudo() {
 
         sudo tee "$SUDOERS_FILE" > /dev/null << EOF
 # Allow xo-server user to mount/unmount without password
-${SERVICE_USER} ALL=(root) NOPASSWD: /bin/mount, /bin/umount, /bin/findmnt
+Defaults:${SERVICE_USER} !requiretty
+${SERVICE_USER} ALL=(ALL:ALL) NOPASSWD:SETENV: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt, /sbin/mount.nfs, /usr/sbin/mount.nfs, /sbin/mount.nfs4, /usr/sbin/mount.nfs4, /sbin/umount.nfs, /usr/sbin/umount.nfs, /sbin/umount.nfs4, /usr/sbin/umount.nfs4
 EOF
 
         sudo chmod 440 "$SUDOERS_FILE"
+        
+        # Remove setuid bit from mount.nfs to avoid conflicts with sudo
+        log_info "Ensuring NFS mount helpers use sudo (not setuid)..."
+        for nfs_mount in /sbin/mount.nfs /usr/sbin/mount.nfs /sbin/mount.nfs4 /usr/sbin/mount.nfs4; do
+            if [[ -f "$nfs_mount" ]]; then
+                sudo chmod u-s "$nfs_mount" 2>/dev/null || true
+            fi
+        done
+        
         log_success "Sudo configured for ${SERVICE_USER}"
     fi
 }
@@ -584,6 +678,9 @@ restore_xo() {
     log_info "Rebuilding Xen Orchestra (node_modules were excluded from backup)..."
     build_xo
 
+    # Regenerate the systemd service file to pick up any script changes
+    create_systemd_service
+
     # Start the service
     log_info "Starting xo-server service..."
     sudo systemctl start xo-server
@@ -661,6 +758,9 @@ update_xo() {
     # Rebuild with clean cache to ensure fresh build
     build_xo clean
 
+    # Regenerate the systemd service file to pick up any script changes
+    create_systemd_service
+
     # Start service
     log_info "Starting xo-server service..."
     sudo systemctl start xo-server
@@ -736,6 +836,9 @@ rebuild_xo() {
 
     # Clean build to ensure no stale artefacts
     build_xo clean
+
+    # Regenerate the systemd service file to pick up any script changes
+    create_systemd_service
 
     # Restart the service
     log_info "Starting xo-server service..."

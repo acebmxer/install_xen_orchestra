@@ -4,8 +4,9 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 
 ## Features
 
-- Installs all required dependencies and prerequisites
-- Uses Node.js 20 LTS
+- Installs all required dependencies and prerequisites automatically
+- Uses Node.js 20 LTS (with npm v10)
+- Yarn package manager installed globally
 - Self-signed SSL certificate generation for HTTPS
 - Direct port binding (80 and 443) - no proxy required
 - Systemd service for automatic startup
@@ -14,6 +15,9 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Interactive restore from any available backup
 - Rebuild functionality — fresh clone + clean build on the current branch, preserves settings
 - Configurable via simple config file
+- **Automatic swap space management** - creates 2GB swap if needed for builds
+- **NFS mount support** - automatically configures sudo permissions for remote storage
+- **Memory-efficient builds** - prevents out-of-memory errors on low-RAM systems
 
 ## Quick Start
 
@@ -64,7 +68,7 @@ The `xo-config.cfg` file supports the following options:
 | `BACKUP_DIR` | /opt/xo-backups | Backup directory for updates |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `NODE_VERSION` | 20 | Node.js major version |
-| `SERVICE_USER` | xo | Service user (set empty for root) |
+| `SERVICE_USER` | xo | Service user (leave empty for root; root recommended for NFS compatibility) |
 | `DEBUG_MODE` | false | Enable debug logging |
 
 ## Updating Xen Orchestra
@@ -200,10 +204,46 @@ To switch to a different branch (e.g., from `master` to `stable`):
 
 The script will automatically fetch and checkout the new branch during the update process.
 
+## System Requirements
+
+### Minimum Hardware
+
+- **RAM:** 2GB minimum (4GB+ recommended for building)
+- **Disk:** 10GB free space
+- **CPU:** 1 core minimum (2+ recommended)
+
+> **Note:** The script automatically creates 2GB swap space if insufficient memory is detected during builds to prevent out-of-memory errors.
+
+### Dependencies
+
+The script automatically installs all required dependencies:
+
+**Debian/Ubuntu:**
+- apt-transport-https, ca-certificates, libcap2-bin, curl, gnupg
+- build-essential, git, patch, sudo
+- Node.js v20 (with npm v10), yarn
+- redis-server
+- python3-minimal, libpng-dev
+- lvm2, cifs-utils, nfs-common, ntfs-3g
+- libvhdi-utils, dmidecode
+- libfuse2t64 (or libfuse2 on older systems)
+- software-properties-common (Ubuntu only)
+
+**RHEL/CentOS/Fedora:**
+- redis or valkey (RHEL 10+)
+- Node.js v20 (with npm v10), yarn
+- ca-certificates, gnupg2, curl
+- make, automake, gcc, gcc-c++, patch, sudo
+- git, libpng-devel
+- lvm2, cifs-utils, nfs-utils, ntfs-3g
+- dmidecode, libcap, fuse-libs
+
 ## Supported Operating Systems
 
-- **Debian/Ubuntu** (apt-based)
+- **Debian 10/11/12/13** (apt-based)
+- **Ubuntu** (apt-based, all supported versions)
 - **RHEL/CentOS/AlmaLinux/Rocky** (dnf/yum-based)
+- **Fedora** (dnf-based)
 
 ## Troubleshooting
 
@@ -236,6 +276,78 @@ sudo -u xo yarn
 sudo -u xo yarn build
 ```
 
+### Out of Memory (OOM) during build
+
+If the build process fails with exit code 137 (killed), your system ran out of memory:
+
+**The script automatically handles this** by:
+- Detecting available swap space before building
+- Creating 2GB swap file if insufficient
+- Setting Node.js memory limits (4GB max)
+
+To manually check/add swap:
+
+```bash
+# Check current swap
+free -h
+
+# Create 2GB swap file if needed
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+### NFS mount errors ("user" NFS mounts not supported)
+
+If you get an error when adding NFS remote storage:
+```
+mount.nfs: not installed setuid - "user" NFS mounts not supported
+```
+
+**The script automatically handles this** by configuring sudo permissions for the `xo` user to run mount/umount commands including NFS-specific helpers.
+
+If you encounter this issue on an existing installation:
+
+```bash
+# Update sudoers configuration
+sudo tee /etc/sudoers.d/xo-server > /dev/null << 'EOF'
+# Allow xo-server user to mount/unmount without password
+Defaults:xo !requiretty
+xo ALL=(ALL:ALL) NOPASSWD:SETENV: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt, /sbin/mount.nfs, /usr/sbin/mount.nfs, /sbin/mount.nfs4, /usr/sbin/mount.nfs4, /sbin/umount.nfs, /usr/sbin/umount.nfs, /sbin/umount.nfs4, /usr/sbin/umount.nfs4
+EOF
+
+sudo chmod 440 /etc/sudoers.d/xo-server
+sudo systemctl restart xo-server
+```
+
+### NFS permission denied errors
+
+If NFS mounts succeed but you get permission errors when writing:
+```
+EACCES: permission denied, open '/run/xo-server/mounts/.keeper_*'
+```
+
+This is a UID/GID mismatch between the xo-server user and your NFS export permissions:
+
+**Option 1: Run as root** (recommended for simplicity)
+```bash
+# Edit config
+nano xo-config.cfg
+# Set: SERVICE_USER=
+# (leave empty to run as root)
+
+# Update service
+sudo sed -i 's/User=xo/User=root/' /etc/systemd/system/xo-server.service
+sudo chown -R root:root /opt/xen-orchestra /var/lib/xo-server /etc/xo-server
+sudo systemctl daemon-reload
+sudo systemctl restart xo-server
+```
+
+**Option 2: Configure NFS for the xo user's UID**
+On your NFS server, adjust exports to allow the xo user's UID (default: 999), or use appropriate squash settings in your NFS export configuration.
+
 ### Redis connection issues
 
 Ensure Redis is running:
@@ -248,9 +360,14 @@ redis-cli ping
 ## Security Considerations
 
 - **No Root:** The script refuses to run as root/sudo and uses sudo internally
-- **Service User:** Runs as dedicated `xo` user by default
-- **SSL:** Self-signed certificate generated automatically
-- **Sudo:** Configured only for NFS mount operations
+- **Service User:** Runs as dedicated `xo` user by default (configurable)
+- **SSL:** Self-signed certificate generated automatically for HTTPS
+- **Sudo Permissions:** Service user configured with minimal sudo access for:
+  - NFS/CIFS mount operations (`/bin/mount`, `/usr/bin/mount`, `/sbin/mount.nfs`, etc.)
+  - Unmount operations (`/bin/umount`, `/usr/bin/umount`, `/sbin/umount.nfs`, etc.)
+  - Mount point discovery (`/bin/findmnt`, `/usr/bin/findmnt`)
+  - All configured in `/etc/sudoers.d/xo-server` with NOPASSWD for specific commands only
+- **Automatic Swap:** Swap file created with secure permissions (600) if needed for builds
 
 ## License
 
