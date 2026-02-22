@@ -15,6 +15,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Interactive restore from any available backup
 - Rebuild functionality — fresh clone + clean build on the current branch, preserves settings
 - Configurable via simple config file
+- **Customizable service user** - run as any username or root, defaults to 'xo'
 - **Automatic swap space management** - creates 2GB swap if needed for builds
 - **NFS mount support** - automatically configures sudo permissions for remote storage
 - **Memory-efficient builds** - prevents out-of-memory errors on low-RAM systems
@@ -68,7 +69,7 @@ The `xo-config.cfg` file supports the following options:
 | `BACKUP_DIR` | /opt/xo-backups | Backup directory for updates |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `NODE_VERSION` | 20 | Node.js major version |
-| `SERVICE_USER` | xo | Service user (leave empty for root; root recommended for NFS compatibility) |
+| `SERVICE_USER` | xo | Service user (any username, leave empty for root) |
 | `DEBUG_MODE` | false | Enable debug logging |
 
 ## Updating Xen Orchestra
@@ -267,11 +268,12 @@ The easiest fix is to use the built-in rebuild command, which takes a backup fir
 ./install-xen-orchestra.sh --rebuild
 ```
 
-Or manually:
+Or manually (if running as non-root SERVICE_USER):
 
 ```bash
 cd /opt/xen-orchestra
 rm -rf node_modules
+# Replace 'xo' with your SERVICE_USER if different
 sudo -u xo yarn
 sudo -u xo yarn build
 ```
@@ -306,19 +308,19 @@ If you get an error when adding NFS remote storage:
 mount.nfs: not installed setuid - "user" NFS mounts not supported
 ```
 
-**The script automatically handles this** by configuring sudo permissions for the `xo` user to run mount/umount commands including NFS-specific helpers.
+**The script automatically handles this** by configuring sudo permissions for your service user (default: `xo`) to run mount/umount commands including NFS-specific helpers.
 
 If you encounter this issue on an existing installation:
 
 ```bash
-# Update sudoers configuration
-sudo tee /etc/sudoers.d/xo-server > /dev/null << 'EOF'
+# Update sudoers configuration (replace 'xo' with your SERVICE_USER if different)
+sudo tee /etc/sudoers.d/xo-server-xo > /dev/null << 'EOF'
 # Allow xo-server user to mount/unmount without password
 Defaults:xo !requiretty
 xo ALL=(ALL:ALL) NOPASSWD:SETENV: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt, /sbin/mount.nfs, /usr/sbin/mount.nfs, /sbin/mount.nfs4, /usr/sbin/mount.nfs4, /sbin/umount.nfs, /usr/sbin/umount.nfs, /sbin/umount.nfs4, /usr/sbin/umount.nfs4
 EOF
 
-sudo chmod 440 /etc/sudoers.d/xo-server
+sudo chmod 440 /etc/sudoers.d/xo-server-xo
 sudo systemctl restart xo-server
 ```
 
@@ -338,15 +340,15 @@ nano xo-config.cfg
 # Set: SERVICE_USER=
 # (leave empty to run as root)
 
-# Update service
+# Update service (replace 'xo' with your SERVICE_USER if different)
 sudo sed -i 's/User=xo/User=root/' /etc/systemd/system/xo-server.service
 sudo chown -R root:root /opt/xen-orchestra /var/lib/xo-server /etc/xo-server
 sudo systemctl daemon-reload
 sudo systemctl restart xo-server
 ```
 
-**Option 2: Configure NFS for the xo user's UID**
-On your NFS server, adjust exports to allow the xo user's UID (default: 999), or use appropriate squash settings in your NFS export configuration.
+**Option 2: Configure NFS for your service user's UID**
+On your NFS server, adjust exports to allow your service user's UID (check with `id <username>`), or use appropriate squash settings in your NFS export configuration.
 
 ### Redis connection issues
 
@@ -360,13 +362,13 @@ redis-cli ping
 ## Security Considerations
 
 - **No Root:** The script refuses to run as root/sudo and uses sudo internally
-- **Service User:** Runs as dedicated `xo` user by default (configurable)
+- **Service User:** Runs as dedicated `xo` user by default (customizable to any username; leave empty for root)
 - **SSL:** Self-signed certificate generated automatically for HTTPS
 - **Sudo Permissions:** Service user configured with minimal sudo access for:
   - NFS/CIFS mount operations (`/bin/mount`, `/usr/bin/mount`, `/sbin/mount.nfs`, etc.)
   - Unmount operations (`/bin/umount`, `/usr/bin/umount`, `/sbin/umount.nfs`, etc.)
   - Mount point discovery (`/bin/findmnt`, `/usr/bin/findmnt`)
-  - All configured in `/etc/sudoers.d/xo-server` with NOPASSWD for specific commands only
+  - All configured in `/etc/sudoers.d/xo-server-<username>` with NOPASSWD for specific commands only
 - **Automatic Swap:** Swap file created with secure permissions (600) if needed for builds
 
 ## License

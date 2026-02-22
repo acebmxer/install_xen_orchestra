@@ -101,7 +101,7 @@ load_config() {
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
     NODE_VERSION=${NODE_VERSION:-20}
-    SERVICE_USER=${SERVICE_USER:-}
+    SERVICE_USER=${SERVICE_USER:-xo}
     DEBUG_MODE=${DEBUG_MODE:-false}
 }
 
@@ -355,7 +355,7 @@ build_xo() {
     fi
 
     # Set Node.js memory limits and limit parallel builds to prevent OOM
-    local BUILD_ENV="NODE_OPTIONS='--max-old-space-size=4096' TURBO_REMOTE_CACHE_READ_ONLY=1"
+    local BUILD_ENV="NODE_OPTIONS='--max-old-space-size=4096' TURBO_CACHE=remote:r"
     
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
@@ -507,10 +507,10 @@ configure_sudo() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         log_info "Configuring sudo for ${SERVICE_USER} with root-equivalent privileges..."
 
-        local SUDOERS_FILE="/etc/sudoers.d/xo-server"
+        local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
 
         sudo tee "$SUDOERS_FILE" > /dev/null << EOF
-# Allow xo-server user to mount/unmount and manage files with root privileges
+# Allow ${SERVICE_USER} user to mount/unmount and manage files with root privileges
 Defaults:${SERVICE_USER} !requiretty
 ${SERVICE_USER} ALL=(root) NOPASSWD:SETENV: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt, /sbin/mount.nfs, /usr/sbin/mount.nfs, /sbin/mount.nfs4, /usr/sbin/mount.nfs4, /sbin/umount.nfs, /usr/sbin/umount.nfs, /sbin/umount.nfs4, /usr/sbin/umount.nfs4, /bin/mkdir, /usr/bin/mkdir, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown
 EOF
