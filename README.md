@@ -14,6 +14,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Automatic backups before updates (keeps last 5)
 - Interactive restore from any available backup
 - Rebuild functionality — fresh clone + clean build on the current branch, preserves settings
+- Reconfigure functionality — apply configuration changes without rebuilding
 - Configurable via simple config file
 - **Customizable service user** - run as any username or root, defaults to 'xo'
 - **Automatic swap space management** - creates 2GB swap if needed for builds
@@ -71,6 +72,11 @@ The `xo-config.cfg` file supports the following options:
 | `NODE_VERSION` | 20 | Node.js major version |
 | `SERVICE_USER` | xo | Service user (any username, leave empty for root) |
 | `DEBUG_MODE` | false | Enable debug logging |
+| `BIND_ADDRESS` | 0.0.0.0 | Bind address (0.0.0.0 for all, 127.0.0.1 for localhost) |
+| `REDIRECT_TO_HTTPS` | false | Redirect HTTP to HTTPS |
+| `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers (false, true, or IP list) |
+| `REDIS_URI` | - | Redis connection URI (optional) |
+| `REDIS_SOCKET` | - | Redis Unix socket path (optional) |
 
 ## Updating Xen Orchestra
 
@@ -158,6 +164,57 @@ The rebuild process will:
 
 > **Note:** Settings stored in `/etc/xo-server` (config.toml) and `/var/lib/xo-server` (databases and state) are **not touched** during a rebuild, so all your connections, users, and configuration are preserved.
 
+## Reconfiguring Xen Orchestra
+
+If you need to change configuration settings (ports, SSL paths, service user, reverse proxy settings, etc.) without rebuilding the entire application, use `--reconfigure`:
+
+```bash
+./install-xen-orchestra.sh --reconfigure
+```
+
+The reconfigure process will:
+
+1. Display all current configuration from `xo-config.cfg` and ask for confirmation
+2. Stop the running service
+3. Create a timestamped backup of the current `/etc/xo-server/config.toml`
+4. Regenerate `/etc/xo-server/config.toml` from your `xo-config.cfg`
+5. Regenerate the systemd service file
+6. Restart the service with the new configuration
+
+### Common Use Cases
+
+**Changing Ports:**
+```bash
+# Edit xo-config.cfg to change HTTP_PORT from 8080 back to 80
+nano xo-config.cfg
+
+# Apply the changes
+./install-xen-orchestra.sh --reconfigure
+```
+
+**Setting up a Reverse Proxy:**
+```bash
+# Edit xo-config.cfg to configure reverse proxy settings
+# - Change HTTP_PORT to 8080
+# - Set BIND_ADDRESS to 127.0.0.1
+# - Set REVERSE_PROXY_TRUST to your proxy IP
+nano xo-config.cfg
+
+# Apply the changes
+./install-xen-orchestra.sh --reconfigure
+```
+
+**Switching Service User:**
+```bash
+# Edit xo-config.cfg to change SERVICE_USER
+nano xo-config.cfg
+
+# Apply the changes
+./install-xen-orchestra.sh --reconfigure
+```
+
+> **Note:** Reconfigure regenerates configuration files from `xo-config.cfg`. Your database and user data in `/var/lib/xo-server` are never modified. Config backups are saved to `/etc/xo-server/config.toml.backup-<timestamp>`.
+
 ## Service Management
 
 After installation, Xen Orchestra runs as a systemd service:
@@ -204,6 +261,128 @@ To switch to a different branch (e.g., from `master` to `stable`):
 ```
 
 The script will automatically fetch and checkout the new branch during the update process.
+
+## Reverse Proxy Setup
+
+If you want to use an external reverse proxy (nginx, Apache, Caddy, etc.) instead of exposing Xen Orchestra directly:
+
+### 1. Configure XO for Reverse Proxy
+
+Edit `xo-config.cfg` with these settings:
+
+```bash
+# Use non-privileged ports
+HTTP_PORT=8080
+HTTPS_PORT=8443
+
+# Bind to localhost only if proxy is on same host
+# (or 0.0.0.0 if proxy is on different host)
+BIND_ADDRESS=127.0.0.1
+
+# Trust X-Forwarded-* headers from your proxy
+# Replace with your proxy's IP address
+REVERSE_PROXY_TRUST=127.0.0.1
+
+# Optional: Let XO redirect HTTP to HTTPS
+# (or handle this in your reverse proxy)
+REDIRECT_TO_HTTPS=false
+```
+
+### 2. Configure Your Reverse Proxy
+
+#### Nginx Example
+
+```nginx
+server {
+    listen 80;
+    listen 443 ssl http2;
+    server_name xo.example.com;
+
+    # SSL configuration
+    ssl_certificate /etc/ssl/certs/your-cert.pem;
+    ssl_certificate_key /etc/ssl/private/your-key.pem;
+
+    # Redirect HTTP to HTTPS
+    if ($scheme = http) {
+        return 301 https://$server_name$request_uri;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Timeouts
+        proxy_read_timeout 1800;
+
+        # Large file uploads
+        client_max_body_size 4G;
+    }
+}
+```
+
+#### Apache Example
+
+```apache
+<VirtualHost *:80>
+    ServerName xo.example.com
+    Redirect permanent / https://xo.example.com/
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName xo.example.com
+
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/certs/your-cert.pem
+    SSLCertificateKeyFile /etc/ssl/private/your-key.pem
+
+    # Enable required modules: mod_proxy, mod_proxy_http, mod_proxy_wstunnel, mod_rewrite
+    
+    # WebSocket support
+    RewriteEngine On
+    RewriteCond %{HTTP:upgrade} websocket [NC]
+    RewriteRule /(.*) ws://127.0.0.1:8080/$1 [L,P]
+
+    # HTTP proxy
+    ProxyPass / http://127.0.0.1:8080/
+    ProxyPassReverse / http://127.0.0.1:8080/
+    
+    # Forward headers
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto "https"
+</VirtualHost>
+```
+
+#### Caddy Example
+
+```caddy
+xo.example.com {
+    reverse_proxy localhost:8080
+}
+```
+
+### 3. Install or Update XO
+
+Run the installation or update script as usual:
+
+```bash
+./install-xen-orchestra.sh
+```
+
+### Benefits of Using a Reverse Proxy
+
+- **Centralized SSL/TLS management** - Use Let's Encrypt or your own certificates
+- **Multiple services on same IP** - Host multiple web apps on ports 80/443
+- **Advanced features** - Load balancing, caching, rate limiting, WAF
+- **Better logging** - Centralized access logs and monitoring
+- **Security** - Additional layer between internet and XO server
 
 ## System Requirements
 
