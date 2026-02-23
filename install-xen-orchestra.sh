@@ -1015,6 +1015,326 @@ start_service() {
     fi
 }
 
+# Install XO Proxy
+install_xo_proxy() {
+    log_info "Starting XO Proxy installation..."
+    echo ""
+
+    # Check if expect is installed
+    if ! command -v expect &> /dev/null; then
+        log_info "Installing expect for automated SSH interaction..."
+        detect_package_manager
+        $PKG_UPDATE
+        $PKG_INSTALL expect
+    fi
+
+    # Prompt for Pool Master connection info
+    echo "=============================================="
+    echo "  Pool Master Connection Information"
+    echo "=============================================="
+    echo ""
+
+    read -p "IP address of Pool Master: " POOL_MASTER_IP
+    if [[ -z "$POOL_MASTER_IP" ]]; then
+        log_error "Pool Master IP address is required"
+        exit 1
+    fi
+
+    read -p "Host username [root]: " HOST_USERNAME
+    HOST_USERNAME=${HOST_USERNAME:-root}
+
+    read -sp "Host password: " HOST_PASSWORD
+    echo ""
+    if [[ -z "$HOST_PASSWORD" ]]; then
+        log_error "Host password is required"
+        exit 1
+    fi
+
+    # Test SSH connection
+    log_info "Testing SSH connection to $HOST_USERNAME@$POOL_MASTER_IP..."
+    if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
+        # Try installing sshpass if not available
+        if ! command -v sshpass &> /dev/null; then
+            log_info "Installing sshpass..."
+            $PKG_INSTALL sshpass
+            # Retry connection
+            if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
+                log_error "Failed to connect to Pool Master. Please check your credentials."
+                exit 1
+            fi
+        else
+            log_error "Failed to connect to Pool Master. Please check your credentials."
+            exit 1
+        fi
+    fi
+    log_success "SSH connection successful"
+
+    # Get XO Proxy configuration from user
+    echo ""
+    echo "=============================================="
+    echo "  XO Proxy Configuration"
+    echo "=============================================="
+    echo ""
+
+    read -p "IP address for proxy [dhcp]: " PROXY_IP
+    PROXY_IP=${PROXY_IP:-dhcp}
+
+    read -p "Custom NTP server (leave blank for default): " NTP_SERVER
+
+    echo ""
+    echo "=============================================="
+    echo "  Xen Orchestra Credentials"
+    echo "=============================================="
+    echo ""
+
+    read -p "Xen Orchestra login username: " XO_USERNAME
+    if [[ -z "$XO_USERNAME" ]]; then
+        log_error "Xen Orchestra username is required"
+        exit 1
+    fi
+
+    read -sp "Xen Orchestra login password: " XO_PASSWORD
+    echo ""
+    if [[ -z "$XO_PASSWORD" ]]; then
+        log_error "Xen Orchestra password is required"
+        exit 1
+    fi
+
+    # Create expect script for proxy installation
+    log_info "Creating installation script..."
+    
+    TEMP_SCRIPT=$(mktemp)
+    cat > "$TEMP_SCRIPT" << 'EXPECT_SCRIPT_END'
+#!/usr/bin/expect -f
+
+set timeout 600
+set pool_master [lindex $argv 0]
+set username [lindex $argv 1]
+set password [lindex $argv 2]
+set proxy_ip [lindex $argv 3]
+set ntp_server [lindex $argv 4]
+set xo_username [lindex $argv 5]
+set xo_password [lindex $argv 6]
+
+# Variables to capture output
+set proxy_uuid ""
+set auth_token ""
+set actual_proxy_ip ""
+
+log_user 1
+
+# Connect to pool master
+spawn ssh -o StrictHostKeyChecking=no $username@$pool_master
+
+# Handle password prompt
+expect {
+    "password:" {
+        send "$password\r"
+    }
+}
+
+# Wait for shell prompt and run installer
+expect {
+    -re ".*#" {
+        send "bash -c \"\$(wget -qO- https://xoa.io/proxy/deploy)\"\r"
+    }
+}
+
+# Handle installer prompts - more specific patterns
+expect {
+    -re "IP address\\? \\\[dhcp\\\]" {
+        if {$proxy_ip eq "dhcp" || $proxy_ip eq "DHCP"} {
+            send "\r"
+        } else {
+            send "$proxy_ip\r"
+        }
+        exp_continue
+    }
+    -re "Custom NTP servers.*\\? \\\[\\\]" {
+        if {$ntp_server eq ""} {
+            send "\r"
+        } else {
+            send "$ntp_server\r"
+        }
+        exp_continue
+    }
+    -re "Xen Orchestra \\(XO\\) address\\?" {
+        send "http://localhost\r"
+        exp_continue
+    }
+    -re "Your Xen Orchestra account \\(email\\)\\?" {
+        send "$xo_username\r"
+        exp_continue
+    }
+    -re "Your Xen Orchestra account password\\?" {
+        send "$xo_password\r"
+        exp_continue
+    }
+    -re "XO Proxy Appliance IP address: (\[0-9.\]+)" {
+        set actual_proxy_ip $expect_out(1,string)
+        exp_continue
+    }
+    -re "UUID: (\[a-f0-9-\]+)" {
+        set proxy_uuid $expect_out(1,string)
+        exp_continue
+    }
+    -re "authentication token: (\[a-zA-Z0-9_-\]+)" {
+        set auth_token $expect_out(1,string)
+        exp_continue
+    }
+    -re "token: (\[a-zA-Z0-9_-\]+)" {
+        set auth_token $expect_out(1,string)
+        exp_continue
+    }
+    -re ".*#" {
+        # Back at prompt, installation complete
+    }
+    timeout {
+        send_user "\nTimeout waiting for installer\n"
+    }
+    eof {
+    }
+}
+
+# Exit SSH session
+send "exit\r"
+expect eof
+
+# Output captured values
+puts "\nCAPTURED_VALUES:"
+puts "PROXY_IP=$actual_proxy_ip"
+puts "PROXY_UUID=$proxy_uuid"
+puts "AUTH_TOKEN=$auth_token"
+EXPECT_SCRIPT_END
+
+    chmod +x "$TEMP_SCRIPT"
+
+    # Run the expect script
+    log_info "Starting XO Proxy installer on Pool Master..."
+    log_info "This may take several minutes..."
+    echo ""
+    
+    OUTPUT=$("$TEMP_SCRIPT" "$POOL_MASTER_IP" "$HOST_USERNAME" "$HOST_PASSWORD" "$PROXY_IP" "$NTP_SERVER" "$XO_USERNAME" "$XO_PASSWORD" 2>&1 | tee /dev/tty)
+    
+    # Extract values from output (look after CAPTURED_VALUES marker)
+    ACTUAL_PROXY_IP=$(echo "$OUTPUT" | grep "^PROXY_IP=" | tail -1 | cut -d'=' -f2)
+    PROXY_UUID=$(echo "$OUTPUT" | grep "^PROXY_UUID=" | tail -1 | cut -d'=' -f2)
+    AUTH_TOKEN=$(echo "$OUTPUT" | grep "^AUTH_TOKEN=" | tail -1 | cut -d'=' -f2)
+
+    # Clean up temp script
+    rm -f "$TEMP_SCRIPT"
+
+    # Use user-specified IP if not captured
+    if [[ -z "$ACTUAL_PROXY_IP" ]]; then
+        if [[ "$PROXY_IP" != "dhcp" ]] && [[ "$PROXY_IP" != "DHCP" ]]; then
+            ACTUAL_PROXY_IP="$PROXY_IP"
+        else
+            log_warning "Could not detect DHCP-assigned IP address"
+            read -p "Please enter the assigned IP address: " ACTUAL_PROXY_IP
+        fi
+    fi
+
+    # Validate we got the required information
+    if [[ -z "$PROXY_UUID" ]] || [[ -z "$AUTH_TOKEN" ]]; then
+        log_warning "Could not automatically extract UUID and/or authentication token"
+        
+        if [[ -z "$PROXY_UUID" ]]; then
+            read -p "Please enter the XO Proxy UUID: " PROXY_UUID
+        fi
+        
+        if [[ -z "$AUTH_TOKEN" ]]; then
+            read -p "Please enter the authentication token: " AUTH_TOKEN
+        fi
+    fi
+
+    echo ""
+    log_success "XO Proxy installation completed on Pool Master"
+    log_info "Proxy IP:   $ACTUAL_PROXY_IP"
+    log_info "Proxy UUID: $PROXY_UUID"
+    log_info "Auth Token: ${AUTH_TOKEN:0:20}..."
+
+    # Install xo-cli locally
+    echo ""
+    log_info "Installing xo-cli..."
+    if command -v xo-cli &> /dev/null; then
+        log_info "xo-cli is already installed"
+    else
+        if ! command -v npm &> /dev/null; then
+            log_error "npm is not installed. Please install Node.js first."
+            exit 1
+        fi
+        sudo npm i -g xo-cli
+        log_success "xo-cli installed"
+    fi
+
+    # Register xo-cli with local Xen Orchestra
+    log_info "Registering xo-cli with Xen Orchestra..."
+    
+    # Create a temporary expect script for xo-cli registration
+    XO_CLI_SCRIPT=$(mktemp)
+    cat > "$XO_CLI_SCRIPT" << 'XO_CLI_EXPECT_END'
+#!/usr/bin/expect -f
+
+set timeout 30
+set username [lindex $argv 0]
+set password [lindex $argv 1]
+
+spawn xo-cli --register http://localhost $username
+
+expect {
+    -re "Password:" {
+        send "$password\r"
+        exp_continue
+    }
+    timeout {
+        send_user "\nTimeout during xo-cli registration\n"
+        exit 1
+    }
+    eof
+}
+XO_CLI_EXPECT_END
+
+    chmod +x "$XO_CLI_SCRIPT"
+    
+    if "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_PASSWORD"; then
+        log_success "xo-cli registered with Xen Orchestra"
+    else
+        log_warning "Failed to register xo-cli automatically"
+        log_info "Please run manually: xo-cli --register http://localhost"
+        rm -f "$XO_CLI_SCRIPT"
+        exit 1
+    fi
+    
+    rm -f "$XO_CLI_SCRIPT"
+
+    # Register the proxy with Xen Orchestra
+    log_info "Registering XO Proxy with Xen Orchestra..."
+    
+    if xo-cli proxy.register authenticationToken="$AUTH_TOKEN" address="$ACTUAL_PROXY_IP:443" vmUuid="$PROXY_UUID"; then
+        log_success "XO Proxy registered successfully!"
+    else
+        log_error "Failed to register XO Proxy"
+        log_info "You can register manually with:"
+        echo "  xo-cli proxy.register authenticationToken=\"$AUTH_TOKEN\" address=\"$ACTUAL_PROXY_IP:443\" vmUuid=\"$PROXY_UUID\""
+        exit 1
+    fi
+
+    # Print summary
+    echo ""
+    echo "=============================================="
+    log_success "XO Proxy Installation Complete!"
+    echo "=============================================="
+    echo ""
+    echo "Proxy Details:"
+    echo "  - IP Address: $ACTUAL_PROXY_IP"
+    echo "  - UUID:       $PROXY_UUID"
+    echo "  - Auth Token: ${AUTH_TOKEN:0:20}..."
+    echo ""
+    echo "The proxy has been registered with your Xen Orchestra instance."
+    echo "You can manage it from the Xen Orchestra web interface."
+    echo ""
+}
+
 # Print installation summary
 print_summary() {
     echo ""
@@ -1091,6 +1411,7 @@ show_help() {
     echo "  --restore     Restore a previous backup interactively"
     echo "  --rebuild     Fresh clone + clean build on the current branch (backup taken first)"
     echo "  --reconfigure Regenerate configuration and systemd service from xo-config.cfg"
+    echo "  --proxy       Install XO Proxy on a pool master"
     echo "  --help        Show this help message"
     echo ""
     echo "Configuration:"
@@ -1126,6 +1447,11 @@ main() {
             check_sudo
             load_config
             reconfigure_xo
+            ;;
+        --proxy)
+            check_not_root
+            check_sudo
+            install_xo_proxy
             ;;
         --help)
             show_help

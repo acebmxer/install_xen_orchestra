@@ -7,6 +7,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Installs all required dependencies and prerequisites automatically
 - Uses Node.js 20 LTS (with npm v10)
 - Yarn package manager installed globally
+- Configurable via simple config file
 - Self-signed SSL certificate generation for HTTPS
 - Reverse proxy support
 - Systemd service for automatic startup
@@ -15,7 +16,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Interactive restore from any available backup
 - Rebuild functionality — fresh clone + clean build on the current branch, preserves settings
 - Reconfigure functionality — apply configuration changes without rebuilding
-- Configurable via simple config file
+- Deploy XO Proxy - Defaults to Pool wide Network associated with eth0
 - **Customizable service user** - run as any username or root, defaults to 'xo'
 - **Automatic swap space management** - creates 2GB swap if needed for builds
 - **NFS mount support** - automatically configures sudo permissions for remote storage
@@ -214,6 +215,24 @@ nano xo-config.cfg
 ```
 
 > **Note:** Reconfigure regenerates configuration files from `xo-config.cfg`. Your database and user data in `/var/lib/xo-server` are never modified. Config backups are saved to `/etc/xo-server/config.toml.backup-<timestamp>`.
+
+## Deploying a Proxy VM
+
+The script supports deploying a Xen Orchestra Proxy VM directly to your XenServer/XCP-ng pool using the `--proxy` option:
+
+```bash
+./install-xen-orchestra.sh --proxy
+```
+
+### Important Limitations and Notes
+
+⚠️ **Network Configuration:**
+- The `--proxy` option **does not allow you to specify which network the VIF is attached to**
+- It will default to **"Pool wide network associated with eth0"**
+⚠️ **Production Use Warning:**
+> **Use at your own risk. Not advised for use in production environments.**
+> 
+> This feature is provided for testing and development purposes. For production deployments, it is recommended to manually configure proxy VMs with proper network planning and validation.
 
 ## Service Management
 
