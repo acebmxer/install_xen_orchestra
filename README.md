@@ -8,7 +8,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Uses Node.js 20 LTS (with npm v10)
 - Yarn package manager installed globally
 - Self-signed SSL certificate generation for HTTPS
-- Direct port binding (80 and 443) - no proxy required
+- Reverse proxy support
 - Systemd service for automatic startup
 - Update functionality with commit comparison
 - Automatic backups before updates (keeps last 5)
