@@ -229,6 +229,7 @@ The script supports deploying a Xen Orchestra Proxy VM directly to your XenServe
 ⚠️ **Network Configuration:**
 - The `--proxy` option **does not allow you to specify which network the VIF is attached to**
 - It will default to **"Pool wide network associated with eth0"**
+ 
 ⚠️ **Production Use Warning:**
 > **Use at your own risk. Not advised for use in production environments.**
 > 
