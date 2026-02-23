@@ -1020,10 +1020,12 @@ install_xo_proxy() {
     log_info "Starting XO Proxy installation..."
     echo ""
 
+    # Detect package manager early
+    detect_package_manager
+
     # Check if expect is installed
     if ! command -v expect &> /dev/null; then
         log_info "Installing expect for automated SSH interaction..."
-        detect_package_manager
         $PKG_UPDATE
         $PKG_INSTALL expect
     fi
