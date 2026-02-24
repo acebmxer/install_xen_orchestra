@@ -1321,6 +1321,38 @@ XO_CLI_EXPECT_END
         exit 1
     fi
 
+    # Disable license check on XO Proxy (not required for XO from sources)
+    log_info "Disabling license check on XO Proxy..."
+    if sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=no "$HOST_USERNAME@$POOL_MASTER_IP" 'bash -s' << 'REMOTE_LICENSE_PATCH'
+set -e
+APPLIANCE_FILE=$(find /opt/xo-proxy -name 'appliance.mjs' 2>/dev/null | head -1)
+if [[ -z "$APPLIANCE_FILE" ]]; then
+    echo "WARNING: appliance.mjs not found, skipping license bypass"
+    exit 0
+fi
+python3 - "$APPLIANCE_FILE" << 'PYEOF'
+import sys, re
+fname = sys.argv[1]
+with open(fname) as f:
+    content = f.read()
+patched = re.sub(
+    r'((\s*)getSelfLicense\(\) \{).*?(\n\2\})',
+    r'\1\n\2    // modified to disable license check for XO from sources\n\2    return true\3',
+    content,
+    flags=re.DOTALL
+)
+with open(fname, 'w') as f:
+    f.write(patched)
+PYEOF
+systemctl restart xo-proxy
+REMOTE_LICENSE_PATCH
+    then
+        log_success "License check disabled on XO Proxy"
+    else
+        log_warning "Failed to disable license check on XO Proxy"
+        log_info "To manually disable: patch /opt/xo-proxy/app/mixins/appliance.mjs and restart xo-proxy service"
+    fi
+
     # Print summary
     echo ""
     echo "=============================================="
