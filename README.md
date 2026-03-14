@@ -427,6 +427,18 @@ The script automatically installs all required dependencies:
 
 ## Troubleshooting
 
+### Enable Debug Mode
+
+If you encounter issues and need to see detailed execution information, run the script with debug mode enabled:
+
+```bash
+XO_DEBUG=1 ./install-xen-orchestra.sh
+# or for any operation:
+XO_DEBUG=1 ./install-xen-orchestra.sh --update
+```
+
+This will print all executed commands (using `set -x`) for troubleshooting purposes.
+
 ### Service fails to start
 
 Check the service logs:
