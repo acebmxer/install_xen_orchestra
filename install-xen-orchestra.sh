@@ -1,5 +1,11 @@
 #!/bin/bash
 set -euo pipefail
+
+# Enable debug mode if XO_DEBUG environment variable is set
+if [[ "${XO_DEBUG:-0}" == "1" ]]; then
+    set -x
+fi
+
 trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
 #
 # Xen Orchestra Installation Script
@@ -56,6 +62,22 @@ check_not_root() {
     fi
 }
 
+# Check for required commands at startup
+check_required_commands() {
+    local missing_commands=()
+
+    for cmd in bash grep sed awk cut; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_commands+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing_commands[@]} -gt 0 ]]; then
+        log_error "The following required commands are missing: ${missing_commands[*]}"
+        exit 1
+    fi
+}
+
 # Check if sudo is available and user has sudo privileges
 check_sudo() {
     if ! command -v sudo >/dev/null 2>&1; then
@@ -66,6 +88,22 @@ check_sudo() {
     if ! sudo -v >/dev/null 2>&1; then
         log_error "You need sudo privileges to run this script."
         log_error "Please ensure your user is in the sudoers file."
+        exit 1
+    fi
+}
+
+# Check if git is available
+check_git() {
+    if ! command -v git >/dev/null 2>&1; then
+        log_error "git is not installed. Please install git first."
+        exit 1
+    fi
+}
+
+# Check if systemctl is available
+check_systemctl() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_error "systemctl is not available. This script requires systemd."
         exit 1
     fi
 }
@@ -106,6 +144,62 @@ load_config() {
     REVERSE_PROXY_TRUST=${REVERSE_PROXY_TRUST:-false}
     REDIS_URI=${REDIS_URI:-}
     REDIS_SOCKET=${REDIS_SOCKET:-}
+
+    # Validate configuration values
+    validate_config
+}
+
+# Validate configuration values
+validate_config() {
+    local errors=()
+
+    # Validate INSTALL_DIR
+    if [[ -z "$INSTALL_DIR" ]]; then
+        errors+=("INSTALL_DIR is not set")
+    elif [[ "$INSTALL_DIR" != /* ]]; then
+        errors+=("INSTALL_DIR must be an absolute path (starting with /)")
+    fi
+
+    # Validate ports are numeric
+    if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]]; then
+        errors+=("HTTP_PORT must be a number, got: $HTTP_PORT")
+    elif [[ $HTTP_PORT -lt 1 ]] || [[ $HTTP_PORT -gt 65535 ]]; then
+        errors+=("HTTP_PORT must be between 1 and 65535, got: $HTTP_PORT")
+    fi
+
+    if ! [[ "$HTTPS_PORT" =~ ^[0-9]+$ ]]; then
+        errors+=("HTTPS_PORT must be a number, got: $HTTPS_PORT")
+    elif [[ $HTTPS_PORT -lt 1 ]] || [[ $HTTPS_PORT -gt 65535 ]]; then
+        errors+=("HTTPS_PORT must be between 1 and 65535, got: $HTTPS_PORT")
+    fi
+
+    # Validate SERVICE_USER if set
+    if [[ -n "$SERVICE_USER" ]]; then
+        if ! [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            errors+=("SERVICE_USER must be a valid Linux username, got: $SERVICE_USER")
+        fi
+    fi
+
+    # Validate BACKUP_KEEP is numeric
+    if ! [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]]; then
+        errors+=("BACKUP_KEEP must be a number, got: $BACKUP_KEEP")
+    elif [[ $BACKUP_KEEP -lt 1 ]]; then
+        errors+=("BACKUP_KEEP must be at least 1, got: $BACKUP_KEEP")
+    fi
+
+    # Validate NODE_VERSION is numeric
+    if ! [[ "$NODE_VERSION" =~ ^[0-9]+$ ]]; then
+        errors+=("NODE_VERSION must be a number, got: $NODE_VERSION")
+    fi
+
+    # Report errors if any
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        log_error "Configuration validation failed:"
+        for error in "${errors[@]}"; do
+            log_error "  - $error"
+        done
+        exit 1
+    fi
 }
 
 # Detect package manager
@@ -132,10 +226,19 @@ detect_package_manager() {
 # Detect OS distribution
 detect_os() {
     if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS_ID="${ID}"
-        OS_VERSION_ID="${VERSION_ID}"
+        if . /etc/os-release 2>/dev/null; then
+            OS_ID="${ID:-unknown}"
+            OS_VERSION_ID="${VERSION_ID:-unknown}"
+            if [[ "$OS_ID" == "unknown" ]]; then
+                log_warning "Could not determine OS ID from /etc/os-release"
+            fi
+        else
+            log_warning "Failed to parse /etc/os-release"
+            OS_ID="unknown"
+            OS_VERSION_ID="unknown"
+        fi
     else
+        log_warning "/etc/os-release not found. OS detection may be inaccurate."
         OS_ID="unknown"
         OS_VERSION_ID="unknown"
     fi
@@ -240,20 +343,20 @@ create_service_user() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            # Create with root group membership for full NFS access
-            sudo useradd -r -m -s /bin/bash -G root,users "$SERVICE_USER" || true
+            # Create with root group membership for NFS/mount operations
+            sudo useradd -r -m -s /bin/bash -G root "$SERVICE_USER" || true
             log_success "Service user created: $SERVICE_USER"
         else
             log_info "Service user $SERVICE_USER already exists"
-            # Add to root and users groups for full privileges
-            sudo usermod -a -G root,users "$SERVICE_USER" 2>/dev/null || true
+            # Ensure user is in root group for mount operations
+            sudo usermod -a -G root "$SERVICE_USER" 2>/dev/null || true
         fi
-        
+
         # Display UID/GID for reference
         local XO_UID=$(id -u "$SERVICE_USER" 2>/dev/null || echo "unknown")
         local XO_GID=$(id -g "$SERVICE_USER" 2>/dev/null || echo "unknown")
         log_info "Service user UID:GID is ${XO_UID}:${XO_GID}"
-        log_info "Service user added to root group for NFS access"
+        log_info "Service user configured for NFS/mount operations"
     fi
 }
 
@@ -261,13 +364,17 @@ create_service_user() {
 setup_redis() {
     log_info "Setting up Redis..."
 
+    check_systemctl
+
     # Try redis-server first, then valkey
-    if systemctl list-unit-files | grep -q redis; then
-        sudo systemctl enable redis-server || sudo systemctl enable redis || true
-        sudo systemctl start redis-server || sudo systemctl start redis || true
-    elif systemctl list-unit-files | grep -q valkey; then
-        sudo systemctl enable valkey
-        sudo systemctl start valkey
+    if systemctl list-unit-files 2>/dev/null | grep -q redis; then
+        sudo systemctl enable redis-server 2>/dev/null || sudo systemctl enable redis 2>/dev/null || true
+        sudo systemctl start redis-server 2>/dev/null || sudo systemctl start redis 2>/dev/null || true
+    elif systemctl list-unit-files 2>/dev/null | grep -q valkey; then
+        sudo systemctl enable valkey 2>/dev/null || true
+        sudo systemctl start valkey 2>/dev/null || true
+    else
+        log_warning "Neither redis nor valkey service found in systemd units"
     fi
 
     # Verify Redis is running
@@ -1066,11 +1173,15 @@ print_summary() {
 install_xo() {
     log_info "Starting Xen Orchestra installation..."
 
+    check_required_commands
     check_not_root
     check_sudo
+    check_systemctl
     load_config
     detect_package_manager
+    detect_os
     install_dependencies
+    check_git
     install_nodejs
     install_yarn
     create_service_user
@@ -1098,6 +1209,9 @@ show_help() {
     echo "  --reconfigure Regenerate configuration and systemd service from xo-config.cfg"
     echo "  --help        Show this help message"
     echo ""
+    echo "Environment Variables:"
+    echo "  XO_DEBUG=1    Enable debug mode (prints all commands with 'set -x')"
+    echo ""
     echo "Configuration:"
     echo "  Copy sample-xo-config.cfg to xo-config.cfg and edit as needed."
     echo "  If xo-config.cfg is not found, it will be created automatically."
@@ -1109,26 +1223,36 @@ show_help() {
 main() {
     case "${1:-}" in
         --update)
+            check_required_commands
             check_not_root
             check_sudo
+            check_systemctl
             load_config
+            check_git
             update_xo
             ;;
         --restore)
+            check_required_commands
             check_not_root
             check_sudo
+            check_systemctl
             load_config
             restore_xo
             ;;
         --rebuild)
+            check_required_commands
             check_not_root
             check_sudo
+            check_systemctl
             load_config
+            check_git
             rebuild_xo
             ;;
         --reconfigure)
+            check_required_commands
             check_not_root
             check_sudo
+            check_systemctl
             load_config
             reconfigure_xo
             ;;
