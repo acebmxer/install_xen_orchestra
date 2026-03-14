@@ -15,6 +15,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 - Interactive restore from any available backup
 - Rebuild functionality — fresh clone + clean build on the current branch, preserves settings
 - Reconfigure functionality — apply configuration changes without rebuilding
+- **XO Proxy installation** - automated deployment to Xen pool masters
 - Configurable via simple config file
 - **Customizable service user** - run as any username or root, defaults to 'xo'
 - **Automatic swap space management** - creates 2GB swap if needed for builds
@@ -77,6 +78,23 @@ The `xo-config.cfg` file supports the following options:
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers (false, true, or IP list) |
 | `REDIS_URI` | - | Redis connection URI (optional) |
 | `REDIS_SOCKET` | - | Redis Unix socket path (optional) |
+| `DISABLE_WARNINGS` | false | Suppress installation warnings (see notes below) |
+| `DISABLE_LICENSE_CHECK` | false | Disable license checks on XO Proxy (see notes below) |
+
+### Warning Suppression and License Check Notes
+
+**`DISABLE_WARNINGS`** - When set to `true`, suppresses non-critical warnings during installation and operation.
+- ⚠️ **WARNING:** Disabling warnings may hide important issues that could affect stability, security, or functionality
+- Only disable if you understand the risks and have reviewed relevant warnings
+- Default: `false`
+
+**`DISABLE_LICENSE_CHECK`** - When set to `true`, disables license verification on XO Proxy appliances during the `--proxy` installation.
+- This is useful when building XO from sources without a proper license
+- ⚠️ **WARNING:** This bypasses important license verification and should only be used in:
+  - Authorized testing/development environments
+  - When explicitly permitted by your license agreement
+  - Unauthorized license bypass may violate licensing terms
+- Default: `false`
 
 ## Updating Xen Orchestra
 
@@ -214,6 +232,124 @@ nano xo-config.cfg
 ```
 
 > **Note:** Reconfigure regenerates configuration files from `xo-config.cfg`. Your database and user data in `/var/lib/xo-server` are never modified. Config backups are saved to `/etc/xo-server/config.toml.backup-<timestamp>`.
+
+## Installing XO Proxy
+
+XO Proxy allows you to manage remote Xen pools through a single Xen Orchestra instance. This script automates the deployment and registration of XO Proxy appliances on your Xen pool masters.
+
+### Quick Start
+
+```bash
+./install-xen-orchestra.sh --proxy
+```
+
+The installation will guide you through:
+
+1. **Pool Master Connection** - IP address and credentials for the target pool master
+2. **Proxy Configuration** - IP address (DHCP or static) and optional NTP server
+3. **XO Credentials** - Login credentials for your Xen Orchestra instance
+4. **Automated Deployment** - The script downloads and installs the XO Proxy appliance
+5. **Registration** - Automatically registers the proxy with your XO instance
+
+### Step-by-Step Example
+
+```bash
+$ ./install-xen-orchestra.sh --proxy
+
+[INFO] Starting XO Proxy installation...
+
+============================================
+  Pool Master Connection Information
+============================================
+
+IP address of Pool Master: 192.168.1.10
+Host username [root]: root
+Host password: ••••••
+
+[INFO] Testing SSH connection to root@192.168.1.10...
+[SUCCESS] SSH connection successful
+
+============================================
+  XO Proxy Configuration
+============================================
+
+IP address for proxy [dhcp]: dhcp
+Custom NTP server (leave blank for default):
+
+============================================
+  Xen Orchestra Credentials
+============================================
+
+Xen Orchestra login username: admin@admin.net
+Xen Orchestra login password: ••••••
+
+[INFO] Starting XO Proxy installer on Pool Master...
+[INFO] This may take several minutes...
+
+...installation output...
+
+[SUCCESS] XO Proxy installation completed on Pool Master
+[INFO] Proxy IP:   192.168.1.20
+[INFO] Proxy UUID: 12345678-1234-1234-1234-123456789012
+[INFO] Auth Token: eyJhbGciOiJIUzI1NiI...
+
+============================================
+[SUCCESS] XO Proxy Installation Complete!
+============================================
+
+Proxy Details:
+  - IP Address: 192.168.1.20
+  - UUID:       12345678-1234-1234-1234-123456789012
+  - Auth Token: eyJhbGciOiJIUzI1NiI...
+
+The proxy has been registered with your Xen Orchestra instance.
+You can manage it from the Xen Orchestra web interface.
+```
+
+### Prerequisites
+
+- Xen Orchestra must already be installed and running
+- SSH access to the target pool master (root or account with admin privileges)
+- Network connectivity between installation machine and pool master
+- Pool master must have internet access for downloading the XO Proxy appliance
+
+### Configuration
+
+Before running `--proxy`, ensure the following config options are set in `xo-config.cfg`:
+
+**Optional - License Check Disabling:**
+
+If you're running XO from sources and want to automatically disable license checks on the proxy:
+
+```bash
+DISABLE_LICENSE_CHECK=true
+```
+
+> **Warning:** Only use this if you understand the licensing implications. See the [Warning Suppression and License Check Notes](#warning-suppression-and-license-check-notes) section above.
+
+### Manual Proxy Registration
+
+If the automatic registration fails, you can register the proxy manually using `xo-cli`:
+
+```bash
+xo-cli proxy.register \
+  authenticationToken="<token>" \
+  address="<proxy-ip>:443" \
+  vmUuid="<proxy-uuid>"
+```
+
+The token, IP address, and UUID are provided at the end of the installation.
+
+### Managing Proxies
+
+Once installed and registered, manage your proxies from the Xen Orchestra web interface:
+
+1. Login to XO web interface
+2. Navigate to **Settings** → **Proxies**
+3. View connected proxies and their status
+4. Configure pool associations as needed
+
+For detailed XO Proxy documentation, see the [official documentation](https://docs.xen-orchestra.com/features/proxy).
 
 ## Service Management
 
