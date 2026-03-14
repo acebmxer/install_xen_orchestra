@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-trap 'log_error "Script failed at line $LINENO. If the service was stopped, run: sudo systemctl start xo-server"' ERR
+trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
 #
 # Xen Orchestra Installation Script
 # Based on: https://docs.xen-orchestra.com/installation#from-the-sources
@@ -14,8 +14,6 @@ trap 'log_error "Script failed at line $LINENO. If the service was stopped, run:
 # - Restore functionality from named backups
 # - Rebuild functionality (fresh clone + build, preserves settings)
 #
-
-set -e
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,12 +58,12 @@ check_not_root() {
 
 # Check if sudo is available and user has sudo privileges
 check_sudo() {
-    if ! command -v sudo &> /dev/null; then
+    if ! command -v sudo >/dev/null 2>&1; then
         log_error "sudo is not installed. Please install sudo first."
         exit 1
     fi
 
-    if ! sudo -v &> /dev/null; then
+    if ! sudo -v >/dev/null 2>&1; then
         log_error "You need sudo privileges to run this script."
         log_error "Please ensure your user is in the sudoers file."
         exit 1
@@ -156,23 +154,27 @@ install_dependencies() {
             build-essential redis-server libpng-dev git python3-minimal \
             libvhdi-utils lvm2 cifs-utils nfs-common ntfs-3g openssl \
             dmidecode patch sudo"
-        
+
         # Add software-properties-common for Ubuntu
         if [[ "$OS_ID" == "ubuntu" ]]; then
             BASE_PACKAGES="$BASE_PACKAGES software-properties-common"
         fi
-        
+
         # Try to install libfuse2t64 (newer systems) or fall back to libfuse2
-        if ! $PKG_INSTALL $BASE_PACKAGES libfuse2t64 2>/dev/null; then
-            log_info "libfuse2t64 not available, trying libfuse2..."
+        if apt-cache search "^libfuse2t64" 2>/dev/null | grep -q libfuse2t64; then
+            $PKG_INSTALL $BASE_PACKAGES libfuse2t64
+        else
+            log_info "libfuse2t64 not available, installing libfuse2 instead..."
             $PKG_INSTALL $BASE_PACKAGES libfuse2
         fi
         
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
         # Check if it's RHEL 10+ or similar where Redis is replaced by Valkey
         if [[ "$PKG_MANAGER" == "dnf" ]]; then
-            # Try to install Redis first, fall back to Valkey
-            if ! $PKG_INSTALL redis 2>/dev/null; then
+            # Check if Redis package exists, fall back to Valkey if not
+            if dnf list available 2>/dev/null | grep -q "^redis"; then
+                $PKG_INSTALL redis
+            else
                 log_info "Redis not available, installing Valkey as replacement..."
                 sudo dnf install -y epel-release || true
                 sudo dnf config-manager --enable devel || true
@@ -193,11 +195,11 @@ install_nodejs() {
     log_info "Installing Node.js ${NODE_VERSION} LTS..."
 
     # Check if Node.js is already installed with correct version
-    if command -v node &> /dev/null; then
+    if command -v node >/dev/null 2>&1; then
         CURRENT_NODE=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
         if [[ "$CURRENT_NODE" == "$NODE_VERSION" ]]; then
             log_info "Node.js ${NODE_VERSION} is already installed: $(node -v)"
-            if command -v npm &> /dev/null; then
+            if command -v npm >/dev/null 2>&1; then
                 log_info "npm is available: $(npm -v)"
             fi
             return 0
@@ -223,7 +225,7 @@ install_nodejs() {
 install_yarn() {
     log_info "Installing Yarn..."
 
-    if command -v yarn &> /dev/null; then
+    if command -v yarn >/dev/null 2>&1; then
         log_info "Yarn is already installed: $(yarn -v)"
         return 0
     fi
@@ -269,10 +271,10 @@ setup_redis() {
     fi
 
     # Verify Redis is running
-    if redis-cli ping | grep -q PONG; then
+    if command -v redis-cli >/dev/null 2>&1 && redis-cli ping 2>/dev/null | grep -q PONG; then
         log_success "Redis is running"
     else
-        log_error "Redis is not responding"
+        log_error "Redis is not running or not responding"
         exit 1
     fi
 }
@@ -360,13 +362,14 @@ build_xo() {
     fi
 
     # Set Node.js memory limits and limit parallel builds to prevent OOM
-    local BUILD_ENV="NODE_OPTIONS='--max-old-space-size=4096' TURBO_CACHE=remote:r"
-    
+    local NODE_OPTIONS="--max-old-space-size=4096"
+    local TURBO_CACHE="remote:r"
+
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
+        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build"
     else
-        sudo bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
+        sudo bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build"
     fi
 
     log_success "Xen Orchestra built successfully"
@@ -482,7 +485,7 @@ EOF
 create_systemd_service() {
     log_info "Creating systemd service..."
 
-    local NODE_PATH=$(which node)
+    local NODE_PATH=$(command -v node)
     local EXEC_USER="${SERVICE_USER:-root}"
     local XO_SERVER_PATH="${INSTALL_DIR}/packages/xo-server/dist/cli.mjs"
     local DEBUG_ENV=""
@@ -502,7 +505,7 @@ Type=simple
 User=${EXEC_USER}
 Group=root
 SupplementaryGroups=root
-Environment="${DEBUG_ENV}"
+$(if [[ -n "$DEBUG_ENV" ]]; then echo "Environment=\"${DEBUG_ENV}\""; fi)
 Environment="NODE_ENV=production"
 WorkingDirectory=${INSTALL_DIR}/packages/xo-server
 ExecStartPre=/bin/mkdir -p /run/xo-server/mounts
@@ -678,7 +681,7 @@ restore_xo() {
     local TOTAL=$((i - 1))
     echo ""
     echo -n "Enter the number of the backup to restore [1-${TOTAL}], or 'q' to quit: "
-    read -r CHOICE
+    read -t 300 -r CHOICE || { log_error "Input timeout"; exit 1; }
 
     if [[ "$CHOICE" == "q" ]] || [[ "$CHOICE" == "Q" ]]; then
         log_info "Restore cancelled."
@@ -698,7 +701,7 @@ restore_xo() {
     log_warning "You are about to restore: $SELECTED_NAME"
     log_warning "This will replace the current installation at $INSTALL_DIR"
     echo -n "Are you sure? [y/N]: "
-    read -r CONFIRM
+    read -t 300 -r CONFIRM || { log_error "Input timeout"; exit 1; }
 
     if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
         log_info "Restore cancelled."
@@ -855,7 +858,7 @@ rebuild_xo() {
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
     echo -n "Continue? [y/N]: "
-    read -r CONFIRM
+    read -t 300 -r CONFIRM || { log_error "Input timeout"; exit 1; }
 
     if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
         log_info "Rebuild cancelled."
@@ -948,7 +951,7 @@ reconfigure_xo() {
     log_warning "Database and user data in /var/lib/xo-server will NOT be affected."
     echo ""
     echo -n "Continue? [y/N]: "
-    read -r CONFIRM
+    read -t 300 -r CONFIRM || { log_error "Input timeout"; exit 1; }
 
     if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
         log_info "Reconfiguration cancelled."
@@ -1032,7 +1035,9 @@ print_summary() {
     echo ""
     echo "Access Xen Orchestra:"
     local SERVER_IP
-    SERVER_IP=$(hostname -I | awk '{print $1}')
+    SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || \
+                ip route get 1 2>/dev/null | awk '{print $7;exit}' || \
+                hostname)
     local HTTP_URL="http://${SERVER_IP}"
     local HTTPS_URL="https://${SERVER_IP}"
     [[ "$HTTP_PORT" != "80" ]]   && HTTP_URL="${HTTP_URL}:${HTTP_PORT}"
