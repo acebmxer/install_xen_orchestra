@@ -137,7 +137,7 @@ load_config() {
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
     NODE_VERSION=${NODE_VERSION:-20}
-    SERVICE_USER=${SERVICE_USER:-xo}
+    SERVICE_USER=${SERVICE_USER:-root}
     DEBUG_MODE=${DEBUG_MODE:-false}
     BIND_ADDRESS=${BIND_ADDRESS:-0.0.0.0}
     REDIRECT_TO_HTTPS=${REDIRECT_TO_HTTPS:-false}
@@ -586,6 +586,11 @@ EOF
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         sudo chown -R "$SERVICE_USER:root" /etc/xo-server
     fi
+
+    # Create VDDK library directory expected by xo-server for VMware V2V import
+    # XO extracts the VDDK tar.gz here when uploaded via the UI
+    sudo mkdir -p /usr/local/lib/vddk
+    sudo chmod 755 /usr/local/lib/vddk
 
     log_success "Configuration written to $XO_CONFIG_FILE"
 }
