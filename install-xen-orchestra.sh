@@ -682,15 +682,18 @@ EOF
     fi
 }
 
+# Run git in the install directory as the directory owner
+# This avoids git's dubious ownership check regardless of SERVICE_USER
+install_dir_git() {
+    local DIR_OWNER
+    DIR_OWNER=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null)
+    sudo -u "$DIR_OWNER" git -C "$INSTALL_DIR" "$@"
+}
+
 # Get current installed commit
 get_installed_commit() {
     if [[ -d "$INSTALL_DIR/.git" ]]; then
-        # Run as service user to avoid git's dubious ownership check
-        if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-            sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null
-        else
-            sudo git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null
-        fi
+        install_dir_git rev-parse HEAD 2>/dev/null
     else
         echo ""
     fi
@@ -766,10 +769,12 @@ restore_xo() {
     for BACKUP in "${BACKUPS[@]}"; do
         local BACKUP_NAME
         BACKUP_NAME=$(basename "$BACKUP")
-        # Read commit hash directly from backup's git repo (backups are owned by root)
+        # Read commit hash from backup's git repo, running as the directory owner
         local BACKUP_COMMIT=""
         if [[ -d "$BACKUP/.git" ]]; then
-            BACKUP_COMMIT=$(sudo git -C "$BACKUP" rev-parse HEAD 2>/dev/null | cut -c1-12 || true)
+            local BACKUP_OWNER
+            BACKUP_OWNER=$(stat -c '%U' "$BACKUP" 2>/dev/null)
+            BACKUP_COMMIT=$(sudo -u "$BACKUP_OWNER" git -C "$BACKUP" rev-parse HEAD 2>/dev/null | cut -c1-12 || true)
         fi
         # Parse timestamp from name: xo-backup-YYYYMMDD_HHMMSS
         # Format using local system timezone in 12-hour time
@@ -911,14 +916,20 @@ update_xo() {
     # Update repository
     log_info "Pulling latest changes..."
 
-    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" checkout .
-        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" fetch origin
-        sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
-    else
-        sudo git -C "$INSTALL_DIR" checkout .
-        sudo git -C "$INSTALL_DIR" fetch origin
-        sudo git -C "$INSTALL_DIR" checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
+    install_dir_git checkout .
+    install_dir_git fetch origin
+    install_dir_git checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
+
+    # Fix ownership if SERVICE_USER changed since initial install
+    local DIR_OWNER
+    DIR_OWNER=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null)
+    if [[ "$SERVICE_USER" != "$DIR_OWNER" ]]; then
+        log_info "Updating directory ownership from ${DIR_OWNER} to ${SERVICE_USER}..."
+        if [[ "$SERVICE_USER" == "root" ]]; then
+            sudo chown -R root:root "$INSTALL_DIR"
+        else
+            sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
+        fi
     fi
 
     # Rebuild with clean cache to ensure fresh build
@@ -947,11 +958,7 @@ rebuild_xo() {
 
     # Detect the currently checked-out branch
     local CURRENT_BRANCH
-    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        CURRENT_BRANCH=$(sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$GIT_BRANCH")
-    else
-        CURRENT_BRANCH=$(sudo git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$GIT_BRANCH")
-    fi
+    CURRENT_BRANCH=$(install_dir_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$GIT_BRANCH")
 
     local CURRENT_COMMIT
     CURRENT_COMMIT=$(get_installed_commit)
