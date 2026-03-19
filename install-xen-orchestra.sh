@@ -839,10 +839,17 @@ restore_xo() {
     log_info "Restoring from backup: $SELECTED_NAME"
     sudo cp -r "$SELECTED_BACKUP" "$INSTALL_DIR"
 
-    # Fix ownership
-    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
-        sudo chmod -R g+rwX "$INSTALL_DIR"
+    # Fix ownership to match current SERVICE_USER
+    local DIR_OWNER
+    DIR_OWNER=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null)
+    if [[ "$SERVICE_USER" != "$DIR_OWNER" ]]; then
+        log_info "Updating directory ownership from ${DIR_OWNER} to ${SERVICE_USER}..."
+        if [[ "$SERVICE_USER" == "root" ]]; then
+            sudo chown -R root:root "$INSTALL_DIR"
+        else
+            sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
+            sudo chmod -R g+rwX "$INSTALL_DIR"
+        fi
     fi
 
     # Rebuild — node_modules are excluded from backups
