@@ -689,7 +689,7 @@ get_installed_commit() {
         if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
             sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null
         else
-            git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null
+            sudo git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null
         fi
     else
         echo ""
