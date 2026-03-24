@@ -1890,7 +1890,7 @@ menu_show_cursor() { printf "${M_CSI}?25h"; }
 menu_gather_info() {
     # Current Script Commit (local HEAD)
     if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
-        MENU_SCRIPT_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null) || MENU_SCRIPT_COMMIT="N/A"
+        MENU_SCRIPT_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_SCRIPT_COMMIT="N/A"
     else
         MENU_SCRIPT_COMMIT="N/A"
     fi
@@ -1901,7 +1901,7 @@ menu_gather_info() {
         current_branch=$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || current_branch=""
         if [[ -n "$current_branch" ]]; then
             git -C "$SCRIPT_DIR" fetch origin "$current_branch" 2>/dev/null || true
-            MENU_SCRIPT_MASTER=$(git -C "$SCRIPT_DIR" rev-parse --short "origin/${current_branch}" 2>/dev/null) || MENU_SCRIPT_MASTER="N/A"
+            MENU_SCRIPT_MASTER=$(git -C "$SCRIPT_DIR" rev-parse "origin/${current_branch}" 2>/dev/null | cut -c1-5) || MENU_SCRIPT_MASTER="N/A"
         else
             MENU_SCRIPT_MASTER="N/A"
         fi
@@ -1914,14 +1914,14 @@ menu_gather_info() {
     if [[ -d "${menu_install_dir}/.git" ]]; then
         local dir_owner
         dir_owner=$(stat -c '%U' "$menu_install_dir" 2>/dev/null) || dir_owner="root"
-        MENU_XO_COMMIT=$(sudo -u "$dir_owner" git -C "$menu_install_dir" rev-parse --short HEAD 2>/dev/null) || MENU_XO_COMMIT="N/A"
+        MENU_XO_COMMIT=$(sudo -u "$dir_owner" git -C "$menu_install_dir" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_XO_COMMIT="N/A"
         [[ -z "$MENU_XO_COMMIT" ]] && MENU_XO_COMMIT="N/A"
     else
         MENU_XO_COMMIT="N/A"
     fi
 
     # Master XO Commit (always show current master from remote)
-    MENU_XO_MASTER=$(git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/master 2>/dev/null | cut -f1 | cut -c1-12) || MENU_XO_MASTER="N/A"
+    MENU_XO_MASTER=$(git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/master 2>/dev/null | cut -f1 | cut -c1-5) || MENU_XO_MASTER="N/A"
     [[ -z "$MENU_XO_MASTER" ]] && MENU_XO_MASTER="N/A"
 
     # Current Node version
