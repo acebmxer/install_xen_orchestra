@@ -123,12 +123,12 @@ self_update_script() {
 
     log_info "Checking for script updates..."
 
-    # Fetch latest from origin
-    local default_branch
-    default_branch=$(git -C "$SCRIPT_DIR" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || true
-    default_branch="${default_branch:-main}"
+    # Fetch latest from the current branch
+    local current_branch
+    current_branch=$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || true
+    current_branch="${current_branch:-main}"
 
-    if ! git -C "$SCRIPT_DIR" fetch origin "$default_branch" 2>/dev/null; then
+    if ! git -C "$SCRIPT_DIR" fetch origin "$current_branch" 2>/dev/null; then
         log_warning "Could not check for script updates (network unavailable?)."
         return 0
     fi
@@ -139,25 +139,25 @@ self_update_script() {
 
     # Attempt fast-forward pull
     local pull_err
-    if ! pull_err=$(git -C "$SCRIPT_DIR" pull --ff-only origin "$default_branch" 2>&1); then
+    if ! pull_err=$(git -C "$SCRIPT_DIR" pull --ff-only origin "$current_branch" 2>&1); then
         log_warning "Script auto-update failed: $pull_err"
         log_warning "Local modifications detected in ${SCRIPT_DIR}."
         local reset_confirm
-        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Reset to origin/${default_branch}? Local changes will be lost. (y/N) " reset_confirm < /dev/tty
+        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Reset to origin/${current_branch}? Local changes will be lost. (y/N) " reset_confirm < /dev/tty
         echo
         if [[ ! "$reset_confirm" =~ ^[Yy]$ ]]; then
             log_warning "Self-update skipped. Continuing with current version."
             return 0
         fi
-        git -C "$SCRIPT_DIR" checkout "$default_branch" 2>/dev/null
-        git -C "$SCRIPT_DIR" reset --hard "origin/${default_branch}" 2>/dev/null
+        git -C "$SCRIPT_DIR" checkout "$current_branch" 2>/dev/null
+        git -C "$SCRIPT_DIR" reset --hard "origin/${current_branch}" 2>/dev/null
         git -C "$SCRIPT_DIR" clean -fd 2>/dev/null
         if [[ "$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)" != \
-              "$(git -C "$SCRIPT_DIR" rev-parse "origin/${default_branch}" 2>/dev/null)" ]]; then
+              "$(git -C "$SCRIPT_DIR" rev-parse "origin/${current_branch}" 2>/dev/null)" ]]; then
             log_warning "Unable to auto-resolve. Continuing with current version."
             return 0
         fi
-        log_success "Reset to origin/${default_branch}."
+        log_success "Reset to origin/${current_branch}."
     fi
 
     after=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
