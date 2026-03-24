@@ -5,7 +5,7 @@ Automated installation script for [Xen Orchestra](https://xen-orchestra.com/) fr
 ## Features
 
 - Installs all required dependencies and prerequisites automatically
-- Uses Node.js 20 LTS (with npm v10)
+- Configurable Node.js version with specific version support (e.g. 22, 22.3, 22.3.1)
 - Yarn package manager installed globally
 - Self-signed SSL certificate generation for HTTPS
 - Reverse proxy support
@@ -70,8 +70,8 @@ The `xo-config.cfg` file supports the following options:
 | `GIT_BRANCH` | master | Git branch (master, stable, or tag) |
 | `BACKUP_DIR` | /opt/xo-backups | Backup directory for updates |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
-| `NODE_VERSION` | 20 | Node.js major version |
-| `SERVICE_USER` | xo | Service user (any username, leave empty for root) |
+| `NODE_VERSION` | 22 | Node.js version (e.g. 22, 22.3, 22.3.1) |
+| `SERVICE_USER` | root | Service user (any username, leave empty for root) |
 | `DEBUG_MODE` | false | Enable debug logging |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address (0.0.0.0 for all, 127.0.0.1 for localhost) |
 | `REDIRECT_TO_HTTPS` | false | Redirect HTTP to HTTPS |
@@ -537,7 +537,7 @@ The script automatically installs all required dependencies:
 **Debian/Ubuntu:**
 - apt-transport-https, ca-certificates, libcap2-bin, curl, gnupg
 - build-essential, git, patch, sudo
-- Node.js v20 (with npm v10), yarn
+- Node.js (configurable version, default v22), yarn
 - redis-server
 - python3-minimal, libpng-dev
 - lvm2, cifs-utils, nfs-common, ntfs-3g
@@ -547,7 +547,7 @@ The script automatically installs all required dependencies:
 
 **RHEL/CentOS/Fedora:**
 - redis or valkey (RHEL 10+)
-- Node.js v20 (with npm v10), yarn
+- Node.js (configurable version, default v22), yarn
 - ca-certificates, gnupg2, curl
 - make, automake, gcc, gcc-c++, patch, sudo
 - git, libpng-devel
