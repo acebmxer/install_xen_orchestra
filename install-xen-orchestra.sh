@@ -425,6 +425,19 @@ install_nodejs() {
         log_warning "Falling back to latest ${NODE_MAJOR}.x via NodeSource..."
     fi
 
+    # Remove any previously installed binary-download Node.js so that
+    # the NodeSource package owns /usr/bin/node without conflicts.
+    if [[ -x /usr/local/bin/node ]]; then
+        log_info "Removing previously installed Node.js binary from /usr/local..."
+        sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+        # Remove symlinks that install_nodejs_binary may have created
+        for bin in node npm npx; do
+            if [[ -L /usr/bin/$bin ]] && [[ "$(readlink -f /usr/bin/$bin 2>/dev/null)" == "/usr/local/bin/$bin" ]]; then
+                sudo rm -f /usr/bin/$bin
+            fi
+        done
+    fi
+
     # Install latest in the major series via NodeSource
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -
@@ -432,6 +445,15 @@ install_nodejs() {
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
         curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -
         $PKG_INSTALL nodejs
+    fi
+
+    # Verify the installed version actually matches what we requested
+    local INSTALLED_FULL
+    INSTALLED_FULL=$(node -v 2>/dev/null | sed 's/^v//')
+    if ! version_satisfies "$INSTALLED_FULL" "$NODE_VERSION"; then
+        log_error "Node.js installation failed: expected ${NODE_VERSION}.x but got v${INSTALLED_FULL}"
+        log_error "Check for conflicting Node.js installations: 'which -a node'"
+        return 1
     fi
 
     log_success "Node.js installed: $(node -v)"
