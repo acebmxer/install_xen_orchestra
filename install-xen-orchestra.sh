@@ -217,6 +217,7 @@ load_config() {
     REDIS_SOCKET=${REDIS_SOCKET:-}
     DISABLE_WARNINGS=${DISABLE_WARNINGS:-false}
     DISABLE_LICENSE_CHECK=${DISABLE_LICENSE_CHECK:-false}
+    PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
 
     # Validate configuration values
     validate_config
@@ -1816,7 +1817,10 @@ show_help() {
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo ""
+    echo "Running without options launches an interactive menu."
+    echo ""
     echo "Options:"
+    echo "  --install     Install Xen Orchestra directly (skip menu)"
     echo "  --update      Update existing installation"
     echo "  --restore     Restore a previous backup interactively"
     echo "  --rebuild     Fresh clone + clean build on the current branch (backup taken first)"
@@ -1833,6 +1837,594 @@ show_help() {
     echo "  If xo-config.cfg is not found, it will be created automatically."
     echo "  To switch branches, edit GIT_BRANCH in xo-config.cfg and run --update."
     echo ""
+}
+
+# ============================================================================
+# Interactive Menu System
+# Provides TUI menu rendering and keyboard navigation
+# ============================================================================
+
+# Menu terminal control sequences
+M_CSI=$'\x1b['
+M_BOLD="${M_CSI}1m"
+M_DIM="${M_CSI}2m"
+M_RESET="${M_CSI}0m"
+M_RED="${M_CSI}31m"
+M_GREEN="${M_CSI}32m"
+M_YELLOW="${M_CSI}33m"
+M_BLUE="${M_CSI}34m"
+M_MAGENTA="${M_CSI}35m"
+M_CYAN="${M_CSI}36m"
+
+# Menu item names (left column indices 0-3, right column indices 4-6)
+MENU_NAMES=(
+    "Install Xen Orchestra"
+    "Update Xen Orchestra"
+    "Rename Sample-xo-config.cfg"
+    "Install XO Proxy"
+    "Reconfigure Xen Orchestra"
+    "Rebuild Xen Orchestra"
+    "Edit xo-config.cfg"
+)
+MENU_HINTS=(
+    ""
+    ""
+    ""
+    ""
+    "(made changes to config)"
+    "(wipe & reinstall maintain settings)"
+    ""
+)
+
+MENU_LEFT_COUNT=4
+MENU_RIGHT_COUNT=3
+MENU_TOTAL=7
+MENU_CURSOR=0
+MENU_SELECTED=(0 0 0 0 0 0 0)
+MCOL=0
+MROW=0
+MENU_SCRIPT_COMMIT="N/A"
+MENU_SCRIPT_MASTER="N/A"
+MENU_XO_COMMIT="N/A"
+MENU_XO_MASTER="N/A"
+MENU_NODE_VERSION="N/A"
+
+# Hide/show cursor
+menu_hide_cursor() { printf "${M_CSI}?25l"; }
+menu_show_cursor() { printf "${M_CSI}?25h"; }
+
+# Gather commit and version info for the menu header
+menu_gather_info() {
+    # Current Script Commit (local HEAD)
+    if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
+        MENU_SCRIPT_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_SCRIPT_COMMIT="N/A"
+    else
+        MENU_SCRIPT_COMMIT="N/A"
+    fi
+
+    # Master (remote) Script Commit for current branch
+    if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
+        local current_branch
+        current_branch=$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || current_branch=""
+        if [[ -n "$current_branch" ]]; then
+            git -C "$SCRIPT_DIR" fetch origin "$current_branch" 2>/dev/null || true
+            MENU_SCRIPT_MASTER=$(git -C "$SCRIPT_DIR" rev-parse "origin/${current_branch}" 2>/dev/null | cut -c1-5) || MENU_SCRIPT_MASTER="N/A"
+        else
+            MENU_SCRIPT_MASTER="N/A"
+        fi
+    else
+        MENU_SCRIPT_MASTER="N/A"
+    fi
+
+    # Current XO Commit (installed)
+    local menu_install_dir="${INSTALL_DIR:-/opt/xen-orchestra}"
+    if [[ -d "${menu_install_dir}/.git" ]]; then
+        local dir_owner
+        dir_owner=$(stat -c '%U' "$menu_install_dir" 2>/dev/null) || dir_owner="root"
+        MENU_XO_COMMIT=$(sudo -u "$dir_owner" git -C "$menu_install_dir" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_XO_COMMIT="N/A"
+        [[ -z "$MENU_XO_COMMIT" ]] && MENU_XO_COMMIT="N/A"
+    else
+        MENU_XO_COMMIT="N/A"
+    fi
+
+    # Master XO Commit (always show current master from remote)
+    MENU_XO_MASTER=$(git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/master 2>/dev/null | cut -f1 | cut -c1-5) || MENU_XO_MASTER="N/A"
+    [[ -z "$MENU_XO_MASTER" ]] && MENU_XO_MASTER="N/A"
+
+    # Current Node version
+    if command -v node &>/dev/null; then
+        MENU_NODE_VERSION=$(node -v 2>/dev/null) || MENU_NODE_VERSION="N/A"
+    else
+        MENU_NODE_VERSION="N/A"
+    fi
+}
+
+# Draw the full menu screen
+draw_menu() {
+    local term_width
+    term_width=$(tput cols 2>/dev/null) || term_width=80
+    local col_width=42
+    local content_width=$((col_width * 2))
+    local margin=0
+    (( term_width > content_width )) && margin=$(( (term_width - content_width) / 2 ))
+    local pad=""
+    (( margin > 0 )) && printf -v pad '%*s' "$margin" ''
+    local eol=$'\033[K'
+    local _buf=""
+
+    # Move cursor to home position (overwrite in place, no flicker)
+    _buf+=$'\033[H'
+
+    # Banner box
+    local inner_width=$((content_width - 2))
+    local border_fill
+    printf -v border_fill '%*s' "$inner_width" ''
+    border_fill="${border_fill// /═}"
+
+    local banner_text="Install Xen Orchestra from Sources Setup and Update"
+    local banner_len=${#banner_text}
+    local blpad=$(( (inner_width - banner_len) / 2 ))
+    local brpad=$(( inner_width - banner_len - blpad ))
+    local blspaces="" brspaces=""
+    (( blpad > 0 )) && printf -v blspaces '%*s' "$blpad" ''
+    (( brpad > 0 )) && printf -v brspaces '%*s' "$brpad" ''
+
+    _buf+="${pad}${eol}"$'\n'
+    _buf+="${pad}${M_BOLD}${M_CYAN}╔${border_fill}╗${M_RESET}${eol}"$'\n'
+    _buf+="${pad}${M_BOLD}${M_CYAN}║${blspaces}${banner_text}${brspaces}║${M_RESET}${eol}"$'\n'
+    _buf+="${pad}${M_BOLD}${M_CYAN}╚${border_fill}╝${M_RESET}${eol}"$'\n'
+    _buf+="${pad}${eol}"$'\n'
+
+    # Commit and version info (centered as a block)
+    local info_labels=(
+        "Current Script Commit :"
+        "Master Script Commit  :"
+        "Current XO Commit     :"
+        "Master XO Commit      :"
+        "Current Node          :"
+    )
+    local info_values=(
+        "$MENU_SCRIPT_COMMIT"
+        "$MENU_SCRIPT_MASTER"
+        "$MENU_XO_COMMIT"
+        "$MENU_XO_MASTER"
+        "$MENU_NODE_VERSION"
+    )
+    # Find the longest full line to compute a single centering offset
+    local info_max_len=0
+    for ((il=0; il<${#info_labels[@]}; il++)); do
+        local full_len=$(( ${#info_labels[$il]} + 1 + ${#info_values[$il]} ))
+        (( full_len > info_max_len )) && info_max_len=$full_len
+    done
+    local info_lpad=$(( (content_width - info_max_len) / 2 ))
+    local info_pad=""
+    (( info_lpad > 0 )) && printf -v info_pad '%*s' "$info_lpad" ''
+    for ((il=0; il<${#info_labels[@]}; il++)); do
+        local info_color="${M_YELLOW}"
+        [[ $il -eq 4 ]] && info_color="${M_GREEN}"
+        _buf+="${pad}${info_pad}${M_BOLD}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
+    done
+    _buf+="${pad}${eol}"$'\n'
+
+    # Separator
+    local sep_fill
+    printf -v sep_fill '%*s' "$content_width" ''
+    sep_fill="${sep_fill// /─}"
+    _buf+="${pad}${M_DIM}${sep_fill}${M_RESET}${eol}"$'\n'
+    _buf+="${pad}${eol}"$'\n'
+
+    # Menu items in 2 columns (left: indices 0-3, right: indices 4-6)
+    local rows=$MENU_LEFT_COUNT
+    for ((row=0; row<rows; row++)); do
+        local line=""
+        for ((col=0; col<2; col++)); do
+            local idx
+            if [[ $col -eq 0 ]]; then
+                idx=$row
+            else
+                idx=$((MENU_LEFT_COUNT + row))
+            fi
+
+            # Skip if index out of range (right column has fewer items)
+            if [[ $idx -ge $MENU_TOTAL ]]; then
+                continue
+            fi
+
+            local prefix="  "
+            local checkbox="[ ]"
+            local name="${MENU_NAMES[$idx]}"
+            local hint="${MENU_HINTS[$idx]}"
+
+            # Cursor indicator
+            if [[ $idx -eq $MENU_CURSOR ]]; then
+                prefix="${M_BOLD}${M_BLUE}▸ ${M_RESET}"
+            fi
+
+            # Selection checkbox
+            if [[ ${MENU_SELECTED[$idx]} -eq 1 ]]; then
+                checkbox="${M_GREEN}[✓]${M_RESET}"
+            fi
+
+            # Build item string
+            local item=""
+            if [[ $idx -eq $MENU_CURSOR ]]; then
+                item="${prefix}${checkbox} ${M_BOLD}${name}${M_RESET}"
+            else
+                item="${prefix}${checkbox} ${name}"
+            fi
+
+            # Add hint in dim text
+            if [[ -n "$hint" ]]; then
+                item="${item} ${M_DIM}${hint}${M_RESET}"
+            fi
+
+            # Pad left column to fixed width (based on visible characters only)
+            if [[ $col -eq 0 ]]; then
+                local visible_len=$((2 + 3 + 1 + ${#name}))
+                if [[ -n "$hint" ]]; then
+                    visible_len=$((visible_len + 1 + ${#hint}))
+                fi
+                local padding=$((col_width - visible_len))
+                [[ $padding -lt 2 ]] && padding=2
+                item="${item}$(printf '%*s' $padding '')"
+            fi
+
+            line="${line}${item}"
+        done
+        _buf+="${pad}${line}${eol}"$'\n'
+    done
+
+    _buf+="${pad}${eol}"$'\n'
+    _buf+="${pad}${M_DIM}${sep_fill}${M_RESET}${eol}"$'\n'
+    _buf+="${pad}${eol}"$'\n'
+
+    # Count selections
+    local sel_count=0
+    for ((i=0; i<MENU_TOTAL; i++)); do
+        [[ ${MENU_SELECTED[$i]} -eq 1 ]] && sel_count=$((sel_count + 1))
+    done
+    _buf+="${pad}${M_CYAN}Selected: ${M_GREEN}${sel_count}${M_RESET}${eol}"$'\n'
+    _buf+="${pad}${eol}"$'\n'
+
+    # Key legend
+    _buf+="${pad}${M_YELLOW}↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Quit${M_RESET}${eol}"$'\n'
+    _buf+="${pad}${M_DIM}Legend: ${M_GREEN}[✓]${M_RESET}${M_DIM} selected  ${M_RESET}${M_DIM}[ ] not selected${M_RESET}${eol}"$'\n'
+
+    # Erase any leftover lines from previous render
+    _buf+=$'\033[J'
+    printf '%s' "$_buf"
+}
+
+# Read a single keypress and return a key name
+menu_read_key() {
+    local key
+    IFS= read -rsn1 key 2>/dev/null || true
+
+    # Escape sequence (arrow keys, etc.)
+    if [[ "$key" == $'\x1b' ]]; then
+        local seq
+        IFS= read -rsn1 -t 0.5 seq 2>/dev/null || true
+        if [[ "$seq" == "[" ]] || [[ "$seq" == "O" ]]; then
+            local code
+            IFS= read -rsn1 -t 0.5 code 2>/dev/null || true
+            case "$code" in
+                A) echo "UP"; return ;;
+                B) echo "DOWN"; return ;;
+                C) echo "RIGHT"; return ;;
+                D) echo "LEFT"; return ;;
+            esac
+        fi
+        echo "ESCAPE"
+        return
+    fi
+
+    case "$key" in
+        ' ') echo "SPACE" ;;
+        '') echo "ENTER" ;;
+        q|Q) echo "QUIT" ;;
+        *) echo "OTHER" ;;
+    esac
+}
+
+# Get the column (0=left, 1=right) and row for a cursor index
+menu_get_pos() {
+    local idx=$1
+    if [[ $idx -lt $MENU_LEFT_COUNT ]]; then
+        MCOL=0
+        MROW=$idx
+    else
+        MCOL=1
+        MROW=$((idx - MENU_LEFT_COUNT))
+    fi
+}
+
+# Convert column/row to cursor index
+menu_set_cursor() {
+    local col=$1 row=$2
+    if [[ $col -eq 0 ]]; then
+        MENU_CURSOR=$row
+    else
+        local target=$((MENU_LEFT_COUNT + row))
+        if [[ $target -lt $MENU_TOTAL ]]; then
+            MENU_CURSOR=$target
+        fi
+    fi
+}
+
+# Rename sample-xo-config.cfg to xo-config.cfg
+menu_rename_config() {
+    echo ""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log_warning "xo-config.cfg already exists!"
+        local overwrite
+        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Overwrite with sample? (y/N) " overwrite < /dev/tty
+        echo
+        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+            log_info "Skipping rename."
+            return 0
+        fi
+    fi
+    if [[ ! -f "$SAMPLE_CONFIG" ]]; then
+        log_error "sample-xo-config.cfg not found in ${SCRIPT_DIR}"
+        return 1
+    fi
+    cp "$SAMPLE_CONFIG" "$CONFIG_FILE"
+    log_success "Copied sample-xo-config.cfg to xo-config.cfg"
+}
+
+# Edit xo-config.cfg using the preferred editor from config
+menu_edit_config() {
+    echo ""
+
+    # Ensure config exists
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        if [[ -f "$SAMPLE_CONFIG" ]]; then
+            log_info "xo-config.cfg not found. Creating from sample..."
+            cp "$SAMPLE_CONFIG" "$CONFIG_FILE"
+            log_success "Created xo-config.cfg from sample."
+        else
+            log_error "Neither xo-config.cfg nor sample-xo-config.cfg found!"
+            return 1
+        fi
+    fi
+
+    # Read preferred editor from config
+    local editor="${PREFERRED_EDITOR:-nano}"
+
+    # Source config to get PREFERRED_EDITOR if not already loaded
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local cfg_editor
+        cfg_editor=$(grep -E '^PREFERRED_EDITOR=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2) || true
+        [[ -n "$cfg_editor" ]] && editor="$cfg_editor"
+    fi
+
+    # Validate editor choice
+    if [[ "$editor" != "nano" ]] && [[ "$editor" != "vim" ]]; then
+        log_warning "PREFERRED_EDITOR must be 'nano' or 'vim'. Got: $editor"
+        log_info "Falling back to nano."
+        editor="nano"
+    fi
+
+    # Check if editor is installed
+    if ! command -v "$editor" &>/dev/null; then
+        log_warning "${editor} is not installed."
+        local install_editor
+        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Install ${editor}? (y/N) " install_editor < /dev/tty
+        echo
+        if [[ "$install_editor" =~ ^[Yy]$ ]]; then
+            # Detect package manager if not already done
+            if [[ -z "${PKG_INSTALL:-}" ]]; then
+                if command -v apt-get &>/dev/null; then
+                    PKG_INSTALL="sudo apt-get install -y"
+                elif command -v dnf &>/dev/null; then
+                    PKG_INSTALL="sudo dnf install -y"
+                elif command -v yum &>/dev/null; then
+                    PKG_INSTALL="sudo yum install -y"
+                else
+                    log_error "No supported package manager found."
+                    return 1
+                fi
+            fi
+            log_info "Installing ${editor}..."
+            $PKG_INSTALL "$editor"
+            if ! command -v "$editor" &>/dev/null; then
+                log_error "Failed to install ${editor}."
+                return 1
+            fi
+            log_success "${editor} installed."
+        else
+            log_error "Cannot edit without an editor. Please install ${editor} manually."
+            return 1
+        fi
+    fi
+
+    log_info "Opening ${CONFIG_FILE} with ${editor}..."
+    "$editor" "$CONFIG_FILE" < /dev/tty
+    log_success "Configuration editing complete."
+}
+
+# Process selected menu items after user confirms
+process_menu_selections() {
+    local has_selection=false
+    for ((i=0; i<MENU_TOTAL; i++)); do
+        [[ ${MENU_SELECTED[$i]} -eq 1 ]] && has_selection=true
+    done
+
+    if [[ "$has_selection" == "false" ]]; then
+        echo "No items selected."
+        return 0
+    fi
+
+    # Preparatory operations first (rename, then edit)
+    if [[ ${MENU_SELECTED[2]} -eq 1 ]]; then
+        menu_rename_config
+    fi
+
+    if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
+        menu_edit_config
+    fi
+
+    # Install Xen Orchestra (full installation with all checks)
+    if [[ ${MENU_SELECTED[0]} -eq 1 ]]; then
+        install_xo
+    fi
+
+    # Update Xen Orchestra
+    if [[ ${MENU_SELECTED[1]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        check_systemctl
+        load_config
+        detect_package_manager
+        check_git
+        update_xo
+    fi
+
+    # Reconfigure Xen Orchestra
+    if [[ ${MENU_SELECTED[4]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        check_systemctl
+        load_config
+        reconfigure_xo
+    fi
+
+    # Rebuild Xen Orchestra
+    if [[ ${MENU_SELECTED[5]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        check_systemctl
+        load_config
+        detect_package_manager
+        check_git
+        rebuild_xo
+    fi
+
+    # Install XO Proxy
+    if [[ ${MENU_SELECTED[3]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        detect_package_manager
+        load_config
+        install_xo_proxy
+    fi
+}
+
+# Run the interactive menu
+run_menu() {
+    # Load config silently for header info (don't error if missing)
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE" 2>/dev/null || true
+    elif [[ -f "$SAMPLE_CONFIG" ]]; then
+        source "$SAMPLE_CONFIG" 2>/dev/null || true
+    fi
+    INSTALL_DIR=${INSTALL_DIR:-/opt/xen-orchestra}
+    PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
+
+    # Reset selection state
+    MENU_CURSOR=0
+    MENU_SELECTED=(0 0 0 0 0 0 0)
+
+    # Gather version/commit info for header display
+    menu_gather_info
+
+    # Save terminal state (global so cleanup_menu trap can access it)
+    saved_stty=$(stty -g 2>/dev/null) || saved_stty=""
+    menu_hide_cursor
+    stty -echo 2>/dev/null || true
+
+    # Restore terminal on exit
+    cleanup_menu() {
+        menu_show_cursor
+        [[ -n "$saved_stty" ]] && stty "$saved_stty" 2>/dev/null || stty echo 2>/dev/null
+    }
+    trap cleanup_menu EXIT
+    trap 'draw_menu' WINCH
+
+    clear
+    draw_menu
+
+    while true; do
+        local key
+        key=$(menu_read_key)
+
+        case "$key" in
+            UP)
+                menu_get_pos $MENU_CURSOR
+                local col_size
+                if [[ $MCOL -eq 0 ]]; then
+                    col_size=$MENU_LEFT_COUNT
+                else
+                    col_size=$MENU_RIGHT_COUNT
+                fi
+                local new_row=$(( (MROW - 1 + col_size) % col_size ))
+                menu_set_cursor $MCOL $new_row
+                ;;
+            DOWN)
+                menu_get_pos $MENU_CURSOR
+                local col_size
+                if [[ $MCOL -eq 0 ]]; then
+                    col_size=$MENU_LEFT_COUNT
+                else
+                    col_size=$MENU_RIGHT_COUNT
+                fi
+                local new_row=$(( (MROW + 1) % col_size ))
+                menu_set_cursor $MCOL $new_row
+                ;;
+            LEFT)
+                menu_get_pos $MENU_CURSOR
+                if [[ $MCOL -eq 1 ]]; then
+                    local target_row=$MROW
+                    [[ $target_row -ge $MENU_LEFT_COUNT ]] && target_row=$((MENU_LEFT_COUNT - 1))
+                    menu_set_cursor 0 $target_row
+                fi
+                ;;
+            RIGHT)
+                menu_get_pos $MENU_CURSOR
+                if [[ $MCOL -eq 0 ]]; then
+                    local target_row=$MROW
+                    [[ $target_row -ge $MENU_RIGHT_COUNT ]] && target_row=$((MENU_RIGHT_COUNT - 1))
+                    menu_set_cursor 1 $target_row
+                fi
+                ;;
+            SPACE)
+                if [[ ${MENU_SELECTED[$MENU_CURSOR]} -eq 1 ]]; then
+                    MENU_SELECTED[$MENU_CURSOR]=0
+                else
+                    MENU_SELECTED[$MENU_CURSOR]=1
+                fi
+                ;;
+            ENTER)
+                break
+                ;;
+            QUIT)
+                cleanup_menu
+                trap - EXIT
+                trap - WINCH
+                clear
+                echo "Cancelled."
+                exit 0
+                ;;
+        esac
+
+        draw_menu
+    done
+
+    # Restore terminal before running operations
+    cleanup_menu
+    trap - EXIT
+    trap - WINCH
+    clear
+
+    # Restore the original ERR trap
+    trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
+
+    # Execute selected operations
+    process_menu_selections
 }
 
 # Main entry point
@@ -1887,11 +2479,14 @@ main() {
             load_config
             install_xo_proxy
             ;;
+        --install)
+            install_xo
+            ;;
         --help)
             show_help
             ;;
         *)
-            install_xo
+            run_menu
             ;;
     esac
 }
