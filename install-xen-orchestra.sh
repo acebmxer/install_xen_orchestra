@@ -189,9 +189,9 @@ validate_config() {
         errors+=("BACKUP_KEEP must be at least 1, got: $BACKUP_KEEP")
     fi
 
-    # Validate NODE_VERSION is numeric
-    if ! [[ "$NODE_VERSION" =~ ^[0-9]+$ ]]; then
-        errors+=("NODE_VERSION must be a number, got: $NODE_VERSION")
+    # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1)
+    if ! [[ "$NODE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+        errors+=("NODE_VERSION must be a valid version number (e.g. 22, 22.3), got: $NODE_VERSION")
     fi
 
     # Report errors if any
@@ -299,10 +299,13 @@ install_dependencies() {
 install_nodejs() {
     log_info "Installing Node.js ${NODE_VERSION} LTS..."
 
+    # Extract major version for NodeSource setup URL (e.g. 22.3 -> 22)
+    NODE_MAJOR=${NODE_VERSION%%.*}
+
     # Check if Node.js is already installed with correct version
     if command -v node >/dev/null 2>&1; then
         CURRENT_NODE=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-        if [[ "$CURRENT_NODE" == "$NODE_VERSION" ]]; then
+        if [[ "$CURRENT_NODE" == "$NODE_MAJOR" ]]; then
             log_info "Node.js ${NODE_VERSION} is already installed: $(node -v)"
             if command -v npm >/dev/null 2>&1; then
                 log_info "npm is available: $(npm -v)"
@@ -315,10 +318,10 @@ install_nodejs() {
 
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         # Install Node.js via NodeSource (includes npm)
-        curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | sudo -E bash -
+        curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -
         sudo apt-get install -y nodejs
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-        curl -fsSL https://rpm.nodesource.com/setup_${NODE_VERSION}.x | sudo -E bash -
+        curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -
         $PKG_INSTALL nodejs
     fi
 
@@ -470,15 +473,41 @@ build_xo() {
         fi
     fi
 
-    # Set Node.js memory limits and limit parallel builds to prevent OOM
-    local NODE_OPTIONS="--max-old-space-size=4096"
+    # Calculate available memory (RAM + swap) and set build limits to prevent OOM
+    local TOTAL_RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
+    local TOTAL_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
+    local TOTAL_MEM_MB=$((TOTAL_RAM_MB + TOTAL_SWAP_MB))
+
+    local NODE_HEAP_SIZE
+    local TURBO_CONCURRENCY
+    if [[ $TOTAL_MEM_MB -lt 6144 ]]; then
+        # Low memory: conservative settings
+        NODE_HEAP_SIZE=1536
+        TURBO_CONCURRENCY=1
+        log_warning "Low memory detected (${TOTAL_RAM_MB}MB RAM + ${TOTAL_SWAP_MB}MB swap). Limiting build concurrency to 1."
+    elif [[ $TOTAL_MEM_MB -lt 10240 ]]; then
+        # Moderate memory: limit concurrency
+        NODE_HEAP_SIZE=3072
+        TURBO_CONCURRENCY=2
+        log_info "Moderate memory detected (${TOTAL_RAM_MB}MB RAM + ${TOTAL_SWAP_MB}MB swap). Limiting build concurrency to 2."
+    else
+        # Plenty of memory
+        NODE_HEAP_SIZE=4096
+        TURBO_CONCURRENCY=""
+    fi
+
+    local NODE_OPTIONS="--max-old-space-size=$NODE_HEAP_SIZE"
     local TURBO_CACHE="remote:r"
+    local CONCURRENCY_FLAG=""
+    if [[ -n "$TURBO_CONCURRENCY" ]]; then
+        CONCURRENCY_FLAG="--concurrency=$TURBO_CONCURRENCY"
+    fi
 
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build"
+        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
     else
-        sudo bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build"
+        sudo bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
     fi
 
     log_success "Xen Orchestra built successfully"
