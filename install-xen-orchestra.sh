@@ -136,7 +136,7 @@ load_config() {
     GIT_BRANCH=${GIT_BRANCH:-master}
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
-    NODE_VERSION=${NODE_VERSION:-20}
+    NODE_VERSION=${NODE_VERSION:-22}
     SERVICE_USER=${SERVICE_USER:-root}
     DEBUG_MODE=${DEBUG_MODE:-false}
     BIND_ADDRESS=${BIND_ADDRESS:-0.0.0.0}
@@ -295,29 +295,138 @@ install_dependencies() {
     log_success "System dependencies installed"
 }
 
-# Install Node.js 20 LTS (includes npm v10)
-install_nodejs() {
-    log_info "Installing Node.js ${NODE_VERSION} LTS..."
+# Check if installed Node.js version satisfies the requirement.
+# Returns 0 if installed >= required within the same major version.
+# Examples:
+#   version_satisfies "22.15.1" "22"     -> true  (major matches)
+#   version_satisfies "22.15.1" "22.3"   -> true  (22.15 >= 22.3)
+#   version_satisfies "22.1.0"  "22.3"   -> false (22.1 < 22.3)
+#   version_satisfies "20.20.1" "22"     -> false (major mismatch)
+version_satisfies() {
+    local INSTALLED=$1
+    local REQUIRED=$2
 
-    # Extract major version for NodeSource setup URL (e.g. 22.3 -> 22)
-    NODE_MAJOR=${NODE_VERSION%%.*}
+    local INST_MAJOR INST_MINOR INST_PATCH
+    IFS='.' read -r INST_MAJOR INST_MINOR INST_PATCH <<< "$INSTALLED"
 
-    # Check if Node.js is already installed with correct version
-    if command -v node >/dev/null 2>&1; then
-        CURRENT_NODE=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-        if [[ "$CURRENT_NODE" == "$NODE_MAJOR" ]]; then
-            log_info "Node.js ${NODE_VERSION} is already installed: $(node -v)"
-            if command -v npm >/dev/null 2>&1; then
-                log_info "npm is available: $(npm -v)"
-            fi
-            return 0
-        else
-            log_warning "Node.js $(node -v) is installed, but version ${NODE_VERSION} is required"
-        fi
+    local REQ_MAJOR REQ_MINOR REQ_PATCH
+    IFS='.' read -r REQ_MAJOR REQ_MINOR REQ_PATCH <<< "$REQUIRED"
+
+    # Major must match
+    [[ "$INST_MAJOR" -ne "$REQ_MAJOR" ]] && return 1
+
+    # If only major specified, major match is enough
+    [[ -z "$REQ_MINOR" ]] && return 0
+
+    # Compare minor
+    [[ "${INST_MINOR:-0}" -lt "${REQ_MINOR:-0}" ]] && return 1
+    [[ "${INST_MINOR:-0}" -gt "${REQ_MINOR:-0}" ]] && return 0
+
+    # Minor matches; if no patch specified, satisfied
+    [[ -z "$REQ_PATCH" ]] && return 0
+
+    # Compare patch
+    [[ "${INST_PATCH:-0}" -ge "${REQ_PATCH:-0}" ]] && return 0
+    return 1
+}
+
+# Download and install a specific Node.js version from nodejs.org.
+# Usage: install_nodejs_binary "22.3"
+# Normalises 22.3 → v22.3.0 and downloads the linux binary tarball.
+# Returns 1 if the requested version does not exist upstream.
+install_nodejs_binary() {
+    local VERSION=$1
+
+    # Detect architecture
+    local ARCH
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)        ARCH="x64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        armv7l)        ARCH="armv7l" ;;
+        *)
+            log_warning "Unsupported architecture for direct download: $ARCH"
+            return 1
+            ;;
+    esac
+
+    # Normalise version: 22.3 -> 22.3.0
+    local VER_PARTS
+    IFS='.' read -ra VER_PARTS <<< "$VERSION"
+    local FULL_VERSION="${VER_PARTS[0]}.${VER_PARTS[1]:-0}.${VER_PARTS[2]:-0}"
+
+    local FILENAME="node-v${FULL_VERSION}-linux-${ARCH}.tar.xz"
+    local URL="https://nodejs.org/dist/v${FULL_VERSION}/${FILENAME}"
+
+    # Check if the exact version exists
+    log_info "Checking for Node.js v${FULL_VERSION} at nodejs.org..."
+    if ! curl -fsSL --head "$URL" >/dev/null 2>&1; then
+        log_warning "Node.js v${FULL_VERSION} not found at nodejs.org"
+        return 1
     fi
 
+    log_info "Downloading Node.js v${FULL_VERSION}..."
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
+
+    if ! curl -fsSL "$URL" -o "${TMP_DIR}/${FILENAME}"; then
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    log_info "Installing Node.js v${FULL_VERSION}..."
+    sudo tar -xJf "${TMP_DIR}/${FILENAME}" --strip-components=1 -C /usr/local/
+    rm -rf "$TMP_DIR"
+
+    # Ensure /usr/local/bin is usable (create symlinks into /usr/bin so
+    # scripts that reference /usr/bin/node keep working)
+    if [[ ! -e /usr/bin/node ]] || [[ "$(readlink -f /usr/bin/node 2>/dev/null)" != "/usr/local/bin/node" ]]; then
+        sudo ln -sf /usr/local/bin/node /usr/bin/node
+    fi
+    if [[ ! -e /usr/bin/npm ]] || [[ "$(readlink -f /usr/bin/npm 2>/dev/null)" != "/usr/local/bin/npm" ]]; then
+        sudo ln -sf /usr/local/bin/npm /usr/bin/npm
+    fi
+    if [[ ! -e /usr/bin/npx ]] || [[ "$(readlink -f /usr/bin/npx 2>/dev/null)" != "/usr/local/bin/npx" ]]; then
+        sudo ln -sf /usr/local/bin/npx /usr/bin/npx
+    fi
+
+    return 0
+}
+
+# Install Node.js to satisfy NODE_VERSION from xo-config.cfg.
+#  - Major-only (e.g. 22):   installs latest 22.x via NodeSource
+#  - Specific  (e.g. 22.3):  downloads exact v22.3.0 from nodejs.org;
+#                             falls back to latest 22.x via NodeSource
+#                             if that version doesn't exist
+install_nodejs() {
+    log_info "Installing Node.js ${NODE_VERSION}..."
+
+    NODE_MAJOR=${NODE_VERSION%%.*}
+
+    # Check if the currently installed version already satisfies the requirement
+    if command -v node >/dev/null 2>&1; then
+        local CURRENT_FULL
+        CURRENT_FULL=$(node -v | sed 's/^v//')
+        if version_satisfies "$CURRENT_FULL" "$NODE_VERSION"; then
+            log_info "Node.js ${NODE_VERSION} requirement satisfied (installed: v${CURRENT_FULL})"
+            command -v npm >/dev/null 2>&1 && log_info "npm is available: $(npm -v)"
+            return 0
+        fi
+        log_warning "Node.js v${CURRENT_FULL} is installed but does not satisfy version ${NODE_VERSION}"
+    fi
+
+    # If a specific minor/patch version was requested, try a direct download first
+    if [[ "$NODE_VERSION" == *.* ]]; then
+        if install_nodejs_binary "$NODE_VERSION"; then
+            log_success "Node.js installed: $(node -v)"
+            log_success "npm installed: $(npm -v)"
+            return 0
+        fi
+        log_warning "Falling back to latest ${NODE_MAJOR}.x via NodeSource..."
+    fi
+
+    # Install latest in the major series via NodeSource
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        # Install Node.js via NodeSource (includes npm)
         curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -
         sudo apt-get install -y nodejs
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
@@ -968,6 +1077,9 @@ update_xo() {
         fi
     fi
 
+    # Ensure Node.js version matches config (upgrade if needed)
+    install_nodejs
+
     # Rebuild with clean cache to ensure fresh build
     build_xo clean
 
@@ -1043,6 +1155,9 @@ rebuild_xo() {
         sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
         sudo chmod -R g+rwX "$INSTALL_DIR"
     fi
+
+    # Ensure Node.js version matches config (upgrade if needed)
+    install_nodejs
 
     # Clean build to ensure no stale artefacts
     build_xo clean
@@ -1635,6 +1750,7 @@ main() {
             check_sudo
             check_systemctl
             load_config
+            detect_package_manager
             check_git
             update_xo
             ;;
@@ -1652,6 +1768,7 @@ main() {
             check_sudo
             check_systemctl
             load_config
+            detect_package_manager
             check_git
             rebuild_xo
             ;;
