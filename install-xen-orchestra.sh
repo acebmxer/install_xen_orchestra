@@ -21,8 +21,10 @@ trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service wa
 # - Rebuild functionality (fresh clone + build, preserves settings)
 #
 
-# Script directory
+# Script directory and self-update support
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+ORIGINAL_ARGS=("$@")
 CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
 
@@ -98,6 +100,75 @@ check_git() {
         log_error "git is not installed. Please install git first."
         exit 1
     fi
+}
+
+# Self-update the installation script from git
+self_update_script() {
+    # Skip self-update if XO_NO_SELF_UPDATE is set
+    if [[ "${XO_NO_SELF_UPDATE:-0}" == "1" ]]; then
+        return 0
+    fi
+
+    # Require git
+    if ! command -v git &>/dev/null; then
+        log_warning "git is not installed; skipping self-update check."
+        return 0
+    fi
+
+    # Require script directory to be a git repo
+    if [[ ! -d "${SCRIPT_DIR}/.git" ]]; then
+        log_warning "Script directory is not a git repository; skipping self-update check."
+        return 0
+    fi
+
+    log_info "Checking for script updates..."
+
+    # Fetch latest from origin
+    local default_branch
+    default_branch=$(git -C "$SCRIPT_DIR" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || true
+    default_branch="${default_branch:-main}"
+
+    if ! git -C "$SCRIPT_DIR" fetch origin "$default_branch" 2>/dev/null; then
+        log_warning "Could not check for script updates (network unavailable?)."
+        return 0
+    fi
+
+    # Record current HEAD
+    local before after
+    before=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+
+    # Attempt fast-forward pull
+    local pull_err
+    if ! pull_err=$(git -C "$SCRIPT_DIR" pull --ff-only origin "$default_branch" 2>&1); then
+        log_warning "Script auto-update failed: $pull_err"
+        log_warning "Local modifications detected in ${SCRIPT_DIR}."
+        local reset_confirm
+        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Reset to origin/${default_branch}? Local changes will be lost. (y/N) " reset_confirm < /dev/tty
+        echo
+        if [[ ! "$reset_confirm" =~ ^[Yy]$ ]]; then
+            log_warning "Self-update skipped. Continuing with current version."
+            return 0
+        fi
+        git -C "$SCRIPT_DIR" checkout "$default_branch" 2>/dev/null
+        git -C "$SCRIPT_DIR" reset --hard "origin/${default_branch}" 2>/dev/null
+        git -C "$SCRIPT_DIR" clean -fd 2>/dev/null
+        if [[ "$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)" != \
+              "$(git -C "$SCRIPT_DIR" rev-parse "origin/${default_branch}" 2>/dev/null)" ]]; then
+            log_warning "Unable to auto-resolve. Continuing with current version."
+            return 0
+        fi
+        log_success "Reset to origin/${default_branch}."
+    fi
+
+    after=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+
+    if [[ "$before" != "$after" ]]; then
+        log_success "Script updated to $(git -C "$SCRIPT_DIR" rev-parse --short HEAD). Restarting..."
+        exec bash "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+    else
+        log_info "Script is already up to date."
+    fi
+    return 0
 }
 
 # Check if systemctl is available
@@ -1754,7 +1825,8 @@ show_help() {
     echo "  --help        Show this help message"
     echo ""
     echo "Environment Variables:"
-    echo "  XO_DEBUG=1    Enable debug mode (prints all commands with 'set -x')"
+    echo "  XO_DEBUG=1              Enable debug mode (prints all commands with 'set -x')"
+    echo "  XO_NO_SELF_UPDATE=1     Skip automatic script self-update check"
     echo ""
     echo "Configuration:"
     echo "  Copy sample-xo-config.cfg to xo-config.cfg and edit as needed."
@@ -1765,6 +1837,11 @@ show_help() {
 
 # Main entry point
 main() {
+    # Self-update before doing anything (skip for --help to avoid delays)
+    if [[ "${1:-}" != "--help" ]]; then
+        self_update_script
+    fi
+
     case "${1:-}" in
         --update)
             check_required_commands
