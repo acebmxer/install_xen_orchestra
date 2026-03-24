@@ -1881,6 +1881,13 @@ MENU_RIGHT_COUNT=3
 MENU_TOTAL=7
 MENU_CURSOR=0
 MENU_SELECTED=(0 0 0 0 0 0 0)
+MCOL=0
+MROW=0
+MENU_SCRIPT_COMMIT="N/A"
+MENU_SCRIPT_MASTER="N/A"
+MENU_XO_COMMIT="N/A"
+MENU_XO_MASTER="N/A"
+MENU_NODE_VERSION="N/A"
 
 # Hide/show cursor
 menu_hide_cursor() { printf "${M_CSI}?25l"; }
@@ -2074,7 +2081,7 @@ draw_menu() {
     # Count selections
     local sel_count=0
     for ((i=0; i<MENU_TOTAL; i++)); do
-        [[ ${MENU_SELECTED[$i]} -eq 1 ]] && ((sel_count++))
+        [[ ${MENU_SELECTED[$i]} -eq 1 ]] && sel_count=$((sel_count + 1))
     done
     _buf+="${pad}${M_CYAN}Selected: ${M_GREEN}${sel_count}${M_RESET}${eol}"$'\n'
     _buf+="${pad}${eol}"$'\n'
@@ -2325,8 +2332,7 @@ run_menu() {
     # Gather version/commit info for header display
     menu_gather_info
 
-    # Save terminal state
-    local saved_stty
+    # Save terminal state (global so cleanup_menu trap can access it)
     saved_stty=$(stty -g 2>/dev/null) || saved_stty=""
     menu_hide_cursor
     stty -echo 2>/dev/null || true
@@ -2398,6 +2404,7 @@ run_menu() {
             QUIT)
                 cleanup_menu
                 trap - EXIT
+                trap - WINCH
                 clear
                 echo "Cancelled."
                 exit 0
