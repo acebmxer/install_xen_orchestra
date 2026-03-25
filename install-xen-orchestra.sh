@@ -2008,7 +2008,7 @@ draw_menu() {
         # Highlight the entire Master XO Commit line when an update is available
         if [[ $il -eq 3 && "$MENU_XO_COMMIT" != "N/A" && "$MENU_XO_MASTER" != "N/A" && "$MENU_XO_COMMIT" != "$MENU_XO_MASTER" ]]; then
             local xo_style="${M_BOLD}${M_REVERSE}${M_RED}"
-            _buf+="${pad}${info_pad}${xo_style}${info_labels[$il]} ${info_values[$il]} ⚠${M_RESET}${eol}"$'\n'
+            _buf+="${pad}${info_pad}${xo_style}⚠ ${info_labels[$il]} ${info_values[$il]}${M_RESET}${eol}"$'\n'
         else
             _buf+="${pad}${info_pad}${label_color}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
         fi
