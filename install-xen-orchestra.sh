@@ -1856,6 +1856,7 @@ M_BLUE="${M_CSI}34m"
 M_MAGENTA="${M_CSI}35m"
 M_CYAN="${M_CSI}36m"
 M_BLINK="${M_CSI}5m"
+M_REVERSE="${M_CSI}7m"
 
 # Menu item names (left column indices 0-3, right column indices 4-6)
 MENU_NAMES=(
@@ -2005,11 +2006,13 @@ draw_menu() {
         local label_color="${M_BOLD}"
         [[ $il -eq 4 ]] && info_color="${M_GREEN}"
         # Flash the entire Master XO Commit line when an update is available
+        local info_prefix=""
         if [[ $il -eq 3 && "$MENU_XO_COMMIT" != "N/A" && "$MENU_XO_MASTER" != "N/A" && "$MENU_XO_COMMIT" != "$MENU_XO_MASTER" ]]; then
-            info_color="${M_BLINK}${M_BOLD}${M_RED}"
-            label_color="${M_BLINK}${M_BOLD}${M_RED}"
+            info_color="${M_BLINK}${M_BOLD}${M_REVERSE}${M_RED}"
+            label_color="${M_BLINK}${M_BOLD}${M_REVERSE}${M_RED}"
+            info_prefix="⚠ "
         fi
-        _buf+="${pad}${info_pad}${label_color}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
+        _buf+="${pad}${info_pad}${label_color}${info_prefix}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
     done
     _buf+="${pad}${eol}"$'\n'
 
