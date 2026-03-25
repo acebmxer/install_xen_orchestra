@@ -40,7 +40,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
 
   ──────────────────────────────────────────────────────────────────────────────────
 
-  ▸ [✓] Install Xen Orchestra                  [ ] Reconfigure Xen Orchestra
+  ▸ [✓] Install Xen Orchestra                   [ ] Reconfigure Xen Orchestra
     [ ] Update Xen Orchestra                    [ ] Rebuild Xen Orchestra
     [ ] Rename Sample-xo-config.cfg             [ ] Edit xo-config.cfg
     [ ] Install XO Proxy
