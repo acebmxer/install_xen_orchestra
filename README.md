@@ -29,7 +29,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
 
 ```
   ╔══════════════════════════════════════════════════════════════════════════════════╗
-  ║              Install Xen Orchestra from Sources Setup and Update               ║
+  ║              Install Xen Orchestra from Sources Setup and Update                 ║
   ╚══════════════════════════════════════════════════════════════════════════════════╝
 
                         Current Script Commit : 693f4
