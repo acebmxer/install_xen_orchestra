@@ -2005,14 +2005,14 @@ draw_menu() {
         local info_color="${M_YELLOW}"
         local label_color="${M_BOLD}"
         [[ $il -eq 4 ]] && info_color="${M_GREEN}"
-        # Flash the entire Master XO Commit line when an update is available
-        local info_prefix=""
+        # Highlight the entire Master XO Commit line when an update is available
+        local info_suffix=""
         if [[ $il -eq 3 && "$MENU_XO_COMMIT" != "N/A" && "$MENU_XO_MASTER" != "N/A" && "$MENU_XO_COMMIT" != "$MENU_XO_MASTER" ]]; then
-            info_color="${M_BLINK}${M_BOLD}${M_REVERSE}${M_RED}"
-            label_color="${M_BLINK}${M_BOLD}${M_REVERSE}${M_RED}"
-            info_prefix="⚠ "
+            info_color="${M_BOLD}${M_REVERSE}${M_RED}"
+            label_color="${M_BOLD}${M_REVERSE}${M_RED}"
+            info_suffix=" ⚠"
         fi
-        _buf+="${pad}${info_pad}${label_color}${info_prefix}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
+        _buf+="${pad}${info_pad}${label_color}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${info_suffix}${M_RESET}${eol}"$'\n'
     done
     _buf+="${pad}${eol}"$'\n'
 
