@@ -1855,6 +1855,7 @@ M_YELLOW="${M_CSI}33m"
 M_BLUE="${M_CSI}34m"
 M_MAGENTA="${M_CSI}35m"
 M_CYAN="${M_CSI}36m"
+M_BLINK="${M_CSI}5m"
 
 # Menu item names (left column indices 0-3, right column indices 4-6)
 MENU_NAMES=(
@@ -2001,8 +2002,14 @@ draw_menu() {
     (( info_lpad > 0 )) && printf -v info_pad '%*s' "$info_lpad" ''
     for ((il=0; il<${#info_labels[@]}; il++)); do
         local info_color="${M_YELLOW}"
+        local label_color="${M_BOLD}"
         [[ $il -eq 4 ]] && info_color="${M_GREEN}"
-        _buf+="${pad}${info_pad}${M_BOLD}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
+        # Flash the entire Master XO Commit line when an update is available
+        if [[ $il -eq 3 && "$MENU_XO_COMMIT" != "N/A" && "$MENU_XO_MASTER" != "N/A" && "$MENU_XO_COMMIT" != "$MENU_XO_MASTER" ]]; then
+            info_color="${M_BLINK}${M_BOLD}${M_RED}"
+            label_color="${M_BLINK}${M_BOLD}${M_RED}"
+        fi
+        _buf+="${pad}${info_pad}${label_color}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
     done
     _buf+="${pad}${eol}"$'\n'
 
