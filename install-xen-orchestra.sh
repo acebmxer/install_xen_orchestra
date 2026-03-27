@@ -1190,6 +1190,14 @@ update_xo() {
     install_dir_git fetch origin
     install_dir_git checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
 
+    # Ensure service user exists before any chown operations
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            log_info "Creating service user: $SERVICE_USER"
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+        fi
+    fi
+
     # Fix ownership if SERVICE_USER changed since initial install
     local DIR_OWNER
     DIR_OWNER=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null)
@@ -1301,6 +1309,14 @@ rebuild_xo() {
     log_info "Cloning Xen Orchestra (branch: ${CURRENT_BRANCH})..."
     sudo mkdir -p "$(dirname "$INSTALL_DIR")"
     sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
+
+    # Ensure service user exists before any chown operations
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            log_info "Creating service user: $SERVICE_USER"
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+        fi
+    fi
 
     # Restore ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
@@ -1437,6 +1453,14 @@ reconfigure_xo() {
         fi
     fi
 
+    # Ensure service user exists before regenerating config (configure_xo does chown)
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            log_info "Creating service user: $SERVICE_USER"
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+        fi
+    fi
+
     # Regenerate configuration
     configure_xo
 
@@ -1446,14 +1470,8 @@ reconfigure_xo() {
     # Update sudoers for non-root service user
     configure_sudo
 
-    # Ensure service user exists and clean up legacy group membership
+    # Clean up legacy group membership and fix file ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        # Create user if they don't exist (e.g. SERVICE_USER changed in config)
-        if ! id "$SERVICE_USER" &>/dev/null; then
-            log_info "Creating service user: $SERVICE_USER"
-            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
-        fi
-
         # Remove legacy root group membership from previous script versions
         # The old script added the service user to the root group for file access,
         # which is no longer needed (ownership is set to SERVICE_USER:SERVICE_USER)
