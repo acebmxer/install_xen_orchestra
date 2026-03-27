@@ -7,7 +7,7 @@ Automated installation and management of [Xen Orchestra](https://xen-orchestra.c
 | Function | CLI Flag | Description |
 |----------|----------|-------------|
 | Install | `--install` | Fresh install of Xen Orchestra |
-| Update | `--update` | Update existing installation (with backup + security hardening) |
+| Update | `--update` | Update existing installation (with backup) |
 | Restore | `--restore` | Restore from a previous backup |
 | Rebuild | `--rebuild` | Fresh clone + clean build, preserves settings |
 | Reconfigure | `--reconfigure` | Apply config changes without rebuilding |
@@ -81,7 +81,7 @@ Key settings:
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `GIT_BRANCH` | master | Git branch or tag |
 | `NODE_VERSION` | 24 | Node.js version |
-| `SERVICE_USER` | root | Service user (`root` required for VMware V2V import) |
+| `SERVICE_USER` | xo-service | Service user (set to `root` for VMware V2V import) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
@@ -108,12 +108,6 @@ After installation, access the web interface at `https://your-server-ip`.
 |----------|-------------|
 | `XO_DEBUG=1` | Enable debug mode (`set -x`) |
 | `XO_NO_SELF_UPDATE=1` | Skip automatic script self-update |
-
-## Upgrading from Older Installations
-
-If your installation predates this commit, run `--reconfigure` before `--update` on your first upgrade. Reconfigure regenerates **all** configuration files (`config.toml`, systemd service, sudoers) from your `xo-config.cfg`, while update only applies security hardening (file permissions, ownership, sudoers, legacy group cleanup) without touching `config.toml`.
-
-After that initial reconfigure, regular `--update` will keep security settings current on every update.
 
 ## Troubleshooting
 
