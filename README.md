@@ -7,7 +7,7 @@ Automated installation and management of [Xen Orchestra](https://xen-orchestra.c
 | Function | CLI Flag | Description |
 |----------|----------|-------------|
 | Install | `--install` | Fresh install of Xen Orchestra |
-| Update | `--update` | Update existing installation (with backup) |
+| Update | `--update` | Update existing installation (with backup + security hardening) |
 | Restore | `--restore` | Restore from a previous backup |
 | Rebuild | `--rebuild` | Fresh clone + clean build, preserves settings |
 | Reconfigure | `--reconfigure` | Apply config changes without rebuilding |
@@ -108,6 +108,12 @@ After installation, access the web interface at `https://your-server-ip`.
 |----------|-------------|
 | `XO_DEBUG=1` | Enable debug mode (`set -x`) |
 | `XO_NO_SELF_UPDATE=1` | Skip automatic script self-update |
+
+## Upgrading from Older Installations
+
+If your installation predates this commit, run `--reconfigure` before `--update` on your first upgrade. Reconfigure regenerates **all** configuration files (`config.toml`, systemd service, sudoers) from your `xo-config.cfg`, while update only applies security hardening (file permissions, ownership, sudoers, legacy group cleanup) without touching `config.toml`.
+
+After that initial reconfigure, regular `--update` will keep security settings current on every update.
 
 ## Troubleshooting
 
