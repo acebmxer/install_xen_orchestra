@@ -955,7 +955,7 @@ install_dir_git() {
 
 # Get current installed commit
 get_installed_commit() {
-    if [[ -d "$INSTALL_DIR/.git" ]]; then
+    if sudo test -d "$INSTALL_DIR/.git" 2>/dev/null; then
         install_dir_git rev-parse HEAD 2>/dev/null
     else
         echo ""
@@ -2079,8 +2079,9 @@ menu_gather_info() {
     fi
 
     # Current XO Commit (installed)
+    # Use sudo test because INSTALL_DIR may have o-rwx permissions (security hardening)
     local menu_install_dir="${INSTALL_DIR:-/opt/xen-orchestra}"
-    if [[ -d "${menu_install_dir}/.git" ]]; then
+    if sudo test -d "${menu_install_dir}/.git" 2>/dev/null; then
         local dir_owner
         dir_owner=$(stat -c '%U' "$menu_install_dir" 2>/dev/null) || dir_owner="root"
         MENU_XO_COMMIT=$(sudo -u "$dir_owner" git -C "$menu_install_dir" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_XO_COMMIT="N/A"
