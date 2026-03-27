@@ -937,7 +937,11 @@ RuntimeDirectoryMode=0755
 
 # Allow binding to privileged ports (80/443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Bounding set: ceiling for all processes in this service tree.
+# CAP_NET_BIND_SERVICE: bind to ports 80/443
+# CAP_SETUID/CAP_SETGID/CAP_AUDIT_WRITE: required for sudo to function
+# CAP_SYS_ADMIN: required for mount syscall (NFS/CIFS remotes)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN CAP_AUDIT_WRITE
 
 [Install]
 WantedBy=multi-user.target
@@ -1436,8 +1440,8 @@ reconfigure_xo() {
         fi
     fi
     if [[ -f /etc/systemd/system/xo-server.service ]]; then
-        if grep -q "CAP_SYS_ADMIN" /etc/systemd/system/xo-server.service 2>/dev/null; then
-            SECURITY_CHANGES+=("Systemd: reduce capabilities to CAP_NET_BIND_SERVICE only (remove CAP_SYS_ADMIN etc.)")
+        if grep -q "^AmbientCapabilities=.*CAP_SYS_ADMIN" /etc/systemd/system/xo-server.service 2>/dev/null; then
+            SECURITY_CHANGES+=("Systemd: remove CAP_SYS_ADMIN from AmbientCapabilities (should only be in CapabilityBoundingSet)")
         fi
         if grep -q "^Group=root" /etc/systemd/system/xo-server.service 2>/dev/null; then
             SECURITY_CHANGES+=("Systemd: remove Group=root and SupplementaryGroups=root")
