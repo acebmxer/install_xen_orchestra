@@ -511,6 +511,13 @@ remove_existing_nodejs() {
         fi
     fi
 
+    # Clean up leftover global node_modules (e.g. yarn) that prevent
+    # dpkg from removing the directory cleanly. These will be
+    # reinstalled after the new Node.js is in place.
+    if [[ -d /usr/lib/node_modules ]]; then
+        sudo rm -rf /usr/lib/node_modules
+    fi
+
     # Remove NodeSource repository entries so the new version's repo is the only one
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         sudo rm -f /etc/apt/sources.list.d/nodesource*.list 2>/dev/null || true
