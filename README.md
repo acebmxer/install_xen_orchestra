@@ -81,7 +81,7 @@ Key settings:
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `GIT_BRANCH` | master | Git branch or tag |
 | `NODE_VERSION` | 24 | Node.js version |
-| `SERVICE_USER` | root | Service user (`root` required for VMware V2V import) |
+| `SERVICE_USER` | xo-service | Service user (set to `root` for VMware V2V import) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |

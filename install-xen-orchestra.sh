@@ -2,8 +2,11 @@
 set -euo pipefail
 
 # Enable debug mode if XO_DEBUG environment variable is set
+# Note: sensitive variables (passwords, tokens) are masked in debug output
 if [[ "${XO_DEBUG:-0}" == "1" ]]; then
     set -x
+    # Mask sensitive variables from debug trace output
+    export PS4='+ '
 fi
 
 trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
@@ -192,6 +195,21 @@ load_config() {
             log_error "Neither xo-config.cfg nor sample-xo-config.cfg found!"
             exit 1
         fi
+    fi
+
+    # Validate config file ownership and permissions before sourcing
+    # The config file is executed as shell code, so it must be owned by
+    # the current user or root, and not writable by others.
+    local CFG_OWNER CFG_PERMS
+    CFG_OWNER=$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null)
+    CFG_PERMS=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null)
+    if [[ "$CFG_OWNER" != "$(whoami)" ]] && [[ "$CFG_OWNER" != "root" ]]; then
+        log_error "Config file $CONFIG_FILE is owned by '$CFG_OWNER' — must be owned by $(whoami) or root"
+        exit 1
+    fi
+    if [[ "${CFG_PERMS: -1}" =~ [2367] ]]; then
+        log_error "Config file $CONFIG_FILE is world-writable (mode $CFG_PERMS) — refusing to source"
+        exit 1
     fi
 
     # Source the configuration
@@ -439,7 +457,8 @@ install_nodejs_binary() {
 
     log_info "Downloading Node.js v${FULL_VERSION}..."
     local TMP_DIR
-    TMP_DIR=$(mktemp -d)
+    TMP_DIR=$(mktemp -d --tmpdir nodejs-XXXXXX)
+    chmod 700 "$TMP_DIR"
 
     if ! curl -fsSL "$URL" -o "${TMP_DIR}/${FILENAME}"; then
         rm -rf "$TMP_DIR"
@@ -511,11 +530,31 @@ install_nodejs() {
     fi
 
     # Install latest in the major series via NodeSource
+    # Download setup script to a file first for auditability instead of piping to shell
+    local NODESOURCE_SCRIPT
+    NODESOURCE_SCRIPT=$(mktemp --tmpdir nodesource-setup-XXXXXX.sh)
+    chmod 600 "$NODESOURCE_SCRIPT"
+
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -
+        local NODESOURCE_URL="https://deb.nodesource.com/setup_${NODE_MAJOR}.x"
+    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+        local NODESOURCE_URL="https://rpm.nodesource.com/setup_${NODE_MAJOR}.x"
+    fi
+
+    log_info "Downloading NodeSource setup script..."
+    if ! curl -fsSL "$NODESOURCE_URL" -o "$NODESOURCE_SCRIPT"; then
+        rm -f "$NODESOURCE_SCRIPT"
+        log_error "Failed to download NodeSource setup script"
+        return 1
+    fi
+
+    log_info "NodeSource setup script saved to $NODESOURCE_SCRIPT for review"
+    sudo bash "$NODESOURCE_SCRIPT"
+    rm -f "$NODESOURCE_SCRIPT"
+
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
         sudo apt-get install -y nodejs
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-        curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -
         $PKG_INSTALL nodejs
     fi
 
@@ -551,20 +590,16 @@ create_service_user() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            # Create with root group membership for NFS/mount operations
-            sudo useradd -r -m -s /bin/bash -G root "$SERVICE_USER" || true
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
             log_success "Service user created: $SERVICE_USER"
         else
             log_info "Service user $SERVICE_USER already exists"
-            # Ensure user is in root group for mount operations
-            sudo usermod -a -G root "$SERVICE_USER" 2>/dev/null || true
         fi
 
         # Display UID/GID for reference
         local XO_UID=$(id -u "$SERVICE_USER" 2>/dev/null || echo "unknown")
         local XO_GID=$(id -g "$SERVICE_USER" 2>/dev/null || echo "unknown")
         log_info "Service user UID:GID is ${XO_UID}:${XO_GID}"
-        log_info "Service user configured for NFS/mount operations"
     fi
 }
 
@@ -610,8 +645,8 @@ clone_repository() {
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
-        sudo chmod -R g+rwX "$INSTALL_DIR"
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        sudo chmod -R o-rwx "$INSTALL_DIR"
     fi
 
     log_success "Repository cloned to $INSTALL_DIR"
@@ -727,10 +762,14 @@ generate_ssl_certificate() {
         return 0
     fi
 
+    local CERT_CN
+    CERT_CN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "xen-orchestra")
+
     sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout "${SSL_CERT_DIR}/${SSL_KEY_FILE}" \
         -out "${SSL_CERT_DIR}/${SSL_CERT_FILE}" \
-        -subj "/C=US/ST=State/L=City/O=Organization/OU=IT/CN=xen-orchestra"
+        -subj "/CN=${CERT_CN}" \
+        -addext "subjectAltName=DNS:${CERT_CN}"
 
     # Set permissions
     sudo chmod 600 "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
@@ -738,7 +777,7 @@ generate_ssl_certificate() {
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:root" "$SSL_CERT_DIR"
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
     fi
 
     log_success "SSL certificates generated in $SSL_CERT_DIR"
@@ -758,8 +797,8 @@ configure_xo() {
     sudo mkdir -p /run/xo-server/mounts
     sudo chmod 755 /run/xo-server/mounts
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:root" /run/xo-server
-        sudo chmod 775 /run/xo-server/mounts
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /run/xo-server
+        sudo chmod 755 /run/xo-server/mounts
     fi
 
     # Create configuration file
@@ -816,7 +855,7 @@ EOF
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:root" /etc/xo-server
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
     fi
 
     # Create VDDK library directory expected by xo-server for VMware V2V import
@@ -849,13 +888,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=${EXEC_USER}
-Group=root
-SupplementaryGroups=root
 $(if [[ -n "$DEBUG_ENV" ]]; then echo "Environment=\"${DEBUG_ENV}\""; fi)
 Environment="NODE_ENV=production"
 WorkingDirectory=${INSTALL_DIR}/packages/xo-server
 ExecStartPre=/bin/mkdir -p /run/xo-server/mounts
-ExecStartPre=/bin/chmod 775 /run/xo-server/mounts
+ExecStartPre=/bin/chmod 755 /run/xo-server/mounts
 ExecStart=${NODE_PATH} ${XO_SERVER_PATH}
 Restart=always
 RestartSec=10
@@ -863,11 +900,11 @@ SyslogIdentifier=xo-server
 
 # Runtime directory
 RuntimeDirectory=xo-server
-RuntimeDirectoryMode=0775
+RuntimeDirectoryMode=0755
 
-# Allow binding to privileged ports and mounting
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
+# Allow binding to privileged ports (80/443)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -876,8 +913,8 @@ EOF
     # Create data directory
     sudo mkdir -p /var/lib/xo-server
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown "$SERVICE_USER:root" /var/lib/xo-server
-        sudo chmod 775 /var/lib/xo-server
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+        sudo chmod 750 /var/lib/xo-server
     fi
 
     # Reload systemd and enable service
@@ -888,29 +925,23 @@ EOF
 }
 
 # Configure sudo for non-root user
+# Per official docs: https://docs.xen-orchestra.com/installation#from-the-sources
+# Only mount, umount, and findmnt are required for NFS/CIFS remote operations
 configure_sudo() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        log_info "Configuring sudo for ${SERVICE_USER} with root-equivalent privileges..."
+        log_info "Configuring sudo for ${SERVICE_USER} (mount/umount/findmnt)..."
 
         local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
 
         sudo tee "$SUDOERS_FILE" > /dev/null << EOF
-# Allow ${SERVICE_USER} user to mount/unmount and manage files with root privileges
-Defaults:${SERVICE_USER} !requiretty
-${SERVICE_USER} ALL=(root) NOPASSWD:SETENV: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt, /sbin/mount.nfs, /usr/sbin/mount.nfs, /sbin/mount.nfs4, /usr/sbin/mount.nfs4, /sbin/umount.nfs, /usr/sbin/umount.nfs, /sbin/umount.nfs4, /usr/sbin/umount.nfs4, /bin/mkdir, /usr/bin/mkdir, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown
+# Allow ${SERVICE_USER} to mount/unmount for XO remote storage operations
+# Ref: https://docs.xen-orchestra.com/installation#from-the-sources
+${SERVICE_USER} ALL=(root) NOPASSWD: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt
 EOF
 
         sudo chmod 440 "$SUDOERS_FILE"
-        
-        # Remove setuid bit from mount.nfs to avoid conflicts with sudo
-        log_info "Ensuring NFS mount helpers use sudo..."
-        for nfs_mount in /sbin/mount.nfs /usr/sbin/mount.nfs /sbin/mount.nfs4 /usr/sbin/mount.nfs4; do
-            if [[ -f "$nfs_mount" ]]; then
-                sudo chmod u-s "$nfs_mount" 2>/dev/null || true
-            fi
-        done
-        
-        log_success "Sudo configured for ${SERVICE_USER} with elevated privileges"
+
+        log_success "Sudo configured for ${SERVICE_USER} (mount, umount, findmnt)"
     fi
 }
 
@@ -1079,8 +1110,8 @@ restore_xo() {
         if [[ "$SERVICE_USER" == "root" ]]; then
             sudo chown -R root:root "$INSTALL_DIR"
         else
-            sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
-            sudo chmod -R g+rwX "$INSTALL_DIR"
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+            sudo chmod -R o-rwx "$INSTALL_DIR"
         fi
     fi
 
@@ -1159,6 +1190,14 @@ update_xo() {
     install_dir_git fetch origin
     install_dir_git checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
 
+    # Ensure service user exists before any chown operations
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            log_info "Creating service user: $SERVICE_USER"
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+        fi
+    fi
+
     # Fix ownership if SERVICE_USER changed since initial install
     local DIR_OWNER
     DIR_OWNER=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null)
@@ -1167,7 +1206,7 @@ update_xo() {
         if [[ "$SERVICE_USER" == "root" ]]; then
             sudo chown -R root:root "$INSTALL_DIR"
         else
-            sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
         fi
     fi
 
@@ -1179,6 +1218,33 @@ update_xo() {
 
     # Regenerate the systemd service file to pick up any script changes
     create_systemd_service
+
+    # Regenerate sudoers for non-root service user (tightens legacy rules)
+    configure_sudo
+
+    # Apply security hardening (permissions, ownership, group cleanup)
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        # Remove legacy root group membership from previous script versions
+        if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw root; then
+            log_info "Removing ${SERVICE_USER} from root group (no longer needed)..."
+            sudo gpasswd -d "$SERVICE_USER" root 2>/dev/null || true
+        fi
+
+        # Ensure proper file permissions
+        log_info "Applying security hardening..."
+        sudo chmod -R o-rwx "$INSTALL_DIR"
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
+        if [[ -d "$SSL_CERT_DIR" ]]; then
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
+        fi
+        if [[ -d /var/lib/xo-server ]]; then
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+            sudo chmod 750 /var/lib/xo-server
+        fi
+    fi
+
+    # Reload systemd daemon to pick up service changes
+    sudo systemctl daemon-reload
 
     # Start service
     log_info "Starting xo-server service..."
@@ -1244,10 +1310,18 @@ rebuild_xo() {
     sudo mkdir -p "$(dirname "$INSTALL_DIR")"
     sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
 
+    # Ensure service user exists before any chown operations
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            log_info "Creating service user: $SERVICE_USER"
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+        fi
+    fi
+
     # Restore ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:root" "$INSTALL_DIR"
-        sudo chmod -R g+rwX "$INSTALL_DIR"
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        sudo chmod -R o-rwx "$INSTALL_DIR"
     fi
 
     # Ensure Node.js version matches config (upgrade if needed)
@@ -1301,6 +1375,7 @@ reconfigure_xo() {
     log_info "This will regenerate configuration from xo-config.cfg:"
     log_warning "  - /etc/xo-server/config.toml"
     log_warning "  - /etc/systemd/system/xo-server.service"
+    log_warning "  - /etc/sudoers.d/xo-server-* (if non-root service user)"
     echo ""
     log_info "Current configuration from xo-config.cfg:"
     echo "  - HTTP Port:        ${HTTP_PORT}"
@@ -1313,8 +1388,38 @@ reconfigure_xo() {
     [[ -n "${REDIS_URI}" ]] && echo "  - Redis URI:        ${REDIS_URI}"
     [[ -n "${REDIS_SOCKET}" ]] && echo "  - Redis Socket:     ${REDIS_SOCKET}"
     [[ "${DEBUG_MODE}" == "true" ]] && echo "  - Debug Mode:       Enabled"
+
+    # Detect security hardening changes from previous script versions
+    local SECURITY_CHANGES=()
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
+        if [[ -f "$SUDOERS_FILE" ]] && grep -q "chmod\|chown\|mkdir\|SETENV" "$SUDOERS_FILE" 2>/dev/null; then
+            SECURITY_CHANGES+=("Sudoers: remove chmod/chown/mkdir/SETENV (keep mount/umount/findmnt per official docs)")
+        fi
+        if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw root; then
+            SECURITY_CHANGES+=("User: remove ${SERVICE_USER} from root group (no longer needed)")
+        fi
+    fi
+    if [[ -f /etc/systemd/system/xo-server.service ]]; then
+        if grep -q "CAP_SYS_ADMIN" /etc/systemd/system/xo-server.service 2>/dev/null; then
+            SECURITY_CHANGES+=("Systemd: reduce capabilities to CAP_NET_BIND_SERVICE only (remove CAP_SYS_ADMIN etc.)")
+        fi
+        if grep -q "^Group=root" /etc/systemd/system/xo-server.service 2>/dev/null; then
+            SECURITY_CHANGES+=("Systemd: remove Group=root and SupplementaryGroups=root")
+        fi
+    fi
+
+    if [[ ${#SECURITY_CHANGES[@]} -gt 0 ]]; then
+        echo ""
+        log_info "Security hardening changes detected (aligning with official XO docs):"
+        for change in "${SECURITY_CHANGES[@]}"; do
+            echo "  - $change"
+        done
+    fi
+
     echo ""
     log_warning "Database and user data in /var/lib/xo-server will NOT be affected."
+    log_warning "NFS/CIFS mounts and reverse proxy settings will continue to work."
     echo ""
     echo -n "Continue? [y/N]: "
     read -t 300 -r CONFIRM || { log_error "Input timeout"; exit 1; }
@@ -1335,11 +1440,60 @@ reconfigure_xo() {
         log_success "Backup created"
     fi
 
+    # Backup current systemd service
+    if [[ -f "/etc/systemd/system/xo-server.service" ]]; then
+        sudo cp /etc/systemd/system/xo-server.service /etc/systemd/system/xo-server.service.backup-$(date +%Y%m%d-%H%M%S)
+    fi
+
+    # Backup current sudoers if present
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
+        if [[ -f "$SUDOERS_FILE" ]]; then
+            sudo cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup-$(date +%Y%m%d-%H%M%S)"
+        fi
+    fi
+
+    # Ensure service user exists before regenerating config (configure_xo does chown)
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            log_info "Creating service user: $SERVICE_USER"
+            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+        fi
+    fi
+
     # Regenerate configuration
     configure_xo
 
     # Regenerate systemd service
     create_systemd_service
+
+    # Update sudoers for non-root service user
+    configure_sudo
+
+    # Clean up legacy group membership and fix file ownership
+    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        # Remove legacy root group membership from previous script versions
+        # The old script added the service user to the root group for file access,
+        # which is no longer needed (ownership is set to SERVICE_USER:SERVICE_USER)
+        if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw root; then
+            log_info "Removing ${SERVICE_USER} from root group (no longer needed)..."
+            sudo gpasswd -d "$SERVICE_USER" root 2>/dev/null || true
+        fi
+
+        # Fix file ownership — migrates from old :root group to SERVICE_USER:SERVICE_USER
+        log_info "Updating file ownership for ${SERVICE_USER}..."
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        sudo chmod -R o-rwx "$INSTALL_DIR"
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
+        if [[ -d "$SSL_CERT_DIR" ]]; then
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
+        fi
+        if [[ -d /var/lib/xo-server ]]; then
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+            sudo chmod 750 /var/lib/xo-server
+        fi
+        log_success "File ownership updated"
+    fi
 
     # Reload systemd daemon
     log_info "Reloading systemd daemon..."
@@ -1485,22 +1639,24 @@ install_xo_proxy() {
     read -p "Host username [root]: " HOST_USERNAME
     HOST_USERNAME=${HOST_USERNAME:-root}
 
+    { set +x; } 2>/dev/null
     read -sp "Host password: " HOST_PASSWORD
     echo ""
     if [[ -z "$HOST_PASSWORD" ]]; then
         log_error "Host password is required"
         exit 1
     fi
+    [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
 
     # Test SSH connection
     log_info "Testing SSH connection to $HOST_USERNAME@$POOL_MASTER_IP..."
-    if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
+    if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
         # Try installing sshpass if not available
         if ! command -v sshpass &> /dev/null; then
             log_info "Installing sshpass..."
             $PKG_INSTALL sshpass
             # Retry connection
-            if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
+            if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
                 log_error "Failed to connect to Pool Master. Please check your credentials."
                 exit 1
             fi
@@ -1535,17 +1691,20 @@ install_xo_proxy() {
         exit 1
     fi
 
+    { set +x; } 2>/dev/null
     read -sp "Xen Orchestra login password: " XO_PASSWORD
     echo ""
     if [[ -z "$XO_PASSWORD" ]]; then
         log_error "Xen Orchestra password is required"
         exit 1
     fi
+    [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
 
     # Create expect script for proxy installation
     log_info "Creating installation script..."
 
-    TEMP_SCRIPT=$(mktemp)
+    TEMP_SCRIPT=$(mktemp --tmpdir xo-proxy-XXXXXX)
+    chmod 700 "$TEMP_SCRIPT"
     cat > "$TEMP_SCRIPT" << 'EXPECT_SCRIPT_END'
 #!/usr/bin/expect -f
 
@@ -1566,7 +1725,7 @@ set actual_proxy_ip ""
 log_user 1
 
 # Connect to pool master
-spawn ssh -o StrictHostKeyChecking=no $username@$pool_master
+spawn ssh -o StrictHostKeyChecking=accept-new $username@$pool_master
 
 # Handle password prompt
 expect {
@@ -1713,7 +1872,8 @@ EXPECT_SCRIPT_END
     log_info "Registering xo-cli with Xen Orchestra..."
 
     # Create a temporary expect script for xo-cli registration
-    XO_CLI_SCRIPT=$(mktemp)
+    XO_CLI_SCRIPT=$(mktemp --tmpdir xo-cli-XXXXXX)
+    chmod 700 "$XO_CLI_SCRIPT"
     cat > "$XO_CLI_SCRIPT" << 'XO_CLI_EXPECT_END'
 #!/usr/bin/expect -f
 
@@ -1764,7 +1924,7 @@ XO_CLI_EXPECT_END
     # Check if license check disabling is enabled in config
     if [[ "${DISABLE_LICENSE_CHECK:-false}" == "true" ]]; then
         log_info "Disabling license check on XO Proxy..."
-        if sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=no "$HOST_USERNAME@$POOL_MASTER_IP" 'bash -s' << 'REMOTE_LICENSE_PATCH'
+        if sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=accept-new "$HOST_USERNAME@$POOL_MASTER_IP" 'bash -s' << 'REMOTE_LICENSE_PATCH'
 set -e
 APPLIANCE_FILE=$(find /opt/xo-proxy -name 'appliance.mjs' 2>/dev/null | head -1)
 if [[ -z "$APPLIANCE_FILE" ]]; then
@@ -1824,7 +1984,7 @@ show_help() {
     echo "  --update      Update existing installation"
     echo "  --restore     Restore a previous backup interactively"
     echo "  --rebuild     Fresh clone + clean build on the current branch (backup taken first)"
-    echo "  --reconfigure Regenerate configuration and systemd service from xo-config.cfg"
+    echo "  --reconfigure Regenerate config, systemd service, sudoers, and file ownership"
     echo "  --proxy       Install XO Proxy on a Xen pool master"
     echo "  --help        Show this help message"
     echo ""
