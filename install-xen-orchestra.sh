@@ -913,7 +913,7 @@ EOF
     # Create data directory
     sudo mkdir -p /var/lib/xo-server
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
         sudo chmod 750 /var/lib/xo-server
     fi
 
@@ -1238,7 +1238,7 @@ update_xo() {
             sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
         fi
         if [[ -d /var/lib/xo-server ]]; then
-            sudo chown "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
             sudo chmod 750 /var/lib/xo-server
         fi
     fi
@@ -1489,7 +1489,7 @@ reconfigure_xo() {
             sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
         fi
         if [[ -d /var/lib/xo-server ]]; then
-            sudo chown "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+            sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
             sudo chmod 750 /var/lib/xo-server
         fi
         log_success "File ownership updated"
