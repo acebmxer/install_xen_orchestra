@@ -484,6 +484,42 @@ install_nodejs_binary() {
     return 0
 }
 
+# Remove any existing Node.js installation (binary or package) to allow
+# clean upgrades, downgrades, and switches between install methods.
+remove_existing_nodejs() {
+    # Remove binary-installed Node.js from /usr/local
+    if [[ -x /usr/local/bin/node ]]; then
+        log_info "Removing binary-installed Node.js from /usr/local..."
+        sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+        for bin in node npm npx; do
+            if [[ -L /usr/bin/$bin ]] && [[ "$(readlink -f /usr/bin/$bin 2>/dev/null)" == "/usr/local/bin/$bin" ]]; then
+                sudo rm -f /usr/bin/$bin
+            fi
+        done
+    fi
+
+    # Remove package-managed Node.js
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        if dpkg -l nodejs 2>/dev/null | grep -q '^ii'; then
+            log_info "Removing package-managed Node.js..."
+            sudo apt-get remove -y nodejs 2>/dev/null || true
+        fi
+    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+        if rpm -q nodejs &>/dev/null; then
+            log_info "Removing package-managed Node.js..."
+            sudo "$PKG_MANAGER" remove -y nodejs 2>/dev/null || true
+        fi
+    fi
+
+    # Remove NodeSource repository entries so the new version's repo is the only one
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        sudo rm -f /etc/apt/sources.list.d/nodesource*.list 2>/dev/null || true
+        sudo rm -f /etc/apt/keyrings/nodesource.gpg 2>/dev/null || true
+    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+        sudo rm -f /etc/yum.repos.d/nodesource*.repo 2>/dev/null || true
+    fi
+}
+
 # Install Node.js to satisfy NODE_VERSION from xo-config.cfg.
 #  - Major-only (e.g. 22):   installs latest 22.x via NodeSource
 #  - Specific  (e.g. 22.3):  downloads exact v22.3.0 from nodejs.org;
@@ -506,6 +542,9 @@ install_nodejs() {
         log_warning "Node.js v${CURRENT_FULL} is installed but does not satisfy version ${NODE_VERSION}"
     fi
 
+    # Remove existing Node.js (binary and/or package) to ensure clean install
+    remove_existing_nodejs
+
     # If a specific minor/patch version was requested, try a direct download first
     if [[ "$NODE_VERSION" == *.* ]]; then
         if install_nodejs_binary "$NODE_VERSION"; then
@@ -514,19 +553,6 @@ install_nodejs() {
             return 0
         fi
         log_warning "Falling back to latest ${NODE_MAJOR}.x via NodeSource..."
-    fi
-
-    # Remove any previously installed binary-download Node.js so that
-    # the NodeSource package owns /usr/bin/node without conflicts.
-    if [[ -x /usr/local/bin/node ]]; then
-        log_info "Removing previously installed Node.js binary from /usr/local..."
-        sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
-        # Remove symlinks that install_nodejs_binary may have created
-        for bin in node npm npx; do
-            if [[ -L /usr/bin/$bin ]] && [[ "$(readlink -f /usr/bin/$bin 2>/dev/null)" == "/usr/local/bin/$bin" ]]; then
-                sudo rm -f /usr/bin/$bin
-            fi
-        done
     fi
 
     # Install latest in the major series via NodeSource
@@ -1210,8 +1236,9 @@ update_xo() {
         fi
     fi
 
-    # Ensure Node.js version matches config (upgrade if needed)
+    # Ensure Node.js version matches config (upgrade/downgrade if needed)
     install_nodejs
+    install_yarn
 
     # Rebuild with clean cache to ensure fresh build
     build_xo clean
@@ -1324,8 +1351,9 @@ rebuild_xo() {
         sudo chmod -R o-rwx "$INSTALL_DIR"
     fi
 
-    # Ensure Node.js version matches config (upgrade if needed)
+    # Ensure Node.js version matches config (upgrade/downgrade if needed)
     install_nodejs
+    install_yarn
 
     # Clean build to ensure no stale artefacts
     build_xo clean
