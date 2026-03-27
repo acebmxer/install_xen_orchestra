@@ -36,7 +36,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
                         Master Script Commit  : 693f4
                         Current XO Commit     : a1b2c
                         Master XO Commit      : d4e5f
-                        Current Node          : v24.1.0
+                        Current Node          : v22.15.0
 
   ──────────────────────────────────────────────────────────────────────────────────
 
@@ -80,7 +80,7 @@ Key settings:
 | `HTTPS_PORT` | 443 | HTTPS port |
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `GIT_BRANCH` | master | Git branch or tag |
-| `NODE_VERSION` | 24 | Node.js version |
+| `NODE_VERSION` | 22 | Node.js version (must be 22 or lower; higher versions are not compatible with Yarn Classic v1) |
 | `SERVICE_USER` | xo-service | Service user (set to `root` for VMware V2V import) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
