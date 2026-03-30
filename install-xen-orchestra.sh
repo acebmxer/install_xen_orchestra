@@ -1273,7 +1273,8 @@ check_active_xo_tasks() {
     # Parse task count — jq preferred, node.js fallback (guaranteed on any XO install)
     if command -v jq &>/dev/null; then
         task_count=$(printf '%s' "$task_response" \
-            | jq 'if type == "array" then length else 0 end' 2>/dev/null) || task_count=0
+            | jq '[.[] | select((.properties.name // "") != "XO user authentication")] | length' \
+            2>/dev/null) || task_count=0
     else
         task_count=$(printf '%s' "$task_response" | node -e '
             let d = "";
@@ -1281,7 +1282,10 @@ check_active_xo_tasks() {
             process.stdin.on("end", () => {
                 try {
                     const a = JSON.parse(d);
-                    process.stdout.write(String(Array.isArray(a) ? a.length : 0));
+                    const filtered = Array.isArray(a)
+                        ? a.filter(t => (t.properties && t.properties.name) !== "XO user authentication")
+                        : [];
+                    process.stdout.write(String(filtered.length));
                 } catch (e) { process.stdout.write("0"); }
             });
         ' 2>/dev/null) || task_count=0
@@ -1302,7 +1306,7 @@ check_active_xo_tasks() {
             while IFS= read -r task_line; do
                 printf '%b\n' "${RED}[ERROR]${NC}   - ${task_line}"
             done < <(printf '%s' "$task_response" \
-                | jq -r '.[] | (.properties.name // .id // "unknown task")' \
+                | jq -r '[.[] | select((.properties.name // "") != "XO user authentication")] | .[] | (.properties.name // .id // "unknown task")' \
                 2>/dev/null || true)
         else
             printf '%s' "$task_response" | node -e '
@@ -1312,11 +1316,13 @@ check_active_xo_tasks() {
                     try {
                         const tasks = JSON.parse(d);
                         if (Array.isArray(tasks)) {
-                            tasks.forEach(t => {
-                                const name = (t.properties && t.properties.name)
-                                    || t.id || "unknown task";
-                                process.stdout.write("         - " + name + "\n");
-                            });
+                            tasks
+                                .filter(t => (t.properties && t.properties.name) !== "XO user authentication")
+                                .forEach(t => {
+                                    const name = (t.properties && t.properties.name)
+                                        || t.id || "unknown task";
+                                    process.stdout.write("         - " + name + "\n");
+                                });
                         }
                     } catch (e) {}
                 });
