@@ -935,6 +935,11 @@ SyslogIdentifier=xo-server
 RuntimeDirectory=xo-server
 RuntimeDirectoryMode=0755
 
+# Resource limits: set high enough that pam_limits won't need CAP_SYS_RESOURCE
+# to raise them when sudo is invoked for NFS/CIFS mount operations
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+
 # Allow binding to privileged ports (80/443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 # Bounding set: ceiling for all processes in this service tree.
