@@ -935,6 +935,11 @@ SyslogIdentifier=xo-server
 RuntimeDirectory=xo-server
 RuntimeDirectoryMode=0755
 
+# Resource limits: set high enough that pam_limits won't need CAP_SYS_RESOURCE
+# to raise them when sudo is invoked for NFS/CIFS mount operations
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+
 # Allow binding to privileged ports (80/443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 # Bounding set: ceiling for all processes in this service tree.
@@ -1081,7 +1086,7 @@ restore_xo() {
         local TS="${BACKUP_NAME#xo-backup-}"
         local RAW_DT="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}:${TS:13:2} UTC"
         local DATETIME
-        DATETIME=$(date -d "$RAW_DT" +"%Y-%m-%d %I:%M:%S %p %Z" 2>/dev/null || echo "${RAW_DT% UTC}")
+        DATETIME=$(date -d "$RAW_DT" +"%I:%M:%S %p %Z" 2>/dev/null || echo "${RAW_DT% UTC}")
         # Label newest and oldest
         local LABEL=""
         if [[ $i -eq 1 ]]; then
@@ -1181,6 +1186,163 @@ restore_xo() {
     echo ""
 }
 
+# Check for active Xen Orchestra tasks before updating.
+# Prompts for XO web UI credentials, queries the XO REST API for pending tasks,
+# and aborts the update if any are found.
+# The username is logged for accountability. The password is never logged,
+# cached, or written to disk — used only for the single API call.
+check_active_xo_tasks() {
+    log_info "Checking for active Xen Orchestra tasks before updating..."
+    printf '\n'
+    log_info "Enter your Xen Orchestra web UI credentials to check for running tasks."
+    log_info "(Press Enter on username to skip and proceed with the update.)"
+    printf '\n'
+
+    local xo_user xo_pass base_url proto port
+    local http_code="" task_response="" task_count=0
+    local connected=false
+
+    # Read username — logged for accountability; password is never logged
+    read -rp "XO Username: " xo_user < /dev/tty
+    if [[ -z "$xo_user" ]]; then
+        log_warning "Task check skipped. Ensure no tasks are running before proceeding."
+        return 0
+    fi
+
+    # Read password silently — never logged, cached, or written to disk
+    read -rsp "XO Password: " xo_pass < /dev/tty
+    printf '\n'
+    if [[ -z "$xo_pass" ]]; then
+        log_warning "No password provided. Task check skipped."
+        return 0
+    fi
+
+    log_info "Querying active tasks as '${xo_user}'..."
+
+    # Temp file for API response body (task data only — not sensitive)
+    local resp_file
+    resp_file=$(mktemp /tmp/xo-resp-XXXXXX)
+
+    # Try HTTPS first (XO default), fall back to HTTP
+    for proto in https http; do
+        if [[ "$proto" == "https" ]]; then
+            port="$HTTPS_PORT"
+        else
+            port="$HTTP_PORT"
+        fi
+        base_url="${proto}://localhost:${port}"
+
+        # Escape double quotes in credentials for curl config file format
+        local esc_user esc_pass
+        esc_user=$(printf '%s' "$xo_user" | sed 's/"/\\"/g')
+        esc_pass=$(printf '%s' "$xo_pass" | sed 's/"/\\"/g')
+
+        # Build curl options
+        # Note: -k (skip TLS verify) is acceptable — loopback only, self-signed cert
+        local curl_opts=(-s --max-time 15
+            --output "$resp_file"
+            --write-out "%{http_code}")
+        if [[ "$proto" == "https" ]]; then
+            curl_opts+=(-k)
+        fi
+
+        # Pipe credentials via curl's -K stdin option — password never in process argv
+        http_code=$(printf 'user = "%s:%s"\n' "$esc_user" "$esc_pass" | \
+            curl "${curl_opts[@]}" -K - \
+            "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
+            2>/dev/null) || true
+
+        # Wipe escaped credentials immediately
+        esc_pass="" ; unset esc_pass
+
+        if [[ "$http_code" == "200" ]]; then
+            task_response=$(< "$resp_file")
+            connected=true
+            break
+        fi
+    done
+
+    # Clear password from memory — no longer needed
+    xo_pass="" ; unset xo_pass
+    rm -f "$resp_file"
+
+    if [[ "$connected" != "true" ]]; then
+        if [[ "${http_code}" == "401" ]]; then
+            log_warning "Authentication failed for '${xo_user}'. Task check skipped."
+        else
+            log_warning "Could not reach XO API (HTTP ${http_code:-unreachable}). Task check skipped."
+        fi
+        return 0
+    fi
+
+    # Parse task count — jq preferred, node.js fallback (guaranteed on any XO install)
+    if command -v jq &>/dev/null; then
+        task_count=$(printf '%s' "$task_response" \
+            | jq '[.[] | select((.properties.name // "") != "XO user authentication")] | length' \
+            2>/dev/null) || task_count=0
+    else
+        task_count=$(printf '%s' "$task_response" | node -e '
+            let d = "";
+            process.stdin.on("data", c => d += c);
+            process.stdin.on("end", () => {
+                try {
+                    const a = JSON.parse(d);
+                    const filtered = Array.isArray(a)
+                        ? a.filter(t => (t.properties && t.properties.name) !== "XO user authentication")
+                        : [];
+                    process.stdout.write(String(filtered.length));
+                } catch (e) { process.stdout.write("0"); }
+            });
+        ' 2>/dev/null) || task_count=0
+    fi
+
+    # Ensure task_count is a valid integer before numeric comparison
+    if ! [[ "$task_count" =~ ^[0-9]+$ ]]; then
+        task_count=0
+    fi
+
+    if [[ "$task_count" -gt 0 ]]; then
+        log_error "Update aborted: ${task_count} active task(s) found in Xen Orchestra."
+        log_error "Task check performed by: ${xo_user}"
+        log_error "Active tasks:"
+
+        # List task names — node fallback if jq not available
+        if command -v jq &>/dev/null; then
+            while IFS= read -r task_line; do
+                printf '%b\n' "${RED}[ERROR]${NC}   - ${task_line}"
+            done < <(printf '%s' "$task_response" \
+                | jq -r '[.[] | select((.properties.name // "") != "XO user authentication")] | .[] | (.properties.name // .id // "unknown task")' \
+                2>/dev/null || true)
+        else
+            printf '%s' "$task_response" | node -e '
+                let d = "";
+                process.stdin.on("data", c => d += c);
+                process.stdin.on("end", () => {
+                    try {
+                        const tasks = JSON.parse(d);
+                        if (Array.isArray(tasks)) {
+                            tasks
+                                .filter(t => (t.properties && t.properties.name) !== "XO user authentication")
+                                .forEach(t => {
+                                    const name = (t.properties && t.properties.name)
+                                        || t.id || "unknown task";
+                                    process.stdout.write("         - " + name + "\n");
+                                });
+                        }
+                    } catch (e) {}
+                });
+            ' 2>/dev/null || true
+        fi
+
+        printf '\n'
+        log_info "Wait for all tasks to complete, then re-run the update."
+        exit 1
+    fi
+
+    log_success "No active tasks found. Proceeding with update..."
+    log_info "Task check performed by: ${xo_user}"
+}
+
 # Update Xen Orchestra
 update_xo() {
     log_info "Checking for updates..."
@@ -1212,6 +1374,9 @@ update_xo() {
     fi
 
     log_info "New version available. Proceeding with update..."
+
+    # Check for active tasks before stopping the service
+    check_active_xo_tasks
 
     # Stop service
     log_info "Stopping xo-server service..."
@@ -2057,7 +2222,7 @@ M_CYAN="${M_CSI}36m"
 M_BLINK="${M_CSI}5m"
 M_REVERSE="${M_CSI}7m"
 
-# Menu item names (left column indices 0-3, right column indices 4-6)
+# Menu item names (left column indices 0-3, right column indices 4-7)
 MENU_NAMES=(
     "Install Xen Orchestra"
     "Update Xen Orchestra"
@@ -2066,6 +2231,7 @@ MENU_NAMES=(
     "Reconfigure Xen Orchestra"
     "Rebuild Xen Orchestra"
     "Edit xo-config.cfg"
+    "Restore Backup"
 )
 MENU_HINTS=(
     ""
@@ -2075,13 +2241,14 @@ MENU_HINTS=(
     "(made changes to config)"
     "(wipe & reinstall maintain settings)"
     ""
+    ""
 )
 
 MENU_LEFT_COUNT=4
-MENU_RIGHT_COUNT=3
-MENU_TOTAL=7
+MENU_RIGHT_COUNT=4
+MENU_TOTAL=8
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0)
 MCOL=0
 MROW=0
 MENU_SCRIPT_COMMIT="N/A"
@@ -2521,6 +2688,16 @@ process_menu_selections() {
         load_config
         install_xo_proxy
     fi
+
+    # Restore Backup
+    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        check_systemctl
+        load_config
+        restore_xo
+    fi
 }
 
 # Run the interactive menu
@@ -2536,7 +2713,7 @@ run_menu() {
 
     # Reset selection state
     MENU_CURSOR=0
-    MENU_SELECTED=(0 0 0 0 0 0 0)
+    MENU_SELECTED=(0 0 0 0 0 0 0 0)
 
     # Gather version/commit info for header display
     menu_gather_info
