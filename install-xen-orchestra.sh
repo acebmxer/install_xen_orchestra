@@ -1086,7 +1086,7 @@ restore_xo() {
         local TS="${BACKUP_NAME#xo-backup-}"
         local RAW_DT="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}:${TS:13:2} UTC"
         local DATETIME
-        DATETIME=$(date -d "$RAW_DT" +"%Y-%m-%d %I:%M:%S %p %Z" 2>/dev/null || echo "${RAW_DT% UTC}")
+        DATETIME=$(date -d "$RAW_DT" +"%I:%M:%S %p %Z" 2>/dev/null || echo "${RAW_DT% UTC}")
         # Label newest and oldest
         local LABEL=""
         if [[ $i -eq 1 ]]; then
@@ -2222,7 +2222,7 @@ M_CYAN="${M_CSI}36m"
 M_BLINK="${M_CSI}5m"
 M_REVERSE="${M_CSI}7m"
 
-# Menu item names (left column indices 0-3, right column indices 4-6)
+# Menu item names (left column indices 0-3, right column indices 4-7)
 MENU_NAMES=(
     "Install Xen Orchestra"
     "Update Xen Orchestra"
@@ -2231,6 +2231,7 @@ MENU_NAMES=(
     "Reconfigure Xen Orchestra"
     "Rebuild Xen Orchestra"
     "Edit xo-config.cfg"
+    "Restore Backup"
 )
 MENU_HINTS=(
     ""
@@ -2240,13 +2241,14 @@ MENU_HINTS=(
     "(made changes to config)"
     "(wipe & reinstall maintain settings)"
     ""
+    ""
 )
 
 MENU_LEFT_COUNT=4
-MENU_RIGHT_COUNT=3
-MENU_TOTAL=7
+MENU_RIGHT_COUNT=4
+MENU_TOTAL=8
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0)
 MCOL=0
 MROW=0
 MENU_SCRIPT_COMMIT="N/A"
@@ -2686,6 +2688,16 @@ process_menu_selections() {
         load_config
         install_xo_proxy
     fi
+
+    # Restore Backup
+    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        check_systemctl
+        load_config
+        restore_xo
+    fi
 }
 
 # Run the interactive menu
@@ -2701,7 +2713,7 @@ run_menu() {
 
     # Reset selection state
     MENU_CURSOR=0
-    MENU_SELECTED=(0 0 0 0 0 0 0)
+    MENU_SELECTED=(0 0 0 0 0 0 0 0)
 
     # Gather version/commit info for header display
     menu_gather_info
