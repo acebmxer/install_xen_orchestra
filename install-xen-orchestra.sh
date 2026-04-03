@@ -1187,37 +1187,57 @@ restore_xo() {
 }
 
 # Check for active Xen Orchestra tasks before updating.
-# Prompts for XO web UI credentials, queries the XO REST API for pending tasks,
-# and aborts the update if any are found.
-# The username is logged for accountability. The password is never logged,
-# cached, or written to disk — used only for the single API call.
+# Authenticates via token, config credentials, or interactive prompt, then
+# queries the XO REST API for pending tasks and aborts if any are found.
+# Auth priority: 1) XO_TASK_CHECK_TOKEN  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
+# Passwords are never logged, cached, or written to disk.
 check_active_xo_tasks() {
     log_info "Checking for active Xen Orchestra tasks before updating..."
     printf '\n'
-    log_info "Enter your Xen Orchestra web UI credentials to check for running tasks."
-    log_info "(Press Enter on username to skip and proceed with the update.)"
-    printf '\n'
 
-    local xo_user xo_pass base_url proto port
+    local xo_user="" xo_pass="" xo_token="" auth_method="" auth_label=""
+    local base_url proto port
     local http_code="" task_response="" task_count=0
     local connected=false
 
-    # Read username — logged for accountability; password is never logged
-    read -rp "XO Username: " xo_user < /dev/tty
-    if [[ -z "$xo_user" ]]; then
-        log_warning "Task check skipped. Ensure no tasks are running before proceeding."
-        return 0
+    # Determine authentication method
+    if [[ -n "${XO_TASK_CHECK_TOKEN:-}" ]]; then
+        # Priority 1: Auth token from config
+        auth_method="token"
+        xo_token="$XO_TASK_CHECK_TOKEN"
+        auth_label="authentication token"
+        log_info "Using authentication token from xo-config.cfg..."
+    elif [[ -n "${XO_TASK_CHECK_USER:-}" && -n "${XO_TASK_CHECK_PASS:-}" ]]; then
+        # Priority 2: Credentials from config
+        auth_method="credentials"
+        xo_user="$XO_TASK_CHECK_USER"
+        xo_pass="$XO_TASK_CHECK_PASS"
+        auth_label="'${xo_user}' (from xo-config.cfg)"
+        log_info "Using credentials from xo-config.cfg..."
+    else
+        # Priority 3: Interactive prompt
+        auth_method="interactive"
+        log_info "Enter your Xen Orchestra web UI credentials to check for running tasks."
+        log_info "(Press Enter on username to skip and proceed with the update.)"
+        printf '\n'
+
+        read -rp "XO Username: " xo_user < /dev/tty
+        if [[ -z "$xo_user" ]]; then
+            log_warning "Task check skipped. Ensure no tasks are running before proceeding."
+            return 0
+        fi
+
+        # Read password silently — never logged, cached, or written to disk
+        read -rsp "XO Password: " xo_pass < /dev/tty
+        printf '\n'
+        if [[ -z "$xo_pass" ]]; then
+            log_warning "No password provided. Task check skipped."
+            return 0
+        fi
+        auth_label="'${xo_user}'"
     fi
 
-    # Read password silently — never logged, cached, or written to disk
-    read -rsp "XO Password: " xo_pass < /dev/tty
-    printf '\n'
-    if [[ -z "$xo_pass" ]]; then
-        log_warning "No password provided. Task check skipped."
-        return 0
-    fi
-
-    log_info "Querying active tasks as '${xo_user}'..."
+    log_info "Querying active tasks as ${auth_label}..."
 
     # Temp file for API response body (task data only — not sensitive)
     local resp_file
@@ -1232,11 +1252,6 @@ check_active_xo_tasks() {
         fi
         base_url="${proto}://localhost:${port}"
 
-        # Escape double quotes in credentials for curl config file format
-        local esc_user esc_pass
-        esc_user=$(printf '%s' "$xo_user" | sed 's/"/\\"/g')
-        esc_pass=$(printf '%s' "$xo_pass" | sed 's/"/\\"/g')
-
         # Build curl options
         # Note: -k (skip TLS verify) is acceptable — loopback only, self-signed cert
         local curl_opts=(-s --max-time 15
@@ -1246,14 +1261,26 @@ check_active_xo_tasks() {
             curl_opts+=(-k)
         fi
 
-        # Pipe credentials via curl's -K stdin option — password never in process argv
-        http_code=$(printf 'user = "%s:%s"\n' "$esc_user" "$esc_pass" | \
-            curl "${curl_opts[@]}" -K - \
-            "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
-            2>/dev/null) || true
+        if [[ "$auth_method" == "token" ]]; then
+            # Token auth — passed via cookie header
+            http_code=$(curl "${curl_opts[@]}" \
+                -b "authenticationToken=${xo_token}" \
+                "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
+                2>/dev/null) || true
+        else
+            # Basic auth — pipe credentials via curl's -K stdin to keep password out of argv
+            local esc_user esc_pass
+            esc_user=$(printf '%s' "$xo_user" | sed 's/"/\\"/g')
+            esc_pass=$(printf '%s' "$xo_pass" | sed 's/"/\\"/g')
 
-        # Wipe escaped credentials immediately
-        esc_pass="" ; unset esc_pass
+            http_code=$(printf 'user = "%s:%s"\n' "$esc_user" "$esc_pass" | \
+                curl "${curl_opts[@]}" -K - \
+                "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
+                2>/dev/null) || true
+
+            # Wipe escaped credentials immediately
+            esc_pass="" ; unset esc_pass
+        fi
 
         if [[ "$http_code" == "200" ]]; then
             task_response=$(< "$resp_file")
@@ -1262,13 +1289,14 @@ check_active_xo_tasks() {
         fi
     done
 
-    # Clear password from memory — no longer needed
+    # Clear sensitive values from memory — no longer needed
     xo_pass="" ; unset xo_pass
+    xo_token="" ; unset xo_token
     rm -f "$resp_file"
 
     if [[ "$connected" != "true" ]]; then
         if [[ "${http_code}" == "401" ]]; then
-            log_warning "Authentication failed for '${xo_user}'. Task check skipped."
+            log_warning "Authentication failed for ${auth_label}. Task check skipped."
         else
             log_warning "Could not reach XO API (HTTP ${http_code:-unreachable}). Task check skipped."
         fi
@@ -1303,7 +1331,7 @@ check_active_xo_tasks() {
 
     if [[ "$task_count" -gt 0 ]]; then
         log_error "Update aborted: ${task_count} active task(s) found in Xen Orchestra."
-        log_error "Task check performed by: ${xo_user}"
+        log_error "Task check performed by: ${auth_label}"
         log_error "Active tasks:"
 
         # List task names — node fallback if jq not available
@@ -1340,7 +1368,7 @@ check_active_xo_tasks() {
     fi
 
     log_success "No active tasks found. Proceeding with update..."
-    log_info "Task check performed by: ${xo_user}"
+    log_info "Task check performed by: ${auth_label}"
 }
 
 # Update Xen Orchestra
