@@ -1,5 +1,8 @@
 # Xen Orchestra Installation Script
 
+[![CI](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml/badge.svg)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Automated installation and management of [Xen Orchestra](https://xen-orchestra.com/) from source.
 
 ## Available Functions
@@ -177,7 +180,7 @@ If the build is broken, rebuild (takes a backup first):
 
 ## License
 
-This installation script is provided as-is. Xen Orchestra itself is licensed under [AGPL-3.0](https://github.com/vatesfr/xen-orchestra/blob/master/LICENSE).
+This project is licensed under the [MIT License](LICENSE). Xen Orchestra itself is licensed under [AGPL-3.0](https://github.com/vatesfr/xen-orchestra/blob/master/LICENSE).
 
 ## Credits
 
