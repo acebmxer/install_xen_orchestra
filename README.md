@@ -32,10 +32,10 @@ Running the script with no arguments opens a two-column menu with keyboard navig
   ║              Install Xen Orchestra from Sources Setup and Update                 ║
   ╚══════════════════════════════════════════════════════════════════════════════════╝
 
-                        Current Script Commit : 693f4
-                        Master Script Commit  : 693f4
-                        Current XO Commit     : a1b2c
-                        Master XO Commit      : d4e5f
+                        Current Script Commit : 693f4 (Branch: main)
+                        Master Script Commit  : 693f4 (Branch: main)
+                        Current XO Commit     : a1b2c (Branch: master)
+                        Master XO Commit      : d4e5f (Branch: master)
                         Current Node          : v22.15.0
 
   ──────────────────────────────────────────────────────────────────────────────────
