@@ -2291,28 +2291,34 @@ menu_show_cursor() { printf "${M_CSI}?25h"; }
 
 # Gather commit and version info for the menu header
 menu_gather_info() {
-    # Current Script Commit (local HEAD)
+    # Current Script Commit (local HEAD) and branch
     if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
         MENU_SCRIPT_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_SCRIPT_COMMIT="N/A"
+        MENU_SCRIPT_BRANCH=$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || MENU_SCRIPT_BRANCH=""
     else
         MENU_SCRIPT_COMMIT="N/A"
+        MENU_SCRIPT_BRANCH=""
     fi
 
-    # Master (remote) Script Commit for current branch
+    # Master (remote) Script Commit — detect default branch of origin
     if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
-        local current_branch
-        current_branch=$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || current_branch=""
-        if [[ -n "$current_branch" ]]; then
-            git -C "$SCRIPT_DIR" fetch origin "$current_branch" 2>/dev/null || true
-            MENU_SCRIPT_MASTER=$(git -C "$SCRIPT_DIR" rev-parse "origin/${current_branch}" 2>/dev/null | cut -c1-5) || MENU_SCRIPT_MASTER="N/A"
-        else
-            MENU_SCRIPT_MASTER="N/A"
+        # Resolve origin's default branch (origin/HEAD -> origin/<branch>)
+        local remote_default
+        remote_default=$(git -C "$SCRIPT_DIR" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||') || remote_default=""
+        if [[ -z "$remote_default" ]]; then
+            # Fallback: try to resolve via ls-remote
+            remote_default=$(git -C "$SCRIPT_DIR" ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/",""); print $2; exit}') || remote_default="main"
         fi
+        MENU_SCRIPT_MASTER_BRANCH="${remote_default:-main}"
+        git -C "$SCRIPT_DIR" fetch origin "$MENU_SCRIPT_MASTER_BRANCH" 2>/dev/null || true
+        MENU_SCRIPT_MASTER=$(git -C "$SCRIPT_DIR" rev-parse "origin/${MENU_SCRIPT_MASTER_BRANCH}" 2>/dev/null | cut -c1-5) || MENU_SCRIPT_MASTER="N/A"
+        [[ -z "$MENU_SCRIPT_MASTER" ]] && MENU_SCRIPT_MASTER="N/A"
     else
         MENU_SCRIPT_MASTER="N/A"
+        MENU_SCRIPT_MASTER_BRANCH="main"
     fi
 
-    # Current XO Commit (installed)
+    # Current XO Commit (installed) and branch
     # Use sudo test because INSTALL_DIR may have o-rwx permissions (security hardening)
     local menu_install_dir="${INSTALL_DIR:-/opt/xen-orchestra}"
     if sudo test -d "${menu_install_dir}/.git" 2>/dev/null; then
@@ -2320,12 +2326,18 @@ menu_gather_info() {
         dir_owner=$(stat -c '%U' "$menu_install_dir" 2>/dev/null) || dir_owner="root"
         MENU_XO_COMMIT=$(sudo -u "$dir_owner" git -C "$menu_install_dir" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_XO_COMMIT="N/A"
         [[ -z "$MENU_XO_COMMIT" ]] && MENU_XO_COMMIT="N/A"
+        MENU_XO_BRANCH=$(sudo -u "$dir_owner" git -C "$menu_install_dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || MENU_XO_BRANCH=""
+        [[ -z "$MENU_XO_BRANCH" ]] && MENU_XO_BRANCH=""
     else
         MENU_XO_COMMIT="N/A"
+        MENU_XO_BRANCH=""
     fi
 
-    # Master XO Commit (always show current master from remote)
-    MENU_XO_MASTER=$(git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/master 2>/dev/null | cut -f1 | cut -c1-5) || MENU_XO_MASTER="N/A"
+    # Master XO Commit — detect default branch of vatesfr/xen-orchestra
+    local xo_default_branch
+    xo_default_branch=$(git ls-remote --symref https://github.com/vatesfr/xen-orchestra HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/",""); print $2; exit}') || xo_default_branch="master"
+    MENU_XO_MASTER_BRANCH="${xo_default_branch:-master}"
+    MENU_XO_MASTER=$(git ls-remote https://github.com/vatesfr/xen-orchestra "refs/heads/${MENU_XO_MASTER_BRANCH}" 2>/dev/null | cut -f1 | cut -c1-5) || MENU_XO_MASTER="N/A"
     [[ -z "$MENU_XO_MASTER" ]] && MENU_XO_MASTER="N/A"
 
     # Current Node version
@@ -2380,11 +2392,16 @@ draw_menu() {
         "Master XO Commit      :"
         "Current Node          :"
     )
+    local script_branch_str="" script_master_branch_str="" xo_branch_str="" xo_master_branch_str=""
+    [[ -n "$MENU_SCRIPT_BRANCH" ]]        && script_branch_str=" (Branch: ${MENU_SCRIPT_BRANCH})"
+    [[ -n "$MENU_SCRIPT_MASTER_BRANCH" ]] && script_master_branch_str=" (Branch: ${MENU_SCRIPT_MASTER_BRANCH})"
+    [[ -n "$MENU_XO_BRANCH" ]]            && xo_branch_str=" (Branch: ${MENU_XO_BRANCH})"
+    [[ -n "$MENU_XO_MASTER_BRANCH" ]]     && xo_master_branch_str=" (Branch: ${MENU_XO_MASTER_BRANCH})"
     local info_values=(
-        "$MENU_SCRIPT_COMMIT"
-        "$MENU_SCRIPT_MASTER"
-        "$MENU_XO_COMMIT"
-        "$MENU_XO_MASTER"
+        "${MENU_SCRIPT_COMMIT}${script_branch_str}"
+        "${MENU_SCRIPT_MASTER}${script_master_branch_str}"
+        "${MENU_XO_COMMIT}${xo_branch_str}"
+        "${MENU_XO_MASTER}${xo_master_branch_str}"
         "$MENU_NODE_VERSION"
     )
     # Find the longest full line to compute a single centering offset
