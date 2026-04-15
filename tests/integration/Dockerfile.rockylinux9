@@ -1,7 +1,8 @@
 FROM rockylinux:9
 RUN dnf install -y epel-release \
-    && dnf install -y sudo git curl bash bats ShellCheck ca-certificates \
-    && dnf clean all
+    && dnf install -y sudo git bash bats ShellCheck ca-certificates \
+    && dnf clean all \
+    && ln -s /usr/bin/ShellCheck /usr/local/bin/shellcheck
 
 # Create non-root user with passwordless sudo
 RUN useradd -m -s /bin/bash tester \
