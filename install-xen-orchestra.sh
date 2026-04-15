@@ -135,7 +135,7 @@ acquire_lock() {
     fi
 
     # Write our PID into the lockfile so operators can identify the holder
-    echo "$$" >&"$XO_LOCK_FD" 2>/dev/null || true
+    { echo "$$" >&"$XO_LOCK_FD"; } 2>/dev/null || true
 
     # Release the lock on any exit
     trap 'flock -u '"$XO_LOCK_FD"' 2>/dev/null || true' EXIT
@@ -202,11 +202,19 @@ check_required_commands() {
 # Check if sudo is available and user has sudo privileges
 check_sudo() {
     if ! command -v sudo >/dev/null 2>&1; then
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            log_warning "[DRY-RUN] sudo is not installed; skipping sudo check."
+            return 0
+        fi
         log_error "sudo is not installed. Please install sudo first."
         exit 1
     fi
 
     if ! sudo -v >/dev/null 2>&1; then
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            log_warning "[DRY-RUN] No sudo privileges; skipping sudo check."
+            return 0
+        fi
         log_error "You need sudo privileges to run this script."
         log_error "Please ensure your user is in the sudoers file."
         exit 1
@@ -291,6 +299,10 @@ self_update_script() {
 # Check if systemctl is available
 check_systemctl() {
     if ! command -v systemctl >/dev/null 2>&1; then
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            log_warning "[DRY-RUN] systemctl is not available; skipping systemd check."
+            return 0
+        fi
         log_error "systemctl is not available. This script requires systemd."
         exit 1
     fi
@@ -768,6 +780,11 @@ install_nodejs() {
         run_cmd $PKG_INSTALL nodejs
     fi
 
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        echo "[DRY-RUN] Would verify Node.js ${NODE_VERSION} installation"
+        return 0
+    fi
+
     # Verify the installed version actually matches what we requested
     local INSTALLED_FULL
     INSTALLED_FULL=$(node -v 2>/dev/null | sed 's/^v//')
@@ -791,6 +808,11 @@ install_yarn() {
     fi
 
     run_cmd sudo npm install -g yarn
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        echo "[DRY-RUN] Would verify yarn installation"
+        return 0
+    fi
 
     log_success "Yarn installed: $(yarn -v)"
 }
@@ -828,6 +850,11 @@ setup_redis() {
         run_cmd sudo systemctl start valkey 2>/dev/null || true
     else
         log_warning "Neither redis nor valkey service found in systemd units"
+    fi
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        echo "[DRY-RUN] Would verify Redis is running"
+        return 0
     fi
 
     # Verify Redis is running
