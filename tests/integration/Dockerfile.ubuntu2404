@@ -1,0 +1,18 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sudo git curl bash bats shellcheck ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user with passwordless sudo
+RUN useradd -m -s /bin/bash tester \
+    && echo "tester ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER tester
+WORKDIR /home/tester
+
+COPY --chown=tester:tester . /home/tester/install-xen-orchestra/
+
+WORKDIR /home/tester/install-xen-orchestra
+
+CMD ["bats", "tests/integration/test_install_smoke.bats"]

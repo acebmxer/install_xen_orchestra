@@ -12,10 +12,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
 
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck on main script
         run: shellcheck -S error install-xen-orchestra.sh
+
+  unit-tests:
+    name: BATS Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bats-core
+        run: sudo apt-get install -y bats
+
+      - name: Run unit tests
+        run: bats tests/unit/
+
+  integration:
+    name: Integration (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian12
+            dockerfile: tests/integration/Dockerfile.debian12
+          - distro: ubuntu2404
+            dockerfile: tests/integration/Dockerfile.ubuntu2404
+          - distro: rockylinux9
+            dockerfile: tests/integration/Dockerfile.rockylinux9
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build integration image (${{ matrix.distro }})
+        run: docker build -f ${{ matrix.dockerfile }} -t xo-test-${{ matrix.distro }} .
+
+      - name: Run integration tests (${{ matrix.distro }})
+        run: docker run --rm xo-test-${{ matrix.distro }}

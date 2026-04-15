@@ -1,0 +1,17 @@
+FROM rockylinux:9
+RUN dnf install -y epel-release \
+    && dnf install -y sudo git curl bash bats ShellCheck ca-certificates \
+    && dnf clean all
+
+# Create non-root user with passwordless sudo
+RUN useradd -m -s /bin/bash tester \
+    && echo "tester ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER tester
+WORKDIR /home/tester
+
+COPY --chown=tester:tester . /home/tester/install-xen-orchestra/
+
+WORKDIR /home/tester/install-xen-orchestra
+
+CMD ["bats", "tests/integration/test_install_smoke.bats"]

@@ -30,6 +30,21 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 ORIGINAL_ARGS=("$@")
 CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
+LATEST_CONFIG_VERSION=1
+
+# Runtime mode flags (set via CLI flags in main())
+NON_INTERACTIVE=false
+RESTORE_BACKUP_FILE=""
+DRY_RUN=false
+
+# Logging flags (set via CLI flags in main())
+LOG_FILE=""
+JSON_LOGS=false
+
+# Lockfile path — prevents two concurrent runs from corrupting the install
+XO_LOCKFILE="/var/lock/xo-install.lock"
+# File descriptor used by flock (assigned in acquire_lock)
+XO_LOCK_FD=9
 
 # Colors for output
 RED='\033[0;31m'
@@ -38,21 +53,122 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Logging functions
+# Internal log dispatcher — all log_* functions funnel through here.
+# Arguments: level  message
+# Outputs:   ANSI human-readable line to stderr (always)
+#            Plain-text line to LOG_FILE when set
+#            JSON line to LOG_FILE when JSON_LOGS=true
+_log() {
+    local level="$1"
+    local msg="$2"
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Choose ANSI colour based on level
+    local colour
+    case "$level" in
+        INFO)    colour="$BLUE" ;;
+        SUCCESS) colour="$GREEN" ;;
+        WARNING) colour="$YELLOW" ;;
+        ERROR)   colour="$RED" ;;
+        *)       colour="$NC" ;;
+    esac
+
+    # Human-readable output to stdout
+    echo -e "${colour}[${level}]${NC} ${msg}"
+
+    # File output (plain-text or JSON)
+    if [[ -n "$LOG_FILE" ]]; then
+        if [[ "$JSON_LOGS" == "true" ]]; then
+            # Escape backslashes and double-quotes in the message for JSON
+            local json_msg="${msg//\\/\\\\}"
+            json_msg="${json_msg//\"/\\\"}"
+            printf '{"ts":"%s","level":"%s","msg":"%s"}\n' \
+                "$ts" "$level" "$json_msg" >> "$LOG_FILE"
+        else
+            printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE"
+        fi
+    fi
+}
+
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    _log "INFO" "$1"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    _log "SUCCESS" "$1"
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    _log "WARNING" "$1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    _log "ERROR" "$1"
+}
+
+# Acquire an exclusive lock on XO_LOCKFILE using flock.
+# The lock is held on file descriptor XO_LOCK_FD for the lifetime of the
+# process.  A trap ensures the lock is always released on exit/signal.
+acquire_lock() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would acquire lock: $XO_LOCKFILE"
+        return 0
+    fi
+
+    # Create the lockfile if it doesn't exist (requires /var/lock to exist)
+    if ! sudo touch "$XO_LOCKFILE" 2>/dev/null; then
+        log_warning "Could not create $XO_LOCKFILE; proceeding without lock."
+        return 0
+    fi
+
+    # Open the lockfile on fd XO_LOCK_FD
+    eval "exec ${XO_LOCK_FD}>'${XO_LOCKFILE}'" 2>/dev/null || {
+        log_warning "Could not open $XO_LOCKFILE for locking; proceeding without lock."
+        return 0
+    }
+
+    if ! flock -n "$XO_LOCK_FD" 2>/dev/null; then
+        log_error "Another instance of this script is already running."
+        log_error "If you are sure no other instance is running, remove: $XO_LOCKFILE"
+        exit 1
+    fi
+
+    # Write our PID into the lockfile so operators can identify the holder
+    echo "$$" >&"$XO_LOCK_FD" 2>/dev/null || true
+
+    # Release the lock on any exit
+    trap 'flock -u '"$XO_LOCK_FD"' 2>/dev/null || true' EXIT
+}
+
+# Explicitly release the lock (called just before exec-restart so the child
+# can re-acquire it).
+release_lock() {
+    flock -u "$XO_LOCK_FD" 2>/dev/null || true
+}
+
+# In non-interactive mode auto-confirms and returns 0; otherwise prompts [y/N].
+# Usage: confirm_or_skip "Description" || { log_info "Cancelled."; exit 0; }
+confirm_or_skip() {
+    local message="$1"
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_info "Non-interactive: auto-confirming: $message"
+        return 0
+    fi
+    echo -n "${message} [y/N]: "
+    local reply
+    read -t 300 -r reply || { log_error "Input timeout"; exit 1; }
+    [[ "$reply" == [Yy] ]]
+}
+
+# Execute a command, or in dry-run mode print what would be executed.
+# Usage: run_cmd sudo systemctl start xo-server
+run_cmd() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would run: $*"
+        return 0
+    fi
+    "$@"
 }
 
 # Check if running as root/sudo and refuse
@@ -145,10 +261,7 @@ self_update_script() {
     if ! pull_err=$(git -C "$SCRIPT_DIR" pull --ff-only origin "$current_branch" 2>&1); then
         log_warning "Script auto-update failed: $pull_err"
         log_warning "Local modifications detected in ${SCRIPT_DIR}."
-        local reset_confirm
-        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Reset to origin/${current_branch}? Local changes will be lost. (y/N) " reset_confirm < /dev/tty
-        echo
-        if [[ ! "$reset_confirm" =~ ^[Yy]$ ]]; then
+        if ! confirm_or_skip "Reset to origin/${current_branch}? Local changes will be lost."; then
             log_warning "Self-update skipped. Continuing with current version."
             return 0
         fi
@@ -167,6 +280,7 @@ self_update_script() {
 
     if [[ "$before" != "$after" ]]; then
         log_success "Script updated to $(git -C "$SCRIPT_DIR" rev-parse --short HEAD). Restarting..."
+        release_lock
         exec bash "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
     else
         log_info "Script is already up to date."
@@ -237,7 +351,8 @@ load_config() {
     DISABLE_LICENSE_CHECK=${DISABLE_LICENSE_CHECK:-false}
     PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
 
-    # Validate configuration values
+    # Migrate config schema if needed, then validate
+    migrate_config "$CONFIG_FILE"
     validate_config
 }
 
@@ -294,6 +409,60 @@ validate_config() {
     fi
 }
 
+# Detect legacy system-level security issues from older script versions.
+# Populates the global LEGACY_SYSTEM_CHANGES array.
+detect_legacy_system_state() {
+    LEGACY_SYSTEM_CHANGES=()
+    if [[ -n "${SERVICE_USER:-}" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
+        if [[ -f "$SUDOERS_FILE" ]] && grep -q "chmod\|chown\|mkdir\|SETENV" "$SUDOERS_FILE" 2>/dev/null; then
+            LEGACY_SYSTEM_CHANGES+=("Sudoers: remove chmod/chown/mkdir/SETENV (keep mount/umount/findmnt per official docs)")
+        fi
+        if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw root; then
+            LEGACY_SYSTEM_CHANGES+=("User: remove ${SERVICE_USER} from root group (no longer needed)")
+        fi
+    fi
+    if [[ -f /etc/systemd/system/xo-server.service ]]; then
+        if grep -q "^AmbientCapabilities=.*CAP_SYS_ADMIN" /etc/systemd/system/xo-server.service 2>/dev/null; then
+            LEGACY_SYSTEM_CHANGES+=("Systemd: remove CAP_SYS_ADMIN from AmbientCapabilities (should only be in CapabilityBoundingSet)")
+        fi
+        if grep -q "^Group=root" /etc/systemd/system/xo-server.service 2>/dev/null; then
+            LEGACY_SYSTEM_CHANGES+=("Systemd: remove Group=root and SupplementaryGroups=root")
+        fi
+    fi
+}
+
+# Migrate config file to the latest schema version.
+# Appends CONFIG_VERSION if missing and surfaces any legacy system-level issues.
+migrate_config() {
+    local cfg_file="$1"
+    local current_ver="${CONFIG_VERSION:-0}"
+
+    if [[ "$current_ver" -ge "$LATEST_CONFIG_VERSION" ]]; then
+        return 0
+    fi
+
+    log_info "Config schema version ${current_ver} detected; migrating to version ${LATEST_CONFIG_VERSION}..."
+
+    # v0 → v1: no config key renames — just stamp the version and surface
+    # any legacy system-level security state that reconfigure_xo() can fix.
+    if [[ "$current_ver" -lt 1 ]]; then
+        detect_legacy_system_state
+        if [[ ${#LEGACY_SYSTEM_CHANGES[@]} -gt 0 ]]; then
+            log_warning "Legacy system state detected. Run --reconfigure to apply security hardening:"
+            for change in "${LEGACY_SYSTEM_CHANGES[@]}"; do
+                log_warning "  - $change"
+            done
+        fi
+        echo "" >> "$cfg_file"
+        echo "# Config schema version — do not modify manually" >> "$cfg_file"
+        echo "CONFIG_VERSION=1" >> "$cfg_file"
+        CONFIG_VERSION=1
+    fi
+
+    log_success "Config migrated from version ${current_ver} to ${LATEST_CONFIG_VERSION}."
+}
+
 # Detect package manager
 detect_package_manager() {
     if command -v apt-get &> /dev/null; then
@@ -341,7 +510,8 @@ install_dependencies() {
     log_info "Installing system dependencies..."
 
     detect_os
-    $PKG_UPDATE
+    # shellcheck disable=SC2086
+    run_cmd $PKG_UPDATE
 
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         # Common packages for all Debian/Ubuntu
@@ -357,28 +527,34 @@ install_dependencies() {
 
         # Try to install libfuse2t64 (newer systems) or fall back to libfuse2
         if apt-cache search "^libfuse2t64" 2>/dev/null | grep -q libfuse2t64; then
-            $PKG_INSTALL $BASE_PACKAGES libfuse2t64
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL $BASE_PACKAGES libfuse2t64
         else
             log_info "libfuse2t64 not available, installing libfuse2 instead..."
-            $PKG_INSTALL $BASE_PACKAGES libfuse2
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL $BASE_PACKAGES libfuse2
         fi
-        
+
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
         # Check if it's RHEL 10+ or similar where Redis is replaced by Valkey
         if [[ "$PKG_MANAGER" == "dnf" ]]; then
             # Check if Redis package exists, fall back to Valkey if not
             if dnf list available 2>/dev/null | grep -q "^redis"; then
-                $PKG_INSTALL redis
+                # shellcheck disable=SC2086
+                run_cmd $PKG_INSTALL redis
             else
                 log_info "Redis not available, installing Valkey as replacement..."
-                sudo dnf install -y epel-release || true
-                sudo dnf config-manager --enable devel || true
-                $PKG_INSTALL valkey valkey-compat-redis
+                run_cmd sudo dnf install -y epel-release || true
+                run_cmd sudo dnf config-manager --enable devel || true
+                # shellcheck disable=SC2086
+                run_cmd $PKG_INSTALL valkey valkey-compat-redis
             fi
         else
-            $PKG_INSTALL redis
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL redis
         fi
-        $PKG_INSTALL libpng-devel git lvm2 cifs-utils make automake gcc gcc-c++ \
+        # shellcheck disable=SC2086
+        run_cmd $PKG_INSTALL libpng-devel git lvm2 cifs-utils make automake gcc gcc-c++ \
             nfs-utils ntfs-3g openssl curl ca-certificates gnupg2 patch sudo dmidecode libcap fuse-libs
     fi
 
@@ -466,19 +642,19 @@ install_nodejs_binary() {
     fi
 
     log_info "Installing Node.js v${FULL_VERSION}..."
-    sudo tar -xJf "${TMP_DIR}/${FILENAME}" --strip-components=1 -C /usr/local/
+    run_cmd sudo tar -xJf "${TMP_DIR}/${FILENAME}" --strip-components=1 -C /usr/local/
     rm -rf "$TMP_DIR"
 
     # Ensure /usr/local/bin is usable (create symlinks into /usr/bin so
     # scripts that reference /usr/bin/node keep working)
     if [[ ! -e /usr/bin/node ]] || [[ "$(readlink -f /usr/bin/node 2>/dev/null)" != "/usr/local/bin/node" ]]; then
-        sudo ln -sf /usr/local/bin/node /usr/bin/node
+        run_cmd sudo ln -sf /usr/local/bin/node /usr/bin/node
     fi
     if [[ ! -e /usr/bin/npm ]] || [[ "$(readlink -f /usr/bin/npm 2>/dev/null)" != "/usr/local/bin/npm" ]]; then
-        sudo ln -sf /usr/local/bin/npm /usr/bin/npm
+        run_cmd sudo ln -sf /usr/local/bin/npm /usr/bin/npm
     fi
     if [[ ! -e /usr/bin/npx ]] || [[ "$(readlink -f /usr/bin/npx 2>/dev/null)" != "/usr/local/bin/npx" ]]; then
-        sudo ln -sf /usr/local/bin/npx /usr/bin/npx
+        run_cmd sudo ln -sf /usr/local/bin/npx /usr/bin/npx
     fi
 
     return 0
@@ -490,10 +666,10 @@ remove_existing_nodejs() {
     # Remove binary-installed Node.js from /usr/local
     if [[ -x /usr/local/bin/node ]]; then
         log_info "Removing binary-installed Node.js from /usr/local..."
-        sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+        run_cmd sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
         for bin in node npm npx; do
             if [[ -L /usr/bin/$bin ]] && [[ "$(readlink -f /usr/bin/$bin 2>/dev/null)" == "/usr/local/bin/$bin" ]]; then
-                sudo rm -f /usr/bin/$bin
+                run_cmd sudo rm -f /usr/bin/$bin
             fi
         done
     fi
@@ -502,12 +678,12 @@ remove_existing_nodejs() {
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         if dpkg -l nodejs 2>/dev/null | grep -q '^ii'; then
             log_info "Removing package-managed Node.js..."
-            sudo apt-get remove -y nodejs 2>/dev/null || true
+            run_cmd sudo apt-get remove -y nodejs 2>/dev/null || true
         fi
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
         if rpm -q nodejs &>/dev/null; then
             log_info "Removing package-managed Node.js..."
-            sudo "$PKG_MANAGER" remove -y nodejs 2>/dev/null || true
+            run_cmd sudo "$PKG_MANAGER" remove -y nodejs 2>/dev/null || true
         fi
     fi
 
@@ -515,15 +691,15 @@ remove_existing_nodejs() {
     # dpkg from removing the directory cleanly. These will be
     # reinstalled after the new Node.js is in place.
     if [[ -d /usr/lib/node_modules ]]; then
-        sudo rm -rf /usr/lib/node_modules
+        run_cmd sudo rm -rf /usr/lib/node_modules
     fi
 
     # Remove NodeSource repository entries so the new version's repo is the only one
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        sudo rm -f /etc/apt/sources.list.d/nodesource*.list 2>/dev/null || true
-        sudo rm -f /etc/apt/keyrings/nodesource.gpg 2>/dev/null || true
+        run_cmd sudo rm -f /etc/apt/sources.list.d/nodesource*.list 2>/dev/null || true
+        run_cmd sudo rm -f /etc/apt/keyrings/nodesource.gpg 2>/dev/null || true
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-        sudo rm -f /etc/yum.repos.d/nodesource*.repo 2>/dev/null || true
+        run_cmd sudo rm -f /etc/yum.repos.d/nodesource*.repo 2>/dev/null || true
     fi
 }
 
@@ -582,13 +758,14 @@ install_nodejs() {
     fi
 
     log_info "NodeSource setup script saved to $NODESOURCE_SCRIPT for review"
-    sudo bash "$NODESOURCE_SCRIPT"
+    run_cmd sudo bash "$NODESOURCE_SCRIPT"
     rm -f "$NODESOURCE_SCRIPT"
 
     if [[ "$PKG_MANAGER" == "apt" ]]; then
-        sudo apt-get install -y nodejs
+        run_cmd sudo apt-get install -y nodejs
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-        $PKG_INSTALL nodejs
+        # shellcheck disable=SC2086
+        run_cmd $PKG_INSTALL nodejs
     fi
 
     # Verify the installed version actually matches what we requested
@@ -613,7 +790,7 @@ install_yarn() {
         return 0
     fi
 
-    sudo npm install -g yarn
+    run_cmd sudo npm install -g yarn
 
     log_success "Yarn installed: $(yarn -v)"
 }
@@ -623,7 +800,7 @@ create_service_user() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+            run_cmd sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
             log_success "Service user created: $SERVICE_USER"
         else
             log_info "Service user $SERVICE_USER already exists"
@@ -644,11 +821,11 @@ setup_redis() {
 
     # Try redis-server first, then valkey
     if systemctl list-unit-files 2>/dev/null | grep -q redis; then
-        sudo systemctl enable redis-server 2>/dev/null || sudo systemctl enable redis 2>/dev/null || true
-        sudo systemctl start redis-server 2>/dev/null || sudo systemctl start redis 2>/dev/null || true
+        run_cmd sudo systemctl enable redis-server 2>/dev/null || run_cmd sudo systemctl enable redis 2>/dev/null || true
+        run_cmd sudo systemctl start redis-server 2>/dev/null || run_cmd sudo systemctl start redis 2>/dev/null || true
     elif systemctl list-unit-files 2>/dev/null | grep -q valkey; then
-        sudo systemctl enable valkey 2>/dev/null || true
-        sudo systemctl start valkey 2>/dev/null || true
+        run_cmd sudo systemctl enable valkey 2>/dev/null || true
+        run_cmd sudo systemctl start valkey 2>/dev/null || true
     else
         log_warning "Neither redis nor valkey service found in systemd units"
     fi
@@ -671,15 +848,15 @@ clone_repository() {
         return 0
     fi
 
-    sudo mkdir -p "$(dirname "$INSTALL_DIR")"
+    run_cmd sudo mkdir -p "$(dirname "$INSTALL_DIR")"
 
     log_info "Cloning Xen Orchestra (branch: $GIT_BRANCH)..."
-    sudo git clone -b "$GIT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
+    run_cmd sudo git clone -b "$GIT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
-        sudo chmod -R o-rwx "$INSTALL_DIR"
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        run_cmd sudo chmod -R o-rwx "$INSTALL_DIR"
     fi
 
     log_success "Repository cloned to $INSTALL_DIR"
@@ -704,19 +881,23 @@ ensure_swap_space() {
     # Check if swap file already exists
     if [[ -f "$SWAP_FILE" ]]; then
         log_info "Removing existing swap file..."
-        sudo swapoff "$SWAP_FILE" 2>/dev/null || true
-        sudo rm -f "$SWAP_FILE"
+        run_cmd sudo swapoff "$SWAP_FILE" 2>/dev/null || true
+        run_cmd sudo rm -f "$SWAP_FILE"
     fi
-    
+
     # Create swap file
-    sudo fallocate -l ${MIN_SWAP_MB}M "$SWAP_FILE" 2>/dev/null || sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$MIN_SWAP_MB status=progress
-    sudo chmod 600 "$SWAP_FILE"
-    sudo mkswap "$SWAP_FILE"
-    sudo swapon "$SWAP_FILE"
-    
+    run_cmd sudo fallocate -l "${MIN_SWAP_MB}M" "$SWAP_FILE" 2>/dev/null || run_cmd sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$MIN_SWAP_MB" status=progress
+    run_cmd sudo chmod 600 "$SWAP_FILE"
+    run_cmd sudo mkswap "$SWAP_FILE"
+    run_cmd sudo swapon "$SWAP_FILE"
+
     # Make it persistent across reboots
     if ! grep -q "$SWAP_FILE" /etc/fstab 2>/dev/null; then
-        echo "$SWAP_FILE none swap sw 0 0" | sudo tee -a /etc/fstab > /dev/null
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY-RUN] Would append '$SWAP_FILE none swap sw 0 0' to /etc/fstab"
+        else
+            echo "$SWAP_FILE none swap sw 0 0" | sudo tee -a /etc/fstab > /dev/null
+        fi
     fi
     
     log_success "Swap space created: ${MIN_SWAP_MB}MB"
@@ -736,11 +917,11 @@ build_xo() {
     if [[ "$CLEAN_BUILD" == "clean" ]]; then
         log_info "Clearing build cache for clean rebuild..."
         if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-            sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
-            sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
+            run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
+            run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
         else
-            sudo rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
-            sudo rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
+            run_cmd sudo rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
+            run_cmd sudo rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
         fi
     fi
 
@@ -776,9 +957,9 @@ build_xo() {
 
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
+        run_cmd sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
     else
-        sudo bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
+        run_cmd sudo bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
     fi
 
     log_success "Xen Orchestra built successfully"
@@ -788,7 +969,7 @@ build_xo() {
 generate_ssl_certificate() {
     log_info "Generating self-signed SSL certificate..."
 
-    sudo mkdir -p "$SSL_CERT_DIR"
+    run_cmd sudo mkdir -p "$SSL_CERT_DIR"
 
     if [[ -f "${SSL_CERT_DIR}/${SSL_CERT_FILE}" ]] && [[ -f "${SSL_CERT_DIR}/${SSL_KEY_FILE}" ]]; then
         log_info "SSL certificates already exist. Skipping generation."
@@ -798,19 +979,19 @@ generate_ssl_certificate() {
     local CERT_CN
     CERT_CN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "xen-orchestra")
 
-    sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    run_cmd sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout "${SSL_CERT_DIR}/${SSL_KEY_FILE}" \
         -out "${SSL_CERT_DIR}/${SSL_CERT_FILE}" \
         -subj "/CN=${CERT_CN}" \
         -addext "subjectAltName=DNS:${CERT_CN}"
 
     # Set permissions
-    sudo chmod 600 "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
-    sudo chmod 644 "${SSL_CERT_DIR}/${SSL_CERT_FILE}"
+    run_cmd sudo chmod 600 "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
+    run_cmd sudo chmod 644 "${SSL_CERT_DIR}/${SSL_CERT_FILE}"
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
     fi
 
     log_success "SSL certificates generated in $SSL_CERT_DIR"
@@ -823,18 +1004,21 @@ configure_xo() {
     local XO_CONFIG_FILE="/etc/xo-server/config.toml"
 
     # Create config directory
-    sudo mkdir -p /etc/xo-server
-    
+    run_cmd sudo mkdir -p /etc/xo-server
+
     # Create mounts directory with proper permissions
     # Note: /run/xo-server is tmpfs and will be recreated by systemd on boot
-    sudo mkdir -p /run/xo-server/mounts
-    sudo chmod 755 /run/xo-server/mounts
+    run_cmd sudo mkdir -p /run/xo-server/mounts
+    run_cmd sudo chmod 755 /run/xo-server/mounts
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /run/xo-server
-        sudo chmod 755 /run/xo-server/mounts
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /run/xo-server
+        run_cmd sudo chmod 755 /run/xo-server/mounts
     fi
 
     # Create configuration file
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would write $XO_CONFIG_FILE"
+    else
     sudo tee "$XO_CONFIG_FILE" > /dev/null << EOF
 # Xen Orchestra Server Configuration
 # Generated by install script
@@ -885,16 +1069,17 @@ mountsDir = '/run/xo-server/mounts'
 useSudo = true
 nfsOptions = 'vers=4.1,rw,nolock,sec=sys'
 EOF
+    fi # end DRY_RUN check
 
     # Set ownership if service user is defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
     fi
 
     # Create VDDK library directory expected by xo-server for VMware V2V import
     # XO extracts the VDDK tar.gz here when uploaded via the UI
-    sudo mkdir -p /usr/local/lib/vddk
-    sudo chmod 755 /usr/local/lib/vddk
+    run_cmd sudo mkdir -p /usr/local/lib/vddk
+    run_cmd sudo chmod 755 /usr/local/lib/vddk
 
     log_success "Configuration written to $XO_CONFIG_FILE"
 }
@@ -912,6 +1097,9 @@ create_systemd_service() {
         DEBUG_ENV="DEBUG=xo:main"
     fi
 
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would write /etc/systemd/system/xo-server.service"
+    else
     sudo tee /etc/systemd/system/xo-server.service > /dev/null << EOF
 [Unit]
 Description=Xen Orchestra Server
@@ -951,17 +1139,18 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN C
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi # end DRY_RUN check
 
     # Create data directory
-    sudo mkdir -p /var/lib/xo-server
+    run_cmd sudo mkdir -p /var/lib/xo-server
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
-        sudo chmod 750 /var/lib/xo-server
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+        run_cmd sudo chmod 750 /var/lib/xo-server
     fi
 
     # Reload systemd and enable service
-    sudo systemctl daemon-reload
-    sudo systemctl enable xo-server
+    run_cmd sudo systemctl daemon-reload
+    run_cmd sudo systemctl enable xo-server
 
     log_success "Systemd service created and enabled"
 }
@@ -975,13 +1164,17 @@ configure_sudo() {
 
         local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
 
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY-RUN] Would write $SUDOERS_FILE"
+        else
         sudo tee "$SUDOERS_FILE" > /dev/null << EOF
 # Allow ${SERVICE_USER} to mount/unmount for XO remote storage operations
 # Ref: https://docs.xen-orchestra.com/installation#from-the-sources
 ${SERVICE_USER} ALL=(root) NOPASSWD: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt
 EOF
+        fi # end DRY_RUN check
 
-        sudo chmod 440 "$SUDOERS_FILE"
+        run_cmd sudo chmod 440 "$SUDOERS_FILE"
 
         log_success "Sudo configured for ${SERVICE_USER} (mount, umount, findmnt)"
     fi
@@ -1013,15 +1206,16 @@ get_remote_commit() {
 create_backup() {
     log_info "Creating backup of current installation..."
 
-    sudo mkdir -p "$BACKUP_DIR"
+    run_cmd sudo mkdir -p "$BACKUP_DIR"
 
-    local TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
+    local TIMESTAMP
+    TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
     local BACKUP_NAME="xo-backup-${TIMESTAMP}"
     local BACKUP_PATH="${BACKUP_DIR}/${BACKUP_NAME}"
 
     # Create backup (excluding node_modules to save space)
-    sudo cp -r "$INSTALL_DIR" "$BACKUP_PATH"
-    sudo rm -rf "${BACKUP_PATH}/node_modules"
+    run_cmd sudo cp -r "$INSTALL_DIR" "$BACKUP_PATH"
+    run_cmd sudo rm -rf "${BACKUP_PATH}/node_modules"
 
     log_success "Backup created: $BACKUP_PATH"
 
@@ -1038,7 +1232,7 @@ create_backup() {
         log_info "Removing ${TO_DELETE} old backup(s)..."
         for (( idx=BACKUP_KEEP; idx<TOTAL_BACKUPS; idx++ )); do
             log_info "Removing old backup: $(basename "${ALL_BACKUPS[$idx]}")"
-            sudo rm -rf "${ALL_BACKUPS[$idx]}"
+            run_cmd sudo rm -rf "${ALL_BACKUPS[$idx]}"
         done
     fi
 
@@ -1104,12 +1298,31 @@ restore_xo() {
 
     local TOTAL=$((i - 1))
     echo ""
-    echo -n "Enter the number of the backup to restore [1-${TOTAL}], or 'q' to quit: "
-    read -t 300 -r CHOICE || { log_error "Input timeout"; exit 1; }
-
-    if [[ "$CHOICE" == "q" ]] || [[ "$CHOICE" == "Q" ]]; then
-        log_info "Restore cancelled."
-        exit 0
+    local CHOICE
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        if [[ -n "$RESTORE_BACKUP_FILE" ]]; then
+            CHOICE=""
+            for idx in "${!BACKUPS[@]}"; do
+                if [[ "$(basename "${BACKUPS[$idx]}")" == "$RESTORE_BACKUP_FILE" ]]; then
+                    CHOICE=$((idx + 1))
+                    break
+                fi
+            done
+            if [[ -z "$CHOICE" ]]; then
+                log_error "Backup not found: $RESTORE_BACKUP_FILE"
+                exit 1
+            fi
+        else
+            log_info "Non-interactive: auto-selecting newest backup: $(basename "${BACKUPS[0]}")"
+            CHOICE=1
+        fi
+    else
+        echo -n "Enter the number of the backup to restore [1-${TOTAL}], or 'q' to quit: "
+        read -t 300 -r CHOICE || { log_error "Input timeout"; exit 1; }
+        if [[ "$CHOICE" == "q" ]] || [[ "$CHOICE" == "Q" ]]; then
+            log_info "Restore cancelled."
+            exit 0
+        fi
     fi
 
     if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [[ "$CHOICE" -lt 1 ]] || [[ "$CHOICE" -gt "$TOTAL" ]]; then
@@ -1124,25 +1337,19 @@ restore_xo() {
     echo ""
     log_warning "You are about to restore: $SELECTED_NAME"
     log_warning "This will replace the current installation at $INSTALL_DIR"
-    echo -n "Are you sure? [y/N]: "
-    read -t 300 -r CONFIRM || { log_error "Input timeout"; exit 1; }
-
-    if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
-        log_info "Restore cancelled."
-        exit 0
-    fi
+    confirm_or_skip "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; exit 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
-    sudo systemctl stop xo-server || true
+    run_cmd sudo systemctl stop xo-server || true
 
     # Remove current installation
     log_info "Removing current installation..."
-    sudo rm -rf "$INSTALL_DIR"
+    run_cmd sudo rm -rf "$INSTALL_DIR"
 
     # Copy backup into place
     log_info "Restoring from backup: $SELECTED_NAME"
-    sudo cp -r "$SELECTED_BACKUP" "$INSTALL_DIR"
+    run_cmd sudo cp -r "$SELECTED_BACKUP" "$INSTALL_DIR"
 
     # Fix ownership to match current SERVICE_USER
     local DIR_OWNER
@@ -1150,10 +1357,10 @@ restore_xo() {
     if [[ "$SERVICE_USER" != "$DIR_OWNER" ]]; then
         log_info "Updating directory ownership from ${DIR_OWNER} to ${SERVICE_USER}..."
         if [[ "$SERVICE_USER" == "root" ]]; then
-            sudo chown -R root:root "$INSTALL_DIR"
+            run_cmd sudo chown -R root:root "$INSTALL_DIR"
         else
-            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
-            sudo chmod -R o-rwx "$INSTALL_DIR"
+            run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+            run_cmd sudo chmod -R o-rwx "$INSTALL_DIR"
         fi
     fi
 
@@ -1166,8 +1373,8 @@ restore_xo() {
 
     # Start the service
     log_info "Starting xo-server service..."
-    sudo systemctl start xo-server
-    sleep 3
+    run_cmd sudo systemctl start xo-server
+    wait_for_xo_ready
 
     local RESTORED_COMMIT
     RESTORED_COMMIT=$(get_installed_commit)
@@ -1216,6 +1423,10 @@ check_active_xo_tasks() {
         log_info "Using credentials from xo-config.cfg..."
     else
         # Priority 3: Interactive prompt
+        if [[ "$NON_INTERACTIVE" == "true" ]]; then
+            log_warning "Non-interactive mode: no XO credentials configured. Skipping task check."
+            return 0
+        fi
         auth_method="interactive"
         log_info "Enter your Xen Orchestra web UI credentials to check for running tasks."
         log_info "(Press Enter on username to skip and proceed with the update.)"
@@ -1372,6 +1583,31 @@ check_active_xo_tasks() {
 }
 
 # Update Xen Orchestra
+# Warn when the running Node.js version diverges from NODE_VERSION in config.
+# Called inside update_xo before install_nodejs so the operator gets a clear
+# heads-up that a runtime change is coming (install_nodejs handles the actual
+# upgrade/downgrade).
+detect_nodejs_drift() {
+    local RUNNING_FULL
+    RUNNING_FULL=$(node -v 2>/dev/null | sed 's/^v//')
+    if [[ -z "$RUNNING_FULL" ]]; then
+        log_warning "Could not determine running Node.js version — skipping drift check"
+        return 0
+    fi
+
+    local RUNNING_MAJOR="${RUNNING_FULL%%.*}"
+    local CONFIG_MAJOR="${NODE_VERSION%%.*}"
+
+    if ! version_satisfies "$RUNNING_FULL" "$NODE_VERSION"; then
+        log_warning "Node.js version drift detected:"
+        log_warning "  Running : v${RUNNING_FULL}  (major: ${RUNNING_MAJOR})"
+        log_warning "  Config  : ${NODE_VERSION}  (major: ${CONFIG_MAJOR})"
+        log_warning "  Node.js will be updated to match NODE_VERSION=${NODE_VERSION} from xo-config.cfg"
+    else
+        log_info "Node.js v${RUNNING_FULL} satisfies configured version ${NODE_VERSION} — no runtime change needed"
+    fi
+}
+
 update_xo() {
     log_info "Checking for updates..."
 
@@ -1403,12 +1639,18 @@ update_xo() {
 
     log_info "New version available. Proceeding with update..."
 
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY-RUN] Would update from commit ${INSTALLED_COMMIT:0:12} to ${REMOTE_COMMIT:0:12}"
+        log_info "[DRY-RUN] Would stop service, create backup, pull latest, rebuild, restart"
+        return 0
+    fi
+
     # Check for active tasks before stopping the service
     check_active_xo_tasks
 
     # Stop service
     log_info "Stopping xo-server service..."
-    sudo systemctl stop xo-server || true
+    run_cmd sudo systemctl stop xo-server || true
 
     # Create backup
     create_backup
@@ -1424,7 +1666,7 @@ update_xo() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+            run_cmd sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
         fi
     fi
 
@@ -1434,11 +1676,14 @@ update_xo() {
     if [[ "$SERVICE_USER" != "$DIR_OWNER" ]]; then
         log_info "Updating directory ownership from ${DIR_OWNER} to ${SERVICE_USER}..."
         if [[ "$SERVICE_USER" == "root" ]]; then
-            sudo chown -R root:root "$INSTALL_DIR"
+            run_cmd sudo chown -R root:root "$INSTALL_DIR"
         else
-            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+            run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
         fi
     fi
+
+    # Detect Node.js version drift before upgrading/downgrading
+    detect_nodejs_drift
 
     # Ensure Node.js version matches config (upgrade/downgrade if needed)
     install_nodejs
@@ -1458,28 +1703,29 @@ update_xo() {
         # Remove legacy root group membership from previous script versions
         if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw root; then
             log_info "Removing ${SERVICE_USER} from root group (no longer needed)..."
-            sudo gpasswd -d "$SERVICE_USER" root 2>/dev/null || true
+            run_cmd sudo gpasswd -d "$SERVICE_USER" root 2>/dev/null || true
         fi
 
         # Ensure proper file permissions
         log_info "Applying security hardening..."
-        sudo chmod -R o-rwx "$INSTALL_DIR"
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
+        run_cmd sudo chmod -R o-rwx "$INSTALL_DIR"
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
         if [[ -d "$SSL_CERT_DIR" ]]; then
-            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
+            run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
         fi
         if [[ -d /var/lib/xo-server ]]; then
-            sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
-            sudo chmod 750 /var/lib/xo-server
+            run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+            run_cmd sudo chmod 750 /var/lib/xo-server
         fi
     fi
 
     # Reload systemd daemon to pick up service changes
-    sudo systemctl daemon-reload
+    run_cmd sudo systemctl daemon-reload
 
     # Start service
     log_info "Starting xo-server service..."
-    sudo systemctl start xo-server
+    run_cmd sudo systemctl start xo-server
+    wait_for_xo_ready
 
     log_success "Update completed successfully!"
     log_info "New commit: $(get_installed_commit | cut -c1-12)"
@@ -1517,42 +1763,36 @@ rebuild_xo() {
     log_warning "  3. Perform a clean rebuild"
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
-    echo -n "Continue? [y/N]: "
-    read -t 300 -r CONFIRM || { log_error "Input timeout"; exit 1; }
-
-    if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
-        log_info "Rebuild cancelled."
-        exit 0
-    fi
+    confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; exit 0; }
 
     # Stop the service before touching anything
     log_info "Stopping xo-server service..."
-    sudo systemctl stop xo-server || true
+    run_cmd sudo systemctl stop xo-server || true
 
     # Backup current installation (node_modules excluded, same as update)
     create_backup
 
     # Wipe current installation directory
     log_info "Removing current installation directory..."
-    sudo rm -rf "$INSTALL_DIR"
+    run_cmd sudo rm -rf "$INSTALL_DIR"
 
     # Fresh clone of the same branch
     log_info "Cloning Xen Orchestra (branch: ${CURRENT_BRANCH})..."
-    sudo mkdir -p "$(dirname "$INSTALL_DIR")"
-    sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
+    run_cmd sudo mkdir -p "$(dirname "$INSTALL_DIR")"
+    run_cmd sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
 
     # Ensure service user exists before any chown operations
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+            run_cmd sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
         fi
     fi
 
     # Restore ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
-        sudo chmod -R o-rwx "$INSTALL_DIR"
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        run_cmd sudo chmod -R o-rwx "$INSTALL_DIR"
     fi
 
     # Ensure Node.js version matches config (upgrade/downgrade if needed)
@@ -1567,8 +1807,8 @@ rebuild_xo() {
 
     # Restart the service
     log_info "Starting xo-server service..."
-    sudo systemctl start xo-server
-    sleep 3
+    run_cmd sudo systemctl start xo-server
+    wait_for_xo_ready
 
     local NEW_COMMIT
     NEW_COMMIT=$(get_installed_commit)
@@ -1579,12 +1819,6 @@ rebuild_xo() {
     echo "=============================================="
     log_info "Branch:      ${CURRENT_BRANCH}"
     log_info "New commit:  ${NEW_COMMIT:0:12}"
-
-    if systemctl is-active --quiet xo-server; then
-        log_success "xo-server is running"
-    else
-        log_warning "xo-server may have failed to start. Check: sudo systemctl status xo-server"
-    fi
 
     log_info "Your settings in /etc/xo-server and /var/lib/xo-server are unchanged."
     echo ""
@@ -1622,24 +1856,8 @@ reconfigure_xo() {
     [[ "${DEBUG_MODE}" == "true" ]] && echo "  - Debug Mode:       Enabled"
 
     # Detect security hardening changes from previous script versions
-    local SECURITY_CHANGES=()
-    if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
-        if [[ -f "$SUDOERS_FILE" ]] && grep -q "chmod\|chown\|mkdir\|SETENV" "$SUDOERS_FILE" 2>/dev/null; then
-            SECURITY_CHANGES+=("Sudoers: remove chmod/chown/mkdir/SETENV (keep mount/umount/findmnt per official docs)")
-        fi
-        if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw root; then
-            SECURITY_CHANGES+=("User: remove ${SERVICE_USER} from root group (no longer needed)")
-        fi
-    fi
-    if [[ -f /etc/systemd/system/xo-server.service ]]; then
-        if grep -q "^AmbientCapabilities=.*CAP_SYS_ADMIN" /etc/systemd/system/xo-server.service 2>/dev/null; then
-            SECURITY_CHANGES+=("Systemd: remove CAP_SYS_ADMIN from AmbientCapabilities (should only be in CapabilityBoundingSet)")
-        fi
-        if grep -q "^Group=root" /etc/systemd/system/xo-server.service 2>/dev/null; then
-            SECURITY_CHANGES+=("Systemd: remove Group=root and SupplementaryGroups=root")
-        fi
-    fi
+    detect_legacy_system_state
+    local SECURITY_CHANGES=("${LEGACY_SYSTEM_CHANGES[@]+"${LEGACY_SYSTEM_CHANGES[@]}"}")
 
     if [[ ${#SECURITY_CHANGES[@]} -gt 0 ]]; then
         echo ""
@@ -1653,35 +1871,29 @@ reconfigure_xo() {
     log_warning "Database and user data in /var/lib/xo-server will NOT be affected."
     log_warning "NFS/CIFS mounts and reverse proxy settings will continue to work."
     echo ""
-    echo -n "Continue? [y/N]: "
-    read -t 300 -r CONFIRM || { log_error "Input timeout"; exit 1; }
-
-    if [[ "$CONFIRM" != "y" ]] && [[ "$CONFIRM" != "Y" ]]; then
-        log_info "Reconfiguration cancelled."
-        exit 0
-    fi
+    confirm_or_skip "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; exit 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
-    sudo systemctl stop xo-server || true
+    run_cmd sudo systemctl stop xo-server || true
 
     # Backup current config file
     if [[ -f "/etc/xo-server/config.toml" ]]; then
         log_info "Backing up current configuration..."
-        sudo cp /etc/xo-server/config.toml /etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)
+        run_cmd sudo cp /etc/xo-server/config.toml "/etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)"
         log_success "Backup created"
     fi
 
     # Backup current systemd service
     if [[ -f "/etc/systemd/system/xo-server.service" ]]; then
-        sudo cp /etc/systemd/system/xo-server.service /etc/systemd/system/xo-server.service.backup-$(date +%Y%m%d-%H%M%S)
+        run_cmd sudo cp /etc/systemd/system/xo-server.service "/etc/systemd/system/xo-server.service.backup-$(date +%Y%m%d-%H%M%S)"
     fi
 
     # Backup current sudoers if present
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
         if [[ -f "$SUDOERS_FILE" ]]; then
-            sudo cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup-$(date +%Y%m%d-%H%M%S)"
+            run_cmd sudo cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup-$(date +%Y%m%d-%H%M%S)"
         fi
     fi
 
@@ -1689,7 +1901,7 @@ reconfigure_xo() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
             log_info "Creating service user: $SERVICE_USER"
-            sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
+            run_cmd sudo useradd -r -m -s /bin/bash "$SERVICE_USER" || true
         fi
     fi
 
@@ -1709,43 +1921,37 @@ reconfigure_xo() {
         # which is no longer needed (ownership is set to SERVICE_USER:SERVICE_USER)
         if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw root; then
             log_info "Removing ${SERVICE_USER} from root group (no longer needed)..."
-            sudo gpasswd -d "$SERVICE_USER" root 2>/dev/null || true
+            run_cmd sudo gpasswd -d "$SERVICE_USER" root 2>/dev/null || true
         fi
 
         # Fix file ownership — migrates from old :root group to SERVICE_USER:SERVICE_USER
         log_info "Updating file ownership for ${SERVICE_USER}..."
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
-        sudo chmod -R o-rwx "$INSTALL_DIR"
-        sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        run_cmd sudo chmod -R o-rwx "$INSTALL_DIR"
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
         if [[ -d "$SSL_CERT_DIR" ]]; then
-            sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
+            run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
         fi
         if [[ -d /var/lib/xo-server ]]; then
-            sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
-            sudo chmod 750 /var/lib/xo-server
+            run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+            run_cmd sudo chmod 750 /var/lib/xo-server
         fi
         log_success "File ownership updated"
     fi
 
     # Reload systemd daemon
     log_info "Reloading systemd daemon..."
-    sudo systemctl daemon-reload
+    run_cmd sudo systemctl daemon-reload
 
     # Start the service
     log_info "Starting xo-server service..."
-    sudo systemctl start xo-server
-    sleep 3
+    run_cmd sudo systemctl start xo-server
+    wait_for_xo_ready
 
     echo ""
     echo "=============================================="
     log_success "Reconfiguration completed successfully!"
     echo "=============================================="
-
-    if systemctl is-active --quiet xo-server; then
-        log_success "xo-server is running"
-    else
-        log_warning "xo-server may have failed to start. Check: sudo systemctl status xo-server"
-    fi
 
     echo ""
     log_info "Configuration has been updated from xo-config.cfg"
@@ -1758,16 +1964,43 @@ reconfigure_xo() {
 # Start the service
 start_service() {
     log_info "Starting xo-server service..."
-    sudo systemctl start xo-server
+    run_cmd sudo systemctl start xo-server
+    wait_for_xo_ready
+}
 
-    # Wait a moment for the service to start
-    sleep 3
-
-    if systemctl is-active --quiet xo-server; then
-        log_success "xo-server is running"
-    else
-        log_warning "xo-server may have failed to start. Check: sudo systemctl status xo-server"
+# Poll the XO web interface until it responds or we hit the retry limit.
+# Tries HTTPS first, falls back to HTTP.  Does not fail the overall install
+# on timeout — a warning is emitted so the operator can investigate.
+wait_for_xo_ready() {
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "[DRY-RUN] Would poll https://localhost:${HTTPS_PORT} for readiness"
+        return 0
     fi
+
+    local RETRIES=10
+    local DELAY=6
+    local i
+
+    log_info "Waiting for Xen Orchestra to become ready (up to $((RETRIES * DELAY))s)..."
+
+    for (( i=1; i<=RETRIES; i++ )); do
+        # Try HTTPS endpoint; fall back to HTTP if HTTPS port is not 443
+        if curl -sk --max-time 3 "https://localhost:${HTTPS_PORT}" -o /dev/null -w "%{http_code}" 2>/dev/null \
+                | grep -qE '^[23]'; then
+            log_success "Xen Orchestra is ready (HTTPS on port ${HTTPS_PORT})"
+            return 0
+        fi
+        if curl -s --max-time 3 "http://localhost:${HTTP_PORT}" -o /dev/null -w "%{http_code}" 2>/dev/null \
+                | grep -qE '^[23]'; then
+            log_success "Xen Orchestra is ready (HTTP on port ${HTTP_PORT})"
+            return 0
+        fi
+        log_info "  Not ready yet (attempt ${i}/${RETRIES}), retrying in ${DELAY}s..."
+        sleep "$DELAY"
+    done
+
+    log_warning "Xen Orchestra did not respond after $((RETRIES * DELAY))s."
+    log_warning "The service may still be starting. Check: sudo journalctl -u xo-server -n 50"
 }
 
 # Print installation summary
@@ -1852,8 +2085,10 @@ install_xo_proxy() {
     # Check if expect is installed
     if ! command -v expect &> /dev/null; then
         log_info "Installing expect for automated SSH interaction..."
-        $PKG_UPDATE
-        $PKG_INSTALL expect
+        # shellcheck disable=SC2086
+        run_cmd $PKG_UPDATE
+        # shellcheck disable=SC2086
+        run_cmd $PKG_INSTALL expect
     fi
 
     # Prompt for Pool Master connection info
@@ -1886,7 +2121,8 @@ install_xo_proxy() {
         # Try installing sshpass if not available
         if ! command -v sshpass &> /dev/null; then
             log_info "Installing sshpass..."
-            $PKG_INSTALL sshpass
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL sshpass
             # Retry connection
             if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
                 log_error "Failed to connect to Pool Master. Please check your credentials."
@@ -1932,115 +2168,19 @@ install_xo_proxy() {
     fi
     [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
 
-    # Create expect script for proxy installation
+    # Copy the companion expect script to a temp file for execution
     log_info "Creating installation script..."
 
+    local HELPER_SCRIPT="${SCRIPT_DIR}/xo-proxy-helper.exp"
+    if [[ ! -f "$HELPER_SCRIPT" ]]; then
+        log_error "xo-proxy-helper.exp not found at ${HELPER_SCRIPT}"
+        log_error "Ensure xo-proxy-helper.exp is in the same directory as this script."
+        exit 1
+    fi
+
     TEMP_SCRIPT=$(mktemp --tmpdir xo-proxy-XXXXXX)
+    cp "$HELPER_SCRIPT" "$TEMP_SCRIPT"
     chmod 700 "$TEMP_SCRIPT"
-    cat > "$TEMP_SCRIPT" << 'EXPECT_SCRIPT_END'
-#!/usr/bin/expect -f
-
-set timeout 600
-set pool_master [lindex $argv 0]
-set username [lindex $argv 1]
-set password [lindex $argv 2]
-set proxy_ip [lindex $argv 3]
-set ntp_server [lindex $argv 4]
-set xo_username [lindex $argv 5]
-set xo_password [lindex $argv 6]
-
-# Variables to capture output
-set proxy_uuid ""
-set auth_token ""
-set actual_proxy_ip ""
-
-log_user 1
-
-# Connect to pool master
-spawn ssh -o StrictHostKeyChecking=accept-new $username@$pool_master
-
-# Handle password prompt
-expect {
-    "password:" {
-        send "$password\r"
-    }
-}
-
-# Wait for shell prompt and run installer
-expect {
-    -re ".*#" {
-        send "bash -c \"\$(wget -qO- https://xoa.io/proxy/deploy)\"\r"
-    }
-}
-
-# Handle installer prompts - more specific patterns
-expect {
-    -re "IP address\\? \\\[dhcp\\\]" {
-        if {$proxy_ip eq "dhcp" || $proxy_ip eq "DHCP"} {
-            send "\r"
-        } else {
-            send "$proxy_ip\r"
-        }
-        exp_continue
-    }
-    -re "Custom NTP servers.*\\? \\\[\\\]" {
-        if {$ntp_server eq ""} {
-            send "\r"
-        } else {
-            send "$ntp_server\r"
-        }
-        exp_continue
-    }
-    -re "Xen Orchestra \\(XO\\) address\\?" {
-        send "http://localhost\r"
-        exp_continue
-    }
-    -re "Your Xen Orchestra account \\(email\\)\\?" {
-        send "$xo_username\r"
-        exp_continue
-    }
-    -re "Your Xen Orchestra account password\\?" {
-        send "$xo_password\r"
-        exp_continue
-    }
-    -re "XO Proxy Appliance IP address: (\[0-9.\]+)" {
-        set actual_proxy_ip $expect_out(1,string)
-        exp_continue
-    }
-    -re "UUID: (\[a-f0-9-\]+)" {
-        set proxy_uuid $expect_out(1,string)
-        exp_continue
-    }
-    -re "authentication token: (\[a-zA-Z0-9_-\]+)" {
-        set auth_token $expect_out(1,string)
-        exp_continue
-    }
-    -re "token: (\[a-zA-Z0-9_-\]+)" {
-        set auth_token $expect_out(1,string)
-        exp_continue
-    }
-    -re ".*#" {
-        # Back at prompt, installation complete
-    }
-    timeout {
-        send_user "\nTimeout waiting for installer\n"
-    }
-    eof {
-    }
-}
-
-# Exit SSH session
-send "exit\r"
-expect eof
-
-# Output captured values
-puts "\nCAPTURED_VALUES:"
-puts "PROXY_IP=$actual_proxy_ip"
-puts "PROXY_UUID=$proxy_uuid"
-puts "AUTH_TOKEN=$auth_token"
-EXPECT_SCRIPT_END
-
-    chmod +x "$TEMP_SCRIPT"
 
     # Run the expect script
     log_info "Starting XO Proxy installer on Pool Master..."
@@ -2096,7 +2236,7 @@ EXPECT_SCRIPT_END
             log_error "npm is not installed. Please install Node.js first."
             exit 1
         fi
-        sudo npm i -g xo-cli
+        run_cmd sudo npm i -g xo-cli
         log_success "xo-cli installed"
     fi
 
@@ -2203,6 +2343,107 @@ REMOTE_LICENSE_PATCH
     echo ""
 }
 
+# Uninstall Xen Orchestra: stop/disable the service, remove the install
+# directory, systemd unit, sudoers file, SSL certs, and optionally the
+# service user and Redis data.
+cleanup_xo() {
+    log_info "Starting Xen Orchestra uninstall..."
+
+    check_required_commands
+    check_not_root
+    check_sudo
+    check_systemctl
+    load_config
+
+    echo ""
+    echo "=============================================="
+    echo "  Xen Orchestra Uninstall"
+    echo "=============================================="
+    echo ""
+    echo "The following will be removed:"
+    echo "  - systemd service:  xo-server"
+    echo "  - install dir:      ${INSTALL_DIR}"
+    echo "  - data dir:         /var/lib/xo-server"
+    echo "  - SSL cert dir:     ${SSL_CERT_DIR}"
+    if [[ -n "${SERVICE_USER:-}" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        echo "  - sudoers file:     /etc/sudoers.d/xo-server-${SERVICE_USER}"
+    fi
+    echo ""
+
+    if ! confirm_or_skip "Proceed with uninstall? This cannot be undone."; then
+        log_info "Uninstall cancelled."
+        return 0
+    fi
+
+    # 1. Stop and disable the systemd service
+    if systemctl list-unit-files xo-server.service &>/dev/null 2>&1 | grep -q xo-server; then
+        log_info "Stopping xo-server service..."
+        run_cmd sudo systemctl stop xo-server 2>/dev/null || true
+        run_cmd sudo systemctl disable xo-server 2>/dev/null || true
+    fi
+
+    # 2. Remove the systemd unit file
+    if [[ -f /etc/systemd/system/xo-server.service ]]; then
+        log_info "Removing systemd unit file..."
+        run_cmd sudo rm -f /etc/systemd/system/xo-server.service
+        run_cmd sudo systemctl daemon-reload
+    fi
+
+    # 3. Remove the sudoers file
+    if [[ -n "${SERVICE_USER:-}" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        local SUDOERS_FILE="/etc/sudoers.d/xo-server-${SERVICE_USER}"
+        if [[ -f "$SUDOERS_FILE" ]]; then
+            log_info "Removing sudoers file..."
+            run_cmd sudo rm -f "$SUDOERS_FILE"
+        fi
+    fi
+
+    # 4. Remove the install directory
+    if [[ -d "$INSTALL_DIR" ]]; then
+        log_info "Removing install directory: ${INSTALL_DIR}..."
+        run_cmd sudo rm -rf "$INSTALL_DIR"
+    fi
+
+    # 5. Remove the data directory
+    if [[ -d /var/lib/xo-server ]]; then
+        log_info "Removing data directory: /var/lib/xo-server..."
+        run_cmd sudo rm -rf /var/lib/xo-server
+    fi
+
+    # 6. Remove SSL certificates
+    if [[ -d "$SSL_CERT_DIR" ]]; then
+        log_info "Removing SSL cert directory: ${SSL_CERT_DIR}..."
+        run_cmd sudo rm -rf "$SSL_CERT_DIR"
+    fi
+
+    # 7. Optionally remove the service user
+    if [[ -n "${SERVICE_USER:-}" ]] && [[ "$SERVICE_USER" != "root" ]]; then
+        if id "$SERVICE_USER" &>/dev/null; then
+            echo ""
+            if confirm_or_skip "Also delete system user '${SERVICE_USER}'?"; then
+                log_info "Removing service user: ${SERVICE_USER}..."
+                run_cmd sudo userdel -r "$SERVICE_USER" 2>/dev/null || \
+                    run_cmd sudo userdel "$SERVICE_USER" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # 8. Optionally remove Redis data
+    echo ""
+    if confirm_or_skip "Also purge Redis data? (WARNING: removes all Redis databases on this host)"; then
+        log_info "Purging Redis data..."
+        run_cmd sudo systemctl stop redis-server 2>/dev/null || \
+            run_cmd sudo systemctl stop redis 2>/dev/null || true
+        run_cmd sudo rm -rf /var/lib/redis /var/lib/valkey 2>/dev/null || true
+    fi
+
+    log_success "Xen Orchestra has been uninstalled."
+    echo ""
+    echo "Note: backups in ${BACKUP_DIR} were NOT removed."
+    echo "      Remove them manually if no longer needed."
+    echo ""
+}
+
 # Show help
 show_help() {
     echo "Xen Orchestra Installation Script"
@@ -2212,13 +2453,22 @@ show_help() {
     echo "Running without options launches an interactive menu."
     echo ""
     echo "Options:"
-    echo "  --install     Install Xen Orchestra directly (skip menu)"
-    echo "  --update      Update existing installation"
-    echo "  --restore     Restore a previous backup interactively"
-    echo "  --rebuild     Fresh clone + clean build on the current branch (backup taken first)"
-    echo "  --reconfigure Regenerate config, systemd service, sudoers, and file ownership"
-    echo "  --proxy       Install XO Proxy on a Xen pool master"
-    echo "  --help        Show this help message"
+    echo "  --install              Install Xen Orchestra directly (skip menu)"
+    echo "  --update               Update existing installation"
+    echo "  --restore              Restore a previous backup interactively"
+    echo "  --rebuild              Fresh clone + clean build on the current branch (backup taken first)"
+    echo "  --reconfigure          Regenerate config, systemd service, sudoers, and file ownership"
+    echo "  --proxy                Install XO Proxy on a Xen pool master"
+    echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
+    echo "  --help                 Show this help message"
+    echo ""
+    echo "Automation Flags (can be combined with any operation):"
+    echo "  --non-interactive      Bypass all interactive prompts; use config defaults"
+    echo "  --yes                  Alias for --non-interactive"
+    echo "  --backup-file NAME     With --restore: select specific backup by directory name"
+    echo "  --dry-run, --check     Show what would be done without making any changes"
+    echo "  --log-file PATH        Append log output to PATH (plain-text by default)"
+    echo "  --json-logs            Write structured JSON lines to --log-file instead of plain text"
     echo ""
     echo "Environment Variables:"
     echo "  XO_DEBUG=1              Enable debug mode (prints all commands with 'set -x')"
@@ -2647,7 +2897,8 @@ menu_edit_config() {
                 fi
             fi
             log_info "Installing ${editor}..."
-            $PKG_INSTALL "$editor"
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL "$editor"
             if ! command -v "$editor" &>/dev/null; then
                 log_error "Failed to install ${editor}."
                 return 1
@@ -2860,12 +3111,62 @@ run_menu() {
 
 # Main entry point
 main() {
+    # Pre-parse global flags before dispatching to operations.
+    # This allows flags like --non-interactive and --dry-run to appear in any order.
+    local OPERATION=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --non-interactive|--yes)
+                NON_INTERACTIVE=true
+                ;;
+            --dry-run|--check)
+                DRY_RUN=true
+                ;;
+            --backup-file)
+                shift
+                RESTORE_BACKUP_FILE="${1:-}"
+                ;;
+            --log-file)
+                shift
+                LOG_FILE="${1:-}"
+                ;;
+            --json-logs)
+                JSON_LOGS=true
+                ;;
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--uninstall|--help)
+                OPERATION="$1"
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                log_error "Run with --help for usage information."
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    # Validate --json-logs requires --log-file
+    if [[ "$JSON_LOGS" == "true" ]] && [[ -z "$LOG_FILE" ]]; then
+        log_error "--json-logs requires --log-file PATH"
+        exit 1
+    fi
+
     # Self-update before doing anything (skip for --help to avoid delays)
-    if [[ "${1:-}" != "--help" ]]; then
+    if [[ "$OPERATION" != "--help" ]]; then
         self_update_script
     fi
 
-    case "${1:-}" in
+    if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --uninstall)"
+        exit 1
+    fi
+
+    # Acquire exclusive lock for all mutating operations (not --help)
+    if [[ "$OPERATION" != "--help" ]]; then
+        acquire_lock
+    fi
+
+    case "$OPERATION" in
         --update)
             check_required_commands
             check_not_root
@@ -2913,6 +3214,9 @@ main() {
         --install)
             install_xo
             ;;
+        --uninstall)
+            cleanup_xo
+            ;;
         --help)
             show_help
             ;;
@@ -2922,4 +3226,7 @@ main() {
     esac
 }
 
-main "$@"
+# Allow test harnesses to source the script without executing main()
+if [[ "${_XO_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi

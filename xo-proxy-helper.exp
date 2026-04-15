@@ -1,0 +1,119 @@
+#!/usr/bin/expect -f
+#
+# xo-proxy-helper.exp — automated XO Proxy installer
+#
+# Called by install-xen-orchestra.sh when the user selects "Install XO Proxy".
+# Arguments (positional):
+#   $argv 0  pool_master   IP/hostname of the Xen pool master
+#   $argv 1  username      SSH username for the pool master
+#   $argv 2  password      SSH password for the pool master
+#   $argv 3  proxy_ip      Desired proxy IP address, or "dhcp"
+#   $argv 4  ntp_server    NTP server address (empty string = use default)
+#   $argv 5  xo_username   Xen Orchestra web UI username (email)
+#   $argv 6  xo_password   Xen Orchestra web UI password
+#
+# Outputs lines of the form:
+#   CAPTURED_VALUES:
+#   PROXY_IP=<ip>
+#   PROXY_UUID=<uuid>
+#   AUTH_TOKEN=<token>
+# which install-xen-orchestra.sh parses after the script exits.
+
+set timeout 600
+set pool_master [lindex $argv 0]
+set username    [lindex $argv 1]
+set password    [lindex $argv 2]
+set proxy_ip    [lindex $argv 3]
+set ntp_server  [lindex $argv 4]
+set xo_username [lindex $argv 5]
+set xo_password [lindex $argv 6]
+
+# Variables to capture output
+set proxy_uuid      ""
+set auth_token      ""
+set actual_proxy_ip ""
+
+log_user 1
+
+# Connect to pool master
+spawn ssh -o StrictHostKeyChecking=accept-new $username@$pool_master
+
+# Handle password prompt
+expect {
+    "password:" {
+        send "$password\r"
+    }
+}
+
+# Wait for shell prompt and run installer
+expect {
+    -re ".*#" {
+        send "bash -c \"\$(wget -qO- https://xoa.io/proxy/deploy)\"\r"
+    }
+}
+
+# Handle installer prompts
+expect {
+    -re "IP address\\? \\\[dhcp\\\]" {
+        if {$proxy_ip eq "dhcp" || $proxy_ip eq "DHCP"} {
+            send "\r"
+        } else {
+            send "$proxy_ip\r"
+        }
+        exp_continue
+    }
+    -re "Custom NTP servers.*\\? \\\[\\\]" {
+        if {$ntp_server eq ""} {
+            send "\r"
+        } else {
+            send "$ntp_server\r"
+        }
+        exp_continue
+    }
+    -re "Xen Orchestra \\(XO\\) address\\?" {
+        send "http://localhost\r"
+        exp_continue
+    }
+    -re "Your Xen Orchestra account \\(email\\)\\?" {
+        send "$xo_username\r"
+        exp_continue
+    }
+    -re "Your Xen Orchestra account password\\?" {
+        send "$xo_password\r"
+        exp_continue
+    }
+    -re "XO Proxy Appliance IP address: (\[0-9.\]+)" {
+        set actual_proxy_ip $expect_out(1,string)
+        exp_continue
+    }
+    -re "UUID: (\[a-f0-9-\]+)" {
+        set proxy_uuid $expect_out(1,string)
+        exp_continue
+    }
+    -re "authentication token: (\[a-zA-Z0-9_-\]+)" {
+        set auth_token $expect_out(1,string)
+        exp_continue
+    }
+    -re "token: (\[a-zA-Z0-9_-\]+)" {
+        set auth_token $expect_out(1,string)
+        exp_continue
+    }
+    -re ".*#" {
+        # Back at prompt — installation complete
+    }
+    timeout {
+        send_user "\nTimeout waiting for installer\n"
+    }
+    eof {
+    }
+}
+
+# Exit SSH session
+send "exit\r"
+expect eof
+
+# Output captured values
+puts "\nCAPTURED_VALUES:"
+puts "PROXY_IP=$actual_proxy_ip"
+puts "PROXY_UUID=$proxy_uuid"
+puts "AUTH_TOKEN=$auth_token"
