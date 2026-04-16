@@ -264,11 +264,33 @@ self_update_script() {
     local before after
     before=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
 
+    # Stash any local changes (tracked + untracked) so they don't block the pull.
+    # This protects user config files (e.g. xo-config.cfg) from being overwritten.
+    local did_stash=false
+    if ! git -C "$SCRIPT_DIR" diff --quiet 2>/dev/null || \
+       [[ -n "$(git -C "$SCRIPT_DIR" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+        if git -C "$SCRIPT_DIR" stash push --include-untracked -m "self-update auto-stash" 2>/dev/null; then
+            did_stash=true
+        fi
+    fi
+
     # Attempt fast-forward pull
     local pull_err
     if ! pull_err=$(git -C "$SCRIPT_DIR" pull --ff-only origin "$current_branch" 2>&1); then
+        # Restore stashed changes before prompting
+        if [[ "$did_stash" == "true" ]]; then
+            git -C "$SCRIPT_DIR" stash pop 2>/dev/null || true
+            did_stash=false
+        fi
         log_warning "Script auto-update failed: $pull_err"
-        log_warning "Local modifications detected in ${SCRIPT_DIR}."
+        # Distinguish between file conflicts and diverged history
+        if printf '%s' "$pull_err" | grep -qi "untracked working tree files\|would be overwritten"; then
+            log_warning "Untracked local files conflict with incoming changes in ${SCRIPT_DIR}."
+        elif printf '%s' "$pull_err" | grep -qi "not possible to fast-forward\|diverge"; then
+            log_warning "Local branch has diverged from origin/${current_branch}."
+        else
+            log_warning "Local modifications detected in ${SCRIPT_DIR}."
+        fi
         if ! confirm_or_skip "Reset to origin/${current_branch}? Local changes will be lost."; then
             log_warning "Self-update skipped. Continuing with current version."
             return 0
@@ -282,6 +304,14 @@ self_update_script() {
             return 0
         fi
         log_success "Reset to origin/${current_branch}."
+    fi
+
+    # Restore stashed local changes (e.g. xo-config.cfg) after a successful pull
+    if [[ "$did_stash" == "true" ]]; then
+        if ! git -C "$SCRIPT_DIR" stash pop 2>/dev/null; then
+            log_warning "Could not restore local changes automatically."
+            log_warning "Your changes are saved in 'git stash'. Run 'git -C ${SCRIPT_DIR} stash pop' to recover them."
+        fi
     fi
 
     after=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
