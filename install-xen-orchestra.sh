@@ -700,6 +700,13 @@ install_nodejs_binary() {
     if [[ ! -e /usr/bin/npx ]] || [[ "$(readlink -f /usr/bin/npx 2>/dev/null)" != "/usr/local/bin/npx" ]]; then
         run_cmd sudo ln -sf /usr/local/bin/npx /usr/bin/npx
     fi
+    if [[ -f /usr/local/bin/corepack ]] && { [[ ! -e /usr/bin/corepack ]] || [[ "$(readlink -f /usr/bin/corepack 2>/dev/null)" != "/usr/local/bin/corepack" ]]; }; then
+        run_cmd sudo ln -sf /usr/local/bin/corepack /usr/bin/corepack
+    fi
+
+    # Clear npm cache — stale cache from the previously package-managed npm
+    # causes "Class extends value undefined" errors when installing global packages.
+    run_cmd sudo npm cache clean --force 2>/dev/null || true
 
     return 0
 }
@@ -711,7 +718,7 @@ remove_existing_nodejs() {
     if [[ -x /usr/local/bin/node ]]; then
         log_info "Removing binary-installed Node.js from /usr/local..."
         run_cmd sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
-        for bin in node npm npx; do
+        for bin in node npm npx corepack; do
             if [[ -L /usr/bin/$bin ]] && [[ "$(readlink -f /usr/bin/$bin 2>/dev/null)" == "/usr/local/bin/$bin" ]]; then
                 run_cmd sudo rm -f /usr/bin/$bin
             fi
@@ -839,7 +846,14 @@ install_yarn() {
         return 0
     fi
 
-    run_cmd sudo npm install -g yarn
+    # npm 11+ (shipped with Node 22+) broke `npm install -g yarn` for yarn v1.
+    # Use corepack instead — it ships with Node.js >= 16 and is the recommended way.
+    if command -v corepack >/dev/null 2>&1; then
+        run_cmd sudo corepack enable
+        run_cmd sudo corepack prepare yarn@stable --activate
+    else
+        run_cmd sudo npm install -g yarn
+    fi
 
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         echo "[DRY-RUN] Would verify yarn installation"
