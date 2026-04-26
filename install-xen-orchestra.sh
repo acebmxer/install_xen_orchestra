@@ -1541,54 +1541,137 @@ check_active_xo_tasks() {
         auth_label="'${xo_user}'"
     fi
 
-    log_info "Querying active tasks as ${auth_label}..."
-
     # Temp file for API response body (task data only — not sensitive)
     local resp_file
     resp_file=$(mktemp /tmp/xo-resp-XXXXXX)
 
-    # Try HTTPS first (XO default), fall back to HTTP
-    for proto in https http; do
-        if [[ "$proto" == "https" ]]; then
-            port="$HTTPS_PORT"
+    # Retry loop: on 401 from a token/config source, offer to re-enter credentials
+    local auth_attempts=0
+    local max_auth_attempts=3
+    while [[ $auth_attempts -lt $max_auth_attempts ]]; do
+        (( auth_attempts++ )) || true
+
+        log_info "Querying active tasks as ${auth_label}..."
+
+        # Try HTTPS first (XO default), fall back to HTTP
+        http_code=""
+        connected=false
+        for proto in https http; do
+            if [[ "$proto" == "https" ]]; then
+                port="$HTTPS_PORT"
+            else
+                port="$HTTP_PORT"
+            fi
+            base_url="${proto}://localhost:${port}"
+
+            # Build curl options
+            # Note: -k (skip TLS verify) is acceptable — loopback only, self-signed cert
+            local curl_opts=(-s --max-time 15
+                --output "$resp_file"
+                --write-out "%{http_code}")
+            if [[ "$proto" == "https" ]]; then
+                curl_opts+=(-k)
+            fi
+
+            if [[ "$auth_method" == "token" ]]; then
+                # Token auth — passed via cookie header
+                http_code=$(curl "${curl_opts[@]}" \
+                    -b "authenticationToken=${xo_token}" \
+                    "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
+                    2>/dev/null) || true
+            else
+                # Basic auth — pipe credentials via curl's -K stdin to keep password out of argv
+                local esc_user esc_pass
+                esc_user=$(printf '%s' "$xo_user" | sed 's/"/\\"/g')
+                esc_pass=$(printf '%s' "$xo_pass" | sed 's/"/\\"/g')
+
+                http_code=$(printf 'user = "%s:%s"\n' "$esc_user" "$esc_pass" | \
+                    curl "${curl_opts[@]}" -K - \
+                    "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
+                    2>/dev/null) || true
+
+                # Wipe escaped credentials immediately
+                esc_pass="" ; unset esc_pass
+            fi
+
+            if [[ "$http_code" == "200" ]]; then
+                task_response=$(< "$resp_file")
+                connected=true
+                break
+            fi
+        done
+
+        # Success — exit the retry loop
+        if [[ "$connected" == "true" ]]; then
+            break
+        fi
+
+        # On 401: token may be expired or credentials wrong — offer a retry
+        if [[ "${http_code}" == "401" ]]; then
+            # Clear expired/invalid credentials from memory
+            xo_pass="" ; unset xo_pass
+            xo_token="" ; unset xo_token
+
+            if [[ "$NON_INTERACTIVE" == "true" ]]; then
+                log_warning "Authentication failed for ${auth_label} (token may be expired). Task check skipped."
+                rm -f "$resp_file"
+                return 0
+            fi
+
+            log_warning "Authentication failed for ${auth_label} — the token or credentials may be expired or invalid."
+            printf '\n'
+
+            if [[ $auth_attempts -ge $max_auth_attempts ]]; then
+                log_warning "Too many failed authentication attempts. Task check skipped."
+                rm -f "$resp_file"
+                return 0
+            fi
+
+            # Offer re-entry: new token or username/password
+            printf "  [1] Enter a new authentication token\n"
+            printf "  [2] Enter username and password\n"
+            printf "  [s] Skip the task check and proceed with the update\n"
+            printf '\n'
+            local retry_choice
+            read -rp "Choice [1/2/s]: " retry_choice < /dev/tty
+
+            case "$retry_choice" in
+                1)
+                    read -rsp "New authentication token: " xo_token < /dev/tty
+                    printf '\n'
+                    if [[ -z "$xo_token" ]]; then
+                        log_warning "No token entered. Task check skipped."
+                        rm -f "$resp_file"
+                        return 0
+                    fi
+                    auth_method="token"
+                    auth_label="new authentication token"
+                    ;;
+                2)
+                    read -rp "XO Username: " xo_user < /dev/tty
+                    if [[ -z "$xo_user" ]]; then
+                        log_warning "No username entered. Task check skipped."
+                        rm -f "$resp_file"
+                        return 0
+                    fi
+                    read -rsp "XO Password: " xo_pass < /dev/tty
+                    printf '\n'
+                    if [[ -z "$xo_pass" ]]; then
+                        log_warning "No password provided. Task check skipped."
+                        rm -f "$resp_file"
+                        return 0
+                    fi
+                    auth_method="credentials"
+                    auth_label="'${xo_user}'"
+                    ;;
+                *)
+                    log_warning "Task check skipped. Ensure no tasks are running before proceeding."
+                    rm -f "$resp_file"
+                    return 0
+                    ;;
+            esac
         else
-            port="$HTTP_PORT"
-        fi
-        base_url="${proto}://localhost:${port}"
-
-        # Build curl options
-        # Note: -k (skip TLS verify) is acceptable — loopback only, self-signed cert
-        local curl_opts=(-s --max-time 15
-            --output "$resp_file"
-            --write-out "%{http_code}")
-        if [[ "$proto" == "https" ]]; then
-            curl_opts+=(-k)
-        fi
-
-        if [[ "$auth_method" == "token" ]]; then
-            # Token auth — passed via cookie header
-            http_code=$(curl "${curl_opts[@]}" \
-                -b "authenticationToken=${xo_token}" \
-                "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
-                2>/dev/null) || true
-        else
-            # Basic auth — pipe credentials via curl's -K stdin to keep password out of argv
-            local esc_user esc_pass
-            esc_user=$(printf '%s' "$xo_user" | sed 's/"/\\"/g')
-            esc_pass=$(printf '%s' "$xo_pass" | sed 's/"/\\"/g')
-
-            http_code=$(printf 'user = "%s:%s"\n' "$esc_user" "$esc_pass" | \
-                curl "${curl_opts[@]}" -K - \
-                "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
-                2>/dev/null) || true
-
-            # Wipe escaped credentials immediately
-            esc_pass="" ; unset esc_pass
-        fi
-
-        if [[ "$http_code" == "200" ]]; then
-            task_response=$(< "$resp_file")
-            connected=true
+            # Non-auth failure (network, etc.) — no point retrying
             break
         fi
     done
