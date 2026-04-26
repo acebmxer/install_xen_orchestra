@@ -1028,6 +1028,26 @@ build_xo() {
         CONCURRENCY_FLAG="--concurrency=$TURBO_CONCURRENCY"
     fi
 
+    # Patch @xen-orchestra/rest-api's prebuild hook to call rimraf directly instead
+    # of `npm run clean`.  When yarn runs the prebuild lifecycle it sets
+    # npm_lifecycle_event=prebuild; npm 11 silently exits-1 when asked to run
+    # another npm script while that variable is present.  Calling rimraf directly
+    # avoids the npm re-entrancy check entirely.  git checkout . before each
+    # update reverts this patch automatically.
+    local REST_API_DIR="$INSTALL_DIR/@xen-orchestra/rest-api"
+    local REST_API_PKG="$REST_API_DIR/package.json"
+    if [[ -f "$REST_API_PKG" ]]; then
+        local _build_user="${SERVICE_USER:-root}"
+        sudo -u "$_build_user" node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('$REST_API_PKG', 'utf8'));
+            if (p.scripts && p.scripts.prebuild === 'npm run clean' && p.scripts.clean) {
+                p.scripts.prebuild = p.scripts.clean;
+                fs.writeFileSync('$REST_API_PKG', JSON.stringify(p, null, 2) + '\n');
+            }
+        " 2>/dev/null && log_info "Patched @xen-orchestra/rest-api prebuild hook for npm 11 compatibility" || true
+    fi
+
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         run_cmd sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
