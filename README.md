@@ -39,7 +39,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
                         Master Script Commit  : 693f4 (Branch: main)
                         Current XO Commit     : a1b2c (Branch: master)
                         Master XO Commit      : d4e5f (Branch: master)
-                        Current Node          : v22.15.0
+                        Current Node          : v24.15.0
 
   ──────────────────────────────────────────────────────────────────────────────────
 
@@ -83,7 +83,7 @@ Key settings:
 | `HTTPS_PORT` | 443 | HTTPS port |
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `GIT_BRANCH` | master | Git branch or tag |
-| `NODE_VERSION` | 22 | Node.js version (must be 22 or lower; higher versions are not compatible with Yarn Classic v1) |
+| `NODE_VERSION` | 24.15.0 | Node.js version |
 | `SERVICE_USER` | xo-service | Service user (set to `root` for VMware V2V import) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
@@ -201,7 +201,7 @@ On hosts without internet access (or with strict egress firewall rules) the Node
 
 **Option A** — pre-download and import the key manually, then copy the `.deb`/`.rpm` packages to the host.
 
-**Option B** — set `NODE_VERSION` to a specific patch version (e.g. `22.3`) in `xo-config.cfg`. The script will then download a pre-built binary directly from `nodejs.org` instead of using the NodeSource package repository.
+**Option B** — set `NODE_VERSION` to a specific patch version (e.g. `24.15.0`) in `xo-config.cfg`. The script will then download a pre-built binary directly from `nodejs.org` instead of using the NodeSource package repository.
 
 ### `git` reports "dubious ownership" and exits
 
