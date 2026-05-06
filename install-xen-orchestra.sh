@@ -1491,6 +1491,13 @@ restore_xo() {
 # queries the XO REST API for pending tasks and aborts if any are found.
 # Auth priority: 1) XO_TASK_CHECK_TOKEN  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
 # Passwords are never logged, cached, or written to disk.
+#
+# Orphan filter: tasks whose start time predates xo-server's process start
+# are treated as stale DB records (e.g. left over after restoring an XO
+# config backup onto a new VM) and excluded from the active-task count.
+# A genuine running task cannot have started before the process running it.
+# If xo-server's start time can't be determined, the filter is a no-op
+# and all pending tasks are counted (fail-safe to original behavior).
 check_active_xo_tasks() {
     log_info "Checking for active Xen Orchestra tasks before updating..."
     printf '\n'
@@ -1690,30 +1697,72 @@ check_active_xo_tasks() {
         return 0
     fi
 
+    # Determine xo-server's process start time (epoch ms) for orphan filtering.
+    # Tasks predating xo-server can't be live runs — they're stale DB records,
+    # commonly left over after restoring an XO config backup to a new VM.
+    # Best-effort: if any step fails, xo_start_ms stays empty and the filter
+    # below becomes a no-op (fail-safe to original count-everything behavior).
+    local xo_pid="" xo_lstart="" xo_start_s="" xo_start_ms="" total_pending=0
+    xo_pid=$(systemctl show -p MainPID --value xo-server 2>/dev/null) || xo_pid=""
+    if [[ -n "$xo_pid" && "$xo_pid" != "0" ]]; then
+        xo_lstart=$(ps -o lstart= -p "$xo_pid" 2>/dev/null) || xo_lstart=""
+        if [[ -n "$xo_lstart" ]]; then
+            # GNU date -d parses the lstart string; non-GNU date will fail and we fall back
+            xo_start_s=$(date -d "$xo_lstart" +%s 2>/dev/null) || xo_start_s=""
+            if [[ "$xo_start_s" =~ ^[0-9]+$ ]]; then
+                xo_start_ms=$((xo_start_s * 1000))
+            fi
+        fi
+    fi
+
     # Parse task count — jq preferred, node.js fallback (guaranteed on any XO install)
+    # Filter: exclude "XO user authentication" tasks, and orphans (start < xo_start_ms).
+    # cutoff=0 disables the orphan filter (fail-safe when xo_start_ms unknown).
     if command -v jq &>/dev/null; then
-        task_count=$(printf '%s' "$task_response" \
+        total_pending=$(printf '%s' "$task_response" \
             | jq '[.[] | select((.properties.name // "") != "XO user authentication")] | length' \
+            2>/dev/null) || total_pending=0
+        task_count=$(printf '%s' "$task_response" \
+            | jq --argjson cutoff "${xo_start_ms:-0}" '
+                [.[]
+                 | select((.properties.name // "") != "XO user authentication")
+                 | select($cutoff == 0 or (.start // 0) >= $cutoff)
+                ] | length' \
             2>/dev/null) || task_count=0
     else
-        task_count=$(printf '%s' "$task_response" | node -e '
+        # shellcheck disable=SC2016 — node script uses single quotes intentionally
+        local node_counts
+        node_counts=$(printf '%s' "$task_response" | XO_CUTOFF="${xo_start_ms:-0}" node -e '
             let d = "";
             process.stdin.on("data", c => d += c);
             process.stdin.on("end", () => {
                 try {
+                    const cutoff = parseInt(process.env.XO_CUTOFF || "0", 10) || 0;
                     const a = JSON.parse(d);
-                    const filtered = Array.isArray(a)
+                    const named = Array.isArray(a)
                         ? a.filter(t => (t.properties && t.properties.name) !== "XO user authentication")
                         : [];
-                    process.stdout.write(String(filtered.length));
-                } catch (e) { process.stdout.write("0"); }
+                    const live = named.filter(t => cutoff === 0 || (t.start || 0) >= cutoff);
+                    process.stdout.write(named.length + " " + live.length);
+                } catch (e) { process.stdout.write("0 0"); }
             });
-        ' 2>/dev/null) || task_count=0
+        ' 2>/dev/null) || node_counts="0 0"
+        total_pending=${node_counts% *}
+        task_count=${node_counts#* }
     fi
 
-    # Ensure task_count is a valid integer before numeric comparison
+    # Ensure counts are valid integers before numeric comparison
     if ! [[ "$task_count" =~ ^[0-9]+$ ]]; then
         task_count=0
+    fi
+    if ! [[ "$total_pending" =~ ^[0-9]+$ ]]; then
+        total_pending=0
+    fi
+
+    # Inform the user when orphans were filtered out (post-restore scenario)
+    if [[ -n "$xo_start_ms" && "$total_pending" -gt "$task_count" ]]; then
+        local filtered=$((total_pending - task_count))
+        log_info "Filtered ${filtered} stale task(s) predating xo-server start (likely orphans from a config restore)."
     fi
 
     if [[ "$task_count" -gt 0 ]]; then
@@ -1721,23 +1770,31 @@ check_active_xo_tasks() {
         log_error "Task check performed by: ${auth_label}"
         log_error "Active tasks:"
 
-        # List task names — node fallback if jq not available
+        # List task names — node fallback if jq not available.
+        # Same cutoff filter as the count above, so orphans aren't named.
         if command -v jq &>/dev/null; then
             while IFS= read -r task_line; do
                 printf '%b\n' "${RED}[ERROR]${NC}   - ${task_line}"
             done < <(printf '%s' "$task_response" \
-                | jq -r '[.[] | select((.properties.name // "") != "XO user authentication")] | .[] | (.properties.name // .id // "unknown task")' \
+                | jq -r --argjson cutoff "${xo_start_ms:-0}" '
+                    [.[]
+                     | select((.properties.name // "") != "XO user authentication")
+                     | select($cutoff == 0 or (.start // 0) >= $cutoff)
+                    ] | .[] | (.properties.name // .id // "unknown task")' \
                 2>/dev/null || true)
         else
-            printf '%s' "$task_response" | node -e '
+            # shellcheck disable=SC2016 — node script uses single quotes intentionally
+            printf '%s' "$task_response" | XO_CUTOFF="${xo_start_ms:-0}" node -e '
                 let d = "";
                 process.stdin.on("data", c => d += c);
                 process.stdin.on("end", () => {
                     try {
+                        const cutoff = parseInt(process.env.XO_CUTOFF || "0", 10) || 0;
                         const tasks = JSON.parse(d);
                         if (Array.isArray(tasks)) {
                             tasks
                                 .filter(t => (t.properties && t.properties.name) !== "XO user authentication")
+                                .filter(t => cutoff === 0 || (t.start || 0) >= cutoff)
                                 .forEach(t => {
                                     const name = (t.properties && t.properties.name)
                                         || t.id || "unknown task";
