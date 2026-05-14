@@ -1168,7 +1168,10 @@ configure_xo() {
     run_cmd sudo mkdir -p /run/xo-server/mounts
     run_cmd sudo chmod 755 /run/xo-server/mounts
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /run/xo-server
+        # Only chown the directories themselves — do NOT recurse into /run/xo-server/mounts
+        # since active NFS/CIFS mount points live there and chown -R would fail on them
+        run_cmd sudo chown "$SERVICE_USER:$SERVICE_USER" /run/xo-server
+        run_cmd sudo chown "$SERVICE_USER:$SERVICE_USER" /run/xo-server/mounts
         run_cmd sudo chmod 755 /run/xo-server/mounts
     fi
 
