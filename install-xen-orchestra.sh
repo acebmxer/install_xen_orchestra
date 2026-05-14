@@ -881,13 +881,22 @@ create_service_user() {
     fi
 }
 
-# Delete all xo:token:* keys from Redis.
+# Flush session tokens from Redis, preserving API tokens used by third-party integrations.
+#
+# XO stores two categories of tokens under xo:token:*:
+#   - Session tokens  (created at browser login)  — no 'description' field
+#   - API tokens      (created via Settings > API) — have a non-empty 'description'
+#
+# Only session tokens become invalid after an XO schema change; API tokens are
+# long-lived and must survive an update so that third-party integrations,
+# scripts, and the XO_TASK_CHECK_TOKEN used by this installer are not broken.
+#
 # Called before any xo-server restart that may involve a code change (update,
-# rebuild, reconfigure) so that tokens written by a previous schema cannot
-# cause "Cannot destructure property 'client' of 'token'" 401 errors.
+# rebuild, reconfigure) to eliminate schema-mismatched session tokens that
+# would otherwise cause "Cannot destructure property 'client' of 'token'" 401s.
 flush_redis_tokens() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "[DRY-RUN] Would flush stale Redis auth tokens"
+        log_info "[DRY-RUN] Would flush session tokens from Redis (API tokens with descriptions are preserved)"
         return 0
     fi
 
@@ -903,14 +912,40 @@ flush_redis_tokens() {
 
     local -a token_keys
     mapfile -t token_keys < <(redis-cli KEYS "xo:token:*" 2>/dev/null)
-    local count=${#token_keys[@]}
+    local total=${#token_keys[@]}
 
-    if [[ $count -gt 0 ]]; then
-        redis-cli DEL "${token_keys[@]}" >/dev/null 2>&1
-        log_info "Flushed ${count} stale Redis auth token(s) — all users will need to log in again"
-    else
-        log_info "No stale Redis auth tokens found"
+    if [[ $total -eq 0 ]]; then
+        log_info "No Redis auth tokens found"
+        return 0
     fi
+
+    local deleted=0 kept=0
+    for key in "${token_keys[@]}"; do
+        local raw description
+        raw=$(redis-cli GET "$key" 2>/dev/null)
+
+        # Extract the description field from the token JSON.
+        # Tokens with a non-empty description are API/integration tokens — keep them.
+        # Tokens with no description are browser session tokens — delete them.
+        if command -v jq >/dev/null 2>&1; then
+            description=$(printf '%s' "$raw" | jq -r '.description // empty' 2>/dev/null)
+        else
+            # Fallback: match "description":"<non-empty-value>"
+            description=$(printf '%s' "$raw" | grep -o '"description":"[^"]*"' | sed 's/"description":"//;s/"//' 2>/dev/null || true)
+        fi
+
+        if [[ -n "$description" ]]; then
+            log_info "  Preserving API token (\"${description}\")"
+            (( kept++ )) || true
+        else
+            redis-cli DEL "$key" >/dev/null 2>&1
+            (( deleted++ )) || true
+        fi
+    done
+
+    [[ $deleted -gt 0 ]] && log_info "Flushed ${deleted} session token(s) — users will need to log in again"
+    [[ $kept -gt 0 ]]    && log_info "Preserved ${kept} API token(s) — third-party integrations unaffected"
+    [[ $deleted -eq 0 && $kept -eq 0 ]] && log_info "No session tokens to flush"
 }
 
 # Disable Redis RDB/AOF persistence for the local Redis instance.
@@ -1558,6 +1593,12 @@ restore_xo() {
 # queries the XO REST API for pending tasks and aborts if any are found.
 # Auth priority: 1) XO_TASK_CHECK_TOKEN  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
 # Passwords are never logged, cached, or written to disk.
+#
+# NOTE: XO_TASK_CHECK_TOKEN must be a token created via XO's Settings →
+# Authentication tokens (or via the REST API with a "description" field in the
+# request body). During updates flush_redis_tokens() preserves tokens that have
+# a non-empty description and deletes tokens without one (browser sessions).
+# A token created without a description will be wiped on the next update.
 #
 # Orphan filter: tasks whose start time predates xo-server's process start
 # are treated as stale DB records (e.g. left over after restoring an XO

@@ -136,11 +136,35 @@ You are free to use any admin account you choose, but a dedicated account is the
 
 Tokens are more secure than storing a password — they can be revoked independently and expire after 30 days by default.
 
+> [!IMPORTANT]
+> **Tokens must have a description or they will be deleted during updates.**
+>
+> During an update the installer flushes stale session tokens from Redis to prevent schema-mismatch 401 errors after XO restarts. It tells session tokens apart from API tokens by checking for a non-empty `description` field in the token's stored JSON:
+>
+> - Tokens **with** a description → treated as API/integration tokens → **kept**
+> - Tokens **without** a description → treated as browser session tokens → **deleted**
+>
+> This applies to `XO_TASK_CHECK_TOKEN` and to **any other API tokens** used by third-party tools (monitoring agents, Terraform, scripts, etc.) that connect to this XO server. Always create tokens with a meaningful description.
+
+**Option 1 — XO web UI (always prompts for a description):**
+
 1. Log into the XO web UI with the dedicated account
-2. Generate a token:
+2. Go to **Settings → Authentication tokens → New token**
+3. Enter a description (e.g. `installer-task-check`) and copy the generated token value
+4. Add to `xo-config.cfg`:
+   ```bash
+   XO_TASK_CHECK_TOKEN=UlTBEnFeL12XocK-7Qx-DKvOYbPn0eG7Z2oMvOniNjg
+   ```
+
+**Option 2 — curl (include a description in the request body):**
+
+1. Log into the XO web UI with the dedicated account
+2. Generate a token with a description:
    ```bash
    curl -X POST -u 'task-checker@local.net:yourpassword' \
-     https://localhost/rest/v0/users/me/authentication_tokens -k
+     https://localhost/rest/v0/users/me/authentication_tokens \
+     -H 'Content-Type: application/json' \
+     -d '{"description":"installer-task-check"}' -k
    ```
 3. Copy the `id` field from the response
 4. Add to `xo-config.cfg`:
