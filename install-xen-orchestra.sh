@@ -905,7 +905,7 @@ flush_redis_tokens() {
         return 0
     fi
 
-    if ! redis-cli ping 2>/dev/null | grep -q PONG; then
+    if ! timeout 5 redis-cli ping 2>/dev/null | grep -q PONG; then
         log_warning "Redis not responding — skipping token flush"
         return 0
     fi
@@ -928,7 +928,7 @@ flush_redis_tokens() {
         # Tokens with a non-empty description are API/integration tokens — keep them.
         # Tokens with no description are browser session tokens — delete them.
         if command -v jq >/dev/null 2>&1; then
-            description=$(printf '%s' "$raw" | jq -r '.description // empty' 2>/dev/null)
+            description=$(printf '%s' "$raw" | jq -r '.description // empty' 2>/dev/null || true)
         else
             # Fallback: match "description":"<non-empty-value>"
             description=$(printf '%s' "$raw" | grep -o '"description":"[^"]*"' | sed 's/"description":"//;s/"//' 2>/dev/null || true)
@@ -943,9 +943,9 @@ flush_redis_tokens() {
         fi
     done
 
-    [[ $deleted -gt 0 ]] && log_info "Flushed ${deleted} session token(s) — users will need to log in again"
-    [[ $kept -gt 0 ]]    && log_info "Preserved ${kept} API token(s) — third-party integrations unaffected"
-    [[ $deleted -eq 0 && $kept -eq 0 ]] && log_info "No session tokens to flush"
+    [[ $deleted -gt 0 ]] && log_info "Flushed ${deleted} session token(s) — users will need to log in again" || true
+    [[ $kept -gt 0 ]]    && log_info "Preserved ${kept} API token(s) — third-party integrations unaffected" || true
+    [[ $deleted -eq 0 && $kept -eq 0 ]] && log_info "No session tokens to flush" || true
 }
 
 # Disable Redis RDB/AOF persistence for the local Redis instance.
@@ -964,7 +964,7 @@ configure_redis_persistence() {
         return 0
     fi
 
-    if ! command -v redis-cli >/dev/null 2>&1 || ! redis-cli ping 2>/dev/null | grep -q PONG; then
+    if ! command -v redis-cli >/dev/null 2>&1 || ! timeout 5 redis-cli ping 2>/dev/null | grep -q PONG; then
         return 0
     fi
 
@@ -2223,7 +2223,7 @@ reconfigure_xo() {
 
     # Stop the service
     log_info "Stopping xo-server service..."
-    run_cmd sudo systemctl stop xo-server || true
+    run_cmd timeout 30 sudo systemctl stop xo-server || true
 
     # Flush stale auth tokens and ensure Redis is configured correctly
     flush_redis_tokens
