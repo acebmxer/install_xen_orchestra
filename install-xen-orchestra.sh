@@ -881,6 +881,69 @@ create_service_user() {
     fi
 }
 
+# Delete all xo:token:* keys from Redis.
+# Called before any xo-server restart that may involve a code change (update,
+# rebuild, reconfigure) so that tokens written by a previous schema cannot
+# cause "Cannot destructure property 'client' of 'token'" 401 errors.
+flush_redis_tokens() {
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        log_info "[DRY-RUN] Would flush stale Redis auth tokens"
+        return 0
+    fi
+
+    if ! command -v redis-cli >/dev/null 2>&1; then
+        log_warning "redis-cli not found — skipping token flush"
+        return 0
+    fi
+
+    if ! redis-cli ping 2>/dev/null | grep -q PONG; then
+        log_warning "Redis not responding — skipping token flush"
+        return 0
+    fi
+
+    local -a token_keys
+    mapfile -t token_keys < <(redis-cli KEYS "xo:token:*" 2>/dev/null)
+    local count=${#token_keys[@]}
+
+    if [[ $count -gt 0 ]]; then
+        redis-cli DEL "${token_keys[@]}" >/dev/null 2>&1
+        log_info "Flushed ${count} stale Redis auth token(s) — all users will need to log in again"
+    else
+        log_info "No stale Redis auth tokens found"
+    fi
+}
+
+# Disable Redis RDB/AOF persistence for the local Redis instance.
+# XO only uses Redis for ephemeral session tokens and cache — there is no
+# value in writing them to disk. Persisted tokens can survive a Redis restart
+# and cause schema-mismatch 401 errors if XO was updated in the meantime.
+# Skipped when REDIS_URI or REDIS_SOCKET is set (external Redis is the user's
+# responsibility).
+configure_redis_persistence() {
+    if [[ -n "${REDIS_URI:-}" ]] || [[ -n "${REDIS_SOCKET:-}" ]]; then
+        return 0
+    fi
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        log_info "[DRY-RUN] Would disable Redis persistence"
+        return 0
+    fi
+
+    if ! command -v redis-cli >/dev/null 2>&1 || ! redis-cli ping 2>/dev/null | grep -q PONG; then
+        return 0
+    fi
+
+    log_info "Disabling Redis persistence (tokens are ephemeral, no need to write to disk)..."
+    redis-cli CONFIG SET save "" >/dev/null 2>&1 || true
+    redis-cli CONFIG SET appendonly no >/dev/null 2>&1 || true
+
+    if redis-cli CONFIG REWRITE >/dev/null 2>&1; then
+        log_success "Redis persistence disabled and written to config"
+    else
+        log_warning "Redis persistence disabled for this session only (CONFIG REWRITE failed — change won't survive a Redis restart)"
+    fi
+}
+
 # Start and enable Redis
 setup_redis() {
     log_info "Setting up Redis..."
@@ -906,6 +969,7 @@ setup_redis() {
     # Verify Redis is running
     if command -v redis-cli >/dev/null 2>&1 && redis-cli ping 2>/dev/null | grep -q PONG; then
         log_success "Redis is running"
+        configure_redis_persistence
     else
         log_error "Redis is not running or not responding"
         exit 1
@@ -1828,6 +1892,10 @@ update_xo() {
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
 
+    # Flush stale auth tokens — the new version may have a different token
+    # schema and cannot deserialize tokens written by the old version
+    flush_redis_tokens
+
     # Create backup
     create_backup
 
@@ -1945,6 +2013,9 @@ rebuild_xo() {
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
 
+    # Flush stale auth tokens before the fresh build takes over
+    flush_redis_tokens
+
     # Backup current installation (node_modules excluded, same as update)
     create_backup
 
@@ -2052,6 +2123,10 @@ reconfigure_xo() {
     # Stop the service
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
+
+    # Flush stale auth tokens and ensure Redis is configured correctly
+    flush_redis_tokens
+    configure_redis_persistence
 
     # Backup current config file
     if [[ -f "/etc/xo-server/config.toml" ]]; then
