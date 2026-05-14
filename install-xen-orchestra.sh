@@ -922,6 +922,18 @@ flush_redis_tokens() {
     local deleted=0 kept=0
     for key in "${token_keys[@]}"; do
         local raw description
+
+        # Index/metadata keys (double colon in name, e.g. xo:token::indexes) are
+        # Redis collection internals that map user IDs to token IDs. Delete them
+        # so XO rebuilds clean indexes from the surviving tokens on restart.
+        # Stale index entries pointing to deleted tokens cause:
+        #   "Cannot destructure property 'client' of 'token' as it is undefined"
+        if [[ "$key" == *"::"* ]]; then
+            redis-cli DEL "$key" >/dev/null 2>&1
+            log_info "  Deleted stale collection index: ${key}"
+            continue
+        fi
+
         raw=$(redis-cli GET "$key" 2>/dev/null)
 
         # Safety: if the value is empty or not valid JSON the token data may be
@@ -1096,27 +1108,44 @@ ensure_swap_space() {
 # never written, getting HTML (the SPA catch-all) instead of JS.
 # Called at the end of build_xo — warns and suggests --rebuild if mismatches found.
 verify_xo_web_build() {
-    local web_dist="$INSTALL_DIR/packages/xo-web/dist"
+    # XO now serves two web UIs:
+    #   /    → @xen-orchestra/web/dist  (XO 6, default)
+    #   /v5  → packages/xo-web/dist    (XO 5, legacy)
+    # Check both; warn if either has index.html but missing JS chunks.
+    local -a web_dists=(
+        "$INSTALL_DIR/@xen-orchestra/web/dist"
+        "$INSTALL_DIR/packages/xo-web/dist"
+    )
 
-    if [[ ! -f "${web_dist}/index.html" ]]; then
-        log_warning "xo-web dist/index.html not found — build may be incomplete"
-        return 0
+    local overall_ok=true
+    for web_dist in "${web_dists[@]}"; do
+        [[ ! -f "${web_dist}/index.html" ]] && continue
+
+        local missing=0
+        while IFS= read -r chunk; do
+            [[ -z "$chunk" ]] && continue
+            if [[ ! -f "${web_dist}/${chunk}" ]]; then
+                log_warning "  Missing build artifact in ${web_dist}: ${chunk}"
+                (( missing++ )) || true
+            fi
+        done < <(grep -o 'assets/[a-zA-Z0-9._-]*\.js' "${web_dist}/index.html" 2>/dev/null | sort -u)
+
+        if [[ $missing -gt 0 ]]; then
+            log_warning "Build verification: ${missing} JS chunk(s) missing in $(basename "$web_dist")."
+            overall_ok=false
+        else
+            log_info "Build verification passed: $(basename "$web_dist") — all JS chunks present."
+        fi
+    done
+
+    if [[ "$overall_ok" == "false" ]]; then
+        log_warning "Run '--rebuild' to force a clean rebuild."
     fi
 
-    local missing=0
-    while IFS= read -r chunk; do
-        [[ -z "$chunk" ]] && continue
-        if [[ ! -f "${web_dist}/${chunk}" ]]; then
-            log_warning "  Missing build artifact: ${chunk}"
-            (( missing++ )) || true
-        fi
-    done < <(grep -o 'assets/[a-zA-Z0-9._-]*\.js' "${web_dist}/index.html" 2>/dev/null | sort -u)
-
-    if [[ $missing -gt 0 ]]; then
-        log_warning "Build verification: ${missing} JS chunk(s) listed in index.html are missing from dist/assets/."
-        log_warning "Run '--rebuild' to force a clean Vite rebuild."
-    else
-        log_info "Build verification passed — all xo-web JS chunks present."
+    if [[ ! -f "$INSTALL_DIR/@xen-orchestra/web/dist/index.html" ]]; then
+        log_warning "XO 6 web UI (@xen-orchestra/web/dist) was not built — browser will use XO 5 UI at /v5."
+        log_warning "This may be caused by unmet peer dependencies (pinia 3.x, vue-router 5.x)."
+        log_warning "Access your XO instance at: https://<host>/v5 until the upstream issue is resolved."
     fi
 }
 
@@ -1138,11 +1167,13 @@ build_xo() {
             run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
             run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/node_modules/.vite" 2>/dev/null || true
             run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/packages/xo-web/node_modules/.vite" 2>/dev/null || true
+            run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/@xen-orchestra/web/node_modules/.vite" 2>/dev/null || true
         else
             run_cmd sudo rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
             run_cmd sudo rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
             run_cmd sudo rm -rf "$INSTALL_DIR/node_modules/.vite" 2>/dev/null || true
             run_cmd sudo rm -rf "$INSTALL_DIR/packages/xo-web/node_modules/.vite" 2>/dev/null || true
+            run_cmd sudo rm -rf "$INSTALL_DIR/@xen-orchestra/web/node_modules/.vite" 2>/dev/null || true
         fi
     fi
 
