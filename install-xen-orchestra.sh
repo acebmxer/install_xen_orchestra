@@ -924,6 +924,21 @@ flush_redis_tokens() {
         local raw description
         raw=$(redis-cli GET "$key" 2>/dev/null)
 
+        # Safety: if the value is empty or not valid JSON the token data may be
+        # encrypted (XO upstream adds opt-in AES-256-GCM Redis encryption).
+        # Preserve the token rather than misidentifying it as a session token.
+        if [[ -z "$raw" ]]; then
+            log_warning "  Token key ${key} has no data — skipping"
+            continue
+        fi
+        if command -v jq >/dev/null 2>&1; then
+            if ! printf '%s' "$raw" | jq empty 2>/dev/null; then
+                log_warning "  Token key ${key} is not valid JSON (may be encrypted) — preserving"
+                (( kept++ )) || true
+                continue
+            fi
+        fi
+
         # Extract the description field from the token JSON.
         # Tokens with a non-empty description are API/integration tokens — keep them.
         # Tokens with no description are browser session tokens — delete them.
@@ -1075,6 +1090,36 @@ ensure_swap_space() {
     log_success "Swap space created: ${MIN_SWAP_MB}MB"
 }
 
+# Check that every JS chunk referenced in xo-web's index.html exists on disk.
+# After a Vite or build-tool version bump the chunk hashes change; if the
+# Vite cache served a stale index.html the browser requests files that were
+# never written, getting HTML (the SPA catch-all) instead of JS.
+# Called at the end of build_xo — warns and suggests --rebuild if mismatches found.
+verify_xo_web_build() {
+    local web_dist="$INSTALL_DIR/packages/xo-web/dist"
+
+    if [[ ! -f "${web_dist}/index.html" ]]; then
+        log_warning "xo-web dist/index.html not found — build may be incomplete"
+        return 0
+    fi
+
+    local missing=0
+    while IFS= read -r chunk; do
+        [[ -z "$chunk" ]] && continue
+        if [[ ! -f "${web_dist}/${chunk}" ]]; then
+            log_warning "  Missing build artifact: ${chunk}"
+            (( missing++ )) || true
+        fi
+    done < <(grep -o 'assets/[a-zA-Z0-9._-]*\.js' "${web_dist}/index.html" 2>/dev/null | sort -u)
+
+    if [[ $missing -gt 0 ]]; then
+        log_warning "Build verification: ${missing} JS chunk(s) listed in index.html are missing from dist/assets/."
+        log_warning "Run '--rebuild' to force a clean Vite rebuild."
+    else
+        log_info "Build verification passed — all xo-web JS chunks present."
+    fi
+}
+
 # Usage: build_xo [clean]
 # If "clean" is passed, turbo cache will be cleared first
 build_xo() {
@@ -1091,9 +1136,13 @@ build_xo() {
         if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
             run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
             run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
+            run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/node_modules/.vite" 2>/dev/null || true
+            run_cmd sudo -u "$SERVICE_USER" rm -rf "$INSTALL_DIR/packages/xo-web/node_modules/.vite" 2>/dev/null || true
         else
             run_cmd sudo rm -rf "$INSTALL_DIR/node_modules/.cache/turbo" 2>/dev/null || true
             run_cmd sudo rm -rf "$INSTALL_DIR/.turbo" 2>/dev/null || true
+            run_cmd sudo rm -rf "$INSTALL_DIR/node_modules/.vite" 2>/dev/null || true
+            run_cmd sudo rm -rf "$INSTALL_DIR/packages/xo-web/node_modules/.vite" 2>/dev/null || true
         fi
     fi
 
@@ -1155,6 +1204,7 @@ build_xo() {
     fi
 
     log_success "Xen Orchestra built successfully"
+    verify_xo_web_build
 }
 
 # Generate self-signed SSL certificate
