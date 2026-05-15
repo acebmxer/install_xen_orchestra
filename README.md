@@ -37,6 +37,7 @@ Automated installation and management of [Xen Orchestra](https://xen-orchestra.c
 | Rebuild | `--rebuild` | Fresh clone + clean build, preserves settings |
 | Reconfigure | `--reconfigure` | Apply config changes without rebuilding |
 | XO Proxy | `--proxy` | Deploy XO Proxy to a Xen pool master |
+| Adjust Memory | `--adjust-memory` | Raise the heap memory allocated to the `xo-server` process |
 | Edit Config | *(menu only)* | Open `xo-config.cfg` in your preferred editor |
 | Rename Config | *(menu only)* | Rename `sample-xo-config.cfg` to `xo-config.cfg` |
 
@@ -68,7 +69,8 @@ Running the script with no arguments opens a two-column menu with keyboard navig
   ▸ [✓] Install Xen Orchestra                   [ ] Reconfigure Xen Orchestra
     [ ] Update Xen Orchestra                    [ ] Rebuild Xen Orchestra
     [ ] Rename Sample-xo-config.cfg             [ ] Edit xo-config.cfg
-    [ ] Install XO Proxy
+    [ ] Install XO Proxy                        [ ] Restore Backup
+                  [ ] Adjust Xen Orchestra Memory Allocation
 
   ──────────────────────────────────────────────────────────────────────────────────
 
@@ -78,6 +80,17 @@ Running the script with no arguments opens a two-column menu with keyboard navig
 ```
 
 Select one or more items with SPACE, then press ENTER to run them.
+
+### Adjust Xen Orchestra Memory Allocation
+
+If `xo-server` runs out of memory you will see a `JavaScript heap out of
+memory` fatal error in `journalctl -u xo-server.service`. Raising the VM's RAM
+alone does **not** fix this — the systemd service must also pass
+`--max-old-space-size` to Node so V8 can use the extra heap.
+
+This option detects the system RAM, suggests a heap size (total RAM minus
+~512 MB reserved for the OS), backs up `/etc/systemd/system/xo-server.service`,
+rewrites the `ExecStart` line, then reloads systemd and restarts `xo-server`.
 
 ## Quick Start
 

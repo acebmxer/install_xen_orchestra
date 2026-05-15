@@ -2943,6 +2943,162 @@ cleanup_xo() {
     echo ""
 }
 
+# Adjust the memory allocated to the xo-server Node.js process.
+# When xo-server runs out of heap it logs "JavaScript heap out of memory"
+# and aborts. Raising the VM RAM alone is not enough — the systemd service
+# must pass --max-old-space-size to node so V8 can use the extra memory.
+adjust_xo_memory() {
+    local service_file="/etc/systemd/system/xo-server.service"
+
+    log_info "Starting Xen Orchestra memory allocation adjustment..."
+    echo ""
+
+    if [[ ! -f "$service_file" ]]; then
+        log_error "$service_file not found. Is Xen Orchestra installed?"
+        return 1
+    fi
+
+    # Determine total system RAM in MB
+    local total_ram_mb=0
+    if [[ -r /proc/meminfo ]]; then
+        local total_kb
+        total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null) || total_kb=0
+        [[ -n "$total_kb" ]] && total_ram_mb=$((total_kb / 1024))
+    fi
+
+    # Detect the current --max-old-space-size value from the service file (if any)
+    local current_exec current_limit=""
+    current_exec=$(grep -E '^ExecStart=' "$service_file" 2>/dev/null | head -n1) || current_exec=""
+    if [[ "$current_exec" =~ --max-old-space-size=([0-9]+) ]]; then
+        current_limit="${BASH_REMATCH[1]}"
+    fi
+
+    # Suggest a heap size: total RAM minus ~512MB reserved for the Debian OS.
+    # Clamp to a sane floor so we never suggest a value smaller than the default.
+    local suggested=2048
+    if [[ "$total_ram_mb" -gt 0 ]]; then
+        suggested=$((total_ram_mb - 512))
+        [[ "$suggested" -lt 1024 ]] && suggested=1024
+    fi
+
+    echo "=============================================="
+    echo "  Xen Orchestra Memory Allocation"
+    echo "=============================================="
+    echo ""
+    if [[ "$total_ram_mb" -gt 0 ]]; then
+        log_info "Detected total system RAM: ${total_ram_mb} MB"
+    else
+        log_warning "Could not detect total system RAM."
+    fi
+    if [[ -n "$current_limit" ]]; then
+        log_info "Current xo-server heap limit: ${current_limit} MB (--max-old-space-size)"
+    else
+        log_info "Current xo-server heap limit: node default (no --max-old-space-size set)"
+    fi
+    echo ""
+    echo "If xo-server runs out of memory you will see this in the logs"
+    echo "(journalctl -u xo-server.service):"
+    echo ""
+    echo "    FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed -"
+    echo "    JavaScript heap out of memory"
+    echo ""
+    echo "Raising the VM's RAM alone does not fix it — the xo-server service"
+    echo "must also tell node how much heap it may use."
+    echo ""
+    echo "Tip: leave ~512 MB for the Debian OS itself. For a VM with"
+    echo "${total_ram_mb:-4096} MB total RAM, a heap of ${suggested} MB is recommended."
+    echo ""
+
+    # Prompt for the desired heap size
+    local heap_mb=""
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        heap_mb="$suggested"
+        log_info "Non-interactive: using suggested heap size ${heap_mb} MB"
+    else
+        local input
+        read -rp "Heap size in MB [${suggested}]: " input < /dev/tty
+        heap_mb="${input:-$suggested}"
+    fi
+
+    # Validate: must be a positive integer
+    if ! [[ "$heap_mb" =~ ^[0-9]+$ ]] || [[ "$heap_mb" -le 0 ]]; then
+        log_error "Invalid heap size: '${heap_mb}'. Must be a positive integer (MB)."
+        return 1
+    fi
+
+    # Sanity warnings (non-fatal)
+    if [[ "$heap_mb" -lt 1024 ]]; then
+        log_warning "A heap below 1024 MB may be too small for Xen Orchestra."
+    fi
+    if [[ "$total_ram_mb" -gt 0 ]] && [[ "$heap_mb" -ge "$total_ram_mb" ]]; then
+        log_warning "Heap size (${heap_mb} MB) meets or exceeds total RAM (${total_ram_mb} MB)."
+        log_warning "Leave headroom for the OS or the VM may start swapping or be OOM-killed."
+    fi
+
+    if [[ -n "$current_limit" ]] && [[ "$current_limit" -eq "$heap_mb" ]]; then
+        log_info "xo-server is already configured for a ${heap_mb} MB heap. Nothing to do."
+        return 0
+    fi
+
+    # Resolve the node binary path
+    local node_path
+    node_path=$(command -v node 2>/dev/null) || node_path=""
+    if [[ -z "$node_path" ]]; then
+        node_path="/usr/local/bin/node"
+        log_warning "node not found on PATH; assuming ${node_path}"
+    fi
+
+    echo ""
+    log_info "ExecStart will be updated to:"
+    echo "    ExecStart=${node_path} --max-old-space-size=${heap_mb} <xo-server>"
+    echo ""
+    if ! confirm_or_skip "Apply this change to ${service_file}?"; then
+        log_info "Skipping memory allocation adjustment."
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would back up and rewrite ExecStart in ${service_file}"
+        echo "[DRY-RUN] Would run: systemctl daemon-reload && systemctl restart xo-server"
+        return 0
+    fi
+
+    # Back up the service file before editing
+    run_cmd sudo cp "$service_file" "${service_file}.backup-$(date +%Y%m%d-%H%M%S)"
+
+    # Rewrite the ExecStart line. Two cases:
+    #   1. Already has --max-old-space-size=N -> replace N
+    #   2. No flag yet -> insert "node --max-old-space-size=N" before the script path
+    if [[ -n "$current_limit" ]]; then
+        run_cmd sudo sed -i -E \
+            "s|(--max-old-space-size=)[0-9]+|\1${heap_mb}|" "$service_file"
+    else
+        # ExecStart=<node> <xo-server-path>  ->  ExecStart=<node> --max-old-space-size=N <xo-server-path>
+        run_cmd sudo sed -i -E \
+            "s|^(ExecStart=)([^[:space:]]+)([[:space:]]+)|\1\2 --max-old-space-size=${heap_mb}\3|" \
+            "$service_file"
+    fi
+
+    # Verify the edit landed
+    if ! grep -qE "^ExecStart=.*--max-old-space-size=${heap_mb}" "$service_file"; then
+        log_error "Failed to update ExecStart in ${service_file}. Service file left unchanged."
+        log_error "A backup was saved alongside the original — inspect it manually."
+        return 1
+    fi
+    log_success "ExecStart updated to use a ${heap_mb} MB heap."
+
+    # Refresh systemd and restart the service
+    log_info "Reloading systemd and restarting xo-server..."
+    run_cmd sudo systemctl daemon-reload
+    run_cmd sudo systemctl restart xo-server
+
+    log_success "xo-server restarted with a ${heap_mb} MB heap limit."
+    echo ""
+    log_info "Reminder: also ensure the VM itself has enough RAM"
+    echo "         (heap ${heap_mb} MB + ~512 MB for the OS)."
+    echo ""
+}
+
 # Show help
 show_help() {
     echo "Xen Orchestra Installation Script"
@@ -2958,6 +3114,7 @@ show_help() {
     echo "  --rebuild              Fresh clone + clean build on the current branch (backup taken first)"
     echo "  --reconfigure          Regenerate config, systemd service, sudoers, and file ownership"
     echo "  --proxy                Install XO Proxy on a Xen pool master"
+    echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
     echo "  --help                 Show this help message"
     echo ""
@@ -2999,7 +3156,8 @@ M_CYAN="${M_CSI}36m"
 M_BLINK="${M_CSI}5m"
 M_REVERSE="${M_CSI}7m"
 
-# Menu item names (left column indices 0-3, right column indices 4-7)
+# Menu item names (left column indices 0-3, right column indices 4-7,
+# index 8 is a full-width centered row below both columns)
 MENU_NAMES=(
     "Install Xen Orchestra"
     "Update Xen Orchestra"
@@ -3009,6 +3167,7 @@ MENU_NAMES=(
     "Rebuild Xen Orchestra"
     "Edit xo-config.cfg"
     "Restore Backup"
+    "Adjust Xen Orchestra Memory Allocation"
 )
 MENU_HINTS=(
     ""
@@ -3019,13 +3178,15 @@ MENU_HINTS=(
     "(wipe & reinstall maintain settings)"
     ""
     ""
+    ""
 )
 
 MENU_LEFT_COUNT=4
 MENU_RIGHT_COUNT=4
-MENU_TOTAL=8
+MENU_CENTER_COUNT=1
+MENU_TOTAL=9
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0 0)
 MCOL=0
 MROW=0
 MENU_SCRIPT_COMMIT="N/A"
@@ -3183,7 +3344,7 @@ draw_menu() {
     _buf+="${pad}${M_DIM}${sep_fill}${M_RESET}${eol}"$'\n'
     _buf+="${pad}${eol}"$'\n'
 
-    # Menu items in 2 columns (left: indices 0-3, right: indices 4-6)
+    # Menu items in 2 columns (left: indices 0-3, right: indices 4-7)
     local rows=$MENU_LEFT_COUNT
     for ((row=0; row<rows; row++)); do
         local line=""
@@ -3196,7 +3357,7 @@ draw_menu() {
             fi
 
             # Skip if index out of range (right column has fewer items)
-            if [[ $idx -ge $MENU_TOTAL ]]; then
+            if [[ $idx -ge $((MENU_LEFT_COUNT + MENU_RIGHT_COUNT)) ]]; then
                 continue
             fi
 
@@ -3242,6 +3403,35 @@ draw_menu() {
             line="${line}${item}"
         done
         _buf+="${pad}${line}${eol}"$'\n'
+    done
+
+    # Full-width centered rows below the two columns (indices 8+)
+    local center_start=$((MENU_LEFT_COUNT + MENU_RIGHT_COUNT))
+    for ((cidx=center_start; cidx<MENU_TOTAL; cidx++)); do
+        local cname="${MENU_NAMES[$cidx]}"
+        local chint="${MENU_HINTS[$cidx]}"
+        local ccheckbox="[ ]"
+        [[ ${MENU_SELECTED[$cidx]} -eq 1 ]] && ccheckbox="${M_GREEN}[✓]${M_RESET}"
+
+        # Visible length: "▸ " (2) + "[ ]" (3) + " " (1) + name (+ hint)
+        local cvisible=$((2 + 3 + 1 + ${#cname}))
+        [[ -n "$chint" ]] && cvisible=$((cvisible + 1 + ${#chint}))
+        local clpad=$(( (content_width - cvisible) / 2 ))
+        local cpad=""
+        (( clpad > 0 )) && printf -v cpad '%*s' "$clpad" ''
+
+        local cprefix="  "
+        [[ $cidx -eq $MENU_CURSOR ]] && cprefix="${M_BOLD}${M_BLUE}▸ ${M_RESET}"
+
+        local citem
+        if [[ $cidx -eq $MENU_CURSOR ]]; then
+            citem="${cprefix}${ccheckbox} ${M_BOLD}${cname}${M_RESET}"
+        else
+            citem="${cprefix}${ccheckbox} ${cname}"
+        fi
+        [[ -n "$chint" ]] && citem="${citem} ${M_DIM}${chint}${M_RESET}"
+
+        _buf+="${pad}${cpad}${citem}${eol}"$'\n'
     done
 
     _buf+="${pad}${eol}"$'\n'
@@ -3296,28 +3486,34 @@ menu_read_key() {
     esac
 }
 
-# Get the column (0=left, 1=right) and row for a cursor index
+# Get the column (0=left, 1=right, 2=center) and row for a cursor index
 menu_get_pos() {
     local idx=$1
     if [[ $idx -lt $MENU_LEFT_COUNT ]]; then
         MCOL=0
         MROW=$idx
-    else
+    elif [[ $idx -lt $((MENU_LEFT_COUNT + MENU_RIGHT_COUNT)) ]]; then
         MCOL=1
         MROW=$((idx - MENU_LEFT_COUNT))
+    else
+        MCOL=2
+        MROW=$((idx - MENU_LEFT_COUNT - MENU_RIGHT_COUNT))
     fi
 }
 
 # Convert column/row to cursor index
 menu_set_cursor() {
     local col=$1 row=$2
+    local target
     if [[ $col -eq 0 ]]; then
-        MENU_CURSOR=$row
+        target=$row
+    elif [[ $col -eq 1 ]]; then
+        target=$((MENU_LEFT_COUNT + row))
     else
-        local target=$((MENU_LEFT_COUNT + row))
-        if [[ $target -lt $MENU_TOTAL ]]; then
-            MENU_CURSOR=$target
-        fi
+        target=$((MENU_LEFT_COUNT + MENU_RIGHT_COUNT + row))
+    fi
+    if [[ $target -lt $MENU_TOTAL ]]; then
+        MENU_CURSOR=$target
     fi
 }
 
@@ -3493,6 +3689,15 @@ process_menu_selections() {
         load_config
         restore_xo
     fi
+
+    # Adjust Xen Orchestra Memory Allocation
+    if [[ ${MENU_SELECTED[8]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        check_systemctl
+        adjust_xo_memory
+    fi
 }
 
 # Run the interactive menu
@@ -3508,7 +3713,7 @@ run_menu() {
 
     # Reset selection state
     MENU_CURSOR=0
-    MENU_SELECTED=(0 0 0 0 0 0 0 0)
+    MENU_SELECTED=(0 0 0 0 0 0 0 0 0)
 
     # Gather version/commit info for header display
     menu_gather_info
@@ -3536,25 +3741,43 @@ run_menu() {
         case "$key" in
             UP)
                 menu_get_pos $MENU_CURSOR
-                local col_size
-                if [[ $MCOL -eq 0 ]]; then
-                    col_size=$MENU_LEFT_COUNT
+                if [[ $MCOL -eq 2 ]]; then
+                    # From the centered row, go up into the last row of the left column
+                    menu_set_cursor 0 $((MENU_LEFT_COUNT - 1))
                 else
-                    col_size=$MENU_RIGHT_COUNT
+                    local col_size
+                    if [[ $MCOL -eq 0 ]]; then
+                        col_size=$MENU_LEFT_COUNT
+                    else
+                        col_size=$MENU_RIGHT_COUNT
+                    fi
+                    if [[ $MROW -eq 0 ]]; then
+                        # Wrap from the top of a column down to the centered row
+                        menu_set_cursor 2 0
+                    else
+                        menu_set_cursor $MCOL $((MROW - 1))
+                    fi
                 fi
-                local new_row=$(( (MROW - 1 + col_size) % col_size ))
-                menu_set_cursor $MCOL $new_row
                 ;;
             DOWN)
                 menu_get_pos $MENU_CURSOR
-                local col_size
-                if [[ $MCOL -eq 0 ]]; then
-                    col_size=$MENU_LEFT_COUNT
+                if [[ $MCOL -eq 2 ]]; then
+                    # From the centered row, wrap to the top of the left column
+                    menu_set_cursor 0 0
                 else
-                    col_size=$MENU_RIGHT_COUNT
+                    local col_size
+                    if [[ $MCOL -eq 0 ]]; then
+                        col_size=$MENU_LEFT_COUNT
+                    else
+                        col_size=$MENU_RIGHT_COUNT
+                    fi
+                    if [[ $MROW -ge $((col_size - 1)) ]]; then
+                        # Wrap from the bottom of a column down to the centered row
+                        menu_set_cursor 2 0
+                    else
+                        menu_set_cursor $MCOL $((MROW + 1))
+                    fi
                 fi
-                local new_row=$(( (MROW + 1) % col_size ))
-                menu_set_cursor $MCOL $new_row
                 ;;
             LEFT)
                 menu_get_pos $MENU_CURSOR
@@ -3632,7 +3855,7 @@ main() {
             --json-logs)
                 JSON_LOGS=true
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--uninstall|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--adjust-memory|--uninstall|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -3656,7 +3879,7 @@ main() {
     fi
 
     if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
-        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --uninstall)"
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --uninstall)"
         exit 1
     fi
 
@@ -3709,6 +3932,13 @@ main() {
             detect_package_manager
             load_config
             install_xo_proxy
+            ;;
+        --adjust-memory)
+            check_required_commands
+            check_not_root
+            check_sudo
+            check_systemctl
+            adjust_xo_memory
             ;;
         --install)
             install_xo
