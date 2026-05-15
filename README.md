@@ -5,6 +5,28 @@
 
 Automated installation and management of [Xen Orchestra](https://xen-orchestra.com/) from source.
 
+> ## ⚠️ Upgrading from an earlier version of this script? Read this first.
+>
+> This version bumps the config schema to **v2** (adds `PUBLIC_URL` and
+> `ENCRYPT_REDIS_CREDENTIALS`) and corrects two `config.toml` generation bugs.
+> Your `xo-config.cfg` is migrated automatically and non-destructively, but the
+> corrected `/etc/xo-server/config.toml` is **only written by `--reconfigure`**.
+>
+> **Run `--reconfigure` once** before resuming normal updates:
+>
+> ```bash
+> ./install-xen-orchestra.sh --reconfigure
+> ```
+>
+> This regenerates `config.toml` with the fixes (your old file is backed up
+> first; data in `/var/lib/xo-server` is untouched). It is **strongly
+> recommended** if you set both `REDIRECT_TO_HTTPS=true` and
+> `REVERSE_PROXY_TRUST` — that combination previously produced a duplicate
+> `[http]` section and silently dropped one of the settings.
+>
+> Afterwards, run `--update` as normal for routine XO updates — `--update` does
+> not need to be preceded by `--reconfigure` again.
+
 ## Available Functions
 
 | Function | CLI Flag | Description |
@@ -83,13 +105,17 @@ Key settings:
 | `HTTPS_PORT` | 443 | HTTPS port |
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `GIT_BRANCH` | master | Git branch or tag |
-| `NODE_VERSION` | 24.15.0 | Node.js version |
+| `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
 | `SERVICE_USER` | xo-service | Service user (set to `root` for VMware V2V import) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
+| `PUBLIC_URL` | *(unset)* | Public URL advertised to external entities (e.g. XO Lite) |
+| `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see note below) |
 
 > **Note on `BACKUP_KEEP` rotation:** The retention policy only applies to backups created by the current version of the script. Backups made by older script versions may use a different naming convention and will **not** be counted or pruned by the rotation logic. If you are upgrading from an older version, manually review your backup directory (`BACKUP_DIR` in config, default `/var/lib/xo-backups`) and remove any legacy-named archives you no longer need.
+
+> **Note on `ENCRYPT_REDIS_CREDENTIALS`:** This is an opt-in xo-server feature that encrypts credentials stored in Redis at rest (AES-256-GCM). It **only works when Xen Orchestra runs as a VM on a XenServer/XCP-ng host**, because half of the encryption key is stored in XenStore. It will **not** work on bare metal or on other hypervisors (KVM, VMware, Hyper-V). Leave it `false` unless XO is an XCP-ng guest. To opt out later, set it back to `false` and run `--reconfigure` — xo-server decrypts the records and removes the key files automatically.
 
 ## Default Credentials
 
