@@ -66,17 +66,18 @@ Running the script with no arguments opens a two-column menu with keyboard navig
 
   ──────────────────────────────────────────────────────────────────────────────────
 
-  ▸ [✓] Install Xen Orchestra                   [ ] Reconfigure Xen Orchestra
-    [ ] Update Xen Orchestra                    [ ] Rebuild Xen Orchestra
-    [ ] Rename Sample-xo-config.cfg             [ ] Edit xo-config.cfg
-    [ ] Install XO Proxy                        [ ] Restore Backup
-                  [ ] Adjust Xen Orchestra Memory Allocation
+  ▸ [ ] Install Xen Orchestra          [ ] Reconfigure Xen Orchestra (made changes to config)
+    [ ] Update Xen Orchestra           [ ] Rebuild Xen Orchestra (wipe & reinstall maintain settings)
+    [ ] Rename Sample-xo-config.cfg    [ ] Edit xo-config.cfg
+    [ ] Install XO Proxy               [ ] Restore Backup
+                       [ ] Adjust Xen Orchestra Memory Allocation
 
   ──────────────────────────────────────────────────────────────────────────────────
 
-  Selected: 1
+  Selected: 0
 
   ↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Quit
+  Legend: [✓] selected   [ ] not selected
 ```
 
 Select one or more items with SPACE, then press ENTER to run them.
