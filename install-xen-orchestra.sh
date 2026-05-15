@@ -1919,7 +1919,7 @@ check_active_xo_tasks() {
                 ] | length' \
             2>/dev/null) || task_count=0
     else
-        # shellcheck disable=SC2016 — node script uses single quotes intentionally
+        # shellcheck disable=SC2016
         local node_counts
         node_counts=$(printf '%s' "$task_response" | XO_CUTOFF="${xo_start_ms:-0}" node -e '
             let d = "";
@@ -1972,7 +1972,7 @@ check_active_xo_tasks() {
                     ] | .[] | (.properties.name // .id // "unknown task")' \
                 2>/dev/null || true)
         else
-            # shellcheck disable=SC2016 — node script uses single quotes intentionally
+            # shellcheck disable=SC2016
             printf '%s' "$task_response" | XO_CUTOFF="${xo_start_ms:-0}" node -e '
                 let d = "";
                 process.stdin.on("data", c => d += c);
