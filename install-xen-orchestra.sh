@@ -2985,17 +2985,27 @@ adjust_xo_memory() {
     echo "  Xen Orchestra Memory Allocation"
     echo "=============================================="
     echo ""
-    if [[ "$total_ram_mb" -gt 0 ]]; then
-        log_info "Detected total system RAM: ${total_ram_mb} MB"
+    # Build a human-readable label for the current heap limit
+    local current_label
+    if [[ -n "$current_limit" ]]; then
+        current_label="${current_limit} MB"
     else
+        current_label="node default (no --max-old-space-size set)"
+    fi
+
+    echo "  Setting                       Value"
+    echo "  ----------------------------- -----------------------------------"
+    if [[ "$total_ram_mb" -gt 0 ]]; then
+        printf '  %-29s %s\n' "Total system RAM" "${total_ram_mb} MB"
+    else
+        printf '  %-29s %s\n' "Total system RAM" "could not be detected"
+    fi
+    printf '  %-29s %s\n' "Current xo-server heap limit" "$current_label"
+    printf '  %-29s %s\n' "Recommended heap limit" "${suggested} MB"
+    echo ""
+    if [[ "$total_ram_mb" -le 0 ]]; then
         log_warning "Could not detect total system RAM."
     fi
-    if [[ -n "$current_limit" ]]; then
-        log_info "Current xo-server heap limit: ${current_limit} MB (--max-old-space-size)"
-    else
-        log_info "Current xo-server heap limit: node default (no --max-old-space-size set)"
-    fi
-    echo ""
     echo "If xo-server runs out of memory you will see this in the logs"
     echo "(journalctl -u xo-server.service):"
     echo ""
@@ -3005,8 +3015,7 @@ adjust_xo_memory() {
     echo "Raising the VM's RAM alone does not fix it — the xo-server service"
     echo "must also tell node how much heap it may use."
     echo ""
-    echo "Tip: leave ~512 MB for the Debian OS itself. For a VM with"
-    echo "${total_ram_mb:-4096} MB total RAM, a heap of ${suggested} MB is recommended."
+    echo "The recommended heap leaves ~512 MB for the Debian OS itself."
     echo ""
 
     # Prompt for the desired heap size
