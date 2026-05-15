@@ -20,7 +20,11 @@
     [ "$status" -eq 0 ]
 }
 
-@test "sample-xo-config.cfg contains CONFIG_VERSION=1" {
-    run grep "^CONFIG_VERSION=1" sample-xo-config.cfg
+@test "sample-xo-config.cfg is stamped at the script's latest CONFIG_VERSION" {
+    # The sample config must advertise the same schema version the script
+    # considers current, so a fresh install never needs an immediate migration.
+    latest=$(grep -E '^LATEST_CONFIG_VERSION=' install-xen-orchestra.sh | head -n1 | cut -d= -f2)
+    [ -n "$latest" ]
+    run grep "^CONFIG_VERSION=${latest}" sample-xo-config.cfg
     [ "$status" -eq 0 ]
 }

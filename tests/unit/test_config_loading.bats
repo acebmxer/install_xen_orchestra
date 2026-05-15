@@ -21,10 +21,10 @@ teardown() {
     [ -f "$CONFIG_FILE" ]
 }
 
-@test "config with CONFIG_VERSION=1 passes migrate_config unchanged" {
-    # Write a minimal valid config at version 1
-    cat > "$CONFIG_FILE" <<'EOF'
-CONFIG_VERSION=1
+@test "config already at the latest version passes migrate_config unchanged" {
+    # Write a minimal valid config already stamped at the latest version
+    cat > "$CONFIG_FILE" <<EOF
+CONFIG_VERSION=${LATEST_CONFIG_VERSION}
 HTTP_PORT=80
 HTTPS_PORT=443
 INSTALL_DIR=/opt/xen-orchestra
@@ -32,15 +32,15 @@ BACKUP_KEEP=5
 NODE_VERSION=22
 SERVICE_USER=xo-service
 EOF
-    CONFIG_VERSION=1
+    CONFIG_VERSION=${LATEST_CONFIG_VERSION}
     run migrate_config "$CONFIG_FILE"
     [ "$status" -eq 0 ]
-    # CONFIG_VERSION should still be 1, not duplicated
+    # CONFIG_VERSION should still appear exactly once, not duplicated
     count=$(grep -c "^CONFIG_VERSION=" "$CONFIG_FILE")
     [ "$count" -eq 1 ]
 }
 
-@test "legacy config without CONFIG_VERSION gets CONFIG_VERSION=1 appended" {
+@test "legacy config without CONFIG_VERSION is migrated to the latest schema version" {
     # Write a config with no CONFIG_VERSION (legacy)
     cat > "$CONFIG_FILE" <<'EOF'
 HTTP_PORT=80
@@ -53,5 +53,8 @@ EOF
     CONFIG_VERSION=""
     run migrate_config "$CONFIG_FILE"
     [ "$status" -eq 0 ]
-    grep -q "^CONFIG_VERSION=1" "$CONFIG_FILE"
+    grep -q "^CONFIG_VERSION=${LATEST_CONFIG_VERSION}" "$CONFIG_FILE"
+    # CONFIG_VERSION should appear exactly once
+    count=$(grep -c "^CONFIG_VERSION=" "$CONFIG_FILE")
+    [ "$count" -eq 1 ]
 }

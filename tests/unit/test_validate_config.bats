@@ -12,6 +12,7 @@ setup() {
     BACKUP_KEEP=5
     NODE_VERSION=22
     SERVICE_USER=xo-service
+    ENCRYPT_REDIS_CREDENTIALS=false
 }
 
 @test "valid config passes validation" {
