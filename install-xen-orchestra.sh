@@ -2973,6 +2973,25 @@ adjust_xo_memory() {
         current_limit="${BASH_REMATCH[1]}"
     fi
 
+    # Resolve the node binary path (needed below to query node's default heap)
+    local node_path
+    node_path=$(command -v node 2>/dev/null) || node_path=""
+    if [[ -z "$node_path" ]]; then
+        node_path="/usr/local/bin/node"
+        log_warning "node not found on PATH; assuming ${node_path}"
+    fi
+
+    # When no --max-old-space-size flag is set, node picks a default heap limit
+    # based on physical RAM (~50% on modern node). Query it so the user sees the
+    # real value the service is running with today, not just "default".
+    local node_default_mb=""
+    if [[ -x "$node_path" ]]; then
+        node_default_mb=$("$node_path" -e \
+            'process.stdout.write(String(Math.round(require("v8").getHeapStatistics().heap_size_limit/1048576)))' \
+            2>/dev/null) || node_default_mb=""
+        [[ "$node_default_mb" =~ ^[0-9]+$ ]] || node_default_mb=""
+    fi
+
     # Suggest a heap size: total RAM minus ~512MB reserved for the Debian OS.
     # Clamp to a sane floor so we never suggest a value smaller than the default.
     local suggested=2048
@@ -2989,6 +3008,8 @@ adjust_xo_memory() {
     local current_label
     if [[ -n "$current_limit" ]]; then
         current_label="${current_limit} MB"
+    elif [[ -n "$node_default_mb" ]]; then
+        current_label="~${node_default_mb} MB (node default, no --max-old-space-size set)"
     else
         current_label="node default (no --max-old-space-size set)"
     fi
@@ -3047,14 +3068,6 @@ adjust_xo_memory() {
     if [[ -n "$current_limit" ]] && [[ "$current_limit" -eq "$heap_mb" ]]; then
         log_info "xo-server is already configured for a ${heap_mb} MB heap. Nothing to do."
         return 0
-    fi
-
-    # Resolve the node binary path
-    local node_path
-    node_path=$(command -v node 2>/dev/null) || node_path=""
-    if [[ -z "$node_path" ]]; then
-        node_path="/usr/local/bin/node"
-        log_warning "node not found on PATH; assuming ${node_path}"
     fi
 
     echo ""
