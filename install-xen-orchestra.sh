@@ -163,6 +163,28 @@ confirm_or_skip() {
     [[ "$reply" == [Yy] ]]
 }
 
+# Strict yes/no prompt: re-asks until the user types y/yes or n/no.
+# Unlike confirm_or_skip, blank or garbage input is rejected, not treated as "no".
+# Returns 0 for yes, 1 for no. In non-interactive mode auto-answers yes.
+# Usage: if prompt_yes_no "Do the thing?"; then ...; fi
+prompt_yes_no() {
+    local message="$1"
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_info "Non-interactive: auto-answering yes: $message"
+        return 0
+    fi
+    local reply
+    while true; do
+        echo -n "${message} [y/n]: "
+        read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+        case "$reply" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo])     return 1 ;;
+            *) log_warning "Please answer 'y' or 'n'." ;;
+        esac
+    done
+}
+
 # Execute a command, or in dry-run mode print what would be executed.
 # Usage: run_cmd sudo systemctl start xo-server
 run_cmd() {
@@ -3038,6 +3060,24 @@ adjust_xo_memory() {
     echo ""
     echo "The recommended heap leaves ~512 MB for the Debian OS itself."
     echo ""
+
+    # If the service is already configured at the recommended heap size, no
+    # change is needed. Show the info above, then let the user opt in anyway.
+    if [[ -n "$current_limit" ]] && [[ "$current_limit" -eq "$suggested" ]]; then
+        log_info "xo-server is already configured for the recommended ${suggested} MB heap."
+        log_info "No changes are needed."
+        echo ""
+        if ! prompt_yes_no "Do you still want to make changes?"; then
+            echo ""
+            if prompt_yes_no "Reload the script?"; then
+                log_info "Reloading ${SCRIPT_PATH}..."
+                exec bash "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+            fi
+            log_info "No changes made. Exiting memory allocation adjustment."
+            return 0
+        fi
+        echo ""
+    fi
 
     # Prompt for the desired heap size
     local heap_mb=""
