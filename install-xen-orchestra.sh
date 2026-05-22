@@ -945,9 +945,18 @@ create_service_user() {
 
 # Flush session tokens from Redis, preserving API tokens used by third-party integrations.
 #
-# XO stores two categories of tokens under xo:token:*:
-#   - Session tokens  (created at browser login)  — no 'description' field
-#   - API tokens      (created via Settings > API) — have a non-empty 'description'
+# XO stores two categories of tokens under xo:token:*, distinguished by the
+# presence of a 'client_id' field in the token JSON:
+#   - Session tokens (created at browser login) — HAVE 'client_id' (and a
+#     'client' object); their 'description' holds the browser User-Agent.
+#   - API tokens (created via Settings > Tokens) — have NO 'client_id'; their
+#     'description' is the human-entered label (or empty).
+#
+# NOTE: classification is by 'client_id', NOT by 'description'. XO stores the
+# User-Agent string in 'description' for session tokens, so a non-empty
+# description does not mean a token is an API token — earlier versions of this
+# function mis-classified every session token as an API token and never flushed
+# them, leaving stale tokens that cause "had no attached entries" 401 noise.
 #
 # Only session tokens become invalid after an XO schema change; API tokens are
 # long-lived and must survive an update so that third-party integrations,
@@ -958,7 +967,7 @@ create_service_user() {
 # would otherwise cause "Cannot destructure property 'client' of 'token'" 401s.
 flush_redis_tokens() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "[DRY-RUN] Would flush session tokens from Redis (API tokens with descriptions are preserved)"
+        log_info "[DRY-RUN] Would flush browser session tokens from Redis (API tokens are preserved)"
         return 0
     fi
 
@@ -983,7 +992,7 @@ flush_redis_tokens() {
 
     local deleted=0 kept=0
     for key in "${token_keys[@]}"; do
-        local raw description
+        local raw client_id description
 
         # Index/metadata keys (double colon in name, e.g. xo:token::indexes) are
         # Redis collection internals that map user IDs to token IDs. Delete them
@@ -1013,22 +1022,27 @@ flush_redis_tokens() {
             fi
         fi
 
-        # Extract the description field from the token JSON.
-        # Tokens with a non-empty description are API/integration tokens — keep them.
-        # Tokens with no description are browser session tokens — delete them.
+        # Classify by the presence of a 'client_id' field:
+        #   - has client_id  -> browser session token -> flush
+        #   - no  client_id  -> API token             -> preserve
+        # 'description' is NOT used to classify — XO puts the User-Agent there
+        # for session tokens, so it is non-empty on both kinds.
         if command -v jq >/dev/null 2>&1; then
+            client_id=$(printf '%s' "$raw" | jq -r '.client_id // empty' 2>/dev/null || true)
             description=$(printf '%s' "$raw" | jq -r '.description // empty' 2>/dev/null || true)
         else
-            # Fallback: match "description":"<non-empty-value>"
+            # Fallback: detect the "client_id" key; extract description for logging.
+            client_id=$(printf '%s' "$raw" | grep -o '"client_id":"[^"]*"' | sed 's/"client_id":"//;s/"//' 2>/dev/null || true)
             description=$(printf '%s' "$raw" | grep -o '"description":"[^"]*"' | sed 's/"description":"//;s/"//' 2>/dev/null || true)
         fi
 
-        if [[ -n "$description" ]]; then
-            log_info "  Preserving API token (\"${description}\")"
-            (( kept++ )) || true
-        else
+        if [[ -n "$client_id" ]]; then
             redis-cli DEL "$key" >/dev/null 2>&1
+            log_info "  Flushed browser session token (client_id ${client_id})"
             (( deleted++ )) || true
+        else
+            log_info "  Preserving API token (\"${description:-no description}\")"
+            (( kept++ )) || true
         fi
     done
 
