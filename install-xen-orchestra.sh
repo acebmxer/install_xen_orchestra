@@ -1037,16 +1037,22 @@ flush_redis_tokens() {
     [[ $deleted -eq 0 && $kept -eq 0 ]] && log_info "No session tokens to flush" || true
 }
 
-# Scan Redis auth tokens for records that reference a user that no longer exists.
+# Scan Redis auth-token state for the two corruption patterns left behind by
+# restoring an exported XO config onto a fresh instance.
 #
-# Restoring an exported XO config onto a fresh instance is the common cause:
-# the export is a point-in-time snapshot, and token records (with their original
-# user_id) can land in the new Redis without the matching xo:user:* record.
-# XO then logs "The id xo:token:... had no attached entries" and the orphaned
-# token yields "[GET] /tasks (401)" noise every time something tries to use it.
+# XO maintains a Redis SET, xo:token::indexes, listing every token ID. For each
+# member it does GET xo:token:<id>. A config restore is a point-in-time snapshot,
+# so it can leave the index and the token bodies inconsistent. Two distinct faults:
+#
+#   A) Dangling index member — an ID is in the xo:token::indexes SET but the
+#      xo:token:<id> body is missing. XO logs:
+#        "The id xo:token:<id> had no attached entries."
+#
+#   B) Orphaned token — a token body exists with a user_id whose xo:user:<id>
+#      record was not restored. Calls using it fail "[GET] ... (401)".
 #
 # This is a non-destructive diagnostic — it only reports. Use --flush-tokens
-# (or let the next update's flush_redis_tokens() run) to clear the orphans.
+# (or let the next update's flush_redis_tokens() run) to clear both.
 check_orphaned_tokens() {
     if ! command -v redis-cli >/dev/null 2>&1; then
         return 0
@@ -1055,7 +1061,23 @@ check_orphaned_tokens() {
         return 0
     fi
 
-    # Collect valid user IDs (xo:user:<uuid>, excluding index/version meta keys).
+    local dangling=0 orphans=0
+
+    # --- Fault A: index members with no token body ---
+    # xo:token::indexes is a SET; only inspect it if that is its actual type
+    # (a wrong type here would mean an XO schema change — skip rather than guess).
+    if [[ "$(redis-cli TYPE xo:token::indexes 2>/dev/null)" == "set" ]]; then
+        local member
+        while IFS= read -r member; do
+            [[ -z "$member" ]] && continue
+            if [[ "$(redis-cli EXISTS "xo:token:${member}" 2>/dev/null)" != "1" ]]; then
+                log_warning "  Dangling token index entry: ${member} (no token body)"
+                (( dangling++ )) || true
+            fi
+        done < <(redis-cli SMEMBERS xo:token::indexes 2>/dev/null)
+    fi
+
+    # --- Fault B: token bodies referencing a missing user ---
     local -A valid_users=()
     local user_key uid
     while IFS= read -r user_key; do
@@ -1065,41 +1087,40 @@ check_orphaned_tokens() {
         valid_users["$uid"]=1
     done < <(redis-cli KEYS "xo:user:*" 2>/dev/null)
 
-    # If we somehow found no users, skip — avoids false positives on a broken read.
-    if [[ ${#valid_users[@]} -eq 0 ]]; then
-        return 0
+    # Only run the user check if we actually read some users — an empty result
+    # likely means a failed read, and would flag every token as a false positive.
+    if [[ ${#valid_users[@]} -gt 0 ]]; then
+        local -a token_keys
+        mapfile -t token_keys < <(redis-cli KEYS "xo:token:*" 2>/dev/null)
+
+        local key raw token_uid
+        for key in "${token_keys[@]}"; do
+            [[ "$key" == *"::"* ]] && continue
+            [[ "$key" == "xo:token:version" ]] && continue
+
+            raw=$(redis-cli GET "$key" 2>/dev/null)
+            [[ -z "$raw" ]] && continue
+
+            if command -v jq >/dev/null 2>&1; then
+                printf '%s' "$raw" | jq empty 2>/dev/null || continue
+                token_uid=$(printf '%s' "$raw" | jq -r '.user_id // empty' 2>/dev/null || true)
+            else
+                token_uid=$(printf '%s' "$raw" | grep -o '"user_id":"[^"]*"' | sed 's/"user_id":"//;s/"//' 2>/dev/null || true)
+            fi
+
+            [[ -z "$token_uid" ]] && continue
+            if [[ -z "${valid_users[$token_uid]:-}" ]]; then
+                log_warning "  Orphaned token ${key} references missing user ${token_uid}"
+                (( orphans++ )) || true
+            fi
+        done
     fi
 
-    local -a token_keys
-    mapfile -t token_keys < <(redis-cli KEYS "xo:token:*" 2>/dev/null)
-
-    local orphans=0
-    local key raw token_uid
-    for key in "${token_keys[@]}"; do
-        [[ "$key" == *"::"* ]] && continue
-        [[ "$key" == "xo:token:version" ]] && continue
-
-        raw=$(redis-cli GET "$key" 2>/dev/null)
-        [[ -z "$raw" ]] && continue
-
-        if command -v jq >/dev/null 2>&1; then
-            printf '%s' "$raw" | jq empty 2>/dev/null || continue
-            token_uid=$(printf '%s' "$raw" | jq -r '.user_id // empty' 2>/dev/null || true)
-        else
-            token_uid=$(printf '%s' "$raw" | grep -o '"user_id":"[^"]*"' | sed 's/"user_id":"//;s/"//' 2>/dev/null || true)
-        fi
-
-        [[ -z "$token_uid" ]] && continue
-        if [[ -z "${valid_users[$token_uid]:-}" ]]; then
-            log_warning "  Orphaned token ${key} references missing user ${token_uid}"
-            (( orphans++ )) || true
-        fi
-    done
-
-    if [[ $orphans -gt 0 ]]; then
-        log_warning "Found ${orphans} auth token(s) referencing users that no longer exist."
+    if [[ $((dangling + orphans)) -gt 0 ]]; then
+        [[ $dangling -gt 0 ]] && log_warning "Found ${dangling} dangling token index entr(ies) — XO logs these as \"had no attached entries\"." || true
+        [[ $orphans -gt 0 ]]  && log_warning "Found ${orphans} auth token(s) referencing users that no longer exist." || true
         log_warning "This is common after restoring an exported XO config onto a new instance."
-        log_warning "Run '${0} --flush-tokens' to clear them and stop 401 log noise."
+        log_warning "Run '${0} --flush-tokens' to clear them and stop the log noise."
     fi
     return 0
 }
