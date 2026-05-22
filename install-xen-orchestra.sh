@@ -1138,37 +1138,6 @@ flush_tokens_standalone() {
     log_success "Token flush complete."
 }
 
-# Disable Redis RDB/AOF persistence for the local Redis instance.
-# XO only uses Redis for ephemeral session tokens and cache — there is no
-# value in writing them to disk. Persisted tokens can survive a Redis restart
-# and cause schema-mismatch 401 errors if XO was updated in the meantime.
-# Skipped when REDIS_URI or REDIS_SOCKET is set (external Redis is the user's
-# responsibility).
-configure_redis_persistence() {
-    if [[ -n "${REDIS_URI:-}" ]] || [[ -n "${REDIS_SOCKET:-}" ]]; then
-        return 0
-    fi
-
-    if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "[DRY-RUN] Would disable Redis persistence"
-        return 0
-    fi
-
-    if ! command -v redis-cli >/dev/null 2>&1 || ! timeout 5 redis-cli ping 2>/dev/null | grep -q PONG; then
-        return 0
-    fi
-
-    log_info "Disabling Redis persistence (tokens are ephemeral, no need to write to disk)..."
-    redis-cli CONFIG SET save "" >/dev/null 2>&1 || true
-    redis-cli CONFIG SET appendonly no >/dev/null 2>&1 || true
-
-    if redis-cli CONFIG REWRITE >/dev/null 2>&1; then
-        log_success "Redis persistence disabled and written to config"
-    else
-        log_warning "Redis persistence disabled for this session only (CONFIG REWRITE failed — change won't survive a Redis restart)"
-    fi
-}
-
 # Start and enable Redis
 setup_redis() {
     log_info "Setting up Redis..."
@@ -1194,7 +1163,6 @@ setup_redis() {
     # Verify Redis is running
     if command -v redis-cli >/dev/null 2>&1 && redis-cli ping 2>/dev/null | grep -q PONG; then
         log_success "Redis is running"
-        configure_redis_persistence
     else
         log_error "Redis is not running or not responding"
         exit 1
@@ -2501,9 +2469,8 @@ reconfigure_xo() {
     log_info "Stopping xo-server service..."
     run_cmd timeout 30 sudo systemctl stop xo-server || true
 
-    # Flush stale auth tokens and ensure Redis is configured correctly
+    # Flush stale auth tokens
     flush_redis_tokens
-    configure_redis_persistence
 
     # Backup current config file
     if [[ -f "/etc/xo-server/config.toml" ]]; then
