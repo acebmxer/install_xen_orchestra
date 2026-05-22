@@ -1037,6 +1037,89 @@ flush_redis_tokens() {
     [[ $deleted -eq 0 && $kept -eq 0 ]] && log_info "No session tokens to flush" || true
 }
 
+# Scan Redis auth tokens for records that reference a user that no longer exists.
+#
+# Restoring an exported XO config onto a fresh instance is the common cause:
+# the export is a point-in-time snapshot, and token records (with their original
+# user_id) can land in the new Redis without the matching xo:user:* record.
+# XO then logs "The id xo:token:... had no attached entries" and the orphaned
+# token yields "[GET] /tasks (401)" noise every time something tries to use it.
+#
+# This is a non-destructive diagnostic — it only reports. Use --flush-tokens
+# (or let the next update's flush_redis_tokens() run) to clear the orphans.
+check_orphaned_tokens() {
+    if ! command -v redis-cli >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! timeout 5 redis-cli ping 2>/dev/null | grep -q PONG; then
+        return 0
+    fi
+
+    # Collect valid user IDs (xo:user:<uuid>, excluding index/version meta keys).
+    local -A valid_users=()
+    local user_key uid
+    while IFS= read -r user_key; do
+        [[ "$user_key" == *"::"* ]] && continue
+        uid="${user_key#xo:user:}"
+        [[ "$uid" == "version" ]] && continue
+        valid_users["$uid"]=1
+    done < <(redis-cli KEYS "xo:user:*" 2>/dev/null)
+
+    # If we somehow found no users, skip — avoids false positives on a broken read.
+    if [[ ${#valid_users[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    local -a token_keys
+    mapfile -t token_keys < <(redis-cli KEYS "xo:token:*" 2>/dev/null)
+
+    local orphans=0
+    local key raw token_uid
+    for key in "${token_keys[@]}"; do
+        [[ "$key" == *"::"* ]] && continue
+        [[ "$key" == "xo:token:version" ]] && continue
+
+        raw=$(redis-cli GET "$key" 2>/dev/null)
+        [[ -z "$raw" ]] && continue
+
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$raw" | jq empty 2>/dev/null || continue
+            token_uid=$(printf '%s' "$raw" | jq -r '.user_id // empty' 2>/dev/null || true)
+        else
+            token_uid=$(printf '%s' "$raw" | grep -o '"user_id":"[^"]*"' | sed 's/"user_id":"//;s/"//' 2>/dev/null || true)
+        fi
+
+        [[ -z "$token_uid" ]] && continue
+        if [[ -z "${valid_users[$token_uid]:-}" ]]; then
+            log_warning "  Orphaned token ${key} references missing user ${token_uid}"
+            (( orphans++ )) || true
+        fi
+    done
+
+    if [[ $orphans -gt 0 ]]; then
+        log_warning "Found ${orphans} auth token(s) referencing users that no longer exist."
+        log_warning "This is common after restoring an exported XO config onto a new instance."
+        log_warning "Run '${0} --flush-tokens' to clear them and stop 401 log noise."
+    fi
+    return 0
+}
+
+# Standalone entry point for flushing stale Redis auth tokens without an update.
+# flush_redis_tokens() otherwise only runs as a side effect of update/rebuild/
+# reconfigure (which require a pending code change). A config restore can leave
+# stale token/index records behind with no such change pending — this gives the
+# user a direct way to clean them up.
+flush_tokens_standalone() {
+    log_info "Flushing stale Redis auth tokens..."
+    printf '\n'
+    check_orphaned_tokens
+    flush_redis_tokens
+    printf '\n'
+    log_info "Restart xo-server for XO to rebuild clean token indexes:"
+    log_info "  sudo systemctl restart xo-server"
+    log_success "Token flush complete."
+}
+
 # Disable Redis RDB/AOF persistence for the local Redis instance.
 # XO only uses Redis for ephemeral session tokens and cache — there is no
 # value in writing them to disk. Persisted tokens can survive a Redis restart
@@ -1763,11 +1846,13 @@ restore_xo() {
 # Auth priority: 1) XO_TASK_CHECK_TOKEN  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
 # Passwords are never logged, cached, or written to disk.
 #
-# NOTE: XO_TASK_CHECK_TOKEN must be a token created via XO's Settings →
-# Authentication tokens (or via the REST API with a "description" field in the
-# request body). During updates flush_redis_tokens() preserves tokens that have
-# a non-empty description and deletes tokens without one (browser sessions).
-# A token created without a description will be wiped on the next update.
+# NOTE: XO_TASK_CHECK_TOKEN must be a persistent API token created in XO's web
+# UI (open your user menu → Tokens; the exact menu location varies by XO
+# version) or via the REST API with a "description" field in the request body.
+# The token is sent to the REST API via the authenticationToken cookie.
+# During updates flush_redis_tokens() preserves tokens that have a non-empty
+# description and deletes tokens without one (browser sessions). A token
+# created without a description will be wiped on the next update.
 #
 # Orphan filter: tasks whose start time predates xo-server's process start
 # are treated as stale DB records (e.g. left over after restoring an XO
@@ -2144,6 +2229,10 @@ update_xo() {
 
     if [[ "$INSTALLED_COMMIT" == "$REMOTE_COMMIT" ]]; then
         log_success "Already up to date. No update needed."
+        # No code change means no token-schema flush is warranted, but a
+        # config restore can still leave orphaned tokens behind — surface
+        # them so the user knows to run --flush-tokens.
+        check_orphaned_tokens
         exit 0
     fi
 
@@ -3177,6 +3266,7 @@ show_help() {
     echo "  --reconfigure          Regenerate config, systemd service, sudoers, and file ownership"
     echo "  --proxy                Install XO Proxy on a Xen pool master"
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
+    echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
     echo "  --help                 Show this help message"
     echo ""
@@ -3916,7 +4006,7 @@ main() {
             --json-logs)
                 JSON_LOGS=true
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--adjust-memory|--uninstall|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--adjust-memory|--flush-tokens|--uninstall|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -3940,7 +4030,7 @@ main() {
     fi
 
     if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
-        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --uninstall)"
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --flush-tokens, --uninstall)"
         exit 1
     fi
 
@@ -4000,6 +4090,12 @@ main() {
             check_sudo
             check_systemctl
             adjust_xo_memory
+            ;;
+        --flush-tokens)
+            check_required_commands
+            check_not_root
+            check_sudo
+            flush_tokens_standalone
             ;;
         --install)
             install_xo
