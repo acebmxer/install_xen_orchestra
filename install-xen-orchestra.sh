@@ -3684,12 +3684,27 @@ process_menu_selections() {
     fi
 
     # Preparatory operations first (rename, then edit)
+    local config_changed=false
     if [[ ${MENU_SELECTED[2]} -eq 1 ]]; then
-        menu_rename_config
+        menu_rename_config && config_changed=true
     fi
 
     if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
-        menu_edit_config
+        menu_edit_config && config_changed=true
+    fi
+
+    # If the config file was renamed or edited, offer to reload the script so
+    # the new settings take effect. Reloading re-runs load_config from scratch.
+    if [[ "$config_changed" == "true" ]]; then
+        echo ""
+        if prompt_yes_no "Configuration changed. Do you want to reload the script?"; then
+            log_info "Reloading script..."
+            release_lock
+            exec bash "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+        else
+            log_info "Exiting without reload."
+            exit 0
+        fi
     fi
 
     # Install Xen Orchestra (full installation with all checks)
