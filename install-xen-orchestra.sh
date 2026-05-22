@@ -1037,22 +1037,20 @@ flush_redis_tokens() {
     [[ $deleted -eq 0 && $kept -eq 0 ]] && log_info "No session tokens to flush" || true
 }
 
-# Scan Redis auth-token state for the two corruption patterns left behind by
-# restoring an exported XO config onto a fresh instance.
+# Scan Redis auth tokens for records that reference a user that no longer exists.
 #
-# XO maintains a Redis SET, xo:token::indexes, listing every token ID. For each
-# member it does GET xo:token:<id>. A config restore is a point-in-time snapshot,
-# so it can leave the index and the token bodies inconsistent. Two distinct faults:
+# Restoring an exported XO config onto a fresh instance is the common cause:
+# the export is a point-in-time snapshot, so a token body can land in the new
+# Redis with a user_id whose xo:user:<id> record was not restored. Calls using
+# such a token fail with "[GET] ... (401)" and XO logs index inconsistencies.
 #
-#   A) Dangling index member — an ID is in the xo:token::indexes SET but the
-#      xo:token:<id> body is missing. XO logs:
-#        "The id xo:token:<id> had no attached entries."
-#
-#   B) Orphaned token — a token body exists with a user_id whose xo:user:<id>
-#      record was not restored. Calls using it fail "[GET] ... (401)".
+# Note: XO's xo:token::indexes SET lists indexed *field names* (client_id,
+# user_id), not token IDs — it is collection metadata and is intentionally not
+# inspected here. Stale index state is cleared wholesale by flush_redis_tokens(),
+# which deletes the ::indexes key so XO rebuilds it on restart.
 #
 # This is a non-destructive diagnostic — it only reports. Use --flush-tokens
-# (or let the next update's flush_redis_tokens() run) to clear both.
+# (or let the next update's flush_redis_tokens() run) to clear orphaned tokens.
 check_orphaned_tokens() {
     if ! command -v redis-cli >/dev/null 2>&1; then
         return 0
@@ -1061,23 +1059,9 @@ check_orphaned_tokens() {
         return 0
     fi
 
-    local dangling=0 orphans=0
+    local orphans=0
 
-    # --- Fault A: index members with no token body ---
-    # xo:token::indexes is a SET; only inspect it if that is its actual type
-    # (a wrong type here would mean an XO schema change — skip rather than guess).
-    if [[ "$(redis-cli TYPE xo:token::indexes 2>/dev/null)" == "set" ]]; then
-        local member
-        while IFS= read -r member; do
-            [[ -z "$member" ]] && continue
-            if [[ "$(redis-cli EXISTS "xo:token:${member}" 2>/dev/null)" != "1" ]]; then
-                log_warning "  Dangling token index entry: ${member} (no token body)"
-                (( dangling++ )) || true
-            fi
-        done < <(redis-cli SMEMBERS xo:token::indexes 2>/dev/null)
-    fi
-
-    # --- Fault B: token bodies referencing a missing user ---
+    # Token bodies referencing a missing user.
     local -A valid_users=()
     local user_key uid
     while IFS= read -r user_key; do
@@ -1116,9 +1100,8 @@ check_orphaned_tokens() {
         done
     fi
 
-    if [[ $((dangling + orphans)) -gt 0 ]]; then
-        [[ $dangling -gt 0 ]] && log_warning "Found ${dangling} dangling token index entr(ies) — XO logs these as \"had no attached entries\"." || true
-        [[ $orphans -gt 0 ]]  && log_warning "Found ${orphans} auth token(s) referencing users that no longer exist." || true
+    if [[ $orphans -gt 0 ]]; then
+        log_warning "Found ${orphans} auth token(s) referencing users that no longer exist."
         log_warning "This is common after restoring an exported XO config onto a new instance."
         log_warning "Run '${0} --flush-tokens' to clear them and stop the log noise."
     fi
