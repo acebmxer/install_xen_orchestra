@@ -945,9 +945,18 @@ create_service_user() {
 
 # Flush session tokens from Redis, preserving API tokens used by third-party integrations.
 #
-# XO stores two categories of tokens under xo:token:*:
-#   - Session tokens  (created at browser login)  — no 'description' field
-#   - API tokens      (created via Settings > API) — have a non-empty 'description'
+# XO stores two categories of tokens under xo:token:*, distinguished by the
+# presence of a 'client_id' field in the token JSON:
+#   - Session tokens (created at browser login) — HAVE 'client_id' (and a
+#     'client' object); their 'description' holds the browser User-Agent.
+#   - API tokens (created via Settings > Tokens) — have NO 'client_id'; their
+#     'description' is the human-entered label (or empty).
+#
+# NOTE: classification is by 'client_id', NOT by 'description'. XO stores the
+# User-Agent string in 'description' for session tokens, so a non-empty
+# description does not mean a token is an API token — earlier versions of this
+# function mis-classified every session token as an API token and never flushed
+# them, leaving stale tokens that cause "had no attached entries" 401 noise.
 #
 # Only session tokens become invalid after an XO schema change; API tokens are
 # long-lived and must survive an update so that third-party integrations,
@@ -958,7 +967,7 @@ create_service_user() {
 # would otherwise cause "Cannot destructure property 'client' of 'token'" 401s.
 flush_redis_tokens() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "[DRY-RUN] Would flush session tokens from Redis (API tokens with descriptions are preserved)"
+        log_info "[DRY-RUN] Would flush browser session tokens from Redis (API tokens are preserved)"
         return 0
     fi
 
@@ -983,7 +992,7 @@ flush_redis_tokens() {
 
     local deleted=0 kept=0
     for key in "${token_keys[@]}"; do
-        local raw description
+        local raw client_id description
 
         # Index/metadata keys (double colon in name, e.g. xo:token::indexes) are
         # Redis collection internals that map user IDs to token IDs. Delete them
@@ -1013,28 +1022,120 @@ flush_redis_tokens() {
             fi
         fi
 
-        # Extract the description field from the token JSON.
-        # Tokens with a non-empty description are API/integration tokens — keep them.
-        # Tokens with no description are browser session tokens — delete them.
+        # Classify by the presence of a 'client_id' field:
+        #   - has client_id  -> browser session token -> flush
+        #   - no  client_id  -> API token             -> preserve
+        # 'description' is NOT used to classify — XO puts the User-Agent there
+        # for session tokens, so it is non-empty on both kinds.
         if command -v jq >/dev/null 2>&1; then
+            client_id=$(printf '%s' "$raw" | jq -r '.client_id // empty' 2>/dev/null || true)
             description=$(printf '%s' "$raw" | jq -r '.description // empty' 2>/dev/null || true)
         else
-            # Fallback: match "description":"<non-empty-value>"
+            # Fallback: detect the "client_id" key; extract description for logging.
+            client_id=$(printf '%s' "$raw" | grep -o '"client_id":"[^"]*"' | sed 's/"client_id":"//;s/"//' 2>/dev/null || true)
             description=$(printf '%s' "$raw" | grep -o '"description":"[^"]*"' | sed 's/"description":"//;s/"//' 2>/dev/null || true)
         fi
 
-        if [[ -n "$description" ]]; then
-            log_info "  Preserving API token (\"${description}\")"
-            (( kept++ )) || true
-        else
+        if [[ -n "$client_id" ]]; then
             redis-cli DEL "$key" >/dev/null 2>&1
+            log_info "  Flushed browser session token (client_id ${client_id})"
             (( deleted++ )) || true
+        else
+            log_info "  Preserving API token (\"${description:-no description}\")"
+            (( kept++ )) || true
         fi
     done
 
     [[ $deleted -gt 0 ]] && log_info "Flushed ${deleted} session token(s) — users will need to log in again" || true
     [[ $kept -gt 0 ]]    && log_info "Preserved ${kept} API token(s) — third-party integrations unaffected" || true
     [[ $deleted -eq 0 && $kept -eq 0 ]] && log_info "No session tokens to flush" || true
+}
+
+# Scan Redis auth tokens for records that reference a user that no longer exists.
+#
+# Restoring an exported XO config onto a fresh instance is the common cause:
+# the export is a point-in-time snapshot, so a token body can land in the new
+# Redis with a user_id whose xo:user:<id> record was not restored. Calls using
+# such a token fail with "[GET] ... (401)" and XO logs index inconsistencies.
+#
+# Note: XO's xo:token::indexes SET lists indexed *field names* (client_id,
+# user_id), not token IDs — it is collection metadata and is intentionally not
+# inspected here. Stale index state is cleared wholesale by flush_redis_tokens(),
+# which deletes the ::indexes key so XO rebuilds it on restart.
+#
+# This is a non-destructive diagnostic — it only reports. Use --flush-tokens
+# (or let the next update's flush_redis_tokens() run) to clear orphaned tokens.
+check_orphaned_tokens() {
+    if ! command -v redis-cli >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! timeout 5 redis-cli ping 2>/dev/null | grep -q PONG; then
+        return 0
+    fi
+
+    local orphans=0
+
+    # Token bodies referencing a missing user.
+    local -A valid_users=()
+    local user_key uid
+    while IFS= read -r user_key; do
+        [[ "$user_key" == *"::"* ]] && continue
+        uid="${user_key#xo:user:}"
+        [[ "$uid" == "version" ]] && continue
+        valid_users["$uid"]=1
+    done < <(redis-cli KEYS "xo:user:*" 2>/dev/null)
+
+    # Only run the user check if we actually read some users — an empty result
+    # likely means a failed read, and would flag every token as a false positive.
+    if [[ ${#valid_users[@]} -gt 0 ]]; then
+        local -a token_keys
+        mapfile -t token_keys < <(redis-cli KEYS "xo:token:*" 2>/dev/null)
+
+        local key raw token_uid
+        for key in "${token_keys[@]}"; do
+            [[ "$key" == *"::"* ]] && continue
+            [[ "$key" == "xo:token:version" ]] && continue
+
+            raw=$(redis-cli GET "$key" 2>/dev/null)
+            [[ -z "$raw" ]] && continue
+
+            if command -v jq >/dev/null 2>&1; then
+                printf '%s' "$raw" | jq empty 2>/dev/null || continue
+                token_uid=$(printf '%s' "$raw" | jq -r '.user_id // empty' 2>/dev/null || true)
+            else
+                token_uid=$(printf '%s' "$raw" | grep -o '"user_id":"[^"]*"' | sed 's/"user_id":"//;s/"//' 2>/dev/null || true)
+            fi
+
+            [[ -z "$token_uid" ]] && continue
+            if [[ -z "${valid_users[$token_uid]:-}" ]]; then
+                log_warning "  Orphaned token ${key} references missing user ${token_uid}"
+                (( orphans++ )) || true
+            fi
+        done
+    fi
+
+    if [[ $orphans -gt 0 ]]; then
+        log_warning "Found ${orphans} auth token(s) referencing users that no longer exist."
+        log_warning "This is common after restoring an exported XO config onto a new instance."
+        log_warning "Run '${0} --flush-tokens' to clear them and stop the log noise."
+    fi
+    return 0
+}
+
+# Standalone entry point for flushing stale Redis auth tokens without an update.
+# flush_redis_tokens() otherwise only runs as a side effect of update/rebuild/
+# reconfigure (which require a pending code change). A config restore can leave
+# stale token/index records behind with no such change pending — this gives the
+# user a direct way to clean them up.
+flush_tokens_standalone() {
+    log_info "Flushing stale Redis auth tokens..."
+    printf '\n'
+    check_orphaned_tokens
+    flush_redis_tokens
+    printf '\n'
+    log_info "Restart xo-server for XO to rebuild clean token indexes:"
+    log_info "  sudo systemctl restart xo-server"
+    log_success "Token flush complete."
 }
 
 # Disable Redis RDB/AOF persistence for the local Redis instance.
@@ -1763,11 +1864,13 @@ restore_xo() {
 # Auth priority: 1) XO_TASK_CHECK_TOKEN  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
 # Passwords are never logged, cached, or written to disk.
 #
-# NOTE: XO_TASK_CHECK_TOKEN must be a token created via XO's Settings →
-# Authentication tokens (or via the REST API with a "description" field in the
-# request body). During updates flush_redis_tokens() preserves tokens that have
-# a non-empty description and deletes tokens without one (browser sessions).
-# A token created without a description will be wiped on the next update.
+# NOTE: XO_TASK_CHECK_TOKEN must be a persistent API token created in XO's web
+# UI (open your user menu → Tokens; the exact menu location varies by XO
+# version) or via the REST API with a "description" field in the request body.
+# The token is sent to the REST API via the authenticationToken cookie.
+# During updates flush_redis_tokens() preserves tokens that have a non-empty
+# description and deletes tokens without one (browser sessions). A token
+# created without a description will be wiped on the next update.
 #
 # Orphan filter: tasks whose start time predates xo-server's process start
 # are treated as stale DB records (e.g. left over after restoring an XO
@@ -2144,6 +2247,10 @@ update_xo() {
 
     if [[ "$INSTALLED_COMMIT" == "$REMOTE_COMMIT" ]]; then
         log_success "Already up to date. No update needed."
+        # No code change means no token-schema flush is warranted, but a
+        # config restore can still leave orphaned tokens behind — surface
+        # them so the user knows to run --flush-tokens.
+        check_orphaned_tokens
         exit 0
     fi
 
@@ -3177,6 +3284,7 @@ show_help() {
     echo "  --reconfigure          Regenerate config, systemd service, sudoers, and file ownership"
     echo "  --proxy                Install XO Proxy on a Xen pool master"
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
+    echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
     echo "  --help                 Show this help message"
     echo ""
@@ -3931,7 +4039,7 @@ main() {
             --json-logs)
                 JSON_LOGS=true
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--adjust-memory|--uninstall|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--adjust-memory|--flush-tokens|--uninstall|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -3955,7 +4063,7 @@ main() {
     fi
 
     if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
-        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --uninstall)"
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --flush-tokens, --uninstall)"
         exit 1
     fi
 
@@ -4015,6 +4123,12 @@ main() {
             check_sudo
             check_systemctl
             adjust_xo_memory
+            ;;
+        --flush-tokens)
+            check_required_commands
+            check_not_root
+            check_sudo
+            flush_tokens_standalone
             ;;
         --install)
             install_xo
