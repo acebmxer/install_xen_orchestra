@@ -1243,6 +1243,10 @@ verify_xo_web_build() {
     #   /    → @xen-orchestra/web/dist  (XO 6, default)
     #   /v5  → packages/xo-web/dist    (XO 5, legacy)
     # Check both; warn if either has index.html but missing JS chunks.
+    # NOTE: $INSTALL_DIR is typically owned by SERVICE_USER with restrictive
+    # permissions, so we use `sudo test`/`sudo grep` for filesystem checks —
+    # plain bash `[[ -f ]]` would return false for an existing-but-unreadable
+    # path and produce a false-positive warning.
     local -a web_dists=(
         "$INSTALL_DIR/@xen-orchestra/web/dist"
         "$INSTALL_DIR/packages/xo-web/dist"
@@ -1250,16 +1254,16 @@ verify_xo_web_build() {
 
     local overall_ok=true
     for web_dist in "${web_dists[@]}"; do
-        [[ ! -f "${web_dist}/index.html" ]] && continue
+        sudo test -f "${web_dist}/index.html" || continue
 
         local missing=0
         while IFS= read -r chunk; do
             [[ -z "$chunk" ]] && continue
-            if [[ ! -f "${web_dist}/${chunk}" ]]; then
+            if ! sudo test -f "${web_dist}/${chunk}"; then
                 log_warning "  Missing build artifact in ${web_dist}: ${chunk}"
                 (( missing++ )) || true
             fi
-        done < <(grep -o 'assets/[a-zA-Z0-9._-]*\.js' "${web_dist}/index.html" 2>/dev/null | sort -u)
+        done < <(sudo grep -o 'assets/[a-zA-Z0-9._-]*\.js' "${web_dist}/index.html" 2>/dev/null | sort -u)
 
         if [[ $missing -gt 0 ]]; then
             log_warning "Build verification: ${missing} JS chunk(s) missing in $(basename "$web_dist")."
@@ -1274,18 +1278,18 @@ verify_xo_web_build() {
     fi
 
     local xo6_dist="$INSTALL_DIR/@xen-orchestra/web/dist"
-    if [[ ! -f "$xo6_dist/index.html" ]]; then
+    if ! sudo test -f "$xo6_dist/index.html"; then
         log_warning "XO 6 web UI artifact missing: $xo6_dist/index.html"
         log_warning "Browser will fall back to XO 5 UI at /v5 if served."
         log_info  "Diagnostic — state of $xo6_dist:"
-        if [[ -d "$xo6_dist" ]]; then
-            ls -la "$xo6_dist" 2>&1 | sed 's/^/    /' | while IFS= read -r line; do log_info "$line"; done
+        if sudo test -d "$xo6_dist"; then
+            sudo ls -la "$xo6_dist" 2>&1 | sed 's/^/    /' | while IFS= read -r line; do log_info "$line"; done
         else
             log_info "    (directory does not exist)"
         fi
         log_info  "Diagnostic — state of $INSTALL_DIR/@xen-orchestra/web:"
-        if [[ -d "$INSTALL_DIR/@xen-orchestra/web" ]]; then
-            ls -la "$INSTALL_DIR/@xen-orchestra/web" 2>&1 | sed 's/^/    /' | while IFS= read -r line; do log_info "$line"; done
+        if sudo test -d "$INSTALL_DIR/@xen-orchestra/web"; then
+            sudo ls -la "$INSTALL_DIR/@xen-orchestra/web" 2>&1 | sed 's/^/    /' | while IFS= read -r line; do log_info "$line"; done
         else
             log_info "    (directory does not exist)"
         fi
