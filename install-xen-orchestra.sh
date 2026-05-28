@@ -1273,10 +1273,23 @@ verify_xo_web_build() {
         log_warning "Run '--rebuild' to force a clean rebuild."
     fi
 
-    if [[ ! -f "$INSTALL_DIR/@xen-orchestra/web/dist/index.html" ]]; then
-        log_warning "XO 6 web UI (@xen-orchestra/web/dist) was not built — browser will use XO 5 UI at /v5."
-        log_warning "This may be caused by unmet peer dependencies (pinia 3.x, vue-router 5.x)."
-        log_warning "Access your XO instance at: https://<host>/v5 until the upstream issue is resolved."
+    local xo6_dist="$INSTALL_DIR/@xen-orchestra/web/dist"
+    if [[ ! -f "$xo6_dist/index.html" ]]; then
+        log_warning "XO 6 web UI artifact missing: $xo6_dist/index.html"
+        log_warning "Browser will fall back to XO 5 UI at /v5 if served."
+        log_info  "Diagnostic — state of $xo6_dist:"
+        if [[ -d "$xo6_dist" ]]; then
+            ls -la "$xo6_dist" 2>&1 | sed 's/^/    /' | while IFS= read -r line; do log_info "$line"; done
+        else
+            log_info "    (directory does not exist)"
+        fi
+        log_info  "Diagnostic — state of $INSTALL_DIR/@xen-orchestra/web:"
+        if [[ -d "$INSTALL_DIR/@xen-orchestra/web" ]]; then
+            ls -la "$INSTALL_DIR/@xen-orchestra/web" 2>&1 | sed 's/^/    /' | while IFS= read -r line; do log_info "$line"; done
+        else
+            log_info "    (directory does not exist)"
+        fi
+        log_warning "Run '--rebuild' to force a clean rebuild if this persists."
     fi
 }
 
