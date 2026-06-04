@@ -664,6 +664,25 @@ install_dependencies() {
             nfs-utils ntfs-3g openssl curl ca-certificates gnupg2 patch sudo dmidecode libcap fuse-libs
     fi
 
+    # ESXi/VMware import needs the `nbdinfo` binary. XO can build it from source,
+    # but that path is hard-gated on the xo-server process running as root
+    # (packages/xo-server/src/api/esxi.mjs: `id -u` must be 0). A non-root
+    # SERVICE_USER can never satisfy that, so provide nbdinfo from the distro
+    # package instead — XO checks `which nbdinfo` first and skips the root-only
+    # build when the binary already exists on PATH.
+    if [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]]; then
+        log_info "Non-root SERVICE_USER: installing nbdinfo for ESXi/VMware import..."
+        if [[ "$PKG_MANAGER" == "apt" ]]; then
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL libnbd-bin \
+                || log_warning "Could not install libnbd-bin; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
+        elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL libnbd \
+                || log_warning "Could not install libnbd; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
+        fi
+    fi
+
     log_success "System dependencies installed"
 }
 
