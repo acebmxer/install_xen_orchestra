@@ -1554,6 +1554,25 @@ create_systemd_service() {
         DEBUG_ENV="DEBUG=xo:main"
     fi
 
+    # Capability hardening is only emitted for a non-root SERVICE_USER. As root,
+    # CapabilityBoundingSet acts as a *ceiling* and would strip caps that root
+    # normally holds (CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, ...), breaking
+    # features that shell out to apt-get such as the VMware/ESXi import nbd build.
+    local CAP_BLOCK=""
+    if [[ "$EXEC_USER" != "root" ]]; then
+        CAP_BLOCK=$(cat << 'CAPEOF'
+
+# Allow binding to privileged ports (80/443)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Bounding set: ceiling for all processes in this service tree.
+# CAP_NET_BIND_SERVICE: bind to ports 80/443
+# CAP_SETUID/CAP_SETGID/CAP_AUDIT_WRITE: required for sudo to function
+# CAP_SYS_ADMIN: required for mount syscall (NFS/CIFS remotes)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN CAP_AUDIT_WRITE
+CAPEOF
+)
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "[DRY-RUN] Would write /etc/systemd/system/xo-server.service"
     else
@@ -1584,14 +1603,7 @@ RuntimeDirectoryMode=0755
 # to raise them when sudo is invoked for NFS/CIFS mount operations
 LimitNOFILE=1048576
 LimitMEMLOCK=infinity
-
-# Allow binding to privileged ports (80/443)
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-# Bounding set: ceiling for all processes in this service tree.
-# CAP_NET_BIND_SERVICE: bind to ports 80/443
-# CAP_SETUID/CAP_SETGID/CAP_AUDIT_WRITE: required for sudo to function
-# CAP_SYS_ADMIN: required for mount syscall (NFS/CIFS remotes)
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN CAP_AUDIT_WRITE
+${CAP_BLOCK}
 
 [Install]
 WantedBy=multi-user.target
