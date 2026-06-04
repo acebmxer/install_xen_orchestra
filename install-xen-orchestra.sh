@@ -664,6 +664,25 @@ install_dependencies() {
             nfs-utils ntfs-3g openssl curl ca-certificates gnupg2 patch sudo dmidecode libcap fuse-libs
     fi
 
+    # ESXi/VMware import needs the `nbdinfo` binary. XO can build it from source,
+    # but that path is hard-gated on the xo-server process running as root
+    # (packages/xo-server/src/api/esxi.mjs: `id -u` must be 0). A non-root
+    # SERVICE_USER can never satisfy that, so provide nbdinfo from the distro
+    # package instead — XO checks `which nbdinfo` first and skips the root-only
+    # build when the binary already exists on PATH.
+    if [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]]; then
+        log_info "Non-root SERVICE_USER: installing nbdinfo for ESXi/VMware import..."
+        if [[ "$PKG_MANAGER" == "apt" ]]; then
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL libnbd-bin \
+                || log_warning "Could not install libnbd-bin; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
+        elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL libnbd \
+                || log_warning "Could not install libnbd; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
+        fi
+    fi
+
     log_success "System dependencies installed"
 }
 
@@ -1434,6 +1453,13 @@ configure_xo() {
             log_warning "  a XenServer/XCP-ng guest (detected virtualization: ${VIRT_TYPE})."
             log_warning "  xo-server will fail to start credential encryption without XenStore."
             log_warning "  Set ENCRYPT_REDIS_CREDENTIALS=false unless XO is an XCP-ng VM."
+        elif [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]]; then
+            # On a Xen guest the xenbus device is root-only by default, so a
+            # non-root xo-server cannot reach XenStore. configure_xenstore_access()
+            # grants the service user access (group + udev rule) so encryption works
+            # without running the whole service as root. Just note it here.
+            log_info "Non-root SERVICE_USER with encryption enabled — will grant"
+            log_info "  ${SERVICE_USER} XenStore access (group 'xenstore' + udev rule)."
         fi
     fi
 
@@ -1547,6 +1573,25 @@ create_systemd_service() {
         DEBUG_ENV="DEBUG=xo:main"
     fi
 
+    # Capability hardening is only emitted for a non-root SERVICE_USER. As root,
+    # CapabilityBoundingSet acts as a *ceiling* and would strip caps that root
+    # normally holds (CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, ...), breaking
+    # features that shell out to apt-get such as the VMware/ESXi import nbd build.
+    local CAP_BLOCK=""
+    if [[ "$EXEC_USER" != "root" ]]; then
+        CAP_BLOCK=$(cat << 'CAPEOF'
+
+# Allow binding to privileged ports (80/443)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Bounding set: ceiling for all processes in this service tree.
+# CAP_NET_BIND_SERVICE: bind to ports 80/443
+# CAP_SETUID/CAP_SETGID/CAP_AUDIT_WRITE: required for sudo to function
+# CAP_SYS_ADMIN: required for mount syscall (NFS/CIFS remotes)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN CAP_AUDIT_WRITE
+CAPEOF
+)
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "[DRY-RUN] Would write /etc/systemd/system/xo-server.service"
     else
@@ -1577,14 +1622,7 @@ RuntimeDirectoryMode=0755
 # to raise them when sudo is invoked for NFS/CIFS mount operations
 LimitNOFILE=1048576
 LimitMEMLOCK=infinity
-
-# Allow binding to privileged ports (80/443)
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-# Bounding set: ceiling for all processes in this service tree.
-# CAP_NET_BIND_SERVICE: bind to ports 80/443
-# CAP_SETUID/CAP_SETGID/CAP_AUDIT_WRITE: required for sudo to function
-# CAP_SYS_ADMIN: required for mount syscall (NFS/CIFS remotes)
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_ADMIN CAP_AUDIT_WRITE
+${CAP_BLOCK}
 
 [Install]
 WantedBy=multi-user.target
@@ -1628,6 +1666,81 @@ EOF
 
         log_success "Sudo configured for ${SERVICE_USER} (mount, umount, findmnt)"
     fi
+}
+
+# Grant a non-root service user access to XenStore for credential encryption.
+#
+# ENCRYPT_REDIS_CREDENTIALS=true makes xo-server keep half of its encryption key
+# in XenStore. The guest reaches XenStore through the xenbus device, which is
+# owned by root and mode 0600 by default, so a non-root xo-server cannot read or
+# write it — credential encryption then fails (xo-server enters degraded mode and
+# logins are rejected). XO's docs expect the xo-server process to reach XenStore
+# but do not cover this OS-level permission, so we bridge that gap with least
+# privilege — a dedicated 'xenstore' group plus a udev rule — rather than running
+# the whole service as root. (Set SERVICE_USER=root instead if you prefer that.)
+#
+# Only relevant on a Xen guest with a non-root user and encryption enabled.
+configure_xenstore_access() {
+    [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]] || return 0
+    [[ "$ENCRYPT_REDIS_CREDENTIALS" == "true" ]] || return 0
+
+    local VIRT_TYPE
+    VIRT_TYPE=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+    if [[ "$VIRT_TYPE" != "xen" ]]; then
+        # Not a Xen guest: encryption cannot work here regardless of user.
+        # configure_xo() already warns about this, so there is nothing to grant.
+        return 0
+    fi
+
+    log_info "Granting ${SERVICE_USER} XenStore access for credential encryption..."
+
+    local UDEV_RULE="/etc/udev/rules.d/40-xen-xenbus-xo.rules"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would create group 'xenstore', add ${SERVICE_USER}, write $UDEV_RULE, and chown /var/lib/xo-server"
+    else
+        # Dedicated group so the service user gets xenbus access without root.
+        run_cmd sudo groupadd -f xenstore
+        run_cmd sudo usermod -aG xenstore "$SERVICE_USER"
+
+        # udev rule: hand the xenbus device node to the 'xenstore' group (rw).
+        # This persists the permission across reboots / device re-creation.
+        sudo tee "$UDEV_RULE" > /dev/null << 'EOF'
+# Allow members of the 'xenstore' group to access the Xen xenbus device so a
+# non-root xo-server can read/write XenStore for credential encryption.
+# Installed by install-xen-orchestra.sh when SERVICE_USER is non-root and
+# ENCRYPT_REDIS_CREDENTIALS=true.
+# Ref: https://docs.xen-orchestra.com/xo5/credential-encryption
+#
+# The xenbus device (/dev/xen/xenbus) is a 'misc' char device whose kernel
+# sysname is 'xen!xenbus' (udev encodes the '/' in xen/xenbus as '!'), verified
+# via: udevadm info --name=/dev/xen/xenbus -q all
+SUBSYSTEM=="misc", KERNEL=="xen!xenbus", GROUP="xenstore", MODE="0660"
+EOF
+        run_cmd sudo chmod 644 "$UDEV_RULE"
+        # Reload/trigger are best-effort: they re-apply the rule to the live
+        # device, but the explicit chgrp/chmod below is what guarantees access
+        # this session. Don't let a udev quirk abort the install (set -e).
+        run_cmd sudo udevadm control --reload || true
+        run_cmd sudo udevadm trigger --subsystem-match=misc || true
+
+        # Apply to the currently-present device immediately so encryption works
+        # this session without a reboot (the udev rule above covers reboots, and
+        # this does not depend on the udev match being exact for the live node).
+        if [[ -e /dev/xen/xenbus ]]; then
+            run_cmd sudo chgrp xenstore /dev/xen/xenbus
+            run_cmd sudo chmod 0660 /dev/xen/xenbus
+        fi
+
+        # The other half of the key lives on disk; per official docs this path
+        # must be writable by the xo-server process.
+        run_cmd sudo mkdir -p /var/lib/xo-server/data
+        run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/xo-server
+    fi
+
+    log_success "XenStore access granted to ${SERVICE_USER} (group 'xenstore' + udev rule)"
+    log_warning "Group membership applies on the next xo-server restart. Verify with:"
+    log_warning "  sudo -u ${SERVICE_USER} xenstore-ls vm-data"
 }
 
 # Run git in the install directory as the directory owner
@@ -2304,6 +2417,9 @@ update_xo() {
     # Regenerate sudoers for non-root service user (tightens legacy rules)
     configure_sudo
 
+    # Grant XenStore access if a non-root user has credential encryption enabled
+    configure_xenstore_access
+
     # Apply security hardening (permissions, ownership, group cleanup)
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         # Remove legacy root group membership from previous script versions
@@ -2526,6 +2642,9 @@ reconfigure_xo() {
     # Update sudoers for non-root service user
     configure_sudo
 
+    # Grant XenStore access if a non-root user has credential encryption enabled
+    configure_xenstore_access
+
     # Clean up legacy group membership and fix file ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         # Remove legacy root group membership from previous script versions
@@ -2682,6 +2801,7 @@ install_xo() {
     configure_xo
     create_systemd_service
     configure_sudo
+    configure_xenstore_access
     start_service
     print_summary
 }
@@ -3008,6 +3128,13 @@ cleanup_xo() {
             log_info "Removing sudoers file..."
             run_cmd sudo rm -f "$SUDOERS_FILE"
         fi
+    fi
+
+    # 3b. Remove the XenStore-access udev rule (added for non-root encryption)
+    if [[ -f /etc/udev/rules.d/40-xen-xenbus-xo.rules ]]; then
+        log_info "Removing XenStore access udev rule..."
+        run_cmd sudo rm -f /etc/udev/rules.d/40-xen-xenbus-xo.rules
+        run_cmd sudo udevadm control --reload
     fi
 
     # 4. Remove the install directory

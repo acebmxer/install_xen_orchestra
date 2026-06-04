@@ -120,7 +120,7 @@ Key settings:
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `GIT_BRANCH` | master | Git branch or tag |
 | `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
-| `SERVICE_USER` | xo-service | Service user (set to `root` for VMware V2V import) |
+| `SERVICE_USER` | xo-service | Service user; non-root recommended (set to `root` for VMware V2V import — see encryption note for credential-encryption behavior) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
@@ -129,7 +129,11 @@ Key settings:
 
 > **Note on `BACKUP_KEEP` rotation:** The retention policy only applies to backups created by the current version of the script. Backups made by older script versions may use a different naming convention and will **not** be counted or pruned by the rotation logic. If you are upgrading from an older version, manually review your backup directory (`BACKUP_DIR` in config, default `/var/lib/xo-backups`) and remove any legacy-named archives you no longer need.
 
-> **Note on `ENCRYPT_REDIS_CREDENTIALS`:** This is an opt-in xo-server feature that encrypts credentials stored in Redis at rest (AES-256-GCM). It **only works when Xen Orchestra runs as a VM on a XenServer/XCP-ng host**, because half of the encryption key is stored in XenStore. It will **not** work on bare metal or on other hypervisors (KVM, VMware, Hyper-V). Leave it `false` unless XO is an XCP-ng guest. To opt out later, set it back to `false` and run `--reconfigure` — xo-server decrypts the records and removes the key files automatically.
+> **Note on `ENCRYPT_REDIS_CREDENTIALS`:** This is an opt-in xo-server feature that encrypts credentials stored in Redis at rest (AES-256-GCM). It **only works when Xen Orchestra runs as a VM on a XenServer/XCP-ng host**, because half of the encryption key is stored in XenStore. It will **not** work on bare metal or on other hypervisors (KVM, VMware, Hyper-V). Leave it `false` unless XO is an XCP-ng guest.
+>
+> **Works with either `SERVICE_USER`:** root reaches XenStore directly. For a **non-root** `SERVICE_USER`, the xenbus device is root-only by default, so the installer adds the user to a `xenstore` group and installs a udev rule (`/etc/udev/rules.d/40-xen-xenbus-xo.rules`) granting access — without this, xo-server cannot derive the key and rejects logins (degraded mode). Group membership applies on the next service restart; verify with `sudo -u <SERVICE_USER> xenstore-ls vm-data`.
+>
+> To opt out later, set it back to `false` and run `--reconfigure` — xo-server decrypts the records and removes the key files automatically.
 
 ## Default Credentials
 
