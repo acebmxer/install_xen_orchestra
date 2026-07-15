@@ -15,7 +15,7 @@ trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service wa
 # Based on: https://docs.xen-orchestra.com/installation#from-the-sources
 #
 # This script installs Xen Orchestra from source with:
-# - Node.js 20 LTS
+# - Node.js (latest LTS by default; configurable via NODE_VERSION in xo-config.cfg)
 # - Self-signed SSL certificate
 # - Direct ports 80/443 (no proxy)
 # - Systemd service management
@@ -592,6 +592,8 @@ detect_package_manager() {
 
 # Detect OS distribution
 detect_os() {
+    # OS_VERSION_ID is parsed for reference/diagnostics; not read by the script today.
+    # shellcheck disable=SC2034
     if [[ -f /etc/os-release ]]; then
         if . /etc/os-release 2>/dev/null; then
             OS_ID="${ID:-unknown}"
@@ -650,8 +652,15 @@ install_dependencies() {
                 run_cmd $PKG_INSTALL redis
             else
                 log_info "Redis not available, installing Valkey as replacement..."
-                run_cmd sudo dnf install -y epel-release || true
-                run_cmd sudo dnf config-manager --enable devel || true
+                # EPEL and the CRB/devel repo are RHEL-family only — that is where
+                # Valkey lives on RHEL/CentOS/Rocky/Alma. Fedora ships Valkey in its
+                # base repositories and has neither repo, so skip them there:
+                # `epel-release` errors ("No match for argument") and dnf5's
+                # config-manager does not accept `--enable`.
+                if [[ "$OS_ID" != "fedora" ]]; then
+                    run_cmd sudo dnf install -y epel-release || true
+                    run_cmd sudo dnf config-manager --enable devel || true
+                fi
                 # shellcheck disable=SC2086
                 run_cmd $PKG_INSTALL valkey valkey-compat-redis
             fi
@@ -956,8 +965,9 @@ create_service_user() {
         fi
 
         # Display UID/GID for reference
-        local XO_UID=$(id -u "$SERVICE_USER" 2>/dev/null || echo "unknown")
-        local XO_GID=$(id -g "$SERVICE_USER" 2>/dev/null || echo "unknown")
+        local XO_UID XO_GID
+        XO_UID=$(id -u "$SERVICE_USER" 2>/dev/null || echo "unknown")
+        XO_GID=$(id -g "$SERVICE_USER" 2>/dev/null || echo "unknown")
         log_info "Service user UID:GID is ${XO_UID}:${XO_GID}"
     fi
 }
@@ -1163,15 +1173,30 @@ setup_redis() {
 
     check_systemctl
 
-    # Try redis-server first, then valkey
-    if systemctl list-unit-files 2>/dev/null | grep -q redis; then
-        run_cmd sudo systemctl enable redis-server 2>/dev/null || run_cmd sudo systemctl enable redis 2>/dev/null || true
-        run_cmd sudo systemctl start redis-server 2>/dev/null || run_cmd sudo systemctl start redis 2>/dev/null || true
-    elif systemctl list-unit-files 2>/dev/null | grep -q valkey; then
-        run_cmd sudo systemctl enable valkey 2>/dev/null || true
-        run_cmd sudo systemctl start valkey 2>/dev/null || true
+    # A redis/valkey unit may have just been installed; make sure systemd sees it
+    # before we probe for it.
+    run_cmd sudo systemctl daemon-reload 2>/dev/null || true
+
+    # Detect whichever redis-compatible service this distro installed:
+    #   Debian/Ubuntu -> redis-server    RHEL/CentOS -> redis
+    #   Fedora / newer RHEL -> valkey (drop-in replacement for redis)
+    # `systemctl cat` succeeds only when the unit file actually exists, which is a
+    # more reliable test than grepping `list-unit-files` output.
+    local redis_svc=""
+    local candidate
+    for candidate in redis-server redis valkey valkey-server; do
+        if systemctl cat "${candidate}.service" >/dev/null 2>&1; then
+            redis_svc="$candidate"
+            break
+        fi
+    done
+
+    if [[ -n "$redis_svc" ]]; then
+        log_info "Enabling and starting ${redis_svc}.service"
+        run_cmd sudo systemctl enable "$redis_svc" 2>/dev/null || true
+        run_cmd sudo systemctl start "$redis_svc" 2>/dev/null || true
     else
-        log_warning "Neither redis nor valkey service found in systemd units"
+        log_warning "No redis/valkey systemd unit found; probing for a running server anyway"
     fi
 
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
@@ -1179,11 +1204,22 @@ setup_redis() {
         return 0
     fi
 
-    # Verify Redis is running
-    if command -v redis-cli >/dev/null 2>&1 && redis-cli ping 2>/dev/null | grep -q PONG; then
-        log_success "Redis is running"
+    # Verify the server responds. valkey-compat-redis provides a redis-cli symlink;
+    # fall back to valkey-cli if only that is present.
+    local redis_cli=""
+    if command -v redis-cli >/dev/null 2>&1; then
+        redis_cli="redis-cli"
+    elif command -v valkey-cli >/dev/null 2>&1; then
+        redis_cli="valkey-cli"
+    fi
+
+    if [[ -n "$redis_cli" ]] && "$redis_cli" ping 2>/dev/null | grep -q PONG; then
+        log_success "Redis is running (${redis_svc:-server}, via ${redis_cli})"
     else
-        log_error "Redis is not running or not responding"
+        log_error "Redis/Valkey is not running or not responding"
+        log_error "  Detected service: ${redis_svc:-none found}"
+        log_error "  Inspect with: sudo systemctl status ${redis_svc:-valkey} --no-pager"
+        log_error "                sudo journalctl -u ${redis_svc:-valkey} -n 30 --no-pager"
         exit 1
     fi
 }
@@ -1218,7 +1254,8 @@ ensure_swap_space() {
     local SWAP_FILE="/swapfile"
     
     # Check current swap
-    local CURRENT_SWAP=$(free -m | awk '/^Swap:/ {print $2}')
+    local CURRENT_SWAP
+    CURRENT_SWAP=$(free -m | awk '/^Swap:/ {print $2}')
     
     if [[ $CURRENT_SWAP -ge $MIN_SWAP_MB ]]; then
         log_info "Sufficient swap space available: ${CURRENT_SWAP}MB"
@@ -1345,8 +1382,9 @@ build_xo() {
     fi
 
     # Calculate available memory (RAM + swap) and set build limits to prevent OOM
-    local TOTAL_RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
-    local TOTAL_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
+    local TOTAL_RAM_MB TOTAL_SWAP_MB
+    TOTAL_RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
+    TOTAL_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
     local TOTAL_MEM_MB=$((TOTAL_RAM_MB + TOTAL_SWAP_MB))
 
     local NODE_HEAP_SIZE
@@ -1564,7 +1602,8 @@ EOF
 create_systemd_service() {
     log_info "Creating systemd service..."
 
-    local NODE_PATH=$(command -v node)
+    local NODE_PATH
+    NODE_PATH=$(command -v node) || NODE_PATH=""
     local EXEC_USER="${SERVICE_USER:-root}"
     local XO_SERVER_PATH="${INSTALL_DIR}/packages/xo-server/dist/cli.mjs"
     local DEBUG_ENV=""
@@ -1598,7 +1637,7 @@ CAPEOF
     sudo tee /etc/systemd/system/xo-server.service > /dev/null << EOF
 [Unit]
 Description=Xen Orchestra Server
-After=network-online.target redis.service
+After=network-online.target redis.service valkey.service
 Wants=network-online.target
 
 [Service]
@@ -2327,8 +2366,11 @@ update_xo() {
         exit 1
     fi
 
-    local INSTALLED_COMMIT=$(get_installed_commit)
-    local REMOTE_COMMIT=$(get_remote_commit)
+    local INSTALLED_COMMIT REMOTE_COMMIT
+    # Keep failures non-fatal here so the explicit empty-value checks below emit a
+    # clean message instead of letting a transient git/network error trip `set -e`.
+    INSTALLED_COMMIT=$(get_installed_commit) || INSTALLED_COMMIT=""
+    REMOTE_COMMIT=$(get_remote_commit) || REMOTE_COMMIT=""
 
     if [[ -z "$INSTALLED_COMMIT" ]]; then
         log_error "Could not determine installed commit"
@@ -3380,6 +3422,27 @@ adjust_xo_memory() {
 }
 
 # Show help
+# Print the installed script's git revision so users can identify exactly which
+# version they are running (useful in bug reports). Falls back gracefully when
+# the script is run outside a git checkout.
+show_version() {
+    echo "Xen Orchestra Installation Script"
+    if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
+        # describe yields the nearest tag (e.g. v0.1.3), or v0.1.3-N-gHASH when
+        # ahead of it, or the short hash if no tags are reachable.
+        local version branch
+        version=$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null) || version=""
+        branch=$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+        echo "  Version: ${version:-unknown}"
+        if [[ -n "$branch" ]]; then
+            echo "  Branch:  ${branch}"
+        fi
+    else
+        echo "  Version: unknown (not a git checkout)"
+    fi
+    echo "  Based on: https://docs.xen-orchestra.com/installation#from-the-sources"
+}
+
 show_help() {
     echo "Xen Orchestra Installation Script"
     echo ""
@@ -3397,6 +3460,7 @@ show_help() {
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
     echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
+    echo "  --version              Show this script's version and branch, then exit"
     echo "  --help                 Show this help message"
     echo ""
     echo "Automation Flags (can be combined with any operation):"
@@ -3432,8 +3496,11 @@ M_RED="${M_CSI}31m"
 M_GREEN="${M_CSI}32m"
 M_YELLOW="${M_CSI}33m"
 M_BLUE="${M_CSI}34m"
+# M_MAGENTA/M_BLINK complete the ANSI palette but aren't used by the current menu.
+# shellcheck disable=SC2034
 M_MAGENTA="${M_CSI}35m"
 M_CYAN="${M_CSI}36m"
+# shellcheck disable=SC2034
 M_BLINK="${M_CSI}5m"
 M_REVERSE="${M_CSI}7m"
 
@@ -4149,6 +4216,11 @@ main() {
                 ;;
             --json-logs)
                 JSON_LOGS=true
+                ;;
+            --version)
+                # Informational: print revision and exit before self-update/lock.
+                show_version
+                exit 0
                 ;;
             --install|--update|--restore|--rebuild|--reconfigure|--proxy|--adjust-memory|--flush-tokens|--uninstall|--help)
                 OPERATION="$1"

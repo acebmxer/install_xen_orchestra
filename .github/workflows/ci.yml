@@ -18,7 +18,7 @@ jobs:
         run: sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck on main script
-        run: shellcheck -S error install-xen-orchestra.sh
+        run: shellcheck -S warning install-xen-orchestra.sh
 
   unit-tests:
     name: BATS Unit Tests

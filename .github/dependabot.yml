@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Keep the GitHub Actions used in CI (e.g. actions/checkout) up to date.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - "dependencies"
