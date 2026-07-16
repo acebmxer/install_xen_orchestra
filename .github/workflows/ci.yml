@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.0
 
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.0
 
       - name: Install bats-core
         run: sudo apt-get install -y bats
@@ -58,7 +58,7 @@ jobs:
             dockerfile: tests/integration/Dockerfile.centosstream9
     steps:
       - name: Checkout
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.0
 
       - name: Build integration image (${{ matrix.distro }})
         run: docker build -f ${{ matrix.dockerfile }} -t xo-test-${{ matrix.distro }} .
