@@ -12,6 +12,11 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Added
 - `--version` flag: prints the script's release (via `git describe`) and branch.
+- Firewall: on Fedora/RHEL-family hosts running `firewalld`, the installer now
+  opens the configured `HTTP_PORT`/`HTTPS_PORT` automatically (no-op where
+  firewalld is absent or stopped). Applied on install, `--reconfigure`, and
+  `--rebuild`.
+- CI: added a Fedora integration job to the test matrix.
 
 ### Changed
 - CI ShellCheck now runs at `-S warning` (was `-S error`); intentional
@@ -20,6 +25,12 @@ This installer builds Xen Orchestra from source and tracks the official
   GitHub Actions.
 
 ### Fixed
+- Guard the `free`-based memory/swap detection so a missing `free` (e.g. minimal
+  images without `procps-ng`) can't abort the script under `set -e`; falls back
+  to the conservative low-memory path. Fixes the Rocky Linux integration test.
+- Server-IP detection for the install/reconfigure summaries no longer aborts on
+  minimal hosts without `hostname`/`ip` (new `detect_server_ip` helper always
+  succeeds, falling back to a placeholder). Fixes the Fedora integration test.
 - Fedora: no longer runs the RHEL-only `epel-release` install and
   `dnf config-manager --enable devel` (both error on Fedora); Valkey is
   installed straight from Fedora's base repositories.

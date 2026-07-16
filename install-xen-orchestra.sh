@@ -1255,7 +1255,9 @@ ensure_swap_space() {
     
     # Check current swap
     local CURRENT_SWAP
-    CURRENT_SWAP=$(free -m | awk '/^Swap:/ {print $2}')
+    # Fall back to 0 if free/awk is unavailable (e.g. minimal images without
+    # procps-ng) so a missing command can't abort the script under `set -e`.
+    CURRENT_SWAP=$(free -m | awk '/^Swap:/ {print $2}') || CURRENT_SWAP=0
     
     if [[ $CURRENT_SWAP -ge $MIN_SWAP_MB ]]; then
         log_info "Sufficient swap space available: ${CURRENT_SWAP}MB"
@@ -1383,8 +1385,10 @@ build_xo() {
 
     # Calculate available memory (RAM + swap) and set build limits to prevent OOM
     local TOTAL_RAM_MB TOTAL_SWAP_MB
-    TOTAL_RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
-    TOTAL_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
+    # Fall back to 0 if free/awk is unavailable so a missing command can't abort
+    # the build under `set -e`; 0 simply selects the conservative low-memory path.
+    TOTAL_RAM_MB=$(free -m | awk '/^Mem:/ {print $2}') || TOTAL_RAM_MB=0
+    TOTAL_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}') || TOTAL_SWAP_MB=0
     local TOTAL_MEM_MB=$((TOTAL_RAM_MB + TOTAL_SWAP_MB))
 
     local NODE_HEAP_SIZE
@@ -1780,6 +1784,27 @@ EOF
     log_success "XenStore access granted to ${SERVICE_USER} (group 'xenstore' + udev rule)"
     log_warning "Group membership applies on the next xo-server restart. Verify with:"
     log_warning "  sudo -u ${SERVICE_USER} xenstore-ls vm-data"
+}
+
+# Open the Xen Orchestra web ports in the host firewall.
+# Fedora and RHEL-family distros (RHEL/CentOS/Rocky/Alma) enable firewalld by
+# default and block inbound HTTP/HTTPS; Debian/Ubuntu ship no active firewall.
+# This is a no-op unless firewalld is installed AND running, so it is safe to
+# call on every distro. Uses the standard firewalld workflow (a permanent rule
+# for each configured port, then a reload). Re-adding an existing port is
+# idempotent, so this is also safe on --reconfigure/--rebuild.
+configure_firewall() {
+    if ! command -v firewall-cmd >/dev/null 2>&1 || ! firewall-cmd --state >/dev/null 2>&1; then
+        # No firewalld (Debian/Ubuntu) or it is not running — nothing to open.
+        return 0
+    fi
+
+    log_info "Opening firewall ports ${HTTP_PORT}/tcp and ${HTTPS_PORT}/tcp (firewalld)..."
+    run_cmd sudo firewall-cmd --permanent --add-port="${HTTP_PORT}/tcp"
+    run_cmd sudo firewall-cmd --permanent --add-port="${HTTPS_PORT}/tcp"
+    run_cmd sudo firewall-cmd --reload
+
+    log_success "Firewall configured (firewalld): ${HTTP_PORT}/tcp and ${HTTPS_PORT}/tcp open"
 }
 
 # Run git in the install directory as the directory owner
@@ -2462,6 +2487,9 @@ update_xo() {
     # Grant XenStore access if a non-root user has credential encryption enabled
     configure_xenstore_access
 
+    # Ensure the web ports are open in firewalld (Fedora/RHEL)
+    configure_firewall
+
     # Apply security hardening (permissions, ownership, group cleanup)
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         # Remove legacy root group membership from previous script versions
@@ -2687,6 +2715,9 @@ reconfigure_xo() {
     # Grant XenStore access if a non-root user has credential encryption enabled
     configure_xenstore_access
 
+    # Ensure the web ports are open in firewalld (Fedora/RHEL) after any port change
+    configure_firewall
+
     # Clean up legacy group membership and fix file ownership
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         # Remove legacy root group membership from previous script versions
@@ -2728,9 +2759,11 @@ reconfigure_xo() {
 
     echo ""
     log_info "Configuration has been updated from xo-config.cfg"
+    local SERVER_IP
+    SERVER_IP=$(detect_server_ip)
     log_info "Access Xen Orchestra at:"
-    echo "  - http://$(hostname):${HTTP_PORT}"
-    echo "  - https://$(hostname):${HTTPS_PORT}"
+    echo "  - http://${SERVER_IP}:${HTTP_PORT}"
+    echo "  - https://${SERVER_IP}:${HTTPS_PORT}"
     echo ""
 }
 
@@ -2777,6 +2810,15 @@ wait_for_xo_ready() {
 }
 
 # Print installation summary
+# Best-effort primary IP (or hostname) for display in summaries. Always succeeds,
+# even on minimal systems without `hostname`/`ip`, so it can't abort under set -e.
+detect_server_ip() {
+    hostname -I 2>/dev/null | awk '{print $1; exit}' \
+        || ip route get 1 2>/dev/null | awk '{print $7; exit}' \
+        || hostname 2>/dev/null \
+        || echo "your-server-ip"
+}
+
 print_summary() {
     echo ""
     echo "=============================================="
@@ -2793,9 +2835,7 @@ print_summary() {
     echo ""
     echo "Access Xen Orchestra:"
     local SERVER_IP
-    SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || \
-                ip route get 1 2>/dev/null | awk '{print $7;exit}' || \
-                hostname)
+    SERVER_IP=$(detect_server_ip)
     local HTTP_URL="http://${SERVER_IP}"
     local HTTPS_URL="https://${SERVER_IP}"
     [[ "$HTTP_PORT" != "80" ]]   && HTTP_URL="${HTTP_URL}:${HTTP_PORT}"
@@ -2844,6 +2884,7 @@ install_xo() {
     create_systemd_service
     configure_sudo
     configure_xenstore_access
+    configure_firewall
     start_service
     print_summary
 }

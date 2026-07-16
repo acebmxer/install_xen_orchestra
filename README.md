@@ -151,6 +151,12 @@ After installation, access the web interface at `https://your-server-ip`.
 - RHEL / CentOS / AlmaLinux / Rocky
 - Fedora
 
+> **Firewall:** On Fedora and RHEL-family systems (which enable `firewalld` by
+> default and block inbound HTTP/HTTPS), the installer opens the configured
+> `HTTP_PORT`/`HTTPS_PORT` automatically. Debian/Ubuntu ship no active firewall,
+> so nothing is changed there. If `firewalld` is not running, the step is
+> skipped — open the ports yourself if you add one later.
+
 ## Running Task Detection (Update Safety)
 
 Before applying an update, the script queries the Xen Orchestra REST API for active tasks (e.g. running backups, VM exports). If any are found, the update is aborted to prevent data loss or corruption.

@@ -46,6 +46,8 @@ jobs:
             dockerfile: tests/integration/Dockerfile.ubuntu2404
           - distro: rockylinux9
             dockerfile: tests/integration/Dockerfile.rockylinux9
+          - distro: fedora
+            dockerfile: tests/integration/Dockerfile.fedora
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
