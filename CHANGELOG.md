@@ -10,13 +10,17 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-15
+
 ### Added
 - `--version` flag: prints the script's release (via `git describe`) and branch.
 - Firewall: on Fedora/RHEL-family hosts running `firewalld`, the installer now
   opens the configured `HTTP_PORT`/`HTTPS_PORT` automatically (no-op where
   firewalld is absent or stopped). Applied on install, `--reconfigure`, and
   `--rebuild`.
-- CI: added a Fedora integration job to the test matrix.
+- CI: expanded the integration matrix to Debian 11/13, AlmaLinux 9,
+  CentOS Stream 9, and Fedora (alongside the existing Debian 12, Ubuntu 24.04,
+  and Rocky Linux 9) so every supported distro family is smoke-tested.
 
 ### Changed
 - CI ShellCheck now runs at `-S warning` (was `-S error`); intentional
@@ -118,7 +122,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.0...v0.1.1

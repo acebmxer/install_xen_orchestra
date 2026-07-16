@@ -146,10 +146,14 @@ After installation, access the web interface at `https://your-server-ip`.
 
 ## Supported Operating Systems
 
-- Debian 10/11/12/13
+- Debian 11/12/13
 - Ubuntu (all supported versions)
-- RHEL / CentOS / AlmaLinux / Rocky
+- RHEL / CentOS Stream / AlmaLinux / Rocky
 - Fedora
+
+> Continuously smoke-tested in CI on Debian 11/12/13, Ubuntu 24.04, Rocky Linux 9,
+> AlmaLinux 9, CentOS Stream 9, and Fedora. RHEL uses the same `dnf` path as its
+> rebuilds; other Ubuntu releases use the same `apt` path.
 
 > **Firewall:** On Fedora and RHEL-family systems (which enable `firewalld` by
 > default and block inbound HTTP/HTTPS), the installer opens the configured
