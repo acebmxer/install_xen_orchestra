@@ -18,7 +18,7 @@ jobs:
         run: sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck on main script
-        run: shellcheck -S error install-xen-orchestra.sh
+        run: shellcheck -S warning install-xen-orchestra.sh
 
   unit-tests:
     name: BATS Unit Tests
@@ -46,6 +46,16 @@ jobs:
             dockerfile: tests/integration/Dockerfile.ubuntu2404
           - distro: rockylinux9
             dockerfile: tests/integration/Dockerfile.rockylinux9
+          - distro: fedora
+            dockerfile: tests/integration/Dockerfile.fedora
+          - distro: debian11
+            dockerfile: tests/integration/Dockerfile.debian11
+          - distro: debian13
+            dockerfile: tests/integration/Dockerfile.debian13
+          - distro: almalinux9
+            dockerfile: tests/integration/Dockerfile.almalinux9
+          - distro: centosstream9
+            dockerfile: tests/integration/Dockerfile.centosstream9
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2

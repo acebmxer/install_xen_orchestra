@@ -1,0 +1,11 @@
+# ShellCheck configuration for install-xen-orchestra.sh
+#
+# CI runs `shellcheck -S warning`. Everything not listed below is enforced;
+# fix new warnings rather than adding blanket disables here.
+
+# SC1090: the config file is sourced from a path computed at runtime
+# ($CONFIG_FILE / renamed configs), which ShellCheck cannot resolve
+# statically. This is by design, so the "can't follow non-constant source"
+# warning is suppressed globally. Variables set by the config are validated
+# at runtime in validate_config().
+disable=SC1090
