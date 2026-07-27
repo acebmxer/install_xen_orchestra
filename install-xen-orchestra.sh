@@ -3570,6 +3570,8 @@ MENU_HINTS=(
     ""
 )
 
+MENU_TITLE="Install Xen Orchestra from Sources Setup and Update"
+
 MENU_LEFT_COUNT=4
 MENU_RIGHT_COUNT=4
 MENU_TOTAL=9
@@ -3577,6 +3579,59 @@ MENU_CURSOR=0
 MENU_SELECTED=(0 0 0 0 0 0 0 0 0)
 MCOL=0
 MROW=0
+# Last key read by menu_read_key (set as a global so the read can stay out of a
+# subshell — see menu_read_key)
+MENU_KEY=""
+
+# Set by the SIGWINCH trap; polled by menu_read_key
+MENU_RESIZED=0
+
+# How long menu_read_key waits before letting a pending SIGWINCH trap run. Also
+# the worst-case delay between resizing the window and seeing the reflow.
+MENU_READ_TIMEOUT=0.2
+
+# Blank columns between the two menu columns
+MENU_COL_GAP=4
+
+# Layout state, recomputed from the terminal size on every draw by
+# menu_compute_layout. Nothing here is a fixed dimension: the menu shrinks by
+# dropping detail (hints, branch names, the banner box, spacer rows) rather than
+# by letting lines run off the right edge.
+ML_TERM_W=80        # terminal width in columns
+ML_TERM_H=24        # terminal height in rows
+ML_CONTENT_W=84     # width of the drawn block
+ML_COL_W=42         # left column width, two-column mode only
+ML_TWO_COL=1        # 1 = two columns, 0 = single stacked column
+ML_HINTS=1          # 1 = show the dim hint text after an item name
+ML_BRANCHES=1       # 1 = show "(Branch: x)" in the header info block
+ML_BANNER=1         # 1 = boxed banner, 0 = plain one-line title
+ML_LEGEND=1         # 1 = show the key legend
+ML_BLANKS=1         # 1 = show blank spacer rows
+ML_TOO_SMALL=0      # 1 = terminal cannot fit even the minimal layout
+ML_MIN_W=0          # minimum usable width, reported when ML_TOO_SMALL=1
+ML_MIN_H=0          # minimum usable height, reported when ML_TOO_SMALL=1
+ML_INFO_LABELS=()   # header info labels, built by menu_compute_layout
+ML_INFO_VALUES=()   # header info values, matching ML_INFO_LABELS
+
+# Truncated result from menu_truncate
+MTRUNC=""
+
+# Truncate a plain (escape-free) string to at most $2 columns, marking the cut
+# with an ellipsis. Result goes to $MTRUNC rather than stdout so the draw loop
+# does not fork a subshell per item. Bash string length is character-based under
+# a UTF-8 locale, which matches display width for every glyph this menu uses.
+menu_truncate() {
+    local s="$1" max="$2"
+    if (( max <= 0 )); then
+        MTRUNC=""
+    elif (( ${#s} <= max )); then
+        MTRUNC="$s"
+    elif (( max == 1 )); then
+        MTRUNC="…"
+    else
+        MTRUNC="${s:0:max-1}…"
+    fi
+}
 MENU_SCRIPT_COMMIT="N/A"
 MENU_SCRIPT_MASTER="N/A"
 MENU_XO_COMMIT="N/A"
@@ -3589,6 +3644,12 @@ MENU_NODE_VERSION="N/A"
 # Hide/show cursor
 menu_hide_cursor() { printf "${M_CSI}?25l"; }
 menu_show_cursor() { printf "${M_CSI}?25h"; }
+
+# Disable/enable terminal autowrap. With autowrap off the terminal clips any
+# line that overruns the right edge instead of spilling it onto column 0 of the
+# next row, where the in-place (\033[H) redraw would never overwrite it.
+menu_disable_wrap() { printf "${M_CSI}?7l"; }
+menu_enable_wrap() { printf "${M_CSI}?7h"; }
 
 # Gather commit and version info for the menu header
 menu_gather_info() {
@@ -3670,213 +3731,435 @@ menu_gather_info() {
     fi
 }
 
+# Work out how the menu should be laid out at the current terminal size.
+#
+# Widths are measured from the menu data rather than assumed, because the widest
+# row ("Rebuild Xen Orchestra (wipe & reinstall maintain settings)" in the right
+# column) is far wider than the nominal column width. The layout then steps down
+# through progressively more compact forms until one fits.
+menu_compute_layout() {
+    ML_TERM_W=$(tput cols 2>/dev/null) || ML_TERM_W=80
+    ML_TERM_H=$(tput lines 2>/dev/null) || ML_TERM_H=24
+    [[ "$ML_TERM_W" =~ ^[0-9]+$ ]] || ML_TERM_W=80
+    [[ "$ML_TERM_H" =~ ^[0-9]+$ ]] || ML_TERM_H=24
+
+    # Natural width of each item: "▸ " (2) + "[ ]" (3) + " " (1) + name, plus
+    # " " + hint when hints are shown. Tracked per column group, with (w) and
+    # without (nh) hints.
+    local i w wh
+    local left_w=0 right_w=0 center_w=0
+    local left_nh=0 right_nh=0 center_nh=0
+    for ((i=0; i<MENU_TOTAL; i++)); do
+        w=$(( 6 + ${#MENU_NAMES[i]} ))
+        wh=$w
+        [[ -n "${MENU_HINTS[i]}" ]] && wh=$(( w + 1 + ${#MENU_HINTS[i]} ))
+        if (( i < MENU_LEFT_COUNT )); then
+            (( wh > left_w )) && left_w=$wh
+            (( w > left_nh )) && left_nh=$w
+        elif (( i < MENU_LEFT_COUNT + MENU_RIGHT_COUNT )); then
+            (( wh > right_w )) && right_w=$wh
+            (( w > right_nh )) && right_nh=$w
+        else
+            (( wh > center_w )) && center_w=$wh
+            (( w > center_nh )) && center_nh=$w
+        fi
+    done
+    local single_w=$left_w single_nh=$left_nh
+    (( right_w > single_w )) && single_w=$right_w
+    (( center_w > single_w )) && single_w=$center_w
+    (( right_nh > single_nh )) && single_nh=$right_nh
+    (( center_nh > single_nh )) && single_nh=$center_nh
+
+    # Keep a column of breathing room on each side where there is room to spare
+    local avail=$(( ML_TERM_W - 2 ))
+    (( avail < 20 )) && avail=$ML_TERM_W
+
+    # Width ladder. Two columns are preferred over one even when that costs the
+    # hints, because the stacked form is four rows taller and height is the
+    # scarcer resource on a default 80x24 terminal.
+    local body_w
+    if (( left_w + MENU_COL_GAP + right_w <= avail )); then
+        ML_TWO_COL=1; ML_HINTS=1
+        ML_COL_W=$(( left_w + MENU_COL_GAP ))
+        body_w=$(( left_w + MENU_COL_GAP + right_w ))
+        (( center_w > body_w )) && body_w=$center_w
+    elif (( left_nh + MENU_COL_GAP + right_nh <= avail )); then
+        ML_TWO_COL=1; ML_HINTS=0
+        ML_COL_W=$(( left_nh + MENU_COL_GAP ))
+        body_w=$(( left_nh + MENU_COL_GAP + right_nh ))
+        (( center_nh > body_w )) && body_w=$center_nh
+    elif (( single_w <= avail )); then
+        ML_TWO_COL=0; ML_HINTS=1
+        ML_COL_W=$single_w
+        body_w=$single_w
+    else
+        ML_TWO_COL=0; ML_HINTS=0
+        ML_COL_W=$single_nh
+        body_w=$single_nh
+    fi
+
+    # Header info block. The "(Branch: x)" suffixes are the first detail dropped
+    # when a line no longer fits; the "N commits behind" suffix is kept because
+    # it is the actionable part of the line.
+    ML_BRANCHES=1
+    local pass info_w=0
+    for pass in 1 2; do
+        local script_b="" script_mb="" xo_b="" xo_mb=""
+        if (( ML_BRANCHES )); then
+            [[ -n "$MENU_SCRIPT_BRANCH" ]]        && script_b=" (Branch: ${MENU_SCRIPT_BRANCH})"
+            [[ -n "$MENU_SCRIPT_MASTER_BRANCH" ]] && script_mb=" (Branch: ${MENU_SCRIPT_MASTER_BRANCH})"
+            [[ -n "$MENU_XO_BRANCH" ]]            && xo_b=" (Branch: ${MENU_XO_BRANCH})"
+            [[ -n "$MENU_XO_MASTER_BRANCH" ]]     && xo_mb=" (Branch: ${MENU_XO_MASTER_BRANCH})"
+        fi
+        [[ -n "$MENU_XO_BEHIND" ]] && xo_mb+=" - ${MENU_XO_BEHIND}"
+
+        ML_INFO_LABELS=(
+            "Current Script Commit :"
+            "Master Script Commit  :"
+            "Current XO Commit     :"
+            "Master XO Commit      :"
+            "Current Node          :"
+        )
+        ML_INFO_VALUES=(
+            "${MENU_SCRIPT_COMMIT}${script_b}"
+            "${MENU_SCRIPT_MASTER}${script_mb}"
+            "${MENU_XO_COMMIT}${xo_b}"
+            "${MENU_XO_MASTER}${xo_mb}"
+            "$MENU_NODE_VERSION"
+        )
+
+        # +2 for the "⚠ " that hangs off the Master XO Commit line
+        info_w=0
+        for ((i=0; i<${#ML_INFO_LABELS[@]}; i++)); do
+            w=$(( ${#ML_INFO_LABELS[i]} + 1 + ${#ML_INFO_VALUES[i]} + 2 ))
+            (( w > info_w )) && info_w=$w
+        done
+
+        (( info_w <= avail )) && break
+        (( pass == 1 )) && ML_BRANCHES=0
+    done
+
+    ML_CONTENT_W=$body_w
+    (( info_w > ML_CONTENT_W )) && ML_CONTENT_W=$info_w
+    (( ML_CONTENT_W > avail )) && ML_CONTENT_W=$avail
+    # Widen to fit the title box where there is spare room, so the title is not
+    # clipped merely because the item rows happen to be narrow
+    local title_w=$(( ${#MENU_TITLE} + 2 ))
+    (( title_w > ML_CONTENT_W && title_w <= avail )) && ML_CONTENT_W=$title_w
+    (( ML_CONTENT_W < 1 )) && ML_CONTENT_W=1
+
+    # Height ladder: shed decoration in order of how little it costs to lose.
+    # Row budget = top blank + banner(3) + blank + info(5) + blank + rule +
+    # blank + items + blank + rule + blank + selected + blank + legend(2).
+    local item_rows=5
+    (( ML_TWO_COL == 0 )) && item_rows=$MENU_TOTAL
+    local fixed=$(( 5 + 1 + 1 + item_rows + 1 + 1 ))   # info, 2 rules, items, selected
+    local base=$(( fixed + 3 + 2 ))                    # + banner box + legend, no blanks
+    ML_BLANKS=2; ML_BANNER=1; ML_LEGEND=1
+    local needed=$(( base + 7 ))                       # all seven spacer rows
+    if (( needed > ML_TERM_H )); then
+        # Give up the outermost spacers first — the ones between sections do
+        # more for legibility than the ones at the very top and bottom
+        ML_BLANKS=1
+        needed=$(( base + 5 ))
+    fi
+    if (( needed > ML_TERM_H )); then
+        ML_BLANKS=0
+        needed=$base
+    fi
+    if (( needed > ML_TERM_H )); then
+        ML_BANNER=0
+        needed=$(( needed - 2 ))                       # box becomes one plain line
+    fi
+    if (( needed > ML_TERM_H )); then
+        ML_LEGEND=0
+        needed=$(( needed - 2 ))
+    fi
+
+    # Nothing left to shed. Report the floor instead of drawing a broken screen.
+    ML_MIN_W=$(( single_nh + 2 ))
+    ML_MIN_H=$(( fixed + 1 ))
+    ML_TOO_SMALL=0
+    if (( needed > ML_TERM_H || ML_TERM_W < single_nh )); then
+        ML_TOO_SMALL=1
+    fi
+}
+
+# Render one menu item into $MITEM (colorized) given its index and the width it
+# must fit in. Returns the visible width in $MITEM_W so callers can pad.
+MITEM=""
+MITEM_W=0
+menu_render_item() {
+    local idx=$1 max_w=$2
+    local name="${MENU_NAMES[$idx]}"
+    local hint=""
+    (( ML_HINTS )) && hint="${MENU_HINTS[$idx]}"
+
+    # "▸ " (2) + "[ ]" (3) + " " (1) leaves max_w - 6 for the name and hint
+    local text="$name"
+    [[ -n "$hint" ]] && text="${name} ${hint}"
+    local avail=$(( max_w - 6 ))
+    if (( ${#text} > avail )); then
+        # Drop the hint before truncating the name — a clipped name is harder to
+        # act on than a missing parenthetical
+        if [[ -n "$hint" ]] && (( ${#name} <= avail )); then
+            hint=""
+            text="$name"
+        else
+            menu_truncate "$name" "$avail"
+            name="$MTRUNC"
+            hint=""
+            text="$name"
+        fi
+    fi
+
+    local prefix="  "
+    [[ $idx -eq $MENU_CURSOR ]] && prefix="${M_BOLD}${M_BLUE}▸ ${M_RESET}"
+
+    local checkbox="[ ]"
+    [[ ${MENU_SELECTED[$idx]} -eq 1 ]] && checkbox="${M_GREEN}[✓]${M_RESET}"
+
+    if [[ $idx -eq $MENU_CURSOR ]]; then
+        MITEM="${prefix}${checkbox} ${M_BOLD}${name}${M_RESET}"
+    else
+        MITEM="${prefix}${checkbox} ${name}"
+    fi
+    [[ -n "$hint" ]] && MITEM="${MITEM} ${M_DIM}${hint}${M_RESET}"
+
+    MITEM_W=$(( 6 + ${#text} ))
+}
+
 # Draw the full menu screen
 draw_menu() {
-    local term_width
-    term_width=$(tput cols 2>/dev/null) || term_width=80
-    local col_width=42
-    local content_width=$((col_width * 2))
-    local margin=0
-    (( term_width > content_width )) && margin=$(( (term_width - content_width) / 2 ))
-    local pad=""
-    (( margin > 0 )) && printf -v pad '%*s' "$margin" ''
+    menu_compute_layout
+
     local eol=$'\033[K'
     local _buf=""
 
     # Move cursor to home position (overwrite in place, no flicker)
     _buf+=$'\033[H'
 
-    # Banner box
-    local inner_width=$((content_width - 2))
-    local border_fill
-    printf -v border_fill '%*s' "$inner_width" ''
-    border_fill="${border_fill// /═}"
+    if (( ML_TOO_SMALL )); then
+        # Kept short and clipped to the terminal: a wrapped "too small" notice
+        # would be its own instance of the problem it is reporting
+        menu_truncate "Terminal too small" "$ML_TERM_W"
+        _buf+="${M_BOLD}${M_YELLOW}${MTRUNC}${M_RESET}${eol}"$'\n'
+        menu_truncate "Need ${ML_MIN_W}x${ML_MIN_H}, have ${ML_TERM_W}x${ML_TERM_H}" "$ML_TERM_W"
+        _buf+="${MTRUNC}${eol}"$'\n'
+        _buf+=$'\033[J'
+        printf '%s' "$_buf"
+        return
+    fi
 
-    local banner_text="Install Xen Orchestra from Sources Setup and Update"
-    local banner_len=${#banner_text}
-    local blpad=$(( (inner_width - banner_len) / 2 ))
-    local brpad=$(( inner_width - banner_len - blpad ))
-    local blspaces="" brspaces=""
-    (( blpad > 0 )) && printf -v blspaces '%*s' "$blpad" ''
-    (( brpad > 0 )) && printf -v brspaces '%*s' "$brpad" ''
+    local content_width=$ML_CONTENT_W
+    local margin=0
+    (( ML_TERM_W > content_width )) && margin=$(( (ML_TERM_W - content_width) / 2 ))
+    local pad=""
+    (( margin > 0 )) && printf -v pad '%*s' "$margin" ''
 
-    _buf+="${pad}${eol}"$'\n'
-    _buf+="${pad}${M_BOLD}${M_CYAN}╔${border_fill}╗${M_RESET}${eol}"$'\n'
-    _buf+="${pad}${M_BOLD}${M_CYAN}║${blspaces}${banner_text}${brspaces}║${M_RESET}${eol}"$'\n'
-    _buf+="${pad}${M_BOLD}${M_CYAN}╚${border_fill}╝${M_RESET}${eol}"$'\n'
-    _buf+="${pad}${eol}"$'\n'
+    # blank_hi are the outermost spacers, dropped one tier before the rest
+    local blank="" blank_hi=""
+    (( ML_BLANKS >= 1 )) && blank="${pad}${eol}"$'\n'
+    (( ML_BLANKS >= 2 )) && blank_hi="$blank"
 
-    # Commit and version info (centered as a block)
-    local info_labels=(
-        "Current Script Commit :"
-        "Master Script Commit  :"
-        "Current XO Commit     :"
-        "Master XO Commit      :"
-        "Current Node          :"
-    )
-    local script_branch_str="" script_master_branch_str="" xo_branch_str="" xo_master_branch_str=""
-    [[ -n "$MENU_SCRIPT_BRANCH" ]]        && script_branch_str=" (Branch: ${MENU_SCRIPT_BRANCH})"
-    [[ -n "$MENU_SCRIPT_MASTER_BRANCH" ]] && script_master_branch_str=" (Branch: ${MENU_SCRIPT_MASTER_BRANCH})"
-    [[ -n "$MENU_XO_BRANCH" ]]            && xo_branch_str=" (Branch: ${MENU_XO_BRANCH})"
-    [[ -n "$MENU_XO_MASTER_BRANCH" ]]     && xo_master_branch_str=" (Branch: ${MENU_XO_MASTER_BRANCH})"
-    [[ -n "$MENU_XO_BEHIND" ]]            && xo_master_branch_str+=" - ${MENU_XO_BEHIND}"
-    local info_values=(
-        "${MENU_SCRIPT_COMMIT}${script_branch_str}"
-        "${MENU_SCRIPT_MASTER}${script_master_branch_str}"
-        "${MENU_XO_COMMIT}${xo_branch_str}"
-        "${MENU_XO_MASTER}${xo_master_branch_str}"
-        "$MENU_NODE_VERSION"
-    )
-    # Find the longest full line to compute a single centering offset
-    local info_max_len=0
-    for ((il=0; il<${#info_labels[@]}; il++)); do
-        local full_len=$(( ${#info_labels[$il]} + 1 + ${#info_values[$il]} ))
+    # Banner
+    local banner_text="$MENU_TITLE"
+    if (( ML_BANNER )); then
+        local inner_width=$((content_width - 2))
+        local border_fill
+        printf -v border_fill '%*s' "$inner_width" ''
+        border_fill="${border_fill// /═}"
+
+        menu_truncate "$banner_text" "$inner_width"
+        local btext="$MTRUNC"
+        local blpad=$(( (inner_width - ${#btext}) / 2 ))
+        local brpad=$(( inner_width - ${#btext} - blpad ))
+        local blspaces="" brspaces=""
+        (( blpad > 0 )) && printf -v blspaces '%*s' "$blpad" ''
+        (( brpad > 0 )) && printf -v brspaces '%*s' "$brpad" ''
+
+        _buf+="$blank_hi"
+        _buf+="${pad}${M_BOLD}${M_CYAN}╔${border_fill}╗${M_RESET}${eol}"$'\n'
+        _buf+="${pad}${M_BOLD}${M_CYAN}║${blspaces}${btext}${brspaces}║${M_RESET}${eol}"$'\n'
+        _buf+="${pad}${M_BOLD}${M_CYAN}╚${border_fill}╝${M_RESET}${eol}"$'\n'
+    else
+        # No room for the box: keep the title as a single centered line
+        menu_truncate "$banner_text" "$content_width"
+        local btext="$MTRUNC"
+        local blpad=$(( (content_width - ${#btext}) / 2 ))
+        local blspaces=""
+        (( blpad > 0 )) && printf -v blspaces '%*s' "$blpad" ''
+        _buf+="${pad}${blspaces}${M_BOLD}${M_CYAN}${btext}${M_RESET}${eol}"$'\n'
+    fi
+    _buf+="$blank"
+
+    # Commit and version info (centered as a block). Labels and values come from
+    # menu_compute_layout, which has already decided whether branch names fit.
+    local il info_max_len=0
+    for ((il=0; il<${#ML_INFO_LABELS[@]}; il++)); do
+        local full_len=$(( ${#ML_INFO_LABELS[il]} + 1 + ${#ML_INFO_VALUES[il]} ))
         (( full_len > info_max_len )) && info_max_len=$full_len
     done
     local info_lpad=$(( (content_width - info_max_len) / 2 ))
     local info_pad=""
     (( info_lpad > 0 )) && printf -v info_pad '%*s' "$info_lpad" ''
     # The warning line carries a leading "⚠ " (2 columns). Hang it in the left
-    # margin by starting that line 2 columns earlier, so its label — and the
-    # colon that follows — stays aligned with the unmarked lines.
-    local info_warn_pad="$info_pad"
-    (( info_lpad >= 2 )) && info_warn_pad="${info_pad:2}"
-    for ((il=0; il<${#info_labels[@]}; il++)); do
+    # margin by starting that line up to 2 columns earlier, so its label — and
+    # the colon that follows — stays aligned with the unmarked lines. Whatever
+    # cannot be hung there makes the line that much wider, so it comes off the
+    # room available to the value.
+    local warn_shift=$info_lpad
+    (( warn_shift > 2 )) && warn_shift=2
+    local info_warn_pad="${info_pad:warn_shift}"
+    local warn_extra=$(( 2 - warn_shift ))
+    for ((il=0; il<${#ML_INFO_LABELS[@]}; il++)); do
         local info_color="${M_YELLOW}"
         local label_color="${M_BOLD}"
         [[ $il -eq 4 ]] && info_color="${M_GREEN}"
+
+        # Clip the value to whatever is left of the terminal on this line
+        local label="${ML_INFO_LABELS[il]}"
+        local value_room=$(( ML_TERM_W - margin - info_lpad - ${#label} - 1 ))
+        [[ $il -eq 3 ]] && value_room=$(( value_room - warn_extra ))
+        menu_truncate "${ML_INFO_VALUES[il]}" "$value_room"
+        local value="$MTRUNC"
+
         # Highlight the entire Master XO Commit line when an update is available
         if [[ $il -eq 3 && "$MENU_XO_COMMIT" != "N/A" && "$MENU_XO_MASTER" != "N/A" && "$MENU_XO_COMMIT" != "$MENU_XO_MASTER" ]]; then
             local xo_style="${M_BOLD}${M_REVERSE}${M_RED}"
-            _buf+="${pad}${info_warn_pad}${xo_style}⚠ ${info_labels[$il]} ${info_values[$il]}${M_RESET}${eol}"$'\n'
+            _buf+="${pad}${info_warn_pad}${xo_style}⚠ ${label} ${value}${M_RESET}${eol}"$'\n'
         else
-            _buf+="${pad}${info_pad}${label_color}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
+            _buf+="${pad}${info_pad}${label_color}${label}${M_RESET} ${info_color}${value}${M_RESET}${eol}"$'\n'
         fi
     done
-    _buf+="${pad}${eol}"$'\n'
+    _buf+="$blank"
 
     # Separator
     local sep_fill
     printf -v sep_fill '%*s' "$content_width" ''
     sep_fill="${sep_fill// /─}"
     _buf+="${pad}${M_DIM}${sep_fill}${M_RESET}${eol}"$'\n'
-    _buf+="${pad}${eol}"$'\n'
+    _buf+="$blank"
 
-    # Menu items in 2 columns (left: indices 0-3, right: indices 4-7)
-    local rows=$MENU_LEFT_COUNT
-    for ((row=0; row<rows; row++)); do
-        local line=""
-        for ((col=0; col<2; col++)); do
-            local idx
-            if [[ $col -eq 0 ]]; then
-                idx=$row
-            else
-                idx=$((MENU_LEFT_COUNT + row))
-            fi
-
-            # Skip if index out of range (right column has fewer items)
-            if [[ $idx -ge $((MENU_LEFT_COUNT + MENU_RIGHT_COUNT)) ]]; then
-                continue
-            fi
-
-            local prefix="  "
-            local checkbox="[ ]"
-            local name="${MENU_NAMES[$idx]}"
-            local hint="${MENU_HINTS[$idx]}"
-
-            # Cursor indicator
-            if [[ $idx -eq $MENU_CURSOR ]]; then
-                prefix="${M_BOLD}${M_BLUE}▸ ${M_RESET}"
-            fi
-
-            # Selection checkbox
-            if [[ ${MENU_SELECTED[$idx]} -eq 1 ]]; then
-                checkbox="${M_GREEN}[✓]${M_RESET}"
-            fi
-
-            # Build item string
-            local item=""
-            if [[ $idx -eq $MENU_CURSOR ]]; then
-                item="${prefix}${checkbox} ${M_BOLD}${name}${M_RESET}"
-            else
-                item="${prefix}${checkbox} ${name}"
-            fi
-
-            # Add hint in dim text
-            if [[ -n "$hint" ]]; then
-                item="${item} ${M_DIM}${hint}${M_RESET}"
-            fi
-
-            # Pad left column to fixed width (based on visible characters only)
-            if [[ $col -eq 0 ]]; then
-                local visible_len=$((2 + 3 + 1 + ${#name}))
-                if [[ -n "$hint" ]]; then
-                    visible_len=$((visible_len + 1 + ${#hint}))
+    local idx
+    if (( ML_TWO_COL )); then
+        # Two columns (left: indices 0-3, right: 4-7), then any trailing
+        # full-width rows centered beneath them
+        local row col right_w=$(( content_width - ML_COL_W ))
+        for ((row=0; row<MENU_LEFT_COUNT; row++)); do
+            local line=""
+            for ((col=0; col<2; col++)); do
+                if (( col == 0 )); then
+                    idx=$row
+                else
+                    idx=$((MENU_LEFT_COUNT + row))
                 fi
-                local padding=$((col_width - visible_len))
-                [[ $padding -lt 2 ]] && padding=2
-                item="${item}$(printf '%*s' $padding '')"
-            fi
+                (( idx >= MENU_LEFT_COUNT + MENU_RIGHT_COUNT )) && continue
 
-            line="${line}${item}"
+                if (( col == 0 )); then
+                    menu_render_item "$idx" "$ML_COL_W"
+                    local padding=$(( ML_COL_W - MITEM_W ))
+                    (( padding < 1 )) && padding=1
+                    local gap_str
+                    printf -v gap_str '%*s' "$padding" ''
+                    line="${line}${MITEM}${gap_str}"
+                else
+                    menu_render_item "$idx" "$right_w"
+                    line="${line}${MITEM}"
+                fi
+            done
+            _buf+="${pad}${line}${eol}"$'\n'
         done
-        _buf+="${pad}${line}${eol}"$'\n'
-    done
 
-    # Full-width centered rows below the two columns (indices 8+)
-    local center_start=$((MENU_LEFT_COUNT + MENU_RIGHT_COUNT))
-    for ((cidx=center_start; cidx<MENU_TOTAL; cidx++)); do
-        local cname="${MENU_NAMES[$cidx]}"
-        local chint="${MENU_HINTS[$cidx]}"
-        local ccheckbox="[ ]"
-        [[ ${MENU_SELECTED[$cidx]} -eq 1 ]] && ccheckbox="${M_GREEN}[✓]${M_RESET}"
+        local center_start=$((MENU_LEFT_COUNT + MENU_RIGHT_COUNT))
+        for ((idx=center_start; idx<MENU_TOTAL; idx++)); do
+            menu_render_item "$idx" "$content_width"
+            local clpad=$(( (content_width - MITEM_W) / 2 ))
+            local cpad=""
+            (( clpad > 0 )) && printf -v cpad '%*s' "$clpad" ''
+            _buf+="${pad}${cpad}${MITEM}${eol}"$'\n'
+        done
+    else
+        # Single stacked column, left-aligned: centering each row on its own
+        # width reads as ragged once the rows differ in length
+        for ((idx=0; idx<MENU_TOTAL; idx++)); do
+            menu_render_item "$idx" "$content_width"
+            _buf+="${pad}${MITEM}${eol}"$'\n'
+        done
+    fi
 
-        # Visible length: "▸ " (2) + "[ ]" (3) + " " (1) + name (+ hint)
-        local cvisible=$((2 + 3 + 1 + ${#cname}))
-        [[ -n "$chint" ]] && cvisible=$((cvisible + 1 + ${#chint}))
-        local clpad=$(( (content_width - cvisible) / 2 ))
-        local cpad=""
-        (( clpad > 0 )) && printf -v cpad '%*s' "$clpad" ''
-
-        local cprefix="  "
-        [[ $cidx -eq $MENU_CURSOR ]] && cprefix="${M_BOLD}${M_BLUE}▸ ${M_RESET}"
-
-        local citem
-        if [[ $cidx -eq $MENU_CURSOR ]]; then
-            citem="${cprefix}${ccheckbox} ${M_BOLD}${cname}${M_RESET}"
-        else
-            citem="${cprefix}${ccheckbox} ${cname}"
-        fi
-        [[ -n "$chint" ]] && citem="${citem} ${M_DIM}${chint}${M_RESET}"
-
-        _buf+="${pad}${cpad}${citem}${eol}"$'\n'
-    done
-
-    _buf+="${pad}${eol}"$'\n'
+    _buf+="$blank"
     _buf+="${pad}${M_DIM}${sep_fill}${M_RESET}${eol}"$'\n'
-    _buf+="${pad}${eol}"$'\n'
+    _buf+="$blank"
 
     # Count selections
     local sel_count=0
+    local i
     for ((i=0; i<MENU_TOTAL; i++)); do
         [[ ${MENU_SELECTED[$i]} -eq 1 ]] && sel_count=$((sel_count + 1))
     done
     _buf+="${pad}${M_CYAN}Selected: ${M_GREEN}${sel_count}${M_RESET}${eol}"$'\n'
-    _buf+="${pad}${eol}"$'\n'
 
-    # Key legend
-    _buf+="${pad}${M_YELLOW}↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Quit${M_RESET}${eol}"$'\n'
-    _buf+="${pad}${M_DIM}Legend: ${M_GREEN}[✓]${M_RESET}${M_DIM} selected  ${M_RESET}${M_DIM}[ ] not selected${M_RESET}${eol}"$'\n'
+    # Key legend. The long form names every key; the short form keeps the same
+    # information in roughly half the width.
+    if (( ML_LEGEND )); then
+        _buf+="$blank_hi"
+        local keys="↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Quit"
+        (( ML_TWO_COL == 0 )) && keys="↑↓ Move  SPACE Select  ENTER Go  Q Quit"
+        menu_truncate "$keys" "$content_width"
+        _buf+="${pad}${M_YELLOW}${MTRUNC}${M_RESET}${eol}"$'\n'
+        if (( content_width >= 38 )); then
+            _buf+="${pad}${M_DIM}Legend: ${M_GREEN}[✓]${M_RESET}${M_DIM} selected  ${M_RESET}${M_DIM}[ ] not selected${M_RESET}${eol}"$'\n'
+        else
+            _buf+="${pad}${eol}"$'\n'
+        fi
+    fi
+
+    # Drop the final newline: emitting one on the bottom row scrolls the screen,
+    # which would push the top of the menu out of view whenever the layout
+    # happens to fill the terminal exactly. \033[J still clears anything below.
+    _buf="${_buf%$'\n'}"
 
     # Erase any leftover lines from previous render
     _buf+=$'\033[J'
     printf '%s' "$_buf"
 }
 
-# Read a single keypress and return a key name
+# Read a single keypress into MENU_KEY.
+#
+# Sets a global rather than echoing a value: the caller must not run this in a
+# command substitution, because bash resets caught traps in a subshell and
+# SIGWINCH defaults to "ignore", so a resize would be swallowed entirely.
+#
+# Even called directly, bash restarts the read syscall across a trapped signal
+# and defers the handler until the read returns — so a blocking read would still
+# sit on a stale screen until the next keypress. The short timeout below bounds
+# that: the read gives up, the pending WINCH trap runs, and the loop sees
+# MENU_RESIZED. A read timeout costs no process, so idling here is cheap.
 menu_read_key() {
-    local key
-    IFS= read -rsn1 key 2>/dev/null || true
+    local key rc
+    MENU_KEY=""
+
+    while true; do
+        rc=0
+        # rc must be captured via || so a non-zero read (timeout, EOF) is not
+        # fatal under set -e
+        IFS= read -rsn1 -t "$MENU_READ_TIMEOUT" key 2>/dev/null || rc=$?
+        (( rc == 0 )) && break
+
+        if (( MENU_RESIZED )); then
+            MENU_RESIZED=0
+            MENU_KEY="REDRAW"
+            return
+        fi
+
+        # rc > 128 is the timeout; anything else is EOF, which ends the menu the
+        # same way Enter does
+        if (( rc <= 128 )); then
+            MENU_KEY="ENTER"
+            return
+        fi
+    done
 
     # Escape sequence (arrow keys, etc.)
     if [[ "$key" == $'\x1b' ]]; then
@@ -3886,21 +4169,21 @@ menu_read_key() {
             local code
             IFS= read -rsn1 -t 0.5 code 2>/dev/null || true
             case "$code" in
-                A) echo "UP"; return ;;
-                B) echo "DOWN"; return ;;
-                C) echo "RIGHT"; return ;;
-                D) echo "LEFT"; return ;;
+                A) MENU_KEY="UP"; return ;;
+                B) MENU_KEY="DOWN"; return ;;
+                C) MENU_KEY="RIGHT"; return ;;
+                D) MENU_KEY="LEFT"; return ;;
             esac
         fi
-        echo "ESCAPE"
+        MENU_KEY="ESCAPE"
         return
     fi
 
     case "$key" in
-        ' ') echo "SPACE" ;;
-        '') echo "ENTER" ;;
-        q|Q) echo "QUIT" ;;
-        *) echo "OTHER" ;;
+        ' ') MENU_KEY="SPACE" ;;
+        '') MENU_KEY="ENTER" ;;
+        q|Q) MENU_KEY="QUIT" ;;
+        *) MENU_KEY="OTHER" ;;
     esac
 }
 
@@ -4154,25 +4437,42 @@ run_menu() {
     # Save terminal state (global so cleanup_menu trap can access it)
     saved_stty=$(stty -g 2>/dev/null) || saved_stty=""
     menu_hide_cursor
+    menu_disable_wrap
     stty -echo 2>/dev/null || true
 
     # Restore terminal on exit
     cleanup_menu() {
         menu_show_cursor
+        menu_enable_wrap
         [[ -n "$saved_stty" ]] && stty "$saved_stty" 2>/dev/null || stty echo 2>/dev/null
     }
     trap cleanup_menu EXIT
-    trap 'draw_menu' WINCH
+    # Only raise a flag here — drawing from inside the handler could interleave
+    # with a draw already in progress. menu_read_key turns this into a REDRAW.
+    trap 'MENU_RESIZED=1' WINCH
 
     clear
     draw_menu
 
     while true; do
         local key
-        key=$(menu_read_key)
+        # Direct call, not $(...) — see menu_read_key for why the subshell
+        # would break live resize handling.
+        menu_read_key
+        key="$MENU_KEY"
 
         case "$key" in
             UP)
+                # Single-column layout has no grid to navigate — walk the list
+                if (( ML_TWO_COL == 0 )); then
+                    if (( MENU_CURSOR == 0 )); then
+                        MENU_CURSOR=$((MENU_TOTAL - 1))
+                    else
+                        MENU_CURSOR=$((MENU_CURSOR - 1))
+                    fi
+                    draw_menu
+                    continue
+                fi
                 menu_get_pos $MENU_CURSOR
                 if [[ $MCOL -eq 2 ]]; then
                     # From the centered row, go up into the last row of the left column
@@ -4193,6 +4493,11 @@ run_menu() {
                 fi
                 ;;
             DOWN)
+                if (( ML_TWO_COL == 0 )); then
+                    MENU_CURSOR=$(( (MENU_CURSOR + 1) % MENU_TOTAL ))
+                    draw_menu
+                    continue
+                fi
                 menu_get_pos $MENU_CURSOR
                 if [[ $MCOL -eq 2 ]]; then
                     # From the centered row, wrap to the top of the left column
@@ -4213,6 +4518,8 @@ run_menu() {
                 fi
                 ;;
             LEFT)
+                # No second column to move to in the stacked layout
+                (( ML_TWO_COL == 0 )) && continue
                 menu_get_pos $MENU_CURSOR
                 if [[ $MCOL -eq 1 ]]; then
                     local target_row=$MROW
@@ -4221,6 +4528,7 @@ run_menu() {
                 fi
                 ;;
             RIGHT)
+                (( ML_TWO_COL == 0 )) && continue
                 menu_get_pos $MENU_CURSOR
                 if [[ $MCOL -eq 0 ]]; then
                     local target_row=$MROW
@@ -4237,6 +4545,10 @@ run_menu() {
                 ;;
             ENTER)
                 break
+                ;;
+            REDRAW)
+                # Terminal resized. The draw_menu at the foot of the loop
+                # recomputes the layout, so there is nothing to do here.
                 ;;
             QUIT)
                 cleanup_menu
