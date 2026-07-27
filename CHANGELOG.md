@@ -10,6 +10,12 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+- Menu header: the `Master XO Commit` line now shows how many commits the
+  installation trails master by (e.g. `efbfb (Branch: master) - 12 commits
+  behind`). Shown only when the installed commit is behind; the count is
+  computed locally from the install directory's git history.
+
 ## [0.2.0] - 2026-07-15
 
 ### Added

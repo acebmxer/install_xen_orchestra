@@ -61,7 +61,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
                         Current Script Commit : 693f4 (Branch: main)
                         Master Script Commit  : 693f4 (Branch: main)
                         Current XO Commit     : a1b2c (Branch: master)
-                        Master XO Commit      : d4e5f (Branch: master)
+                      ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 commits behind
                         Current Node          : v24.15.0
 
   ──────────────────────────────────────────────────────────────────────────────────
@@ -81,6 +81,9 @@ Running the script with no arguments opens a two-column menu with keyboard navig
 ```
 
 Select one or more items with SPACE, then press ENTER to run them.
+
+When the installed commit differs from XO's master, the `Master XO Commit` line
+is highlighted and shows how many commits the installation is behind.
 
 ### Adjust Xen Orchestra Memory Allocation
 

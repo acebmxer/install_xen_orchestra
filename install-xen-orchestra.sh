@@ -3581,6 +3581,9 @@ MENU_SCRIPT_COMMIT="N/A"
 MENU_SCRIPT_MASTER="N/A"
 MENU_XO_COMMIT="N/A"
 MENU_XO_MASTER="N/A"
+# Commit count the install trails master by; appended to the Master XO Commit
+# line only when non-empty (i.e. only when behind). Not a separate menu row.
+MENU_XO_BEHIND=""
 MENU_NODE_VERSION="N/A"
 
 # Hide/show cursor
@@ -3637,6 +3640,27 @@ menu_gather_info() {
     MENU_XO_MASTER_BRANCH="${xo_default_branch:-master}"
     MENU_XO_MASTER=$(git ls-remote https://github.com/vatesfr/xen-orchestra "refs/heads/${MENU_XO_MASTER_BRANCH}" 2>/dev/null | cut -f1 | cut -c1-5) || MENU_XO_MASTER="N/A"
     [[ -z "$MENU_XO_MASTER" ]] && MENU_XO_MASTER="N/A"
+
+    # How many commits the installed tree trails master by. Only computed when
+    # the installed commit differs from master; the clone is full depth
+    # (see install_xen_orchestra), so the count is done locally after fetching
+    # the master ref. Stays empty on any failure so the line renders as before.
+    MENU_XO_BEHIND=""
+    if [[ "$MENU_XO_COMMIT" != "N/A" && "$MENU_XO_MASTER" != "N/A" && "$MENU_XO_COMMIT" != "$MENU_XO_MASTER" ]]; then
+        local behind_owner behind_count
+        behind_owner=$(stat -c '%U' "$menu_install_dir" 2>/dev/null) || behind_owner="root"
+        if sudo -u "$behind_owner" git -C "$menu_install_dir" fetch --quiet origin "$MENU_XO_MASTER_BRANCH" 2>/dev/null; then
+            # HEAD..FETCH_HEAD = commits on master that the install doesn't have
+            behind_count=$(sudo -u "$behind_owner" git -C "$menu_install_dir" rev-list --count HEAD..FETCH_HEAD 2>/dev/null) || behind_count=""
+            if [[ "$behind_count" =~ ^[0-9]+$ ]] && (( behind_count > 0 )); then
+                if (( behind_count == 1 )); then
+                    MENU_XO_BEHIND="1 commit behind"
+                else
+                    MENU_XO_BEHIND="${behind_count} commits behind"
+                fi
+            fi
+        fi
+    fi
 
     # Current Node version
     if command -v node &>/dev/null; then
@@ -3695,6 +3719,7 @@ draw_menu() {
     [[ -n "$MENU_SCRIPT_MASTER_BRANCH" ]] && script_master_branch_str=" (Branch: ${MENU_SCRIPT_MASTER_BRANCH})"
     [[ -n "$MENU_XO_BRANCH" ]]            && xo_branch_str=" (Branch: ${MENU_XO_BRANCH})"
     [[ -n "$MENU_XO_MASTER_BRANCH" ]]     && xo_master_branch_str=" (Branch: ${MENU_XO_MASTER_BRANCH})"
+    [[ -n "$MENU_XO_BEHIND" ]]            && xo_master_branch_str+=" - ${MENU_XO_BEHIND}"
     local info_values=(
         "${MENU_SCRIPT_COMMIT}${script_branch_str}"
         "${MENU_SCRIPT_MASTER}${script_master_branch_str}"
@@ -3711,6 +3736,11 @@ draw_menu() {
     local info_lpad=$(( (content_width - info_max_len) / 2 ))
     local info_pad=""
     (( info_lpad > 0 )) && printf -v info_pad '%*s' "$info_lpad" ''
+    # The warning line carries a leading "⚠ " (2 columns). Hang it in the left
+    # margin by starting that line 2 columns earlier, so its label — and the
+    # colon that follows — stays aligned with the unmarked lines.
+    local info_warn_pad="$info_pad"
+    (( info_lpad >= 2 )) && info_warn_pad="${info_pad:2}"
     for ((il=0; il<${#info_labels[@]}; il++)); do
         local info_color="${M_YELLOW}"
         local label_color="${M_BOLD}"
@@ -3718,7 +3748,7 @@ draw_menu() {
         # Highlight the entire Master XO Commit line when an update is available
         if [[ $il -eq 3 && "$MENU_XO_COMMIT" != "N/A" && "$MENU_XO_MASTER" != "N/A" && "$MENU_XO_COMMIT" != "$MENU_XO_MASTER" ]]; then
             local xo_style="${M_BOLD}${M_REVERSE}${M_RED}"
-            _buf+="${pad}${info_pad}${xo_style}⚠ ${info_labels[$il]} ${info_values[$il]}${M_RESET}${eol}"$'\n'
+            _buf+="${pad}${info_warn_pad}${xo_style}⚠ ${info_labels[$il]} ${info_values[$il]}${M_RESET}${eol}"$'\n'
         else
             _buf+="${pad}${info_pad}${label_color}${info_labels[$il]}${M_RESET} ${info_color}${info_values[$il]}${M_RESET}${eol}"$'\n'
         fi
