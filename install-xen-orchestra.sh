@@ -1259,7 +1259,10 @@ ensure_swap_space() {
     # procps-ng) so a missing command can't abort the script under `set -e`.
     CURRENT_SWAP=$(free -m | awk '/^Swap:/ {print $2}') || CURRENT_SWAP=0
     
-    if [[ $CURRENT_SWAP -ge $MIN_SWAP_MB ]]; then
+    # free -m reports slightly less than the file size (mkswap header + MB
+    # rounding): a 2048MB swap file shows as 2047MB. Tolerate a small shortfall
+    # so the swap file isn't deleted and recreated on every run.
+    if [[ $CURRENT_SWAP -ge $((MIN_SWAP_MB - 16)) ]]; then
         log_info "Sufficient swap space available: ${CURRENT_SWAP}MB"
         return 0
     fi
@@ -1411,9 +1414,14 @@ build_xo() {
 
     local NODE_OPTIONS="--max-old-space-size=$NODE_HEAP_SIZE"
     local TURBO_CACHE="remote:r"
-    local CONCURRENCY_FLAG=""
+    # Concurrency must go through the TURBO_CONCURRENCY env var, not
+    # `yarn build --concurrency=N`: yarn 1 appends extra args to the END of the
+    # script string, and upstream's build script now ends with
+    # `&& yarn build:doc`, so a flag would cascade into `docusaurus build`
+    # (which rejects it) while turbo itself would never see the limit.
+    local BUILD_ENV="NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE'"
     if [[ -n "$TURBO_CONCURRENCY" ]]; then
-        CONCURRENCY_FLAG="--concurrency=$TURBO_CONCURRENCY"
+        BUILD_ENV="$BUILD_ENV TURBO_CONCURRENCY='$TURBO_CONCURRENCY'"
     fi
 
     # Patch @xen-orchestra/rest-api's prebuild hook to call rimraf directly instead
@@ -1438,9 +1446,9 @@ build_xo() {
 
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        run_cmd sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
+        run_cmd sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
     else
-        run_cmd sudo bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
+        run_cmd sudo bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
     fi
 
     log_success "Xen Orchestra built successfully"
