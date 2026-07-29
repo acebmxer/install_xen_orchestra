@@ -10,6 +10,15 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+- Build concurrency limit is now passed via the `TURBO_CONCURRENCY` environment
+  variable instead of `yarn build --concurrency=N`. Yarn 1 appends extra args to
+  the end of the script string, and upstream's `build` script now ends with
+  `&& yarn build:doc` (xen-orchestra commit `ada3cf7`, PR #10154), so the flag
+  cascaded into `docusaurus build` — which rejects it with
+  `error: unknown option '--concurrency=1'` and aborted low-memory updates —
+  while turbo itself never received the limit.
+
 ### Added
 - Menu header: the `Master XO Commit` line now shows how many commits the
   installation trails master by (e.g. `efbfb (Branch: master) - 12 commits

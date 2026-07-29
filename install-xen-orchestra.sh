@@ -1411,9 +1411,14 @@ build_xo() {
 
     local NODE_OPTIONS="--max-old-space-size=$NODE_HEAP_SIZE"
     local TURBO_CACHE="remote:r"
-    local CONCURRENCY_FLAG=""
+    # Concurrency must go through the TURBO_CONCURRENCY env var, not
+    # `yarn build --concurrency=N`: yarn 1 appends extra args to the END of the
+    # script string, and upstream's build script now ends with
+    # `&& yarn build:doc`, so a flag would cascade into `docusaurus build`
+    # (which rejects it) while turbo itself would never see the limit.
+    local BUILD_ENV="NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE'"
     if [[ -n "$TURBO_CONCURRENCY" ]]; then
-        CONCURRENCY_FLAG="--concurrency=$TURBO_CONCURRENCY"
+        BUILD_ENV="$BUILD_ENV TURBO_CONCURRENCY='$TURBO_CONCURRENCY'"
     fi
 
     # Patch @xen-orchestra/rest-api's prebuild hook to call rimraf directly instead
@@ -1438,9 +1443,9 @@ build_xo() {
 
     # Run as service user if defined
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
-        run_cmd sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
+        run_cmd sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
     else
-        run_cmd sudo bash -c "cd '$INSTALL_DIR' && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn && NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE' yarn build $CONCURRENCY_FLAG"
+        run_cmd sudo bash -c "cd '$INSTALL_DIR' && $BUILD_ENV yarn && $BUILD_ENV yarn build"
     fi
 
     log_success "Xen Orchestra built successfully"
