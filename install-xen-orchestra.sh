@@ -1259,7 +1259,10 @@ ensure_swap_space() {
     # procps-ng) so a missing command can't abort the script under `set -e`.
     CURRENT_SWAP=$(free -m | awk '/^Swap:/ {print $2}') || CURRENT_SWAP=0
     
-    if [[ $CURRENT_SWAP -ge $MIN_SWAP_MB ]]; then
+    # free -m reports slightly less than the file size (mkswap header + MB
+    # rounding): a 2048MB swap file shows as 2047MB. Tolerate a small shortfall
+    # so the swap file isn't deleted and recreated on every run.
+    if [[ $CURRENT_SWAP -ge $((MIN_SWAP_MB - 16)) ]]; then
         log_info "Sufficient swap space available: ${CURRENT_SWAP}MB"
         return 0
     fi
