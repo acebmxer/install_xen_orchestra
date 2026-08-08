@@ -814,21 +814,15 @@ build_libnbd_from_source() {
     local BUILD_DIR
     BUILD_DIR=$(mktemp -d)
 
-    # libnbd's build uses OCaml as an internal code-generation tool for its
-    # C API/headers (generator/), independent of whether the optional OCaml
-    # *language binding* is enabled — a git checkout has no pre-generated
-    # files the way a release tarball would, so `ocamlc` is required or
-    # `make` fails immediately in generator/ with "Generated files are
-    # missing from your build."
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         # shellcheck disable=SC2086
         run_cmd $PKG_INSTALL build-essential autoconf automake libtool pkg-config \
-            libxml2-dev libglib2.0-dev libgnutls28-dev bash-completion ocaml-nox \
+            libxml2-dev libglib2.0-dev libgnutls28-dev bash-completion \
             || { log_warning "Could not install libnbd build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
     elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
         # shellcheck disable=SC2086
         run_cmd $PKG_INSTALL autoconf automake libtool pkgconfig \
-            libxml2-devel glib2-devel gnutls-devel bash-completion ocaml \
+            libxml2-devel glib2-devel gnutls-devel bash-completion \
             || { log_warning "Could not install libnbd build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
     fi
 

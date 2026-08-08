@@ -11,13 +11,6 @@ This installer builds Xen Orchestra from source and tracks the official
 ## [Unreleased]
 
 ### Fixed
-- The libnbd-from-source build now installs `ocaml-nox`/`ocaml` (apt/dnf) as
-  a build dependency. libnbd's build uses OCaml as an internal
-  code-generation tool for its C API/headers (`generator/`), independent of
-  whether the optional OCaml *language binding* is enabled — a git checkout
-  has no pre-generated files the way a release tarball would, so without
-  `ocamlc` present `make` failed immediately with "Generated files are
-  missing from your build."
 - `build_xo` now hard-fails before restarting the service if the build did
   not produce `packages/xo-server/dist/cli.mjs` — the actual entrypoint
   `xo-server.service` execs. Previously the only post-build check
