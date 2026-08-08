@@ -32,12 +32,17 @@ CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
 LATEST_CONFIG_VERSION=2
 
-# Minimum libnbd/nbdinfo version XO's ESXi/VMware import prerequisite check
-# expects (see packages/xo-server/src/api/esxi.mjs upstream). Debian/Ubuntu's
-# own libnbd-bin package regularly lags behind this, so when the distro
-# package is too old we build libnbd from source instead. Bump this if a
-# newer XO release raises the requirement.
+# Minimum libnbd/nbdinfo and nbdkit versions XO's ESXi/VMware import
+# prerequisite check expects (see packages/xo-server/src/api/esxi.mjs
+# upstream). These are two separate upstream projects with independent
+# version numbers — nbdkit's releases run well ahead of libnbd's (e.g. XO
+# wanting nbdkit 1.42.5 alongside libnbd/nbdinfo 1.23.4 is normal, not a
+# typo) — so do not assume they should ever be the same value. Debian/Ubuntu
+# package repos regularly lag both, so when the distro package is too old we
+# build from source instead. Bump these if a newer XO release raises either
+# requirement.
 REQUIRED_NBDINFO_VERSION="1.23.4"
+REQUIRED_NBDKIT_VERSION="1.42.5"
 
 # Runtime mode flags (set via CLI flags in main())
 NON_INTERACTIVE=false
@@ -754,6 +759,30 @@ install_nbdkit_stack() {
         build_nbdkit_from_source
     fi
 
+    # nbdkit and libnbd/nbdinfo are checked independently — each has its own
+    # required version and the two are unrelated upstream projects (see the
+    # REQUIRED_NBDKIT_VERSION/REQUIRED_NBDINFO_VERSION comment above), so
+    # one satisfying its requirement must never short-circuit checking the
+    # other.
+    local INSTALLED_NBDKIT_VERSION=""
+    if command -v nbdkit &> /dev/null; then
+        # `nbdkit --version` prints e.g. "nbdkit 1.42.3"
+        INSTALLED_NBDKIT_VERSION=$(nbdkit --version 2>/dev/null | head -n1 | awk '{print $2}')
+    fi
+    if [[ "$NEED_NBDKIT_SOURCE_BUILD" != "true" ]]; then
+        if [[ -n "$INSTALLED_NBDKIT_VERSION" ]] \
+            && version_satisfies "$INSTALLED_NBDKIT_VERSION" "$REQUIRED_NBDKIT_VERSION"; then
+            log_info "nbdkit ${INSTALLED_NBDKIT_VERSION} already satisfies the required ${REQUIRED_NBDKIT_VERSION}."
+        else
+            if [[ -n "$INSTALLED_NBDKIT_VERSION" ]]; then
+                log_warning "nbdkit ${INSTALLED_NBDKIT_VERSION} is older than the ${REQUIRED_NBDKIT_VERSION} XO expects; building nbdkit from source..."
+            else
+                log_warning "nbdkit not found on PATH; building nbdkit ${REQUIRED_NBDKIT_VERSION} from source..."
+            fi
+            build_nbdkit_from_source
+        fi
+    fi
+
     local INSTALLED_NBDINFO_VERSION=""
     if command -v nbdinfo &> /dev/null; then
         INSTALLED_NBDINFO_VERSION=$(nbdinfo --version 2>/dev/null | head -n1 | awk '{print $2}')
@@ -830,17 +859,21 @@ build_libnbd_from_source() {
     fi
 }
 
-# Build and install nbdkit (with its VDDK plugin) from source, for distros
-# whose package manager has no nbdkit-plugin-vddk package to offer — notably
-# Debian 11/12, where the plugin was never packaged (it only appeared in
-# Debian 13/trixie). The plugin dlopen()s the actual VDDK library at runtime
-# rather than linking it at build time, so no VDDK download is needed to
-# build it — only the operator-supplied library in /usr/local/lib/vddk is
-# needed at runtime, same as the packaged version. Historically nbdkit and
-# libnbd share release tags, so this reuses REQUIRED_NBDINFO_VERSION.
+# Build and install nbdkit (with its VDDK plugin) from source. Used both
+# when the distro's package manager has no nbdkit-plugin-vddk package to
+# offer (notably Debian 11/12, where the plugin was never packaged — it only
+# appeared in Debian 13/trixie) and when the distro's nbdkit itself is older
+# than REQUIRED_NBDKIT_VERSION. The plugin dlopen()s the actual VDDK library
+# at runtime rather than linking it at build time, so no VDDK download is
+# needed to build it — only the operator-supplied library in
+# /usr/local/lib/vddk is needed at runtime, same as the packaged version.
+#
+# Uses REQUIRED_NBDKIT_VERSION, NOT REQUIRED_NBDINFO_VERSION — nbdkit and
+# libnbd are separate upstream projects with independent version numbers
+# (see the constants' definitions near the top of this script).
 build_nbdkit_from_source() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "[DRY-RUN] Would build nbdkit v${REQUIRED_NBDINFO_VERSION} (with VDDK plugin) from source and install to /usr/local"
+        echo "[DRY-RUN] Would build nbdkit v${REQUIRED_NBDKIT_VERSION} (with VDDK plugin) from source and install to /usr/local"
         return 0
     fi
 
@@ -881,7 +914,7 @@ build_nbdkit_from_source() {
     (
         set -e
         cd "$BUILD_DIR"
-        git clone --depth 1 --branch "v${REQUIRED_NBDINFO_VERSION}" https://gitlab.com/nbdkit/nbdkit.git
+        git clone --depth 1 --branch "v${REQUIRED_NBDKIT_VERSION}" https://gitlab.com/nbdkit/nbdkit.git
         cd nbdkit
         autoreconf -i
         ./configure --disable-perl --disable-python --disable-lua \
@@ -895,7 +928,7 @@ build_nbdkit_from_source() {
     rm -rf "$BUILD_DIR"
 
     if [[ $BUILD_STATUS -ne 0 ]]; then
-        log_warning "Building nbdkit ${REQUIRED_NBDINFO_VERSION} from source failed; ESXi/VMware import prerequisite check may still report nbdkit/the VDDK plugin as missing."
+        log_warning "Building nbdkit ${REQUIRED_NBDKIT_VERSION} from source failed; ESXi/VMware import prerequisite check may still report nbdkit/the VDDK plugin as missing."
         return 1
     fi
 
@@ -1671,6 +1704,25 @@ build_xo() {
 
     log_success "Xen Orchestra built successfully"
     verify_xo_web_build
+
+    # The web-UI checks above only warn — a missing JS chunk degrades the
+    # frontend but doesn't stop xo-server itself from running. This one is
+    # different: cli.mjs is what systemd actually execs (see
+    # ExecStart in create_systemd_service), so if the build didn't produce
+    # it, starting the service is guaranteed to crash-loop
+    # (MODULE_NOT_FOUND). Fail loudly here instead of silently restarting a
+    # broken build — the caller (install/update/rebuild) still has the
+    # pre-build backup on disk to fall back to.
+    local server_entrypoint="$INSTALL_DIR/packages/xo-server/dist/cli.mjs"
+    if ! sudo test -f "$server_entrypoint"; then
+        log_error "Build did not produce $server_entrypoint — xo-server would fail to start (MODULE_NOT_FOUND)."
+        log_error "Not restarting the service against a broken build."
+        if [[ -n "${BACKUP_DIR:-}" ]] && [[ -d "$BACKUP_DIR" ]]; then
+            log_error "The previous working install was backed up under: $BACKUP_DIR"
+            log_error "Restore it with: $0 --restore <backup-name>"
+        fi
+        exit 1
+    fi
 }
 
 # Generate self-signed SSL certificate
