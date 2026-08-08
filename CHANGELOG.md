@@ -11,25 +11,6 @@ This installer builds Xen Orchestra from source and tracks the official
 ## [Unreleased]
 
 ### Fixed
-- `build_xo` now hard-fails before restarting the service if the build did
-  not produce `packages/xo-server/dist/cli.mjs` — the actual entrypoint
-  `xo-server.service` execs. Previously the only post-build check
-  (`verify_xo_web_build`) looked solely at the web-frontend dist and only
-  ever warned, never aborted, so an incomplete backend build (e.g. `yarn
-  build` exiting without producing server output, for whatever reason) could
-  sail through `--update`/`--rebuild` and get restarted anyway, crash-looping
-  on `MODULE_NOT_FOUND` with no clear signal of what went wrong. It now exits
-  with an explicit error pointing at the pre-build backup under `$BACKUP_DIR`
-  instead.
-- `nbdkit`'s own version is now checked against a required minimum
-  (`REQUIRED_NBDKIT_VERSION`) independently of `nbdinfo`'s
-  (`REQUIRED_NBDINFO_VERSION`), and rebuilt from source when too old — same
-  as the existing `nbdinfo` handling below, but previously missing entirely
-  for `nbdkit` itself. `nbdkit` and `libnbd` are separate upstream projects
-  with unrelated version numbers (confirmed by XO wanting nbdkit 1.42.5
-  alongside libnbd/nbdinfo 1.23.4); the nbdkit-from-source build was
-  incorrectly reusing `REQUIRED_NBDINFO_VERSION` as its git tag, so it built
-  and installed nbdkit 1.23.4 instead of the required 1.42.5.
 - ESXi/VMware import prerequisites (`nbdkit`, its VDDK plugin, `nbdinfo`) are
   now installed for every `SERVICE_USER`, not just non-root. Previously the
   root path (the default) installed nothing at all, and the non-root path
