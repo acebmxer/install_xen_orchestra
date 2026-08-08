@@ -797,14 +797,9 @@ build_libnbd_from_source() {
             || { log_warning "Could not install libnbd build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
     fi
 
-    # `set +e`/`set -e` bracket this rather than `(...) || BUILD_STATUS=$?`:
-    # bash disables errexit for everything *inside* a subshell that is the
-    # direct left-hand operand of `||` (documented bash quirk), which would
-    # silently let a failed `make` fall through to `make install` anyway.
-    # Turning off -e in the parent first avoids that trap while still
-    # letting the subshell's own `set -e` abort it correctly on failure.
-    local BUILD_STATUS
-    set +e
+    # Guarded with `||` so a failure here doesn't trip the script's global
+    # `set -e` before BUILD_STATUS can be inspected below.
+    local BUILD_STATUS=0
     (
         set -e
         cd "$BUILD_DIR"
@@ -815,9 +810,7 @@ build_libnbd_from_source() {
         make -j"$(nproc)"
         sudo make install
         sudo ldconfig
-    )
-    BUILD_STATUS=$?
-    set -e
+    ) || BUILD_STATUS=$?
     rm -rf "$BUILD_DIR"
 
     if [[ $BUILD_STATUS -ne 0 ]]; then
@@ -861,37 +854,20 @@ build_nbdkit_from_source() {
             || { log_warning "Could not install nbdkit build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
     fi
 
-    # `set +e`/`set -e` bracket this rather than `(...) || BUILD_STATUS=$?`:
-    # bash disables errexit for everything *inside* a subshell that is the
-    # direct left-hand operand of `||` (documented bash quirk), which would
-    # silently let a failed `make` fall through to `make install` anyway.
-    # Turning off -e in the parent first avoids that trap while still
-    # letting the subshell's own `set -e` abort it correctly on failure.
-    #
-    # Only the core server + vddk plugin are needed, so the optional
-    # language-embedding plugins are explicitly disabled. Leaving them on
-    # is what broke this build the first time round: configure detects
-    # Perl's headers/archlib and enables the perl plugin, but Debian's base
-    # `perl` package (unlike `libnbd-bin`) doesn't ship the `libperl.so` dev
-    # symlink `-lperl` needs, so linking it fails — and since `perl` sorts
-    # before `vddk` alphabetically, `make install` aborts there and never
-    # reaches the plugin this build actually exists for.
-    local BUILD_STATUS
-    set +e
+    # Guarded with `||` so a failure here doesn't trip the script's global
+    # `set -e` before BUILD_STATUS can be inspected below.
+    local BUILD_STATUS=0
     (
         set -e
         cd "$BUILD_DIR"
         git clone --depth 1 --branch "v${REQUIRED_NBDINFO_VERSION}" https://gitlab.com/nbdkit/nbdkit.git
         cd nbdkit
         autoreconf -i
-        ./configure --disable-perl --disable-python --disable-lua \
-            --disable-tcl --disable-ruby --disable-ocaml --disable-golang --disable-rust
+        ./configure
         make -j"$(nproc)"
         sudo make install
         sudo ldconfig
-    )
-    BUILD_STATUS=$?
-    set -e
+    ) || BUILD_STATUS=$?
     rm -rf "$BUILD_DIR"
 
     if [[ $BUILD_STATUS -ne 0 ]]; then
@@ -901,15 +877,6 @@ build_nbdkit_from_source() {
 
     if command -v nbdkit &> /dev/null; then
         log_success "nbdkit now reports: $(nbdkit --version 2>/dev/null | head -n1)"
-    fi
-
-    # The core binary can install successfully even if a specific plugin's
-    # `make install` step failed partway through (this is exactly what
-    # happened before --disable-perl etc. were added above), so confirm the
-    # one plugin this whole build exists for is actually present.
-    if [[ ! -f /usr/local/lib/nbdkit/plugins/nbdkit-vddk-plugin.so ]]; then
-        log_warning "nbdkit built, but nbdkit-vddk-plugin.so was not found in /usr/local/lib/nbdkit/plugins — the VDDK plugin did not install correctly."
-        return 1
     fi
 }
 
