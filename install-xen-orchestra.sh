@@ -32,13 +32,6 @@ CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
 LATEST_CONFIG_VERSION=2
 
-# Minimum libnbd/nbdinfo version XO's ESXi/VMware import prerequisite check
-# expects (see packages/xo-server/src/api/esxi.mjs upstream). Debian/Ubuntu's
-# own libnbd-bin package regularly lags behind this, so when the distro
-# package is too old we build libnbd from source instead. Bump this if a
-# newer XO release raises the requirement.
-REQUIRED_NBDINFO_VERSION="1.23.4"
-
 # Runtime mode flags (set via CLI flags in main())
 NON_INTERACTIVE=false
 RESTORE_BACKUP_FILE=""
@@ -680,204 +673,26 @@ install_dependencies() {
             nfs-utils ntfs-3g openssl curl ca-certificates gnupg2 patch sudo dmidecode libcap fuse-libs
     fi
 
-    # ESXi/VMware import needs `nbdkit`, its VDDK plugin, and the `nbdinfo`
-    # binary. XO can build nbdinfo from source itself, but that path is
-    # hard-gated on the xo-server process running as root (see
-    # packages/xo-server/src/api/esxi.mjs: `id -u` must be 0), so a non-root
-    # SERVICE_USER can never satisfy it — and even under a root SERVICE_USER
-    # that build only runs if it's triggered from the XO UI. Install the
-    # nbdkit packages here unconditionally so the prerequisite check has
-    # something to find either way. The VDDK library itself is intentionally
-    # left for the operator to download from Broadcom and drop into
-    # /usr/local/lib/vddk (see docs.xen-orchestra.com/xo5/v2v-migration-guide)
-    # — it's under a license Broadcom requires manual acceptance for, so this
-    # script does not fetch it.
-    install_nbdkit_stack
+    # ESXi/VMware import needs the `nbdinfo` binary. XO can build it from source,
+    # but that path is hard-gated on the xo-server process running as root
+    # (packages/xo-server/src/api/esxi.mjs: `id -u` must be 0). A non-root
+    # SERVICE_USER can never satisfy that, so provide nbdinfo from the distro
+    # package instead — XO checks `which nbdinfo` first and skips the root-only
+    # build when the binary already exists on PATH.
+    if [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]]; then
+        log_info "Non-root SERVICE_USER: installing nbdinfo for ESXi/VMware import..."
+        if [[ "$PKG_MANAGER" == "apt" ]]; then
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL libnbd-bin \
+                || log_warning "Could not install libnbd-bin; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
+        elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+            # shellcheck disable=SC2086
+            run_cmd $PKG_INSTALL libnbd \
+                || log_warning "Could not install libnbd; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
+        fi
+    fi
+
     log_success "System dependencies installed"
-}
-
-# Install nbdkit + its VDDK plugin, and ensure nbdinfo (from libnbd) meets
-# the minimum version XO's ESXi/VMware import prerequisite check requires.
-#
-# Two distro-specific gaps this accounts for:
-#   - Debian bullseye/bookworm (11/12) never packaged nbdkit-plugin-vddk at
-#     all (it only appeared in trixie/13); apt has nothing to install there,
-#     so this falls back to building nbdkit itself from source.
-#   - RHEL-family (RHEL/CentOS Stream/Rocky/Alma, not Fedora) ships nbdkit
-#     only via EPEL, not the base repos, so EPEL must be enabled first
-#     rather than assumed present.
-#
-# Debian/Ubuntu's libnbd-bin package also regularly lags XO's required
-# nbdinfo version (e.g. trixie ships 1.22.2 when XO wants 1.23.4), and apt
-# has no newer candidate to upgrade to in that case — so when the distro
-# package is too old, this builds libnbd from source too.
-install_nbdkit_stack() {
-    log_info "Installing nbdkit and VDDK plugin for ESXi/VMware import..."
-
-    # Called from update_xo/rebuild_xo as well as fresh installs; those paths
-    # don't call detect_os themselves, and $OS_ID is read below under this
-    # script's `set -u`, so ensure it's populated regardless of caller.
-    if [[ -z "${OS_ID:-}" ]]; then
-        detect_os
-    fi
-
-    local NEED_NBDKIT_SOURCE_BUILD=false
-
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL nbdkit libnbd-bin \
-            || log_warning "Could not install nbdkit/libnbd-bin; ESXi/VMware import may be unavailable."
-
-        if apt-cache show nbdkit-plugin-vddk &>/dev/null; then
-            # shellcheck disable=SC2086
-            run_cmd $PKG_INSTALL nbdkit-plugin-vddk \
-                || { log_warning "Could not install nbdkit-plugin-vddk; will build nbdkit with the VDDK plugin from source instead."; NEED_NBDKIT_SOURCE_BUILD=true; }
-        else
-            log_warning "nbdkit-plugin-vddk is not packaged for this Debian/Ubuntu release (only Debian 13/trixie and newer have it); building nbdkit with the VDDK plugin from source instead."
-            NEED_NBDKIT_SOURCE_BUILD=true
-        fi
-    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-        # nbdkit and its VDDK plugin live in EPEL on RHEL-family systems
-        # (Fedora ships them in its base repos already). Ensure EPEL is
-        # enabled here directly rather than relying on it as a side effect
-        # of the Redis/Valkey fallback logic above, which may not trigger.
-        if [[ "$OS_ID" != "fedora" ]]; then
-            # shellcheck disable=SC2086
-            run_cmd $PKG_INSTALL epel-release || true
-        fi
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL nbdkit nbdkit-vddk-plugin libnbd \
-            || log_warning "Could not install nbdkit/nbdkit-vddk-plugin/libnbd; ESXi/VMware import may be unavailable."
-    fi
-
-    if [[ "$NEED_NBDKIT_SOURCE_BUILD" == "true" ]]; then
-        build_nbdkit_from_source
-    fi
-
-    local INSTALLED_NBDINFO_VERSION=""
-    if command -v nbdinfo &> /dev/null; then
-        INSTALLED_NBDINFO_VERSION=$(nbdinfo --version 2>/dev/null | head -n1 | awk '{print $2}')
-    fi
-
-    if [[ -n "$INSTALLED_NBDINFO_VERSION" ]] \
-        && version_satisfies "$INSTALLED_NBDINFO_VERSION" "$REQUIRED_NBDINFO_VERSION"; then
-        log_info "nbdinfo ${INSTALLED_NBDINFO_VERSION} already satisfies the required ${REQUIRED_NBDINFO_VERSION}."
-        return 0
-    fi
-
-    if [[ -n "$INSTALLED_NBDINFO_VERSION" ]]; then
-        log_warning "nbdinfo ${INSTALLED_NBDINFO_VERSION} is older than the ${REQUIRED_NBDINFO_VERSION} XO expects; building libnbd from source..."
-    else
-        log_warning "nbdinfo not found on PATH; building libnbd ${REQUIRED_NBDINFO_VERSION} from source..."
-    fi
-    build_libnbd_from_source
-}
-
-# Build and install libnbd (which provides nbdinfo) from source at
-# REQUIRED_NBDINFO_VERSION, into /usr/local/bin so it takes precedence over
-# any older distro package still on PATH.
-build_libnbd_from_source() {
-    if [[ "$DRY_RUN" == "true" ]]; then
-        echo "[DRY-RUN] Would build libnbd v${REQUIRED_NBDINFO_VERSION} from source and install to /usr/local"
-        return 0
-    fi
-
-    local BUILD_DIR
-    BUILD_DIR=$(mktemp -d)
-
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL build-essential autoconf automake libtool pkg-config \
-            libxml2-dev libglib2.0-dev libgnutls28-dev bash-completion \
-            || { log_warning "Could not install libnbd build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
-    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL autoconf automake libtool pkgconfig \
-            libxml2-devel glib2-devel gnutls-devel bash-completion \
-            || { log_warning "Could not install libnbd build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
-    fi
-
-    # Guarded with `||` so a failure here doesn't trip the script's global
-    # `set -e` before BUILD_STATUS can be inspected below.
-    local BUILD_STATUS=0
-    (
-        set -e
-        cd "$BUILD_DIR"
-        git clone --depth 1 --branch "v${REQUIRED_NBDINFO_VERSION}" https://gitlab.com/nbdkit/libnbd.git
-        cd libnbd
-        autoreconf -i
-        ./configure
-        make -j"$(nproc)"
-        sudo make install
-        sudo ldconfig
-    ) || BUILD_STATUS=$?
-    rm -rf "$BUILD_DIR"
-
-    if [[ $BUILD_STATUS -ne 0 ]]; then
-        log_warning "Building libnbd ${REQUIRED_NBDINFO_VERSION} from source failed; ESXi/VMware import prerequisite check may still report an outdated nbdinfo."
-        return 1
-    fi
-
-    if command -v nbdinfo &> /dev/null; then
-        log_success "nbdinfo now reports: $(nbdinfo --version 2>/dev/null | head -n1)"
-    fi
-}
-
-# Build and install nbdkit (with its VDDK plugin) from source, for distros
-# whose package manager has no nbdkit-plugin-vddk package to offer — notably
-# Debian 11/12, where the plugin was never packaged (it only appeared in
-# Debian 13/trixie). The plugin dlopen()s the actual VDDK library at runtime
-# rather than linking it at build time, so no VDDK download is needed to
-# build it — only the operator-supplied library in /usr/local/lib/vddk is
-# needed at runtime, same as the packaged version. Historically nbdkit and
-# libnbd share release tags, so this reuses REQUIRED_NBDINFO_VERSION.
-build_nbdkit_from_source() {
-    if [[ "$DRY_RUN" == "true" ]]; then
-        echo "[DRY-RUN] Would build nbdkit v${REQUIRED_NBDINFO_VERSION} (with VDDK plugin) from source and install to /usr/local"
-        return 0
-    fi
-
-    local BUILD_DIR
-    BUILD_DIR=$(mktemp -d)
-
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL build-essential autoconf automake libtool pkg-config \
-            libxml2-dev libglib2.0-dev libgnutls28-dev bash-completion \
-            libselinux1-dev flex bison zlib1g-dev \
-            || { log_warning "Could not install nbdkit build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
-    elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL autoconf automake libtool pkgconfig \
-            libxml2-devel glib2-devel gnutls-devel bash-completion \
-            libselinux-devel flex bison zlib-devel \
-            || { log_warning "Could not install nbdkit build dependencies; skipping source build."; rm -rf "$BUILD_DIR"; return 1; }
-    fi
-
-    # Guarded with `||` so a failure here doesn't trip the script's global
-    # `set -e` before BUILD_STATUS can be inspected below.
-    local BUILD_STATUS=0
-    (
-        set -e
-        cd "$BUILD_DIR"
-        git clone --depth 1 --branch "v${REQUIRED_NBDINFO_VERSION}" https://gitlab.com/nbdkit/nbdkit.git
-        cd nbdkit
-        autoreconf -i
-        ./configure
-        make -j"$(nproc)"
-        sudo make install
-        sudo ldconfig
-    ) || BUILD_STATUS=$?
-    rm -rf "$BUILD_DIR"
-
-    if [[ $BUILD_STATUS -ne 0 ]]; then
-        log_warning "Building nbdkit ${REQUIRED_NBDINFO_VERSION} from source failed; ESXi/VMware import prerequisite check may still report nbdkit/the VDDK plugin as missing."
-        return 1
-    fi
-
-    if command -v nbdkit &> /dev/null; then
-        log_success "nbdkit now reports: $(nbdkit --version 2>/dev/null | head -n1)"
-    fi
 }
 
 # Check if installed Node.js version satisfies the requirement.
@@ -2668,11 +2483,6 @@ update_xo() {
     install_nodejs
     install_yarn
 
-    # A newer XO release can raise the nbdinfo version its ESXi/VMware import
-    # prerequisite check requires (this is exactly how existing installs go
-    # stale after an update). Re-check and rebuild from source if needed.
-    install_nbdkit_stack
-
     # Rebuild with clean cache to ensure fresh build
     build_xo clean
 
@@ -2791,10 +2601,6 @@ rebuild_xo() {
     # Ensure Node.js version matches config (upgrade/downgrade if needed)
     install_nodejs
     install_yarn
-
-    # A newer XO release can raise the nbdinfo version its ESXi/VMware import
-    # prerequisite check requires. Re-check and rebuild from source if needed.
-    install_nbdkit_stack
 
     # Clean build to ensure no stale artefacts
     build_xo clean
