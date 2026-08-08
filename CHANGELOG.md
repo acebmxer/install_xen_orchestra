@@ -10,6 +10,46 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+- ESXi/VMware import prerequisites (`nbdkit`, its VDDK plugin, `nbdinfo`) are
+  now installed for every `SERVICE_USER`, not just non-root. Previously the
+  root path (the default) installed nothing at all, and the non-root path
+  only installed `libnbd-bin`/`libnbd` — never `nbdkit` or its VDDK plugin —
+  leaving XO's Import → From VMware prerequisite check permanently red on a
+  fresh install.
+- `nbdinfo` version is now checked against the minimum XO's ESXi/VMware
+  import prerequisite check requires (`REQUIRED_NBDINFO_VERSION`) and rebuilt
+  from source when the distro package is too old to satisfy it. Debian/Ubuntu
+  package repos regularly lag this requirement (e.g. Debian 13/trixie ships
+  libnbd 1.22.2 when XO wants 1.23.4) with no newer candidate to upgrade to.
+- Debian 11/12 (bullseye/bookworm) never packaged `nbdkit-plugin-vddk` at all
+  (it only appeared in Debian 13/trixie); the installer now detects this and
+  builds `nbdkit` with the VDDK plugin from source instead of silently
+  leaving it missing.
+- RHEL-family hosts (RHEL/CentOS Stream/Rocky/Alma, excluding Fedora) now
+  have EPEL enabled explicitly before installing `nbdkit`, rather than
+  relying on it as an incidental side effect of the Redis/Valkey fallback
+  logic, which doesn't always trigger.
+- The above nbdkit/nbdinfo check now also runs on `--update` and `--rebuild`,
+  not just a fresh install, so a future XO release raising the version
+  requirement gets caught and remediated automatically instead of only
+  surfacing as a warning in the XO UI after the fact.
+- Fixed a bash `set -e` subshell gotcha in the new nbdkit/libnbd source-build
+  helpers: a subshell that is the direct left-hand operand of `||` has
+  errexit silently disabled for everything inside it, even with a nested
+  `set -e` — so a failed `make` was falling through to `make install`
+  instead of stopping. Replaced with a `set +e` / subshell / `set -e`
+  bracket, and added an explicit post-build check that
+  `nbdkit-vddk-plugin.so` actually landed in `/usr/local/lib/nbdkit/plugins`.
+- The nbdkit source build now passes `--disable-perl --disable-python
+  --disable-lua --disable-tcl --disable-ruby --disable-ocaml --disable-golang
+  --disable-rust` to `configure`. Only the VDDK plugin is needed; leaving the
+  language-embedding plugins enabled meant `configure` auto-detected Perl's
+  headers and enabled that plugin even though Debian's base `perl` package
+  doesn't ship the `libperl.so` dev symlink `-lperl` needs, so linking it
+  failed — and since `perl` sorts alphabetically before `vddk`, `make
+  install` aborted there and never reached the plugin the build exists for.
+
 ## [0.2.1] - 2026-07-29
 
 ### Fixed
