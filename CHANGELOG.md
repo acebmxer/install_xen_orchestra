@@ -10,6 +10,20 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+- `TURBO_CACHE_ENABLED` config option (default: `true`). Enables turbo's local
+  build cache so `--update` reuses unchanged packages' build output instead of
+  rebuilding all 25 packages every time. `--rebuild` always does a clean,
+  cache-free build regardless of this setting. Set to `false` to restore the
+  previous always-cold-cache behavior.
+
+### Changed
+- `build_xo`'s `TURBO_CACHE` now defaults to `local:rw` (was `remote:r`, which
+  disabled all caching since no `TURBO_TOKEN`/`TURBO_TEAM` is configured).
+- `--update` no longer forces a clean build (`build_xo clean` → `build_xo`),
+  so it can benefit from the local cache. `--rebuild` is unchanged and still
+  wipes the cache for a guaranteed fresh build.
+
 ## [0.2.1] - 2026-07-29
 
 ### Fixed

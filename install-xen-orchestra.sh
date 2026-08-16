@@ -405,6 +405,7 @@ load_config() {
     GIT_BRANCH=${GIT_BRANCH:-master}
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
+    TURBO_CACHE_ENABLED=${TURBO_CACHE_ENABLED:-true}
     NODE_VERSION=${NODE_VERSION:-24.15.0}
     SERVICE_USER=${SERVICE_USER:-root}
     DEBUG_MODE=${DEBUG_MODE:-false}
@@ -470,6 +471,11 @@ validate_config() {
     # Validate ENCRYPT_REDIS_CREDENTIALS is a boolean
     if [[ "$ENCRYPT_REDIS_CREDENTIALS" != "true" ]] && [[ "$ENCRYPT_REDIS_CREDENTIALS" != "false" ]]; then
         errors+=("ENCRYPT_REDIS_CREDENTIALS must be true or false, got: $ENCRYPT_REDIS_CREDENTIALS")
+    fi
+
+    # Validate TURBO_CACHE_ENABLED is a boolean
+    if [[ "$TURBO_CACHE_ENABLED" != "true" ]] && [[ "$TURBO_CACHE_ENABLED" != "false" ]]; then
+        errors+=("TURBO_CACHE_ENABLED must be true or false, got: $TURBO_CACHE_ENABLED")
     fi
 
     # Report errors if any
@@ -1417,8 +1423,12 @@ build_xo() {
     # instead of rebuilding all 25 every time. `clean` builds (--rebuild)
     # wipe .turbo/node_modules/.cache/turbo before this runs, so they still
     # get a fully fresh build regardless of this setting. Remote is left off
-    # since no TURBO_TOKEN/TURBO_TEAM is configured.
-    local TURBO_CACHE="local:rw"
+    # since no TURBO_TOKEN/TURBO_TEAM is configured. Controlled by
+    # TURBO_CACHE_ENABLED in xo-config.cfg (default: true).
+    local TURBO_CACHE="remote:r"
+    if [[ "${TURBO_CACHE_ENABLED:-true}" == "true" ]]; then
+        TURBO_CACHE="local:rw"
+    fi
     # Concurrency must go through the TURBO_CONCURRENCY env var, not
     # `yarn build --concurrency=N`: yarn 1 appends extra args to the END of the
     # script string, and upstream's build script now ends with
