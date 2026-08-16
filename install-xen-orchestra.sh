@@ -1413,7 +1413,12 @@ build_xo() {
     fi
 
     local NODE_OPTIONS="--max-old-space-size=$NODE_HEAP_SIZE"
-    local TURBO_CACHE="remote:r"
+    # Local cache lets `--update` reuse unchanged packages' build output
+    # instead of rebuilding all 25 every time. `clean` builds (--rebuild)
+    # wipe .turbo/node_modules/.cache/turbo before this runs, so they still
+    # get a fully fresh build regardless of this setting. Remote is left off
+    # since no TURBO_TOKEN/TURBO_TEAM is configured.
+    local TURBO_CACHE="local:rw"
     # Concurrency must go through the TURBO_CONCURRENCY env var, not
     # `yarn build --concurrency=N`: yarn 1 appends extra args to the END of the
     # script string, and upstream's build script now ends with
@@ -2483,8 +2488,9 @@ update_xo() {
     install_nodejs
     install_yarn
 
-    # Rebuild with clean cache to ensure fresh build
-    build_xo clean
+    # Rebuild, reusing the local turbo cache for any package that didn't
+    # change since the last build (see build_xo's TURBO_CACHE comment).
+    build_xo
 
     # Regenerate the systemd service file to pick up any script changes
     create_systemd_service
