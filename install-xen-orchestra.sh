@@ -1364,6 +1364,31 @@ verify_xo_web_build() {
     fi
 }
 
+# Write an untracked packages/xo-web/turbo.json adding GIT_HEAD to the cache
+# key of xo-web's build task (see the rationale in build_xo).  Untracked files
+# survive the `git checkout .` and `git checkout -B` in update_xo, and the
+# script never runs `git clean`, so this persists across updates.  Written
+# idempotently so it doesn't churn xo-web's package hash on every build.
+pin_xo_web_cache_key() {
+    local xo_web_dir="$INSTALL_DIR/packages/xo-web"
+    sudo test -d "$xo_web_dir" || return 0
+
+    local cfg="$xo_web_dir/turbo.json"
+    # "extends": ["//"] is required of every package-level turbo.json; "tasks"
+    # is the turbo 2 spelling of what turbo 1 called "pipeline".
+    local desired='{"extends":["//"],"tasks":{"build":{"env":["GIT_HEAD"]}}}'
+
+    if [[ "$(sudo cat "$cfg" 2>/dev/null)" == "$desired" ]]; then
+        return 0
+    fi
+
+    if printf '%s\n' "$desired" | sudo -u "${SERVICE_USER:-root}" tee "$cfg" >/dev/null 2>&1; then
+        log_info "Pinned xo-web's build cache key to the checked-out commit"
+    else
+        log_warning "Could not write $cfg — the XO 5 About page may report a stale commit"
+    fi
+}
+
 # Usage: build_xo [clean]
 # If "clean" is passed, turbo cache will be cleared first
 build_xo() {
@@ -1374,7 +1399,9 @@ build_xo() {
     # Ensure swap space exists to prevent OOM
     ensure_swap_space
 
-    # Clear turbo cache if clean build requested
+    # Clear turbo cache if clean build requested.  Turbo 2 keeps the filesystem
+    # cache in .turbo/cache; node_modules/.cache/turbo is the turbo 1 location,
+    # removed only so a downgrade can't resurrect a stale cache.
     if [[ "$CLEAN_BUILD" == "clean" ]]; then
         log_info "Clearing build cache for clean rebuild..."
         if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
@@ -1421,9 +1448,9 @@ build_xo() {
     local NODE_OPTIONS="--max-old-space-size=$NODE_HEAP_SIZE"
     # Local cache lets `--update` reuse unchanged packages' build output
     # instead of rebuilding all 25 every time. `clean` builds (--rebuild)
-    # wipe .turbo/node_modules/.cache/turbo before this runs, so they still
-    # get a fully fresh build regardless of this setting. Remote is left off
-    # since no TURBO_TOKEN/TURBO_TEAM is configured. Controlled by
+    # wipe the cache directory before this runs, so they still get a fully
+    # fresh build regardless of this setting. Remote is left off since no
+    # TURBO_TOKEN/TURBO_TEAM is configured. Controlled by
     # TURBO_CACHE_ENABLED in xo-config.cfg (default: true).
     local TURBO_CACHE="remote:r"
     if [[ "${TURBO_CACHE_ENABLED:-true}" == "true" ]]; then
@@ -1437,6 +1464,32 @@ build_xo() {
     local BUILD_ENV="NODE_OPTIONS='$NODE_OPTIONS' TURBO_CACHE='$TURBO_CACHE'"
     if [[ -n "$TURBO_CONCURRENCY" ]]; then
         BUILD_ENV="$BUILD_ENV TURBO_CONCURRENCY='$TURBO_CONCURRENCY'"
+    fi
+
+    # xo-web bakes the checked-out commit into its bundle at build time:
+    #   "build": "GIT_HEAD=$(git rev-parse HEAD) NODE_ENV=production gulp build"
+    # and src/xo-app/about/index.js does `const COMMIT_ID = process.env.GIT_HEAD`,
+    # which loose-envify inlines as a string literal into dist/index.js.
+    #
+    # Turbo hashes a package's *files*, not the checked-out commit, and GIT_HEAD
+    # is computed by the shell inside that script — after turbo has already
+    # decided hit vs. miss.  So an update whose diff doesn't touch
+    # packages/xo-web/ gets a cache hit and restores a dist carrying the
+    # PREVIOUS commit.  The XO 5 About page then reports the old commit and
+    # keeps claiming you're behind master after a successful update.
+    #
+    # Fix: hand turbo GIT_HEAD explicitly and, via an untracked package-level
+    # turbo.json, tell it to fold that value into the cache key for xo-web's
+    # build task only.  The commit changes on every update, so xo-web rebuilds
+    # every time while the other ~34 tasks stay cached.  Scoping it to xo-web
+    # matters: `turbo run build --filter xo-web --force` would also force
+    # xo-web's dependencies (--force applies to the whole run), and a
+    # root-level globalEnv would bust every package.
+    local XO_WEB_HEAD
+    XO_WEB_HEAD=$(install_dir_git rev-parse HEAD 2>/dev/null) || XO_WEB_HEAD=""
+    if [[ -n "$XO_WEB_HEAD" ]]; then
+        BUILD_ENV="$BUILD_ENV GIT_HEAD='$XO_WEB_HEAD'"
+        pin_xo_web_cache_key
     fi
 
     # Patch @xen-orchestra/rest-api's prebuild hook to call rimraf directly instead

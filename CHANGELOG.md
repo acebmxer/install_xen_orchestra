@@ -24,6 +24,19 @@ This installer builds Xen Orchestra from source and tracks the official
   so it can benefit from the local cache. `--rebuild` is unchanged and still
   wipes the cache for a guaranteed fresh build.
 
+### Fixed
+- XO 5's About page reported the *previous* commit after a successful update
+  and kept claiming the install was behind master. `xo-web`'s build bakes the
+  commit into its bundle (`GIT_HEAD=$(git rev-parse HEAD)` in its `build`
+  script, read as `process.env.GIT_HEAD` and inlined by `loose-envify`), but
+  turbo hashes a package's files rather than the checked-out commit — so any
+  update whose diff didn't touch `packages/xo-web/` restored a cached `dist`
+  carrying the old commit. `build_xo` now exports `GIT_HEAD` and writes an
+  untracked `packages/xo-web/turbo.json` adding it to that task's cache key,
+  so xo-web rebuilds whenever the commit changes while the rest of the
+  workspace stays cached. Only the displayed commit was ever wrong; the code
+  in a cache-hit `dist` was correct.
+
 ## [0.2.1] - 2026-07-29
 
 ### Fixed
