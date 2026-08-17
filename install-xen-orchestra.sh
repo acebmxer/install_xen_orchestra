@@ -1916,7 +1916,10 @@ create_backup() {
     local BACKUP_NAME="xo-backup-${TIMESTAMP}"
     local BACKUP_PATH="${BACKUP_DIR}/${BACKUP_NAME}"
 
-    # Create backup (excluding node_modules to save space)
+    # Create backup.  node_modules is dropped to save space; yarn reinstalls it
+    # on the next build.  Turbo's cache (.turbo/cache, ~15MB) is deliberately
+    # kept: without it the first update after a restore would be a cold full
+    # rebuild of all ~25 packages, which costs far more than the space saved.
     run_cmd sudo cp -r "$INSTALL_DIR" "$BACKUP_PATH"
     run_cmd sudo rm -rf "${BACKUP_PATH}/node_modules"
 
