@@ -10,6 +10,33 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+- `TURBO_CACHE_ENABLED` config option (default: `true`). Enables turbo's local
+  build cache so `--update` reuses unchanged packages' build output instead of
+  rebuilding all 25 packages every time. `--rebuild` always does a clean,
+  cache-free build regardless of this setting. Set to `false` to restore the
+  previous always-cold-cache behavior.
+
+### Changed
+- `build_xo`'s `TURBO_CACHE` now defaults to `local:rw` (was `remote:r`, which
+  disabled all caching since no `TURBO_TOKEN`/`TURBO_TEAM` is configured).
+- `--update` no longer forces a clean build (`build_xo clean` → `build_xo`),
+  so it can benefit from the local cache. `--rebuild` is unchanged and still
+  wipes the cache for a guaranteed fresh build.
+
+### Fixed
+- XO 5's About page reported the *previous* commit after a successful update
+  and kept claiming the install was behind master. `xo-web`'s build bakes the
+  commit into its bundle (`GIT_HEAD=$(git rev-parse HEAD)` in its `build`
+  script, read as `process.env.GIT_HEAD` and inlined by `loose-envify`), but
+  turbo hashes a package's files rather than the checked-out commit — so any
+  update whose diff didn't touch `packages/xo-web/` restored a cached `dist`
+  carrying the old commit. `build_xo` now exports `GIT_HEAD` and writes an
+  untracked `packages/xo-web/turbo.json` adding it to that task's cache key,
+  so xo-web rebuilds whenever the commit changes while the rest of the
+  workspace stays cached. Only the displayed commit was ever wrong; the code
+  in a cache-hit `dist` was correct.
+
 ## [0.2.1] - 2026-07-29
 
 ### Fixed

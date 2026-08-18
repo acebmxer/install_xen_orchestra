@@ -13,6 +13,7 @@ setup() {
     NODE_VERSION=22
     SERVICE_USER=xo-service
     ENCRYPT_REDIS_CREDENTIALS=false
+    TURBO_CACHE_ENABLED=true
 }
 
 @test "valid config passes validation" {
