@@ -62,6 +62,70 @@ This installer builds Xen Orchestra from source and tracks the official
   pool's VM list. Nothing is destroyed automatically.
 
 ### Security
+- **The cloud image is verified against its published checksum.** The size
+  check catches a download that was cut short; it cannot catch one that arrived
+  complete from the wrong place, because a substituted image has a perfectly
+  consistent `Content-Length`. The staged image is now checked against the
+  `SHA512SUMS` its origin publishes beside it — which is what Debian ships —
+  and a mismatch aborts before anything reaches the disk. An origin that
+  publishes no sums warns and continues, so a custom `XO_DEPLOY_IMAGE_URL`
+  keeps working. Set `XO_DEPLOY_IMAGE_SHA512` to require a specific digest
+  instead: that makes the check mandatory, aborting rather than continuing
+  unverified, and refuses the streaming import outright because a pipe fed
+  straight into the VDI leaves no file to hash. Fetching sums over the same
+  connection as the image is not a detached signature — it defends against a
+  bad mirror or a stale cache, not an attacker holding the TLS session for
+  both requests.
+- **A pinned pool-master fingerprint is now enforced instead of advised.**
+  `deploy_verify_host_key` fingerprinted the host key and then returned success
+  on every path that could not complete the check — so with
+  `XO_DEPLOY_POOL_FINGERPRINT` set, a `ssh-keyscan` that timed out meant the
+  host password was sent to whatever answered on that address, which is exactly
+  what pinning exists to prevent and the easiest outcome for an on-path attacker
+  to arrange. A pin that cannot be checked is now a hard failure.
+- **The verified host key is bound to the connection that carries the password.**
+  The scanned key was fingerprinted, shown, and then discarded, while
+  `dom0_exec` connected with `StrictHostKeyChecking=accept-new` against the
+  default `known_hosts` — verifying one transaction and trusting another.
+  Nothing stopped a different key, or the host's RSA key when the ED25519 one
+  had been displayed, being accepted at connect time. The whole scan is now
+  pinned into a run-scoped `known_hosts` that `dom0_exec` enforces with
+  `StrictHostKeyChecking=yes`, the same way `deploy_wait_for_guest` already
+  treated the guest.
+- **A hostile pool master can no longer run commands on the workstation.** The
+  free-space probe in `deploy_import_vdi_staged` fed the host's reply straight
+  into `(( ))`, which expands an array subscript before evaluating it — so an
+  answer of `PATH[$(...)]` executed locally rather than being rejected. It is
+  now checked against `^[0-9]+$` first, matching the guards already applied to
+  `size` and `got` in the same function. Note that `set -euo pipefail` does not
+  cover this: `set -u` blocks only the unbound-variable form of the payload.
+  This mattered more after staging became the default import path, because the
+  probe went from rarely reached to running on every deploy.
+- **The pool master's root password is no longer visible in `ps`.** Three calls
+  predating `dom0_exec` still used `sshpass -p "$HOST_PASSWORD"`, putting the
+  password in the process list where any other user on the workstation could
+  read it. They now use `sshpass -e` with `$SSHPASS`, as `dom0_exec` does.
+- **The admin password hash is kept out of `XO_DEBUG=1` output.**
+  `deploy_harden_guest_sudo` and `deploy_build_config_drive` were missing the
+  `local -` / `set +x` guard the rest of the script uses, so the hash was
+  printed by xtrace. Previously masked on automated runs only because
+  `--non-interactive` left the hash empty; requiring a password made it
+  reachable on every deploy.
+- **Revoking the deployment key can no longer empty `authorized_keys`.** A
+  `grep` failure — no space for the temporary file, an unreadable source — was
+  swallowed by `|| true` and the empty result written back, taking the
+  operator's own key with it. grep's "nothing matched" (a legitimate empty
+  result) is now distinguished from a real error, which aborts and leaves the
+  file untouched.
+- **The streaming import's FIFO is created inside a private directory.**
+  `mktemp -u` returns a name without creating anything, leaving a window in
+  dom0's world-writable `/tmp`. The FIFO now lives in a `mktemp -d` directory.
+- **DSA public keys are rejected.** `ssh-dss` was accepted by
+  `deploy_load_pubkey`, but OpenSSH has refused DSA since 7.0 and removed it in
+  9.8, so it only installed a key that silently never worked.
+- **The cloud-init cache scrub covers `cloud-config.txt`.** The rendered config
+  holds `hashed_passwd` just as the raw user-data does; only the latter was
+  being redacted.
 - **The deployment SSH key is destroyed at the end of a deploy.** It used to be
   saved next to the script as `xo-deploy-<hostname>.key` and handed to the
   operator as the way into the VM — an unencrypted, passphraseless private key

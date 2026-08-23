@@ -3192,15 +3192,21 @@ install_xo_proxy() {
     [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
 
     # Test SSH connection
+    #
+    # `sshpass -e` reading $SSHPASS, never `sshpass -p "$password"`: an argument
+    # is visible in the process list for the life of the call, so any other user
+    # on this workstation can read the pool master's root password out of `ps`.
+    # The environment of another user's process is not readable the same way.
+    # This is what dom0_exec already does; these calls predate it.
     log_info "Testing SSH connection to $HOST_USERNAME@$POOL_MASTER_IP..."
-    if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
+    if ! SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
         # Try installing sshpass if not available
         if ! command -v sshpass &> /dev/null; then
             log_info "Installing sshpass..."
             # shellcheck disable=SC2086
             run_cmd $PKG_INSTALL sshpass
             # Retry connection
-            if ! sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
+            if ! SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
                 log_error "Failed to connect to Pool Master. Please check your credentials."
                 exit 1
             fi
@@ -3372,7 +3378,8 @@ XO_CLI_EXPECT_END
     # Check if license check disabling is enabled in config
     if [[ "${DISABLE_LICENSE_CHECK:-false}" == "true" ]]; then
         log_info "Disabling license check on XO Proxy..."
-        if sshpass -p "$HOST_PASSWORD" ssh -o StrictHostKeyChecking=accept-new "$HOST_USERNAME@$POOL_MASTER_IP" 'bash -s' << 'REMOTE_LICENSE_PATCH'
+        # -e/$SSHPASS rather than -p: see the note on the connection test above.
+        if SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new "$HOST_USERNAME@$POOL_MASTER_IP" 'bash -s' << 'REMOTE_LICENSE_PATCH'
 set -e
 APPLIANCE_FILE=$(find /opt/xo-proxy -name 'appliance.mjs' 2>/dev/null | head -1)
 if [[ -z "$APPLIANCE_FILE" ]]; then
@@ -3486,6 +3493,10 @@ DEPLOY_KEY_REVOKED="false"
 # Declared here so the post-install hardening steps can test it under `set -u`
 # even on a path that never reached deploy_wait_for_guest.
 DEPLOY_SSH_OPTS=()
+# The run-scoped known_hosts holding the pool master key deploy_verify_host_key
+# checked. Empty until then, which is what keeps dom0_exec usable under `set -u`
+# on the paths that run before the check.
+DEPLOY_POOL_KNOWN_HOSTS=""
 
 # Suppressing `set -x` around anything that touches the pool password.
 #
@@ -3578,9 +3589,31 @@ dom0_exec() {
         -o ControlMaster=auto
         -o ControlPath="$DEPLOY_SSH_CTL"
         -o ControlPersist=600
-        -o StrictHostKeyChecking=accept-new
         -o ConnectTimeout=15
     )
+
+    # Bind the connection to the key deploy_verify_host_key actually checked.
+    #
+    # Fingerprinting a key and then connecting under `accept-new` against the
+    # default known_hosts verifies one transaction and trusts another: nothing
+    # stops a different key -- or the same host's RSA key, when the ED25519 one
+    # was what was shown -- being accepted at connect time. Pinning the scanned
+    # key into a run-scoped file and demanding StrictHostKeyChecking=yes is what
+    # makes the check bind to the session that carries the host password. This
+    # is the same pattern deploy_wait_for_guest already uses for the guest.
+    #
+    # Before the check has run (DEPLOY_POOL_KNOWN_HOSTS empty) there is nothing
+    # to pin against, so `accept-new` stands -- but deploy_connect_pool_master
+    # calls deploy_verify_host_key before the first dom0_exec, so no call that
+    # carries the password takes this branch.
+    if [[ -n "$DEPLOY_POOL_KNOWN_HOSTS" && -s "$DEPLOY_POOL_KNOWN_HOSTS" ]]; then
+        common+=(
+            -o UserKnownHostsFile="$DEPLOY_POOL_KNOWN_HOSTS"
+            -o StrictHostKeyChecking=yes
+        )
+    else
+        common+=(-o StrictHostKeyChecking=accept-new)
+    fi
     if [[ "$DEPLOY_AUTH_MODE" == "sshpass" ]]; then
         SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${common[@]}" \
             "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@" || rc=$?
@@ -3682,9 +3715,14 @@ deploy_stream_script() {
 set -o pipefail
 url=$1; size=$2; target=$3
 
-fifo=$(mktemp -u) || exit 1
+# mktemp -d, not mktemp -u: -u hands back a name without creating anything,
+# leaving a window in dom0's world-writable /tmp where another process can take
+# the path first. A directory is created atomically at mode 700, so the fifo
+# inside it cannot be pre-empted or opened by anyone else.
+d=$(mktemp -d) || exit 1
+trap 'rm -rf "$d"' EXIT
+fifo="$d/pipe"
 mkfifo "$fifo" || exit 1
-trap 'rm -f "$fifo"' EXIT
 
 curl -fsS -L --speed-limit 1024 --speed-time 60 --max-time 3600 "$url" > "$fifo" &
 dl=$!
@@ -3704,6 +3742,95 @@ STREAM_EOF
 
 # Get the cloud image into a VDI, staging it on the host by preference.
 #
+# Check a staged image against the checksum its origin publishes.
+#
+# The size check above catches a download that was cut short. It cannot catch a
+# download that arrived complete from the wrong place -- a poisoned mirror, a
+# hijacked redirect, a stale cache -- because a substituted image has a
+# perfectly consistent Content-Length. Only a cryptographic digest separates
+# those, and the whole point of this image is that it becomes the appliance
+# holding the pool's root credentials.
+#
+# Two sources, in order of authority:
+#
+#   XO_DEPLOY_IMAGE_SHA512  an explicit pin. Like XO_DEPLOY_POOL_FINGERPRINT,
+#                           setting it means the check is mandatory: if it
+#                           cannot be made, the deploy stops.
+#   SHA512SUMS              fetched from the image's own directory, which is
+#                           where Debian publishes it. Best effort, because a
+#                           private mirror may not carry one -- a missing file
+#                           warns, a mismatched digest always fails.
+#
+# Fetching the sums over the same connection as the image is not the strong
+# guarantee a detached signature would be; it defends against a bad mirror or a
+# corrupted cache, not against an attacker holding the TLS session for both
+# requests. Pin the digest when that distinction matters.
+#
+# Returns 0 when verified or legitimately skipped, 1 when the image must not be
+# imported.
+deploy_verify_image_checksum() {
+    local url="$1" tmp="$2"
+    local pinned="${XO_DEPLOY_IMAGE_SHA512:-}"
+    local want=""
+
+    if [[ -n "$pinned" ]]; then
+        want="$pinned"
+        log_info "  verifying the image against XO_DEPLOY_IMAGE_SHA512..."
+    else
+        # Both derived from a URL is_safe_url has already cleared of quotes and
+        # whitespace, so they stay safe inside the single-quoted remote argument.
+        local base="${url##*/}"; base="${base%%\?*}"
+        local dir="${url%/*}"
+
+        local sums
+        sums=$(dom0_exec "curl -fsSL --max-time 120 '${dir}/SHA512SUMS' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+        if [[ -n "$sums" ]]; then
+            # Lines are "<digest>  <name>"; coreutils marks binary mode with a
+            # leading '*' on the name.
+            want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
+        fi
+
+        if [[ -z "$want" ]]; then
+            log_warning "  no published SHA512SUMS entry for $(basename "$base") at the image origin."
+            log_warning "  The image cannot be verified, only size-checked. Set"
+            log_warning "  XO_DEPLOY_IMAGE_SHA512 to require a digest match."
+            return 0
+        fi
+        log_info "  verifying the image against the origin's SHA512SUMS..."
+    fi
+
+    if [[ ! "$want" =~ ^[a-fA-F0-9]{128}$ ]]; then
+        log_error "The expected SHA-512 digest is not 128 hex characters:"
+        log_error "  ${want}"
+        return 1
+    fi
+
+    local got
+    got=$(dom0_exec "sha512sum '${tmp}' 2>/dev/null | awk '{print \$1}'" | tr -d '\r')
+    if [[ ! "$got" =~ ^[a-fA-F0-9]{128}$ ]]; then
+        # A pin is a demand for proof, so failing to produce one is fatal.
+        if [[ -n "$pinned" ]]; then
+            log_error "Could not compute the image's SHA-512 on the pool master, and"
+            log_error "XO_DEPLOY_IMAGE_SHA512 is set. Refusing to import it unverified."
+            return 1
+        fi
+        log_warning "  could not compute the image's checksum on the pool master; skipping."
+        return 0
+    fi
+
+    if [[ "${got,,}" != "${want,,}" ]]; then
+        log_error "The downloaded image does not match its published checksum."
+        log_error "  expected: ${want,,}"
+        log_error "  actual:   ${got,,}"
+        log_error "Refusing to import it. This is a corrupted download or the wrong"
+        log_error "file; if it repeats, treat the mirror as suspect."
+        return 1
+    fi
+
+    log_success "  image checksum verified"
+    return 0
+}
+
 # Staging wins on every count that matters. The download lands in a file, so it
 # can be resumed with -C - and retried, and its size can be checked against
 # what the server advertised before a byte reaches the disk. Streaming can do
@@ -3732,9 +3859,23 @@ deploy_import_vdi_from_url() {
         return $rc
     fi
 
+    # A pinned digest cannot be honoured by the streaming path: the bytes go
+    # straight from the origin into the VDI, so there is no file to hash and
+    # nothing to reject if it does not match. Silently importing an unverified
+    # image because the host was short on scratch space would make the pin mean
+    # whatever the disk happened to allow, so this stops instead.
+    if [[ -n "${XO_DEPLOY_IMAGE_SHA512:-}" ]]; then
+        log_error "Not enough scratch space on the pool master to stage the image, and"
+        log_error "XO_DEPLOY_IMAGE_SHA512 is set. A streamed image cannot be verified,"
+        log_error "so it will not be imported."
+        log_error "Free up space in /var/tmp on the pool master and retry."
+        return 1
+    fi
+
     log_warning "Not enough scratch space on the pool master to stage the image."
     log_warning "Falling back to streaming it straight into the disk."
     log_warning "This cannot resume a broken transfer, so a flaky link may fail it."
+    log_warning "It also cannot be checksummed -- nothing verifies what arrives."
 
     # The PUT needs an exact Content-Length, so ask the origin how big the
     # image is before starting. -L follows the redirects Debian's mirrors use.
@@ -3784,9 +3925,20 @@ deploy_import_vdi_staged() {
     # Returns 2, not 1, when there is no room: this is the one failure the
     # caller can do something about, by falling back to a streaming import that
     # needs no scratch space. Every other failure here is terminal.
+    #
+    # The `=~ ^[0-9]+$` is load-bearing, not tidiness, and matches the guards on
+    # `size` above and `got` below. `(( ))` evaluates an array subscript as an
+    # arithmetic expression, and expands it first -- so a non-numeric answer from
+    # the host, `PATH[$(...)]`, is *executed here*, on the workstation, rather
+    # than rejected. That turns a hostile or impersonated pool master into local
+    # code execution, so the value is checked before it reaches `(( ))` at all.
+    #
+    # `set -u` is not the guard it looks like: it stops the payload naming an
+    # *unset* variable (`x[$(...)]` aborts), but any bound name -- PATH, HOME, or
+    # anything this script declares -- sails straight through it.
     local free_mb
     free_mb=$(dom0_exec "df -BM --output=avail /var/tmp 2>/dev/null | tail -1 | tr -d ' M'" | tr -d '\r')
-    if [[ -n "$free_mb" ]] && (( free_mb < need_mb )); then
+    if [[ "$free_mb" =~ ^[0-9]+$ ]] && (( free_mb < need_mb )); then
         log_info "  /var/tmp on the pool master has ${free_mb} MiB free; staging needs ${need_mb} MiB."
         return 2
     fi
@@ -3823,6 +3975,13 @@ deploy_import_vdi_staged() {
             dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
             return 1
         fi
+    fi
+
+    # After the size check and before anything reaches the VDI: a bad image is
+    # cheap to delete now and expensive to discover once it is the appliance.
+    if ! deploy_verify_image_checksum "$url" "$tmp"; then
+        dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+        return 1
     fi
 
     log_info "  importing it into the disk..."
@@ -4077,6 +4236,24 @@ deploy_check_local_deps() {
 #
 # Set XO_DEPLOY_POOL_FINGERPRINT to the expected SHA256 fingerprint to check it
 # without a prompt -- the only form of this that works under --non-interactive.
+
+# Pin the scanned host key so dom0_exec is bound to the key that was verified.
+#
+# Every line of the scan is pinned, not just the ED25519 one whose fingerprint
+# was displayed: the host legitimately offers several types and ssh picks one at
+# negotiation time. Pinning the whole scan means whichever it picks came from
+# the host we checked, while a key that was not in the scan -- an attacker's RSA
+# key offered in place of the ED25519 one we showed the operator -- is rejected
+# outright rather than accepted under `accept-new`.
+deploy_pin_pool_host_key() {
+    local scan="$1"
+    local pinned="${DEPLOY_WORKDIR}/pool_known_hosts"
+
+    cp "$scan" "$pinned" 2>/dev/null || return 0
+    chmod 600 "$pinned" 2>/dev/null || true
+    DEPLOY_POOL_KNOWN_HOSTS="$pinned"
+}
+
 deploy_verify_host_key() {
     local expected="${XO_DEPLOY_POOL_FINGERPRINT:-}"
 
@@ -4086,8 +4263,22 @@ deploy_verify_host_key() {
 
     local scan="${DEPLOY_WORKDIR}/pool_hostkey"
     if ! ssh-keyscan -T 10 "$POOL_MASTER_IP" > "$scan" 2>/dev/null || [[ ! -s "$scan" ]]; then
+        # A pinned fingerprint is an explicit request for enforcement, so a scan
+        # that did not happen is a failure, not a warning. Returning 0 here would
+        # hand the password to whatever answers on that address -- which is the
+        # one outcome pinning exists to prevent, and the easiest for an on-path
+        # attacker to arrange: drop the probe for ten seconds, then answer the
+        # real connection.
+        if [[ -n "$expected" ]]; then
+            log_error "Could not read the SSH host key of ${POOL_MASTER_IP}."
+            log_error "XO_DEPLOY_POOL_FINGERPRINT is set, so it cannot be checked and"
+            log_error "the host password will not be sent. Confirm the host is reachable"
+            log_error "on port 22 and retry."
+            exit 1
+        fi
         log_warning "Could not read the SSH host key of ${POOL_MASTER_IP} in advance."
-        log_warning "ssh will still verify it against your known_hosts when it connects."
+        log_warning "ssh accepts an unknown key on first contact, so it will NOT be"
+        log_warning "verified for you. Set XO_DEPLOY_POOL_FINGERPRINT to have it checked."
         return 0
     fi
 
@@ -4098,6 +4289,13 @@ deploy_verify_host_key() {
     fp_line=$(ssh-keygen -lf "$scan" 2>/dev/null | grep -i 'ED25519' | head -1)
     [[ -n "$fp_line" ]] || fp_line=$(ssh-keygen -lf "$scan" 2>/dev/null | head -1)
     if [[ -z "$fp_line" ]]; then
+        # Same reasoning as above: with a pin set, "could not check" is a refusal.
+        if [[ -n "$expected" ]]; then
+            log_error "Could not fingerprint the host key of ${POOL_MASTER_IP}, so the"
+            log_error "XO_DEPLOY_POOL_FINGERPRINT check cannot be made. Refusing to send"
+            log_error "the host password."
+            exit 1
+        fi
         log_warning "Could not fingerprint the host key of ${POOL_MASTER_IP}; continuing."
         return 0
     fi
@@ -4107,6 +4305,7 @@ deploy_verify_host_key() {
 
     if [[ -n "$expected" ]]; then
         if [[ "$fp" == "$expected" ]]; then
+            deploy_pin_pool_host_key "$scan"
             log_success "Pool master host key matches XO_DEPLOY_POOL_FINGERPRINT."
             return 0
         fi
@@ -4128,6 +4327,10 @@ deploy_verify_host_key() {
     echo "    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
     echo ""
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        # Still pinned: nobody confirmed this key, but binding the run to the one
+        # key we saw is strictly better than letting every later connection take
+        # whatever is offered.
+        deploy_pin_pool_host_key "$scan"
         log_warning "Non-interactive: accepting this key without confirmation."
         log_warning "Set XO_DEPLOY_POOL_FINGERPRINT to have it verified instead."
         return 0
@@ -4136,6 +4339,8 @@ deploy_verify_host_key() {
         log_error "Host key not confirmed. Nothing has been sent to ${POOL_MASTER_IP}."
         exit 1
     fi
+
+    deploy_pin_pool_host_key "$scan"
 }
 
 # Collect pool master connection details and open the shared SSH connection.
@@ -4322,8 +4527,12 @@ deploy_load_pubkey() {
 
     [[ -n "$line" ]] || return 1
 
+    # ssh-dss is deliberately absent. DSA is capped at 1024 bits, OpenSSH has
+    # refused it since 7.0 and dropped the code entirely in 9.8, so accepting
+    # one here would not grant access -- it would install a key that silently
+    # never works and send the operator hunting for the reason.
     case "${line%% *}" in
-        ssh-ed25519|ssh-rsa|ssh-dss| \
+        ssh-ed25519|ssh-rsa| \
         ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521| \
         sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
         *) return 1 ;;
@@ -4683,6 +4892,13 @@ deploy_prompt_xo_settings() {
 # SSH so its output and error handling reach your terminal instead of
 # disappearing into the guest's cloud-init log.
 deploy_build_config_drive() {
+    # Builds the password_lines block from DEPLOY_ADMIN_PASSWORD_HASH, and the
+    # assignment -- unlike the heredoc it feeds -- is expanded by xtrace. Off for
+    # the whole function rather than the one line, since everything here is
+    # assembling the credential material the guest boots with. See dom0_exec.
+    local -
+    set +x
+
     local dir="${DEPLOY_WORKDIR}/cidata"
     mkdir -p "$dir"
 
@@ -5177,12 +5393,20 @@ deploy_scrub_guest_cloudinit_cache() {
     # A valid, empty cloud-config replaces the cached user-data rather than the
     # files being deleted: cloud-init reads them on a later boot and an empty
     # document is understood, where a missing or malformed one logs errors.
+    #
+    # cloud-config.txt is the *rendered* config, and it carries hashed_passwd
+    # just as the raw user-data does. Current cloud-init writes it 0600 under a
+    # 0700 directory, so it is not an exposure on its own -- but leaving the
+    # credential in a second copy while carefully scrubbing the first is not a
+    # cleanup, so it goes with the rest.
     local scrub_files='
 set -e
 for f in /var/lib/cloud/instance/user-data.txt \
          /var/lib/cloud/instance/user-data.txt.i \
+         /var/lib/cloud/instance/cloud-config.txt \
          /var/lib/cloud/instances/*/user-data.txt \
-         /var/lib/cloud/instances/*/user-data.txt.i; do
+         /var/lib/cloud/instances/*/user-data.txt.i \
+         /var/lib/cloud/instances/*/cloud-config.txt; do
     [ -f "$f" ] || continue
     printf "#cloud-config\n# Redacted by install-xen-orchestra --deploy.\n" > "$f"
     chmod 0600 "$f"
@@ -5255,6 +5479,11 @@ if secret:
 # resulting sudoers tree does not parse: a broken /etc/sudoers.d file is the
 # same lockout by a different route.
 deploy_harden_guest_sudo() {
+    # Reads DEPLOY_ADMIN_PASSWORD_HASH below, which xtrace would print verbatim
+    # -- including in the `[[ -z ... ]]` test. See the note above dom0_exec.
+    local -
+    set +x
+
     [[ ${#DEPLOY_SSH_OPTS[@]} -gt 0 ]] || return 0
 
     DEPLOY_SUDO_HARDENED="false"
@@ -5368,7 +5597,20 @@ p=$(cat) || exit 1
 f="$HOME/.ssh/authorized_keys"
 [ -f "$f" ] || exit 0
 t=$(mktemp) || exit 1
-grep -vxF "$p" "$f" > "$t" 2>/dev/null || true
+grep -vxF "$p" "$f" > "$t" 2>/dev/null
+rc=$?
+# grep's three outcomes are not interchangeable here:
+#   0  lines were kept  -> write them back
+#   1  nothing was kept  -> the deploy key was the only line; an empty file is
+#      the correct result, so this is success, not failure
+#  >1  grep itself failed (no space for $t, unreadable $f) -> $t is empty or
+#      truncated and writing it back would erase the operator's own key. Bail
+#      out and leave authorized_keys exactly as it was; the caller's
+#      verification step then reports the key as still live, which is true.
+if [ "$rc" -gt 1 ]; then
+    rm -f "$t"
+    exit 1
+fi
 cat "$t" > "$f"
 rm -f "$t"
 chmod 600 "$f"

@@ -288,6 +288,23 @@ To deploy a different Debian release, set `XO_DEPLOY_IMAGE_VERSION` and
 `XO_DEPLOY_IMAGE_RELEASE`, or point `XO_DEPLOY_IMAGE_URL` at any raw cloud
 image with cloud-init installed.
 
+The staged image is checked against the `SHA512SUMS` its origin publishes
+alongside it, which is what Debian ships. A mismatch always aborts the deploy.
+An origin that publishes no sums — a private mirror, say — warns and continues,
+so pointing `XO_DEPLOY_IMAGE_URL` somewhere custom keeps working.
+
+Set `XO_DEPLOY_IMAGE_SHA512` to require a specific digest instead. Like
+`XO_DEPLOY_POOL_FINGERPRINT`, this makes the check mandatory: if it cannot be
+performed the deploy stops rather than continuing unverified. That also rules
+out the streaming import, which feeds the origin straight into the disk with no
+file to hash — so a host too short on scratch space to stage the image will
+refuse rather than import something it cannot check.
+
+Note that fetching the sums over the same connection as the image is not a
+detached signature. It defends against a bad mirror or a stale cache, not
+against an attacker who holds the TLS session for both requests. Pin the digest
+when that distinction matters to you.
+
 ### Checking a host before deploying
 
 `--deploy` depends on XAPI behaviour that the test suite cannot exercise
@@ -462,6 +479,7 @@ XO_TASK_CHECK_PASS=changeme
 | `XO_DEPLOY_IMAGE_VERSION` | `--deploy`: Debian major version for the guest (default `13`) |
 | `XO_DEPLOY_IMAGE_RELEASE` | `--deploy`: Debian codename for the guest (default `trixie`) |
 | `XO_DEPLOY_IMAGE_URL` | `--deploy`: full URL of a raw cloud image, overriding the two above |
+| `XO_DEPLOY_IMAGE_SHA512` | `--deploy`: expected SHA-512 digest of the cloud image (128 hex characters). Makes verification mandatory — a digest that cannot be checked aborts the deploy, and the streaming import is refused outright since it cannot be hashed. Without it, the origin's published `SHA512SUMS` is used when available. |
 | `XO_DEPLOY_POOL_FINGERPRINT` | `--deploy`: expected SHA256 host-key fingerprint of the pool master (e.g. `SHA256:abc…`). Verified instead of prompting on first connection; the deploy aborts before the host password is sent if it does not match. |
 | `XO_DEPLOY_ADMIN_PASSWORD` | `--deploy --non-interactive`: password for the VM's admin account. Required — the deploy refuses to run without it. Minimum 12 characters. |
 | `XO_DEPLOY_ADMIN_SSH_PWAUTH` | `--deploy --non-interactive`: set to `true` to allow SSH logins with that password (default `false`, key/console only). |

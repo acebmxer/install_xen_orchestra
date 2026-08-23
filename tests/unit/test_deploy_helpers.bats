@@ -354,6 +354,11 @@ _import_stub() {
         printf '%s\n' "$*" >> "$CMDLOG"
         case "$*" in
             *content-length*) echo "3221225472" ;;
+            # Both default to empty, which is the "origin publishes no sums"
+            # path -- so tests written before checksumming existed are
+            # unaffected by it.
+            *SHA512SUMS*)     printf '%s' "${SUMS_BODY:-}" ;;
+            *sha512sum*)      printf '%s' "${ACTUAL_SHA:-}" ;;
             *"df -BM"*)       echo "$FREE_MB" ;;
             *"stat -c %s"*)   echo "$STAGED_SIZE" ;;
             *"--progress-bar"*) [[ -z "${DOWNLOAD_FAILS:-}" ]] || return 1 ;;
@@ -908,4 +913,312 @@ _seed_keys() {
     ! is_safe_url "https://host/img raw"
     ! is_safe_url "file:///etc/passwd"
     ! is_safe_url ""
+}
+
+# --- security regressions -------------------------------------------------
+#
+# Each test below reproduces a defect found in a security review of the
+# --deploy path. They are written to fail against the code as it was, so a
+# refactor that quietly reintroduces one is caught rather than silently
+# accepted.
+
+# The free-space probe feeds the pool master's reply into (( )), which expands
+# an array subscript before evaluating it. An answer of PATH[$(...)] therefore
+# runs on the *workstation*, making a hostile or impersonated host a local code
+# execution vector.
+#
+# The payload names PATH rather than an unset variable on purpose: `set -u`
+# aborts on the textbook x[$(...)] form, which makes that version of this test
+# pass against vulnerable code.
+@test "a hostile free-space reply is not executed as arithmetic" {
+    local marker="${TMPDIR_TEST}/pwned"
+
+    dom0_exec() {
+        case "$*" in
+            *content-length*) echo "" ;;
+            *df*)             echo "PATH[\$(touch ${marker})]" ;;
+            *)                echo "" ;;
+        esac
+    }
+
+    deploy_import_vdi_staged "fake-vdi" "https://example.com/image.raw" >/dev/null 2>&1 || true
+
+    [ ! -e "$marker" ]
+}
+
+# A pinned fingerprint is an explicit request for enforcement. Every path that
+# cannot complete the check used to return success, so a probe an attacker
+# could stall meant the host password was sent unverified.
+@test "an unverifiable pinned fingerprint refuses to continue" {
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub"
+    printf '#!/bin/sh\nexit 1\n' > "${stub}/ssh-keyscan"
+    printf '#!/bin/sh\nexit 1\n' > "${stub}/ssh-keygen"
+    chmod +x "${stub}/ssh-keyscan" "${stub}/ssh-keygen"
+
+    POOL_MASTER_IP="192.0.2.10"
+    NON_INTERACTIVE=true
+    XO_DEPLOY_POOL_FINGERPRINT="SHA256:definitely-not-the-real-key"
+
+    PATH="${stub}:${PATH}" run deploy_verify_host_key
+    [ "$status" -ne 0 ]
+}
+
+# ...but an operator who set no pin keeps the previous behaviour: warn about
+# the unknown key and carry on. Turning that into a hard failure would break
+# every existing deploy.
+@test "an unverifiable host key without a pin still continues" {
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub"
+    printf '#!/bin/sh\nexit 1\n' > "${stub}/ssh-keyscan"
+    printf '#!/bin/sh\nexit 1\n' > "${stub}/ssh-keygen"
+    chmod +x "${stub}/ssh-keyscan" "${stub}/ssh-keygen"
+
+    POOL_MASTER_IP="192.0.2.10"
+    NON_INTERACTIVE=true
+    unset XO_DEPLOY_POOL_FINGERPRINT
+
+    PATH="${stub}:${PATH}" run deploy_verify_host_key
+    [ "$status" -eq 0 ]
+}
+
+# Fingerprinting a key and then connecting under accept-new verifies one
+# transaction and trusts another.
+@test "dom0_exec binds to the pinned host key once one is recorded" {
+    DEPLOY_POOL_KNOWN_HOSTS="${TMPDIR_TEST}/pool_known_hosts"
+    echo "192.0.2.10 ssh-ed25519 AAAAFAKE" > "$DEPLOY_POOL_KNOWN_HOSTS"
+
+    ssh() { printf '%s\n' "$*"; }
+    DEPLOY_AUTH_MODE="prompt"
+    HOST_USERNAME=root
+    POOL_MASTER_IP=192.0.2.10
+    DEPLOY_SSH_CTL="${TMPDIR_TEST}/ctl"
+
+    run dom0_exec true
+    [[ "$output" == *"StrictHostKeyChecking=yes"* ]]
+    [[ "$output" == *"UserKnownHostsFile=${DEPLOY_POOL_KNOWN_HOSTS}"* ]]
+    [[ "$output" != *"accept-new"* ]]
+}
+
+# The hash is a credential. The script masks secrets under XO_DEBUG=1
+# everywhere else; these two functions were missing the guard.
+@test "the admin password hash is not printed by xtrace" {
+    DEPLOY_ADMIN_PASSWORD_HASH='$6$SALT$SECRETHASHVALUE'
+    DEPLOY_SSH_OPTS=(-o BatchMode=yes)
+    DEPLOY_ADMIN_USER=xo
+    DEPLOY_IP=192.0.2.9
+    ssh() { return 1; }
+
+    # xtrace has to be captured in *this* shell: a `bash -c` subshell does not
+    # have the function defined, so it would exit 127 and the assertion below
+    # would pass without ever running the code under test. BASH_XTRACEFD sends
+    # the trace to a file instead of stderr so it can be searched.
+    exec 9>"${TMPDIR_TEST}/xtrace"
+    BASH_XTRACEFD=9
+    set -x
+    deploy_harden_guest_sudo >/dev/null 2>&1 || true
+    set +x
+    exec 9>&-
+
+    [ -s "${TMPDIR_TEST}/xtrace" ]
+    ! grep -q "SECRETHASHVALUE" "${TMPDIR_TEST}/xtrace"
+}
+
+# A grep that fails for a real reason (no space for the temp file) used to be
+# swallowed, and the empty result written back over authorized_keys — taking
+# the operator's own key with it.
+@test "a grep failure leaves authorized_keys untouched" {
+    [ "$(id -u)" -ne 0 ] || skip "root bypasses the permission this test relies on"
+
+    _seed_keys
+    local before
+    before=$(cat "$(_auth_keys)")
+
+    # Write-only is the exact shape of the bug: `[ -f ]` still passes and the
+    # final write would succeed, but grep cannot read the file and exits 2. The
+    # old `|| true` swallowed that and wrote the empty result back.
+    #
+    # Pointing TMPDIR somewhere unwritable does not work here -- `mktemp` fails
+    # first and the program exits before reaching the grep, so the test passes
+    # against the unfixed code without exercising anything.
+    chmod 200 "$(_auth_keys)"
+    run _revoke "ssh-ed25519 AAAADEPLOY install-xen-orchestra deploy (temporary)"
+    chmod 600 "$(_auth_keys)"
+
+    [ "$status" -ne 0 ]
+    [ "$(cat "$(_auth_keys)")" = "$before" ]
+}
+
+# A control, not a regression: removing the only key in the file is a
+# legitimate empty result. This passes before and after the fix, and exists so
+# that distinguishing grep's exit codes does not turn the legitimate case into
+# an error.
+@test "revoking the only key leaves an empty file, not a failure" {
+    mkdir -p "${TMPDIR_TEST}/.ssh"
+    printf '%s\n' "ssh-ed25519 AAAADEPLOY install-xen-orchestra deploy (temporary)" > "$(_auth_keys)"
+
+    run _revoke "ssh-ed25519 AAAADEPLOY install-xen-orchestra deploy (temporary)"
+    [ "$status" -eq 0 ]
+    [ ! -s "$(_auth_keys)" ]
+}
+
+# OpenSSH refuses DSA outright, so accepting one installs a key that never works.
+#
+# Asserted against the allowlist rather than end-to-end: ssh-keygen rejects a
+# malformed DSA blob on its own, so feeding one to deploy_load_pubkey passes
+# whether or not ssh-dss is still listed. A real DSA key cannot be generated to
+# test with either -- current OpenSSH answers "unknown key type dsa", which is
+# precisely why the entry had to go.
+@test "DSA is not in the accepted public key type list" {
+    local src="${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh"
+    local hits
+    hits=$(grep -v '^[[:space:]]*#' "$src" | grep -c 'ssh-dss' || true)
+    [ "$hits" -eq 0 ]
+}
+
+# The FIFO used by the streaming import lives in dom0's world-writable /tmp.
+@test "the stream script creates its FIFO inside a private directory" {
+    # Comment lines are stripped first: the program explains *why* it avoids
+    # `mktemp -u`, and a naive substring search matches that prose and fails on
+    # correct code.
+    local code
+    code=$(deploy_stream_script | grep -v '^[[:space:]]*#')
+
+    [[ "$code" != *"mktemp -u"* ]]
+    [[ "$code" == *"mktemp -d"* ]]
+}
+
+# The rendered cloud-config carries hashed_passwd just as the raw user-data does.
+@test "the cloud-init scrub covers the rendered cloud-config" {
+    local src="${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh"
+    grep -q 'instance/cloud-config.txt' "$src"
+    grep -q 'instances/\*/cloud-config.txt' "$src"
+}
+
+# An argument is readable in `ps` for the life of the call; an environment
+# variable of another user's process is not.
+@test "the pool master password is never passed to sshpass as an argument" {
+    # Comments stripped for the same reason as the FIFO test above: the note
+    # explaining the choice names `sshpass -p` in prose.
+    local src="${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh"
+    local hits
+    hits=$(grep -v '^[[:space:]]*#' "$src" | grep -c 'sshpass -p' || true)
+    [ "$hits" -eq 0 ]
+}
+
+# --- image checksum verification ------------------------------------------
+#
+# The size check catches a download that was cut short. It cannot catch one
+# that arrived complete from the wrong place, because a substituted image has a
+# consistent Content-Length. This image becomes the appliance holding the
+# pool's root credentials, so a wrong one matters.
+
+_sha_a() { printf 'a%.0s' $(seq 128); }
+_sha_b() { printf 'b%.0s' $(seq 128); }
+
+@test "an image that does not match the published checksum is refused" {
+    _import_stub
+    SUMS_BODY="$(_sha_a)  img.raw"
+    ACTUAL_SHA="$(_sha_b)"
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"does not match"* ]]
+    # Nothing may reach the disk.
+    ! grep -q "import_raw_vdi" "$CMDLOG"
+}
+
+@test "an image matching the published checksum is imported" {
+    _import_stub
+    SUMS_BODY="$(_sha_a)  img.raw"
+    ACTUAL_SHA="$(_sha_a)"
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 0 ]
+    grep -q "import_raw_vdi" "$CMDLOG"
+}
+
+# coreutils writes a '*' before the filename in binary mode; the entry has to
+# be found either way.
+@test "a binary-mode SHA512SUMS entry is matched" {
+    _import_stub
+    SUMS_BODY="$(_sha_a) *img.raw"
+    ACTUAL_SHA="$(_sha_a)"
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 0 ]
+    grep -q "import_raw_vdi" "$CMDLOG"
+}
+
+# A private mirror may not publish sums. That warns rather than blocking the
+# deploy -- otherwise adding verification breaks every custom image URL.
+@test "an origin with no SHA512SUMS warns but still imports" {
+    _import_stub
+    SUMS_BODY=""
+    unset XO_DEPLOY_IMAGE_SHA512
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cannot be verified"* ]]
+    grep -q "import_raw_vdi" "$CMDLOG"
+}
+
+# A pin is a demand for proof: unlike the published-sums path, failing to
+# produce one is fatal rather than a warning.
+@test "a pinned digest that cannot be computed refuses the import" {
+    _import_stub
+    SUMS_BODY=""
+    ACTUAL_SHA=""
+    XO_DEPLOY_IMAGE_SHA512="$(_sha_a)"
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 1 ]
+    ! grep -q "import_raw_vdi" "$CMDLOG"
+}
+
+@test "a pinned digest overrides the origin's own SHA512SUMS" {
+    _import_stub
+    # The origin says one thing, the operator pinned another. The pin wins, and
+    # an image matching only the origin is refused.
+    SUMS_BODY="$(_sha_b)  img.raw"
+    ACTUAL_SHA="$(_sha_b)"
+    XO_DEPLOY_IMAGE_SHA512="$(_sha_a)"
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"does not match"* ]]
+    ! grep -q "import_raw_vdi" "$CMDLOG"
+}
+
+# Streaming feeds the origin straight into the VDI, so there is no file to
+# hash. Honouring a pin by importing an unverified image would make the pin
+# mean whatever the host's free space happened to allow.
+@test "streaming is refused outright when a digest is pinned" {
+    _import_stub
+    FREE_MB=10
+    XO_DEPLOY_IMAGE_SHA512="$(_sha_a)"
+
+    run deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cannot be verified"* ]]
+    ! grep -q -- "bash -s --" "$CMDLOG"
+}
+
+# ...but with no pin, a host short on scratch space still streams as before.
+@test "streaming still happens without a pin when there is no room to stage" {
+    _import_stub
+    FREE_MB=10
+    unset XO_DEPLOY_IMAGE_SHA512
+
+    run deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
+
+    [ "$status" -eq 0 ]
+    grep -q -- "bash -s --" "$CMDLOG"
 }
