@@ -10,14 +10,94 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-22
+
 ### Added
+- **`--deploy`: create a VM and install Xen Orchestra into it.** Aimed at
+  newcomers who have a XenServer/XCP-ng pool but no Linux VM to install onto,
+  and the only operation here that runs on your workstation instead of on the
+  target machine. It opens one multiplexed SSH connection to the pool master
+  and drives `xe` over it, so nothing beyond `ssh`/`sshpass` and an ISO writer
+  is needed locally. A stock Debian 13 cloud image is streamed from
+  `cloud.debian.org` directly into the new VM's disk *by the pool master*, so
+  the 3 GB never crosses your link and never lands on dom0's root filesystem —
+  and there is no appliance image for this project to build, host, or keep
+  patched. Disk import goes through XAPI's `/import_raw_vdi` HTTP endpoint
+  rather than `xe vdi-import`: on XCP-ng 8.3 the latter fails with
+  `VDI_IO_ERROR` when fed a pipe, because XAPI needs a seekable source of
+  known length. The endpoint also rejects chunked encoding, so the length is
+  read from the image server and supplied by hand, and the body is streamed
+  with `curl -T -` rather than `--data-binary @-` — the latter buffers the
+  whole body in RAM and dies with "out of memory" well below a 3 GB image.
+  A cloud-init config drive creates the admin user, installs a
+  generated SSH key, applies the static address, and clones this repository
+  into the guest — either `/opt/install_xen_orchestra` or the admin's home
+  directory, whichever you pick at the prompt. The admin account can also be
+  given a password (hashed locally with `openssl passwd -6`, or `mkpasswd`):
+  it is optional, since the account always gets the SSH key, and exists for the
+  VM's console where no key can be offered. SSH stays key-only unless you
+  answer yes to the follow-up prompt. The config drive is detached and
+  destroyed once the install succeeds — cloud-init has cached its result and
+  netplan's config lives on the root disk by then, so keeping it would only
+  leave the password hash readable to anyone who can attach a VDI, and re-seed
+  cloud-init (static IP included) on any clone of the VM. The VM's
+  `xo-config.cfg` is built from `sample-xo-config.cfg`, or from your own
+  `xo-config.cfg` if you keep one beside the script and pick it when asked;
+  either way `--deploy` then offers to open the generated file in an editor
+  before anything is created on the pool, which is the only way to set the
+  options it does not prompt for (`INSTALL_DIR`, `SERVICE_USER`,
+  `NODE_VERSION`, SSL and backup paths) without editing the tracked sample.
+  Editing happens on a copy in the work directory, so neither the sample nor
+  your own config is touched, and any ports changed there are read back so the
+  review screen, post-install check and summary agree with the file. The
+  install itself then runs over SSH as
+  `--install --non-interactive` with its output streamed to your terminal, so
+  failures are visible instead of buried in the guest's cloud-init log.
+  Available as `--deploy` or from the interactive menu. A static IP is
+  required: a stock cloud image has no `xe-guest-utilities`, so a DHCP lease
+  cannot be read back from the host. Guest image selection is overridable via
+  `XO_DEPLOY_IMAGE_VERSION`, `XO_DEPLOY_IMAGE_RELEASE`, and
+  `XO_DEPLOY_IMAGE_URL`.
+- `tests/probe-xapi-deploy.sh`, a diagnostic that checks `--deploy`'s XAPI
+  assumptions against a real pool master — the parts the BATS suite cannot
+  reach without a hypervisor. Verifies SR/network enumeration, the host's
+  outbound internet access, `vdi-import` from both a dom0-local pipe and SSH
+  stdin (round-tripped through `vdi-export` and checksummed, since an exit code
+  of 0 does not prove the bytes landed), the `/import_raw_vdi` HTTP fallback,
+  and VM creation with the boot/CPU/memory parameters deploy sets. Everything
+  it creates is tagged `xo-probe-<run id>` and torn down on exit including on
+  failure; it never modifies or starts anything it did not create.
 - `TURBO_CACHE_ENABLED` config option (default: `true`). Enables turbo's local
   build cache so `--update` reuses unchanged packages' build output instead of
   rebuilding all 25 packages every time. `--rebuild` always does a clean,
   cache-free build regardless of this setting. Set to `false` to restore the
   previous always-cold-cache behavior.
+- Migration cleanup when `SERVICE_USER` is switched to `root`. Previously every
+  service-user cleanup branch was guarded by `[[ "$SERVICE_USER" != "root" ]]`,
+  so switching to root skipped them all and left the old account's
+  `/etc/sudoers.d/xo-server-<user>` grant (NOPASSWD mount/umount/findmnt) and
+  the `40-xen-xenbus-xo.rules` udev rule in place. `--update`, `--reconfigure`,
+  and `--rebuild` now read the outgoing user from the systemd unit before
+  rewriting it and remove both. The account itself is reported, not deleted —
+  it may own unrelated files — with the exact `userdel` command to run.
 
 ### Changed
+- The menu's two-column grid is derived from the item list instead of being
+  written down beside it. An even number of items now fills two equal columns;
+  an odd number splits them evenly and centers the leftover item beneath, as
+  the layout always intended. Ten items previously drew as 5/4 with one
+  stranded in the middle, because the counts were hardcoded when the list was
+  shorter. Column wrapping follows suit: with no centered row, up from the top
+  of a column now returns to its bottom rather than refusing to move.
+- **`SERVICE_USER` now defaults to `root`** (was `xo-service`). Running as root
+  avoids permission problems with privileged ports, NFS/CIFS remote mounts,
+  XenStore access, and VMware/ESXi V2V import, and matches what the XOA
+  appliance and other from-source installers do. Non-root remains fully
+  supported and is still what the official XO docs recommend — set
+  `SERVICE_USER` to any username and the installer configures the sudoers
+  rule, `CAP_NET_BIND_SERVICE`, `xenstore` group, and udev rule as before.
+  **Existing installs are unaffected** unless you edit `xo-config.cfg`: the
+  value in your existing config is preserved.
 - `build_xo`'s `TURBO_CACHE` now defaults to `local:rw` (was `remote:r`, which
   disabled all caching since no `TURBO_TOKEN`/`TURBO_TEAM` is configured).
 - `--update` no longer forces a clean build (`build_xo clean` → `build_xo`),
@@ -25,6 +105,13 @@ This installer builds Xen Orchestra from source and tracks the official
   wipes the cache for a guaranteed fresh build.
 
 ### Fixed
+- The interactive menu crashed on launch with
+  `MENU_SELECTED[$idx]: unbound variable`. Adding the "Deploy Xen Orchestra to
+  a new VM" entry took the menu to ten items and grew the `MENU_SELECTED`
+  declaration to match, but `run_menu` reset the same array to a hardcoded
+  nine zeroes, so drawing the tenth item read past the end of it. The reset is
+  now sized from `MENU_TOTAL`, and `tests/unit/test_menu_layout.bats` asserts
+  the parallel menu arrays stay in step.
 - XO 5's About page reported the *previous* commit after a successful update
   and kept claiming the install was behind master. `xo-web`'s build bakes the
   commit into its bundle (`GIT_HEAD=$(git rev-parse HEAD)` in its `build`
@@ -170,7 +257,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.2...v0.1.3

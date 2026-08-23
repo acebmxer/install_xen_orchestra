@@ -31,6 +31,7 @@ Automated installation and management of [Xen Orchestra](https://xen-orchestra.c
 
 | Function | CLI Flag | Description |
 |----------|----------|-------------|
+| Deploy | `--deploy` | Create a Debian VM on a XenServer/XCP-ng pool and install XO into it |
 | Install | `--install` | Fresh install of Xen Orchestra |
 | Update | `--update` | Update existing installation (with backup) |
 | Restore | `--restore` | Restore from a previous backup |
@@ -70,6 +71,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
     [ ] Update Xen Orchestra           [ ] Rebuild Xen Orchestra (wipe & reinstall maintain settings)
     [ ] Rename Sample-xo-config.cfg    [ ] Edit xo-config.cfg
     [ ] Install XO Proxy               [ ] Restore Backup
+    [ ] Deploy Xen Orchestra to a new VM (creates the VM for you)
                        [ ] Adjust Xen Orchestra Memory Allocation
 
   ──────────────────────────────────────────────────────────────────────────────────
@@ -110,6 +112,117 @@ nano xo-config.cfg   # edit to your liking
 
 If `xo-config.cfg` doesn't exist, it will be created automatically from the sample.
 
+## Deploying to a New VM (`--deploy`)
+
+If you don't already have a Linux VM to install into, `--deploy` builds one for
+you. Run it **from your own workstation** — it is the only operation in this
+script that does not run on the machine Xen Orchestra ends up on:
+
+```bash
+git clone https://github.com/acebmxer/install_xen_orchestra.git
+cd install_xen_orchestra
+./install-xen-orchestra.sh --deploy
+```
+
+It will ask for your pool master's address and root password, let you pick a
+storage repository and network from what the pool actually has, then ask for
+the VM's size, admin account (optionally with a password), where to clone this
+repository inside the guest, and its static address. From there it:
+
+1. Creates the VM and streams a stock **Debian 13 cloud image** from
+   `cloud.debian.org` straight into its disk. The download runs *on the pool
+   master*, so the 3 GB never crosses your workstation's link and never lands
+   on dom0's root filesystem.
+2. Attaches a cloud-init config drive that creates your admin user, installs a
+   freshly generated SSH key, applies the static address, and clones this
+   repository into the guest — either `/opt/install_xen_orchestra` or
+   `/home/<admin>/install_xen_orchestra`, whichever you pick.
+3. SSHes in and runs `--install --non-interactive`, streaming the output to
+   your terminal so you see the build as it happens.
+4. Verifies XO answers on `/signin`, then detaches and destroys the cloud-init
+   config drive — it has served its purpose, and it holds the admin password
+   hash. If the guest refuses the hot-unplug, you get the `xe` commands to
+   remove it by hand rather than a failed deploy.
+
+**Changing settings the prompts don't cover**
+
+`--deploy` only asks about the HTTP/HTTPS ports and the git branch. Everything
+else the VM is installed with — `INSTALL_DIR`, `SERVICE_USER`, `NODE_VERSION`,
+SSL and backup paths — comes from a base config, and you get to see it before
+anything is created on the pool:
+
+- The base is `sample-xo-config.cfg` from the repo. If you also keep an
+  `xo-config.cfg` beside the script, you are asked which of the two the VM
+  should start from. (Check its paths first — they were written for whatever
+  machine it came from, not a fresh Debian VM.)
+- Right after the prompts, `--deploy` offers to open the generated config in
+  your editor (`$EDITOR`/`$VISUAL`, else the base config's `PREFERRED_EDITOR`,
+  else nano/vim/vi). Save and quit and the VM is built with exactly what you
+  left there.
+
+The edit happens on a throwaway copy in a temp directory, so neither the
+tracked sample nor your own `xo-config.cfg` is modified. Changing the ports in
+the editor is picked up too — the review screen, the post-install check and the
+summary all follow what the file ends up saying.
+
+**Requirements**
+
+- The pool master must have outbound internet access.
+- A free **static IP** — this is required, not optional. A stock Debian cloud
+  image has no `xe-guest-utilities`, so the host cannot report a DHCP lease
+  back and the script would have no address to install over.
+- On your workstation: `ssh`, `scp`, `ssh-keygen`, and an ISO writer
+  (`genisoimage` or `xorriso`). Only the ISO writer might need installing, and
+  that is the sole reason `--deploy` would ask for sudo — nothing else about
+  this operation touches your machine. `sshpass` is optional: with it you are
+  asked for the pool master password once, without it `ssh` asks a second time.
+
+**Afterwards** the VM contains an ordinary checkout of this repository, so
+updates work there exactly as anywhere else:
+
+```bash
+ssh -i xo-deploy-<hostname>.key <admin>@<ip>
+cd <clone dir> && ./install-xen-orchestra.sh --update
+```
+
+The generated SSH private key is saved next to the script as
+`xo-deploy-<hostname>.key` (git-ignored). Keep it, or add your own key to the VM
+and delete it.
+
+**The admin account's password** is optional and asked for during the prompts.
+The account always gets the generated SSH key, so a password only matters for
+the VM's console in XO Lite or XCP-ng Center, where no key can be offered, and
+for `su`. Leave the prompt empty for a key-only account. If you do set one, a
+second prompt asks whether SSH should accept it too; the default is no, keeping
+SSH key-only. Setting the password needs `openssl` (or `mkpasswd`) on your
+workstation — without either, the prompt is skipped and the account stays
+key-only.
+
+The VM is created with `SERVICE_USER=root` (the current default) and XO's
+usual `admin@admin.net` / `admin` starting credentials — **change that password
+before putting the VM to use.**
+
+To deploy a different Debian release, set `XO_DEPLOY_IMAGE_VERSION` and
+`XO_DEPLOY_IMAGE_RELEASE`, or point `XO_DEPLOY_IMAGE_URL` at any raw cloud
+image with cloud-init installed.
+
+### Checking a host before deploying
+
+`--deploy` depends on XAPI behaviour that the test suite cannot exercise
+without a hypervisor. If a deploy fails, or you want to check a host first,
+run the probe:
+
+```bash
+./tests/probe-xapi-deploy.sh --host 192.168.1.10
+```
+
+It verifies each assumption in turn — SR and network enumeration, the pool
+master's internet access, `vdi-import` from a pipe (round-tripped and
+checksummed, not just exit-code checked), the `/import_raw_vdi` HTTP fallback,
+and VM creation with the boot and memory parameters deploy sets. Everything it
+creates is named `xo-probe-<run id>` and destroyed on exit, including on
+failure; it never touches objects it did not create, and never starts a VM.
+
 ## Configuration
 
 All settings live in `xo-config.cfg`. See [sample-xo-config.cfg](sample-xo-config.cfg) for full documentation of every option.
@@ -123,7 +236,7 @@ Key settings:
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `GIT_BRANCH` | master | Git branch or tag |
 | `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
-| `SERVICE_USER` | xo-service | Service user; non-root recommended (set to `root` for VMware V2V import — see encryption note for credential-encryption behavior) |
+| `SERVICE_USER` | root | Service user. Root is the default because it avoids permission issues with privileged ports, NFS/CIFS mounts, XenStore, and VMware V2V import. Set to any username to run non-root (recommended by the official XO docs) — the script configures the required sudoers, capability, group, and udev rules automatically. V2V import requires root. |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `TURBO_CACHE_ENABLED` | true | Reuse turbo's local build cache on `--update` instead of rebuilding every package (`--rebuild` always builds cold) |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
@@ -247,6 +360,9 @@ XO_TASK_CHECK_PASS=changeme
 |----------|-------------|
 | `XO_DEBUG=1` | Enable debug mode (`set -x`) |
 | `XO_NO_SELF_UPDATE=1` | Skip automatic script self-update |
+| `XO_DEPLOY_IMAGE_VERSION` | `--deploy`: Debian major version for the guest (default `13`) |
+| `XO_DEPLOY_IMAGE_RELEASE` | `--deploy`: Debian codename for the guest (default `trixie`) |
+| `XO_DEPLOY_IMAGE_URL` | `--deploy`: full URL of a raw cloud image, overriding the two above |
 
 ## Troubleshooting
 
@@ -292,10 +408,10 @@ Recent versions of Git refuse to operate on a repository owned by a different us
 Fix it by resetting ownership to match your `SERVICE_USER`:
 
 ```bash
-sudo chown -R xo-service:xo-service /opt/xen-orchestra
+sudo chown -R root:root /opt/xen-orchestra
 ```
 
-Replace `xo-service` with the value of `SERVICE_USER` in `xo-config.cfg`. Re-running the script afterwards will resolve the rest.
+Replace `root` with the value of `SERVICE_USER` in `xo-config.cfg` if you changed it. Re-running the script afterwards will resolve the rest.
 
 ### RedHat / Rocky / AlmaLinux: SELinux denials or systemd capability errors
 
