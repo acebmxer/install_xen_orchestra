@@ -3381,6 +3381,8 @@ DEPLOY_ADMIN_SSH_PWAUTH="false"
 DEPLOY_REPO_DIR="/opt/install_xen_orchestra"
 DEPLOY_CIDATA_VDI=""
 DEPLOY_CIDATA_VBD=""
+DEPLOY_CONFIG_BASE=""
+DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
 
 # Run a command on the pool master.
 #
@@ -3982,9 +3984,26 @@ deploy_prompt_network_settings() {
     fi
 }
 
+# Read one KEY=value out of a config file without sourcing it, so a base
+# config can be inspected before we commit to using it.
+deploy_config_value() {
+    local file="$1" key="$2" value
+    [[ -f "$file" ]] || return 0
+    value=$(grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-) || return 0
+    # Strip surrounding quotes and any trailing inline comment.
+    value="${value%%#*}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value#[\"\']}"
+    value="${value%[\"\']}"
+    printf '%s' "$value"
+}
+
 # Collect the Xen Orchestra settings that go into the VM's xo-config.cfg.
-# Only the handful worth asking about at deploy time — everything else keeps
-# the sample's defaults and can be edited in the VM afterwards.
+#
+# Only the handful worth asking about at deploy time are prompted for; the rest
+# come from the base config chosen here. That base is the repo's sample unless
+# you already keep a tuned xo-config.cfg beside the script, in which case you
+# are asked which one the VM should start from.
 deploy_prompt_xo_settings() {
     echo ""
     echo "=============================================="
@@ -3992,9 +4011,33 @@ deploy_prompt_xo_settings() {
     echo "=============================================="
     echo ""
 
-    deploy_read_validated "HTTP port" '^[1-9][0-9]*$' "80" DEPLOY_HTTP_PORT
-    deploy_read_validated "HTTPS port" '^[1-9][0-9]*$' "443" DEPLOY_HTTPS_PORT
-    deploy_read_validated "Git branch to build" '^[A-Za-z0-9._/-]+$' "master" DEPLOY_GIT_BRANCH
+    DEPLOY_CONFIG_BASE="$SAMPLE_CONFIG"
+    DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "You have an xo-config.cfg on this machine. The VM can start from it"
+        echo "instead of the sample — check that its paths and users suit a fresh"
+        echo "Debian VM, since they were written for wherever it came from."
+        deploy_choose "Which config should the VM be built from?" \
+            "${SAMPLE_CONFIG}|sample-xo-config.cfg (defaults)" \
+            "${CONFIG_FILE}|xo-config.cfg (this machine's settings)"
+        DEPLOY_CONFIG_BASE="$DEPLOY_CHOICE"
+        if [[ "$DEPLOY_CONFIG_BASE" == "$CONFIG_FILE" ]]; then
+            DEPLOY_CONFIG_BASE_LABEL="xo-config.cfg (this machine's settings)"
+        fi
+        echo ""
+    fi
+
+    # Offer the base config's own values as the defaults, so choosing a tuned
+    # config does not mean silently reverting its ports on the next prompt.
+    local http https branch
+    http=$(deploy_config_value "$DEPLOY_CONFIG_BASE" HTTP_PORT)
+    https=$(deploy_config_value "$DEPLOY_CONFIG_BASE" HTTPS_PORT)
+    branch=$(deploy_config_value "$DEPLOY_CONFIG_BASE" GIT_BRANCH)
+
+    deploy_read_validated "HTTP port" '^[1-9][0-9]*$' "${http:-80}" DEPLOY_HTTP_PORT
+    deploy_read_validated "HTTPS port" '^[1-9][0-9]*$' "${https:-443}" DEPLOY_HTTPS_PORT
+    deploy_read_validated "Git branch to build" '^[A-Za-z0-9._/-]+$' "${branch:-master}" DEPLOY_GIT_BRANCH
 }
 
 # Write the cloud-init config drive.
@@ -4103,13 +4146,14 @@ EOF
 # the answers collected above.
 deploy_build_xo_config() {
     local out="${DEPLOY_WORKDIR}/xo-config.cfg"
+    local base="${DEPLOY_CONFIG_BASE:-$SAMPLE_CONFIG}"
 
-    if [[ ! -f "$SAMPLE_CONFIG" ]]; then
-        log_error "sample-xo-config.cfg not found at ${SAMPLE_CONFIG}"
+    if [[ ! -f "$base" ]]; then
+        log_error "Base config not found at ${base}"
         exit 1
     fi
 
-    cp "$SAMPLE_CONFIG" "$out"
+    cp "$base" "$out"
     sed -i \
         -e "s|^HTTP_PORT=.*|HTTP_PORT=${DEPLOY_HTTP_PORT}|" \
         -e "s|^HTTPS_PORT=.*|HTTPS_PORT=${DEPLOY_HTTPS_PORT}|" \
@@ -4117,6 +4161,65 @@ deploy_build_xo_config() {
         "$out"
 
     DEPLOY_XO_CONFIG="$out"
+}
+
+# Offer to open the generated config before anything is created on the pool.
+#
+# This is the only chance to set the options --deploy does not prompt for --
+# INSTALL_DIR, SERVICE_USER, NODE_VERSION, backup and SSL paths -- without
+# editing the repo's tracked sample. Editing happens on a throwaway copy in
+# the work dir, so neither the sample nor your own xo-config.cfg is touched.
+deploy_edit_xo_config() {
+    [[ "$NON_INTERACTIVE" == "true" ]] && return 0
+
+    echo ""
+    echo "The VM's xo-config.cfg is built from ${DEPLOY_CONFIG_BASE_LABEL}."
+    echo "Everything not asked about above -- install dir, service user, Node"
+    echo "version, SSL and backup paths -- comes from there."
+    echo ""
+
+    confirm_or_skip "Review it in an editor before the VM is created?" || return 0
+
+    # Prefer whatever the user actually uses; PREFERRED_EDITOR is the config's
+    # own answer to the same question. Nothing is installed for this -- deploy
+    # changes as little as possible on the workstation.
+    local editor="${VISUAL:-${EDITOR:-}}"
+    if [[ -z "$editor" ]]; then
+        editor=$(deploy_config_value "$DEPLOY_CONFIG_BASE" PREFERRED_EDITOR)
+    fi
+    if [[ -z "$editor" ]] || ! command -v "${editor%% *}" >/dev/null 2>&1; then
+        local candidate
+        editor=""
+        for candidate in nano vim vi; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                editor="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$editor" ]]; then
+        log_warning "No editor found (tried \$EDITOR, nano, vim, vi)."
+        log_warning "Edit ${DEPLOY_XO_CONFIG} from another terminal, or set \$EDITOR and re-run."
+        return 0
+    fi
+
+    "$editor" "$DEPLOY_XO_CONFIG" < /dev/tty || {
+        log_warning "The editor exited with an error; keeping the config as generated."
+        return 0
+    }
+
+    # The three prompted values also drive the review screen, the post-install
+    # check and the summary, so take back whatever the edit left behind.
+    local http https branch
+    http=$(deploy_config_value "$DEPLOY_XO_CONFIG" HTTP_PORT)
+    https=$(deploy_config_value "$DEPLOY_XO_CONFIG" HTTPS_PORT)
+    branch=$(deploy_config_value "$DEPLOY_XO_CONFIG" GIT_BRANCH)
+    [[ "$http" =~ ^[1-9][0-9]*$ ]] && DEPLOY_HTTP_PORT="$http"
+    [[ "$https" =~ ^[1-9][0-9]*$ ]] && DEPLOY_HTTPS_PORT="$https"
+    [[ -n "$branch" ]] && DEPLOY_GIT_BRANCH="$branch"
+
+    log_success "Config saved for the new VM"
 }
 
 # Create the VM, import the disks, and start it.
@@ -4431,6 +4534,11 @@ deploy_xo_vm() {
     deploy_prompt_network_settings
     deploy_prompt_xo_settings
 
+    # Built before the review, not after it, so the config can be inspected and
+    # edited while nothing has been created on the pool yet.
+    deploy_build_xo_config
+    deploy_edit_xo_config
+
     echo ""
     echo "=============================================="
     echo "  Review"
@@ -4452,11 +4560,11 @@ deploy_xo_vm() {
     echo "  XO ports:     ${DEPLOY_HTTP_PORT} / ${DEPLOY_HTTPS_PORT}  (branch ${DEPLOY_GIT_BRANCH})"
     echo "  Repository:   ${DEPLOY_REPO_URL}"
     echo "  Clone into:   ${DEPLOY_REPO_DIR}"
+    echo "  XO config:    from ${DEPLOY_CONFIG_BASE_LABEL}"
     echo ""
     confirm_or_skip "Create this VM?" || { log_info "Deploy cancelled."; return 0; }
 
     deploy_build_config_drive
-    deploy_build_xo_config
     deploy_create_vm
     deploy_wait_for_guest
     deploy_save_ssh_key
@@ -4888,14 +4996,24 @@ MENU_HINTS=(
 
 MENU_TITLE="Install Xen Orchestra from Sources Setup and Update"
 
-# The left column carries the extra item: draw_menu iterates rows up to
-# MENU_LEFT_COUNT and skips right-column slots past MENU_RIGHT_COUNT, so the
-# left column must be the longer of the two for every row to render.
-MENU_LEFT_COUNT=5
-MENU_RIGHT_COUNT=4
-MENU_TOTAL=10
+# Derive the grid from the item list rather than writing the counts down a
+# second place to drift from: an even number of items fills two equal columns,
+# an odd one leaves the last item centered beneath them. Indices run down the
+# left column and then down the right, so MENU_NAMES reads in draw order.
+menu_derive_layout() {
+    MENU_TOTAL=${#MENU_NAMES[@]}
+    MENU_LEFT_COUNT=$(( MENU_TOTAL / 2 ))
+    MENU_RIGHT_COUNT=$(( MENU_TOTAL / 2 ))
+    MENU_CENTER_COUNT=$(( MENU_TOTAL - MENU_LEFT_COUNT - MENU_RIGHT_COUNT ))
+}
+menu_derive_layout
+
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0)
+MENU_SELECTED=()
+for ((_menu_i = 0; _menu_i < MENU_TOTAL; _menu_i++)); do
+    MENU_SELECTED[_menu_i]=0
+done
+unset _menu_i
 MCOL=0
 MROW=0
 # Last key read by menu_read_key (set as a global so the read can stay out of a
@@ -5170,7 +5288,7 @@ menu_compute_layout() {
     # Height ladder: shed decoration in order of how little it costs to lose.
     # Row budget = top blank + banner(3) + blank + info(5) + blank + rule +
     # blank + items + blank + rule + blank + selected + blank + legend(2).
-    local item_rows=5
+    local item_rows=$(( MENU_LEFT_COUNT + MENU_CENTER_COUNT ))
     (( ML_TWO_COL == 0 )) && item_rows=$MENU_TOTAL
     local fixed=$(( 5 + 1 + 1 + item_rows + 1 + 1 ))   # info, 2 rules, items, selected
     local base=$(( fixed + 3 + 2 ))                    # + banner box + legend, no blanks
@@ -5362,8 +5480,7 @@ draw_menu() {
 
     local idx
     if (( ML_TWO_COL )); then
-        # Two columns (left: indices 0-3, right: 4-7), then any trailing
-        # full-width rows centered beneath them
+        # Two equal columns, then the odd item (if any) centered beneath them
         local row col right_w=$(( content_width - ML_COL_W ))
         for ((row=0; row<MENU_LEFT_COUNT; row++)); do
             local line=""
@@ -5532,7 +5649,9 @@ menu_set_cursor() {
     else
         target=$((MENU_LEFT_COUNT + MENU_RIGHT_COUNT + row))
     fi
-    if [[ $target -lt $MENU_TOTAL ]]; then
+    # A row that does not exist leaves the cursor where it was rather than
+    # moving it off the end of the list in either direction.
+    if [[ $target -ge 0 && $target -lt $MENU_TOTAL ]]; then
         MENU_CURSOR=$target
     fi
 }
@@ -5755,9 +5874,15 @@ run_menu() {
     INSTALL_DIR=${INSTALL_DIR:-/opt/xen-orchestra}
     PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
 
-    # Reset selection state
+    # Reset selection state. Sized from MENU_TOTAL rather than written out:
+    # a literal list silently drifts when a menu item is added, and every
+    # index past its end is an unbound-variable crash under `set -u`.
     MENU_CURSOR=0
-    MENU_SELECTED=(0 0 0 0 0 0 0 0 0)
+    MENU_SELECTED=()
+    local i
+    for ((i = 0; i < MENU_TOTAL; i++)); do
+        MENU_SELECTED[i]=0
+    done
 
     # Gather version/commit info for header display
     menu_gather_info
@@ -5813,8 +5938,14 @@ run_menu() {
                         col_size=$MENU_RIGHT_COUNT
                     fi
                     if [[ $MROW -eq 0 ]]; then
-                        # Wrap from the top of a column down to the centered row
-                        menu_set_cursor 2 0
+                        # Wrap from the top of a column down to the centered
+                        # row, or to the column's own bottom when the item
+                        # count is even and there is no centered row
+                        if (( MENU_CENTER_COUNT > 0 )); then
+                            menu_set_cursor 2 0
+                        else
+                            menu_set_cursor $MCOL $((col_size - 1))
+                        fi
                     else
                         menu_set_cursor $MCOL $((MROW - 1))
                     fi
@@ -5838,8 +5969,14 @@ run_menu() {
                         col_size=$MENU_RIGHT_COUNT
                     fi
                     if [[ $MROW -ge $((col_size - 1)) ]]; then
-                        # Wrap from the bottom of a column down to the centered row
-                        menu_set_cursor 2 0
+                        # Wrap from the bottom of a column down to the centered
+                        # row, or back to the column's own top when there is
+                        # no centered row
+                        if (( MENU_CENTER_COUNT > 0 )); then
+                            menu_set_cursor 2 0
+                        else
+                            menu_set_cursor $MCOL 0
+                        fi
                     else
                         menu_set_cursor $MCOL $((MROW + 1))
                     fi

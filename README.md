@@ -144,6 +144,27 @@ repository inside the guest, and its static address. From there it:
    hash. If the guest refuses the hot-unplug, you get the `xe` commands to
    remove it by hand rather than a failed deploy.
 
+**Changing settings the prompts don't cover**
+
+`--deploy` only asks about the HTTP/HTTPS ports and the git branch. Everything
+else the VM is installed with — `INSTALL_DIR`, `SERVICE_USER`, `NODE_VERSION`,
+SSL and backup paths — comes from a base config, and you get to see it before
+anything is created on the pool:
+
+- The base is `sample-xo-config.cfg` from the repo. If you also keep an
+  `xo-config.cfg` beside the script, you are asked which of the two the VM
+  should start from. (Check its paths first — they were written for whatever
+  machine it came from, not a fresh Debian VM.)
+- Right after the prompts, `--deploy` offers to open the generated config in
+  your editor (`$EDITOR`/`$VISUAL`, else the base config's `PREFERRED_EDITOR`,
+  else nano/vim/vi). Save and quit and the VM is built with exactly what you
+  left there.
+
+The edit happens on a throwaway copy in a temp directory, so neither the
+tracked sample nor your own `xo-config.cfg` is modified. Changing the ports in
+the editor is picked up too — the review screen, the post-install check and the
+summary all follow what the file ends up saying.
+
 **Requirements**
 
 - The pool master must have outbound internet access.

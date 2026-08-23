@@ -88,6 +88,57 @@ teardown() {
     grep -qx "GIT_BRANCH=stable" "$DEPLOY_XO_CONFIG"
 }
 
+@test "a chosen base config is used instead of the sample" {
+    # What a user gets when they point the deploy at their own xo-config.cfg:
+    # the prompted keys still win, everything else comes from their file.
+    # Not named xo-config.cfg: that is what deploy_build_xo_config writes
+    # into the same work dir.
+    local base="${TMPDIR_TEST}/local-xo-config.cfg"
+    cp "$SAMPLE_CONFIG" "$base"
+    sed -i -e 's|^INSTALL_DIR=.*|INSTALL_DIR=/srv/xen-orchestra|' \
+           -e 's|^SERVICE_USER=.*|SERVICE_USER=xo-service|' \
+           -e 's|^HTTP_PORT=.*|HTTP_PORT=8080|' "$base"
+
+    DEPLOY_CONFIG_BASE="$base"
+    DEPLOY_HTTP_PORT=80
+    DEPLOY_HTTPS_PORT=443
+    DEPLOY_GIT_BRANCH=master
+
+    deploy_build_xo_config
+
+    grep -qx "INSTALL_DIR=/srv/xen-orchestra" "$DEPLOY_XO_CONFIG"
+    grep -qx "SERVICE_USER=xo-service" "$DEPLOY_XO_CONFIG"
+    # The prompt is the authority for the three keys it collects.
+    grep -qx "HTTP_PORT=80" "$DEPLOY_XO_CONFIG"
+}
+
+@test "a missing base config is an error, not a silent fallback" {
+    DEPLOY_CONFIG_BASE="${TMPDIR_TEST}/does-not-exist.cfg"
+    DEPLOY_HTTP_PORT=80
+    DEPLOY_HTTPS_PORT=443
+    DEPLOY_GIT_BRANCH=master
+
+    run deploy_build_xo_config
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Base config not found"* ]]
+}
+
+@test "deploy_config_value reads keys without sourcing the file" {
+    local cfg="${TMPDIR_TEST}/some.cfg"
+    cat > "$cfg" <<'EOF'
+# HTTP_PORT=9999
+HTTP_PORT=8080
+GIT_BRANCH=stable   # trailing comment
+PREFERRED_EDITOR="vim"
+EOF
+
+    [ "$(deploy_config_value "$cfg" HTTP_PORT)" = "8080" ]
+    [ "$(deploy_config_value "$cfg" GIT_BRANCH)" = "stable" ]
+    [ "$(deploy_config_value "$cfg" PREFERRED_EDITOR)" = "vim" ]
+    [ -z "$(deploy_config_value "$cfg" NOT_A_KEY)" ]
+    [ -z "$(deploy_config_value "${TMPDIR_TEST}/missing.cfg" HTTP_PORT)" ]
+}
+
 @test "generated config keeps the sample's other defaults" {
     DEPLOY_HTTP_PORT=80
     DEPLOY_HTTPS_PORT=443
