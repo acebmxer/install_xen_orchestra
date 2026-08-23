@@ -11,13 +11,65 @@ This installer builds Xen Orchestra from source and tracks the official
 ## [Unreleased]
 
 ### Added
+- **`--deploy`: create a VM and install Xen Orchestra into it.** Aimed at
+  newcomers who have a XenServer/XCP-ng pool but no Linux VM to install onto,
+  and the only operation here that runs on your workstation instead of on the
+  target machine. It opens one multiplexed SSH connection to the pool master
+  and drives `xe` over it, so nothing beyond `ssh`/`sshpass` and an ISO writer
+  is needed locally. A stock Debian 13 cloud image is streamed from
+  `cloud.debian.org` directly into the new VM's disk *by the pool master*, so
+  the 3 GB never crosses your link and never lands on dom0's root filesystem —
+  and there is no appliance image for this project to build, host, or keep
+  patched. Disk import goes through XAPI's `/import_raw_vdi` HTTP endpoint
+  rather than `xe vdi-import`: on XCP-ng 8.3 the latter fails with
+  `VDI_IO_ERROR` when fed a pipe, because XAPI needs a seekable source of
+  known length. The endpoint also rejects chunked encoding, so the length is
+  read from the image server and supplied by hand, and the body is streamed
+  with `curl -T -` rather than `--data-binary @-` — the latter buffers the
+  whole body in RAM and dies with "out of memory" well below a 3 GB image.
+  A cloud-init config drive creates the admin user, installs a
+  generated SSH key, applies the static address, and clones this repository
+  into the guest; the install itself then runs over SSH as
+  `--install --non-interactive` with its output streamed to your terminal, so
+  failures are visible instead of buried in the guest's cloud-init log.
+  Available as `--deploy` or from the interactive menu. A static IP is
+  required: a stock cloud image has no `xe-guest-utilities`, so a DHCP lease
+  cannot be read back from the host. Guest image selection is overridable via
+  `XO_DEPLOY_IMAGE_VERSION`, `XO_DEPLOY_IMAGE_RELEASE`, and
+  `XO_DEPLOY_IMAGE_URL`.
+- `tests/probe-xapi-deploy.sh`, a diagnostic that checks `--deploy`'s XAPI
+  assumptions against a real pool master — the parts the BATS suite cannot
+  reach without a hypervisor. Verifies SR/network enumeration, the host's
+  outbound internet access, `vdi-import` from both a dom0-local pipe and SSH
+  stdin (round-tripped through `vdi-export` and checksummed, since an exit code
+  of 0 does not prove the bytes landed), the `/import_raw_vdi` HTTP fallback,
+  and VM creation with the boot/CPU/memory parameters deploy sets. Everything
+  it creates is tagged `xo-probe-<run id>` and torn down on exit including on
+  failure; it never modifies or starts anything it did not create.
 - `TURBO_CACHE_ENABLED` config option (default: `true`). Enables turbo's local
   build cache so `--update` reuses unchanged packages' build output instead of
   rebuilding all 25 packages every time. `--rebuild` always does a clean,
   cache-free build regardless of this setting. Set to `false` to restore the
   previous always-cold-cache behavior.
+- Migration cleanup when `SERVICE_USER` is switched to `root`. Previously every
+  service-user cleanup branch was guarded by `[[ "$SERVICE_USER" != "root" ]]`,
+  so switching to root skipped them all and left the old account's
+  `/etc/sudoers.d/xo-server-<user>` grant (NOPASSWD mount/umount/findmnt) and
+  the `40-xen-xenbus-xo.rules` udev rule in place. `--update`, `--reconfigure`,
+  and `--rebuild` now read the outgoing user from the systemd unit before
+  rewriting it and remove both. The account itself is reported, not deleted —
+  it may own unrelated files — with the exact `userdel` command to run.
 
 ### Changed
+- **`SERVICE_USER` now defaults to `root`** (was `xo-service`). Running as root
+  avoids permission problems with privileged ports, NFS/CIFS remote mounts,
+  XenStore access, and VMware/ESXi V2V import, and matches what the XOA
+  appliance and other from-source installers do. Non-root remains fully
+  supported and is still what the official XO docs recommend — set
+  `SERVICE_USER` to any username and the installer configures the sudoers
+  rule, `CAP_NET_BIND_SERVICE`, `xenstore` group, and udev rule as before.
+  **Existing installs are unaffected** unless you edit `xo-config.cfg`: the
+  value in your existing config is preserved.
 - `build_xo`'s `TURBO_CACHE` now defaults to `local:rw` (was `remote:r`, which
   disabled all caching since no `TURBO_TOKEN`/`TURBO_TEAM` is configured).
 - `--update` no longer forces a clean build (`build_xo clean` → `build_xo`),

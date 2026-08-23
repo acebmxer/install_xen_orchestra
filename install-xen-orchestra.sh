@@ -1862,6 +1862,79 @@ EOF
     log_warning "  sudo -u ${SERVICE_USER} xenstore-ls vm-data"
 }
 
+# Report the user the currently-installed service runs as, by reading the
+# systemd unit written by the previous run. Falls back to the install
+# directory's owner when the unit is absent (e.g. a partial install).
+# Echoes the username, or nothing when neither source is available.
+#
+# Must be called before create_systemd_service rewrites the unit.
+get_previous_service_user() {
+    local unit="/etc/systemd/system/xo-server.service"
+    local prev=""
+
+    if [[ -f "$unit" ]]; then
+        prev=$(grep -m1 '^User=' "$unit" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
+    fi
+
+    if [[ -z "$prev" && -d "$INSTALL_DIR" ]]; then
+        prev=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null || echo "")
+    fi
+
+    echo "$prev"
+}
+
+# Remove artifacts belonging to a previous non-root SERVICE_USER after the
+# config has been switched to root.
+#
+# Every non-root cleanup branch in update_xo/reconfigure_xo/rebuild_xo is
+# guarded by [[ "$SERVICE_USER" != "root" ]], so switching to root skips them
+# all and leaves the old grants in place: a sudoers file still granting
+# NOPASSWD mount/umount/findmnt to an account xo-server no longer runs as, and
+# a udev rule widening access to the xenbus device. Both are written by this
+# script and neither means anything for root, so drop them.
+#
+# The account itself is reported rather than deleted — it may own unrelated
+# files or be shared with something else on the host.
+#
+# Arguments: previous service user (may be empty; no-op if so)
+cleanup_stale_service_user() {
+    local prev="$1"
+
+    # Only relevant when we are now running as root...
+    [[ "${SERVICE_USER:-root}" == "root" ]] || return 0
+    # ...and were previously running as somebody else.
+    [[ -n "$prev" && "$prev" != "root" ]] || return 0
+
+    local sudoers_file="/etc/sudoers.d/xo-server-${prev}"
+    local udev_rule="/etc/udev/rules.d/40-xen-xenbus-xo.rules"
+    local cleaned=false
+
+    if [[ -f "$sudoers_file" ]]; then
+        log_info "SERVICE_USER is now root — removing stale sudoers grant for '${prev}'..."
+        run_cmd sudo rm -f "$sudoers_file"
+        cleaned=true
+    fi
+
+    if [[ -f "$udev_rule" ]]; then
+        log_info "Removing XenStore udev rule (root reaches XenStore directly)..."
+        run_cmd sudo rm -f "$udev_rule"
+        run_cmd sudo udevadm control --reload || true
+        cleaned=true
+    fi
+
+    if [[ "$cleaned" == "true" ]]; then
+        log_success "Removed leftover service-user grants for '${prev}'"
+    fi
+
+    if id "$prev" &>/dev/null; then
+        log_warning "The '${prev}' account is no longer used by xo-server. It was left"
+        log_warning "in place in case other files or services depend on it. Remove it"
+        log_warning "manually once you are sure: sudo userdel -r ${prev}"
+    fi
+
+    return 0
+}
+
 # Open the Xen Orchestra web ports in the host firewall.
 # Fedora and RHEL-family distros (RHEL/CentOS/Rocky/Alma) enable firewalld by
 # default and block inbound HTTP/HTTPS; Debian/Ubuntu ship no active firewall.
@@ -2535,6 +2608,12 @@ update_xo() {
         fi
     fi
 
+    # Record what the service ran as before, so a switch to root can clean up
+    # the previous user's grants further down (create_systemd_service below
+    # overwrites the unit this is read from).
+    local PREV_SERVICE_USER
+    PREV_SERVICE_USER=$(get_previous_service_user)
+
     # Fix ownership if SERVICE_USER changed since initial install
     local DIR_OWNER
     DIR_OWNER=$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null)
@@ -2566,6 +2645,9 @@ update_xo() {
 
     # Grant XenStore access if a non-root user has credential encryption enabled
     configure_xenstore_access
+
+    # Drop the previous user's sudoers/udev grants if SERVICE_USER became root
+    cleanup_stale_service_user "$PREV_SERVICE_USER"
 
     # Ensure the web ports are open in firewalld (Fedora/RHEL)
     configure_firewall
@@ -2670,6 +2752,12 @@ rebuild_xo() {
         run_cmd sudo chmod -R o-rwx "$INSTALL_DIR"
     fi
 
+    # Record what the service ran as before, so a switch to root can clean up
+    # the previous user's grants further down (create_systemd_service below
+    # overwrites the unit this is read from).
+    local PREV_SERVICE_USER
+    PREV_SERVICE_USER=$(get_previous_service_user)
+
     # Ensure Node.js version matches config (upgrade/downgrade if needed)
     install_nodejs
     install_yarn
@@ -2679,6 +2767,9 @@ rebuild_xo() {
 
     # Regenerate the systemd service file to pick up any script changes
     create_systemd_service
+
+    # Drop the previous user's sudoers/udev grants if SERVICE_USER became root
+    cleanup_stale_service_user "$PREV_SERVICE_USER"
 
     # Restart the service
     log_info "Starting xo-server service..."
@@ -2783,6 +2874,12 @@ reconfigure_xo() {
         fi
     fi
 
+    # Record what the service ran as before, so a switch to root can clean up
+    # the previous user's grants further down (create_systemd_service below
+    # overwrites the unit this is read from).
+    local PREV_SERVICE_USER
+    PREV_SERVICE_USER=$(get_previous_service_user)
+
     # Regenerate configuration
     configure_xo
 
@@ -2794,6 +2891,9 @@ reconfigure_xo() {
 
     # Grant XenStore access if a non-root user has credential encryption enabled
     configure_xenstore_access
+
+    # Drop the previous user's sudoers/udev grants if SERVICE_USER became root
+    cleanup_stale_service_user "$PREV_SERVICE_USER"
 
     # Ensure the web ports are open in firewalld (Fedora/RHEL) after any port change
     configure_firewall
@@ -3238,6 +3338,937 @@ REMOTE_LICENSE_PATCH
     echo ""
 }
 
+# ============================================================================
+# Deploy Xen Orchestra to a new VM on a XenServer/XCP-ng pool
+#
+# Unlike every other operation in this script, --deploy runs on your
+# workstation rather than on the machine XO will live on. It:
+#
+#   1. Opens one multiplexed SSH connection to the pool master and drives `xe`
+#      over it (the pool master already has `xe`; your workstation needs no
+#      XAPI tooling at all).
+#   2. Creates a VM and streams a stock Debian cloud image straight from
+#      cloud.debian.org into its root disk, so nothing lands on dom0's small
+#      root filesystem and there is no appliance image to host or keep current.
+#   3. Attaches a cloud-init NoCloud config drive that creates the admin user,
+#      installs your SSH key, sets the static address, and clones this repo.
+#   4. SSHes into the finished VM and runs this same script with
+#      --install --non-interactive, streaming the output to your terminal.
+#
+# The result is an ordinary VM with a checkout of this repo in it, so --update
+# and friends work there from then on exactly as they do anywhere else.
+# ============================================================================
+
+# Debian cloud image used for the guest. Overridable from the environment for
+# testing or to pin an older release. The `.raw` variant is deliberate: XAPI
+# imports raw disks natively, so nothing has to convert a qcow2 and no qemu-img
+# is needed on either end.
+XO_DEPLOY_IMAGE_VERSION="${XO_DEPLOY_IMAGE_VERSION:-13}"
+XO_DEPLOY_IMAGE_RELEASE="${XO_DEPLOY_IMAGE_RELEASE:-trixie}"
+XO_DEPLOY_IMAGE_URL="${XO_DEPLOY_IMAGE_URL:-https://cloud.debian.org/images/cloud/${XO_DEPLOY_IMAGE_RELEASE}/latest/debian-${XO_DEPLOY_IMAGE_VERSION}-genericcloud-amd64.raw}"
+
+# The raw image is 3 GB; the root VDI must be at least that large for the
+# import to fit, and cloud-init's growpart expands the filesystem to whatever
+# size we actually create.
+XO_DEPLOY_MIN_DISK_GB=10
+
+# Populated by the deploy_* prompt functions below.
+DEPLOY_SSH_CTL=""
+DEPLOY_WORKDIR=""
+DEPLOY_CHOICE=""
+
+# Run a command on the pool master.
+#
+# The first invocation authenticates with sshpass and opens a master socket;
+# every later call rides the same connection, so the password is handed to ssh
+# exactly once and each `xe` call costs no extra round trip. sshpass -e reads
+# from $SSHPASS rather than argv, keeping the password out of `ps`.
+dom0_exec() {
+    SSHPASS="$HOST_PASSWORD" sshpass -e ssh \
+        -o ControlMaster=auto \
+        -o ControlPath="$DEPLOY_SSH_CTL" \
+        -o ControlPersist=600 \
+        -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=15 \
+        "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@"
+}
+
+# Run an `xe` command on the pool master and return its output with the
+# trailing whitespace and CRs that xe likes to emit stripped off.
+dom0_xe() {
+    dom0_exec "xe $*" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# ---------------------------------------------------------------------------
+# Getting bytes into a VDI
+#
+# `xe vdi-import filename=/dev/stdin` does not work: XCP-ng 8.3 fails it with
+# VDI_IO_ERROR whether the pipe comes from a local command or from SSH, because
+# XAPI needs a seekable source of known length. XAPI's own HTTP endpoint,
+# /import_raw_vdi, is the supported path, and it likewise rejects chunked
+# transfer encoding.
+#
+# So we PUT to that endpoint from the pool master itself, streaming, with the
+# length supplied by hand:
+#
+#   curl <image> | curl -T - -H 'Transfer-Encoding:' -H 'Content-Length: N'
+#
+# -T - streams stdin through a read callback instead of buffering it, which
+# matters enormously: the obvious alternative (--data-binary @-) reads the
+# whole body into memory first and dies with "out of memory" on a 1 GiB
+# payload, let alone a 3 GiB image.
+#
+# Running it on the pool master means the image never crosses the operator's
+# link and never lands on dom0's filesystem either.
+#
+# All of this is verified by tests/probe-xapi-deploy.sh against a real host.
+# ---------------------------------------------------------------------------
+
+DEPLOY_SESSION=""
+
+# Log in to XAPI and set DEPLOY_SESSION to the resulting opaque reference.
+#
+# The login runs on the pool master against localhost, so --deploy needs only
+# SSH to the host and never requires the operator's machine to reach port 443.
+# The XML body goes over stdin rather than argv so the password never appears
+# in dom0's process list.
+deploy_xapi_login() {
+    local xml
+    xml=$(printf '<?xml version="1.0"?><methodCall><methodName>session.login_with_password</methodName><params><param><value><string>%s</string></value></param><param><value><string>%s</string></value></param></params></methodCall>' \
+        "$HOST_USERNAME" "$HOST_PASSWORD")
+
+    local reply
+    reply=$(printf '%s' "$xml" | dom0_exec \
+        "cat > /tmp/xo-deploy-login.xml && \
+         curl -sk --max-time 30 -H 'Content-Type: text/xml' \
+              --data-binary @/tmp/xo-deploy-login.xml https://localhost/ ; \
+         rm -f /tmp/xo-deploy-login.xml" 2>/dev/null)
+
+    DEPLOY_SESSION=$(grep -o 'OpaqueRef:[a-f0-9-]*' <<< "$reply" | head -1)
+
+    if [[ -z "$DEPLOY_SESSION" ]]; then
+        log_error "Could not log in to XAPI on the pool master."
+        log_error "SSH works, so this is usually a wrong password for the XAPI user."
+        exit 1
+    fi
+}
+
+# Release the XAPI session. Best-effort: sessions expire on their own.
+deploy_xapi_logout() {
+    [[ -n "$DEPLOY_SESSION" ]] || return 0
+    local xml
+    xml=$(printf '<?xml version="1.0"?><methodCall><methodName>session.logout</methodName><params><param><value><string>%s</string></value></param></params></methodCall>' \
+        "$DEPLOY_SESSION")
+    printf '%s' "$xml" | dom0_exec \
+        "cat > /tmp/xo-deploy-logout.xml && \
+         curl -sk --max-time 10 -H 'Content-Type: text/xml' \
+              --data-binary @/tmp/xo-deploy-logout.xml https://localhost/ >/dev/null ; \
+         rm -f /tmp/xo-deploy-logout.xml" >/dev/null 2>&1 || true
+    DEPLOY_SESSION=""
+}
+
+# Stream a remote image straight into a VDI, entirely on the pool master.
+# Arguments: VDI uuid, source URL
+deploy_import_vdi_from_url() {
+    local vdi="$1" url="$2"
+
+    # The PUT needs an exact Content-Length, so ask the origin how big the
+    # image is before starting. -L follows the redirects Debian's mirrors use.
+    local size
+    size=$(dom0_exec "curl -fsSLI '${url}' 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -1 | awk '{print \$2}'")
+
+    if [[ -z "$size" || ! "$size" =~ ^[0-9]+$ ]]; then
+        log_warning "The image server did not report a size; falling back to staging on disk."
+        deploy_import_vdi_staged "$vdi" "$url"
+        return $?
+    fi
+
+    log_info "  image is $(( size / 1048576 )) MiB; streaming it into the disk"
+
+    if dom0_exec "curl -fsSL '${url}' | curl -sk -f --max-time 3600 -T - \
+            -H 'Transfer-Encoding:' -H 'Content-Length: ${size}' \
+            'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'"; then
+        return 0
+    fi
+
+    log_warning "Streaming import failed; retrying by staging the image on the host."
+    deploy_import_vdi_staged "$vdi" "$url"
+}
+
+# Fallback import: download to dom0, PUT from the file, delete it.
+# Slower and needs free space on the host, but survives an origin that will not
+# report a Content-Length.
+deploy_import_vdi_staged() {
+    local vdi="$1" url="$2"
+    local tmp="/var/tmp/xo-deploy-image-$$.raw"
+
+    local free_mb
+    free_mb=$(dom0_exec "df -BM --output=avail /var/tmp 2>/dev/null | tail -1 | tr -d ' M'" | tr -d '\r')
+    if [[ -n "$free_mb" ]] && (( free_mb < 4096 )); then
+        log_error "The pool master has only ${free_mb} MiB free in /var/tmp;"
+        log_error "staging the image needs about 3 GiB. Free some space and retry."
+        return 1
+    fi
+
+    log_info "  downloading the image to the pool master..."
+    if ! dom0_exec "curl -fsSL -o '${tmp}' '${url}'"; then
+        log_error "Failed to download the image on the pool master."
+        dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    log_info "  importing it into the disk..."
+    local rc=0
+    dom0_exec "curl -sk -f --max-time 3600 -T '${tmp}' \
+        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'" || rc=$?
+    dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+    return $rc
+}
+
+# Import a local file into a VDI. Used for the cloud-init config drive, which
+# is small enough that the extra SSH hop costs nothing. It cannot go in over
+# `xe vdi-import` for the same reason the image cannot.
+# Arguments: VDI uuid, local file path
+deploy_import_vdi_from_file() {
+    local vdi="$1" path="$2"
+    local remote="/tmp/xo-deploy-cidata-$$.iso"
+
+    dom0_exec "cat > '${remote}'" < "$path" || {
+        log_error "Could not copy the config drive to the pool master."
+        return 1
+    }
+
+    local rc=0
+    dom0_exec "curl -sk -f --max-time 300 -T '${remote}' \
+        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'" || rc=$?
+    dom0_exec "rm -f '${remote}'" >/dev/null 2>&1 || true
+    return $rc
+}
+
+# Close the shared SSH connection and remove the deploy scratch directory.
+# Registered as an EXIT trap by deploy_xo_vm so an abort doesn't leave a live
+# master socket, an XAPI session, or a config drive containing an SSH key.
+deploy_cleanup() {
+    deploy_xapi_logout
+    if [[ -n "$DEPLOY_SSH_CTL" && -S "$DEPLOY_SSH_CTL" ]]; then
+        ssh -o ControlPath="$DEPLOY_SSH_CTL" -O exit \
+            "${HOST_USERNAME}@${POOL_MASTER_IP}" 2>/dev/null || true
+    fi
+    if [[ -n "$DEPLOY_WORKDIR" && -d "$DEPLOY_WORKDIR" ]]; then
+        rm -rf "$DEPLOY_WORKDIR"
+    fi
+}
+
+# Present a numbered list and read a selection.
+# Arguments: prompt text, then one "value|label" argument per option.
+# Sets DEPLOY_CHOICE to the chosen value.
+deploy_choose() {
+    local prompt="$1"; shift
+    local options=("$@")
+    local count=${#options[@]}
+
+    if [[ $count -eq 0 ]]; then
+        log_error "No options available for: $prompt"
+        exit 1
+    fi
+
+    # A single option needs no menu.
+    if [[ $count -eq 1 ]]; then
+        DEPLOY_CHOICE="${options[0]%%|*}"
+        log_info "${prompt}: ${options[0]#*|} (only option)"
+        return 0
+    fi
+
+    echo ""
+    echo "$prompt"
+    echo ""
+    local i
+    for ((i = 0; i < count; i++)); do
+        printf "  %2d) %s\n" "$((i + 1))" "${options[$i]#*|}"
+    done
+    echo ""
+
+    local reply
+    while true; do
+        echo -n "Pick a number [1-${count}]: "
+        read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= count )); then
+            DEPLOY_CHOICE="${options[$((reply - 1))]%%|*}"
+            return 0
+        fi
+        log_warning "Enter a number between 1 and ${count}."
+    done
+}
+
+# Prompt for a value, re-asking until it matches a regex.
+# Arguments: prompt, regex, default (may be empty), variable name to set
+deploy_read_validated() {
+    local prompt="$1" regex="$2" default="$3" varname="$4"
+    local reply
+    while true; do
+        if [[ -n "$default" ]]; then
+            echo -n "${prompt} [${default}]: "
+        else
+            echo -n "${prompt}: "
+        fi
+        read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+        reply="${reply:-$default}"
+        if [[ "$reply" =~ $regex ]]; then
+            printf -v "$varname" '%s' "$reply"
+            return 0
+        fi
+        log_warning "Invalid value, please try again."
+    done
+}
+
+# Convert a dotted-quad netmask to a CIDR prefix length.
+# cloud-init's network-config v2 schema takes a prefix, but a netmask is what
+# most people know their network by, so we ask for one and convert.
+# A mask must also be contiguous — every 1 bit ahead of every 0 bit. Tracking
+# that matters: without it 255.0.255.0 would quietly convert to /16 and the
+# guest would come up on the wrong subnet.
+netmask_to_prefix() {
+    local mask="$1"
+    local octet bits=0 ended=0
+    local IFS='.'
+    for octet in $mask; do
+        local add
+        case "$octet" in
+            255) add=8 ;;
+            254) add=7 ;;
+            252) add=6 ;;
+            248) add=5 ;;
+            240) add=4 ;;
+            224) add=3 ;;
+            192) add=2 ;;
+            128) add=1 ;;
+            0)   add=0 ;;
+            *)   echo ""; return 1 ;;
+        esac
+
+        # Nothing but zeroes may follow the first non-full octet.
+        if (( ended == 1 && add != 0 )); then
+            echo ""
+            return 1
+        fi
+        (( add < 8 )) && ended=1
+
+        bits=$((bits + add))
+    done
+    echo "$bits"
+}
+
+# Verify the tools --deploy needs locally, installing the ones we can.
+# Note this is the *workstation's* dependency list — it is deliberately short,
+# because all the XAPI work happens on the pool master.
+deploy_check_local_deps() {
+    detect_package_manager
+
+    # sshpass authenticates the initial connection to the pool master.
+    if ! command -v sshpass >/dev/null 2>&1; then
+        log_info "Installing sshpass..."
+        # shellcheck disable=SC2086
+        run_cmd $PKG_UPDATE
+        # shellcheck disable=SC2086
+        run_cmd $PKG_INSTALL sshpass
+    fi
+
+    # An ISO9660 writer for the cloud-init config drive. Either of these will
+    # do and most systems already have one; xorriso is packaged on both Debian
+    # and RHEL families, so that is what we install when neither is present.
+    if ! command -v genisoimage >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then
+        log_info "Installing xorriso (builds the cloud-init config drive)..."
+        # shellcheck disable=SC2086
+        run_cmd $PKG_INSTALL xorriso
+    fi
+
+    local missing=()
+    for cmd in ssh scp ssh-keygen; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required commands: ${missing[*]}"
+        log_error "Install your distribution's openssh-client package and retry."
+        exit 1
+    fi
+}
+
+# Collect pool master connection details and open the shared SSH connection.
+deploy_connect_pool_master() {
+    echo ""
+    echo "=============================================="
+    echo "  Pool Master Connection"
+    echo "=============================================="
+    echo ""
+    echo "The VM is created on this host. You need its IP and root credentials."
+    echo ""
+
+    deploy_read_validated "IP address or hostname of the pool master" \
+        '^[A-Za-z0-9._-]+$' "" POOL_MASTER_IP
+
+    deploy_read_validated "Host username" '^[a-z_][a-z0-9_-]*$' "root" HOST_USERNAME
+
+    { set +x; } 2>/dev/null
+    echo -n "Host password: "
+    read -rs HOST_PASSWORD < /dev/tty
+    echo ""
+    if [[ -z "$HOST_PASSWORD" ]]; then
+        log_error "Host password is required"
+        exit 1
+    fi
+    [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
+
+    DEPLOY_SSH_CTL="${DEPLOY_WORKDIR}/ssh-ctl"
+
+    log_info "Connecting to ${HOST_USERNAME}@${POOL_MASTER_IP}..."
+    if ! dom0_exec "true" >/dev/null 2>&1; then
+        log_error "Could not connect to the pool master. Check the address and credentials."
+        exit 1
+    fi
+
+    # Confirm this is actually a XenServer/XCP-ng host before going further —
+    # a friendly failure here beats a confusing one three prompts later.
+    if ! dom0_exec "command -v xe" >/dev/null 2>&1; then
+        log_error "'xe' was not found on ${POOL_MASTER_IP}."
+        log_error "--deploy must point at a XenServer/XCP-ng host, not the machine XO will run on."
+        exit 1
+    fi
+
+    local host_desc
+    host_desc=$(dom0_xe "host-list params=name-label --minimal" 2>/dev/null || echo "")
+    log_success "Connected to pool master${host_desc:+ (${host_desc})}"
+
+    # Disk imports go through XAPI's HTTP endpoint, which needs a session.
+    # Do it now so a bad password fails here rather than after the VM exists.
+    deploy_xapi_login
+    log_success "Authenticated to XAPI"
+}
+
+# Choose the storage repository for the VM's disks.
+deploy_pick_sr() {
+    local raw
+    # One round trip: enumerate user SRs and print "uuid|label (free space)".
+    raw=$(dom0_exec 'for u in $(xe sr-list content-type=user params=uuid --minimal | tr "," " "); do
+            name=$(xe sr-param-get uuid=$u param-name=name-label 2>/dev/null)
+            size=$(xe sr-param-get uuid=$u param-name=physical-size 2>/dev/null)
+            used=$(xe sr-param-get uuid=$u param-name=physical-utilisation 2>/dev/null)
+            free=$(( (size - used) / 1073741824 ))
+            echo "$u|$name (${free} GiB free)"
+        done' | tr -d '\r')
+
+    local options=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && options+=("$line")
+    done <<< "$raw"
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+        log_error "No usable storage repositories found on this pool."
+        log_error "Create an SR first: https://xcp-ng.org/docs/storage.html"
+        exit 1
+    fi
+
+    deploy_choose "Which storage repository should hold the VM's disks?" "${options[@]}"
+    DEPLOY_SR_UUID="$DEPLOY_CHOICE"
+}
+
+# Choose the network the VM's interface attaches to.
+deploy_pick_network() {
+    local raw
+    raw=$(dom0_exec 'for u in $(xe network-list params=uuid --minimal | tr "," " "); do
+            name=$(xe network-param-get uuid=$u param-name=name-label 2>/dev/null)
+            desc=$(xe network-param-get uuid=$u param-name=name-description 2>/dev/null)
+            echo "$u|$name${desc:+ — $desc}"
+        done' | tr -d '\r')
+
+    local options=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && options+=("$line")
+    done <<< "$raw"
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+        log_error "No networks found on this pool."
+        exit 1
+    fi
+
+    deploy_choose "Which network should the VM use?" "${options[@]}"
+    DEPLOY_NETWORK_UUID="$DEPLOY_CHOICE"
+}
+
+# Collect VM sizing and guest OS settings.
+deploy_prompt_vm_specs() {
+    echo ""
+    echo "=============================================="
+    echo "  VM Configuration"
+    echo "=============================================="
+    echo ""
+
+    deploy_read_validated "VM name" '^[A-Za-z0-9][A-Za-z0-9._-]*$' "xen-orchestra" DEPLOY_VM_NAME
+    deploy_read_validated "Hostname for the guest" '^[a-z0-9][a-z0-9-]*$' "xen-orchestra" DEPLOY_HOSTNAME
+    deploy_read_validated "vCPUs" '^[1-9][0-9]*$' "2" DEPLOY_VCPUS
+    deploy_read_validated "Memory in GB (XO needs 4 GB or more)" '^[1-9][0-9]*$' "4" DEPLOY_RAM_GB
+
+    while true; do
+        deploy_read_validated "Disk size in GB" '^[1-9][0-9]*$' "20" DEPLOY_DISK_GB
+        if (( DEPLOY_DISK_GB >= XO_DEPLOY_MIN_DISK_GB )); then
+            break
+        fi
+        log_warning "Disk must be at least ${XO_DEPLOY_MIN_DISK_GB} GB (the cloud image alone is 3 GB)."
+    done
+
+    if (( DEPLOY_RAM_GB < 4 )); then
+        log_warning "Xen Orchestra builds from source and may fail to build with under 4 GB."
+    fi
+
+    deploy_read_validated "Admin username for the VM (used for SSH)" \
+        '^[a-z_][a-z0-9_-]*$' "xo" DEPLOY_ADMIN_USER
+}
+
+# Collect the guest's static network settings.
+#
+# A static address is required rather than merely offered: a stock Debian cloud
+# image has no xe-guest-utilities, so the host cannot report a DHCP-assigned
+# address back to us and we would have no way to reach the VM afterwards.
+deploy_prompt_network_settings() {
+    local ipregex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+    echo ""
+    echo "=============================================="
+    echo "  Guest Network Settings"
+    echo "=============================================="
+    echo ""
+    echo "A static address is required. The Debian cloud image ships without"
+    echo "xen-guest-utilities, so the host cannot report a DHCP lease back and"
+    echo "this script would have no address to install over."
+    echo ""
+
+    deploy_read_validated "IP address for the VM" "$ipregex" "" DEPLOY_IP
+    deploy_read_validated "Netmask" "$ipregex" "255.255.255.0" DEPLOY_NETMASK
+    deploy_read_validated "Gateway" "$ipregex" "" DEPLOY_GATEWAY
+    deploy_read_validated "DNS server" "$ipregex" "1.1.1.1" DEPLOY_DNS
+
+    DEPLOY_PREFIX=$(netmask_to_prefix "$DEPLOY_NETMASK")
+    if [[ -z "$DEPLOY_PREFIX" ]]; then
+        log_error "Netmask ${DEPLOY_NETMASK} is not a valid contiguous subnet mask."
+        exit 1
+    fi
+}
+
+# Collect the Xen Orchestra settings that go into the VM's xo-config.cfg.
+# Only the handful worth asking about at deploy time — everything else keeps
+# the sample's defaults and can be edited in the VM afterwards.
+deploy_prompt_xo_settings() {
+    echo ""
+    echo "=============================================="
+    echo "  Xen Orchestra Settings"
+    echo "=============================================="
+    echo ""
+
+    deploy_read_validated "HTTP port" '^[1-9][0-9]*$' "80" DEPLOY_HTTP_PORT
+    deploy_read_validated "HTTPS port" '^[1-9][0-9]*$' "443" DEPLOY_HTTPS_PORT
+    deploy_read_validated "Git branch to build" '^[A-Za-z0-9._/-]+$' "master" DEPLOY_GIT_BRANCH
+}
+
+# Write the cloud-init config drive.
+#
+# NoCloud looks for a filesystem labelled `cidata` holding user-data and
+# meta-data (plus optional network-config), which is why the volume ID below
+# matters more than the filename. The drive only has to bring the machine to
+# the point where we can SSH in — the actual XO install runs afterwards over
+# SSH so its output and error handling reach your terminal instead of
+# disappearing into the guest's cloud-init log.
+deploy_build_config_drive() {
+    local dir="${DEPLOY_WORKDIR}/cidata"
+    mkdir -p "$dir"
+
+    log_info "Generating an SSH keypair for the new VM..."
+    ssh-keygen -t ed25519 -N "" -C "install-xen-orchestra deploy" \
+        -f "${DEPLOY_WORKDIR}/id_ed25519" >/dev/null
+    DEPLOY_SSH_KEY="${DEPLOY_WORKDIR}/id_ed25519"
+
+    local pubkey
+    pubkey=$(<"${DEPLOY_SSH_KEY}.pub")
+
+    cat > "${dir}/meta-data" <<EOF
+instance-id: ${DEPLOY_VM_NAME}-$(date +%s)
+local-hostname: ${DEPLOY_HOSTNAME}
+EOF
+
+    # Match on any interface whose name starts with "e" rather than naming one:
+    # the guest may see eth0 or enX0 depending on kernel and udev version.
+    cat > "${dir}/network-config" <<EOF
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "e*"
+    dhcp4: false
+    addresses:
+      - ${DEPLOY_IP}/${DEPLOY_PREFIX}
+    routes:
+      - to: default
+        via: ${DEPLOY_GATEWAY}
+    nameservers:
+      addresses:
+        - ${DEPLOY_DNS}
+EOF
+
+    # Passwordless sudo is a requirement, not a convenience: check_sudo and
+    # --non-interactive both need it for the unattended install below.
+    cat > "${dir}/user-data" <<EOF
+#cloud-config
+hostname: ${DEPLOY_HOSTNAME}
+manage_etc_hosts: true
+preserve_hostname: false
+
+users:
+  - name: ${DEPLOY_ADMIN_USER}
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${pubkey}
+
+# Key-only access; no password is ever set on this account.
+ssh_pwauth: false
+disable_root: true
+
+package_update: true
+packages:
+  - git
+  - curl
+  - sudo
+  - ca-certificates
+
+runcmd:
+  - [git, clone, "${DEPLOY_REPO_URL}", /opt/install_xen_orchestra]
+  - [chown, -R, "${DEPLOY_ADMIN_USER}:${DEPLOY_ADMIN_USER}", /opt/install_xen_orchestra]
+EOF
+
+    log_info "Building the cloud-init config drive..."
+    local iso="${DEPLOY_WORKDIR}/cidata.iso"
+    if command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -quiet -output "$iso" -volid cidata -joliet -rock \
+            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config"
+    else
+        xorriso -as mkisofs -quiet -o "$iso" -V cidata -J -r \
+            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config"
+    fi
+
+    DEPLOY_CIDATA_ISO="$iso"
+    log_success "Config drive built"
+}
+
+# Generate the xo-config.cfg the VM will be installed with, starting from the
+# sample so every default and explanatory comment carries over, then applying
+# the answers collected above.
+deploy_build_xo_config() {
+    local out="${DEPLOY_WORKDIR}/xo-config.cfg"
+
+    if [[ ! -f "$SAMPLE_CONFIG" ]]; then
+        log_error "sample-xo-config.cfg not found at ${SAMPLE_CONFIG}"
+        exit 1
+    fi
+
+    cp "$SAMPLE_CONFIG" "$out"
+    sed -i \
+        -e "s|^HTTP_PORT=.*|HTTP_PORT=${DEPLOY_HTTP_PORT}|" \
+        -e "s|^HTTPS_PORT=.*|HTTPS_PORT=${DEPLOY_HTTPS_PORT}|" \
+        -e "s|^GIT_BRANCH=.*|GIT_BRANCH=${DEPLOY_GIT_BRANCH}|" \
+        "$out"
+
+    DEPLOY_XO_CONFIG="$out"
+}
+
+# Create the VM, import the disks, and start it.
+deploy_create_vm() {
+    echo ""
+    log_info "Creating the VM on the pool master..."
+
+    # "Other install media" is the generic HVM template every XenServer and
+    # XCP-ng release ships. It provisions no disks of its own, which is what we
+    # want — we attach an imported cloud image instead.
+    local template
+    template=$(dom0_xe "template-list name-label='Other install media' params=uuid --minimal")
+    if [[ -z "$template" ]]; then
+        log_error "Could not find the 'Other install media' template on this host."
+        exit 1
+    fi
+
+    DEPLOY_VM_UUID=$(dom0_xe "vm-install template=${template} new-name-label='${DEPLOY_VM_NAME}' sr-uuid=${DEPLOY_SR_UUID}")
+    if [[ -z "$DEPLOY_VM_UUID" ]]; then
+        log_error "VM creation failed."
+        exit 1
+    fi
+    log_success "VM created: ${DEPLOY_VM_UUID}"
+
+    # Some templates provision a blank disk. Remove anything that came with the
+    # template so device 0 is free for the imported cloud image.
+    local existing_vbds
+    existing_vbds=$(dom0_xe "vbd-list vm-uuid=${DEPLOY_VM_UUID} type=Disk params=uuid --minimal" | tr ',' ' ')
+    local vbd
+    for vbd in $existing_vbds; do
+        [[ -n "$vbd" ]] || continue
+        local vdi
+        vdi=$(dom0_xe "vbd-param-get uuid=${vbd} param-name=vdi-uuid" 2>/dev/null || echo "")
+        dom0_xe "vbd-destroy uuid=${vbd}" >/dev/null 2>&1 || true
+        if [[ -n "$vdi" && "$vdi" != "<not in database>" ]]; then
+            dom0_xe "vdi-destroy uuid=${vdi}" >/dev/null 2>&1 || true
+        fi
+    done
+
+    # CPU and memory. All four memory limits must be set together, and XAPI
+    # requires static-max >= dynamic-max >= dynamic-min >= static-min.
+    local mem="${DEPLOY_RAM_GB}GiB"
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} VCPUs-max=${DEPLOY_VCPUS}" >/dev/null
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} VCPUs-at-startup=${DEPLOY_VCPUS}" >/dev/null
+    dom0_xe "vm-memory-limits-set uuid=${DEPLOY_VM_UUID} static-min=${mem} dynamic-min=${mem} dynamic-max=${mem} static-max=${mem}" >/dev/null
+
+    # Boot straight from disk — there is no installer to boot from.
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-policy='BIOS order'" >/dev/null
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-params:order=c" >/dev/null
+
+    # Root disk.
+    log_info "Creating a ${DEPLOY_DISK_GB} GB root disk..."
+    DEPLOY_ROOT_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${DEPLOY_VM_NAME}-root' virtual-size=${DEPLOY_DISK_GB}GiB type=user")
+    dom0_xe "vbd-create vm-uuid=${DEPLOY_VM_UUID} vdi-uuid=${DEPLOY_ROOT_VDI} device=0 bootable=true type=Disk mode=RW" >/dev/null
+
+    # Stream the cloud image from the internet straight into the VDI, entirely
+    # on the pool master — see the import helpers above for why it goes through
+    # XAPI's HTTP endpoint rather than `xe vdi-import`.
+    log_info "Streaming the Debian ${XO_DEPLOY_IMAGE_VERSION} cloud image into the root disk..."
+    log_info "  ${XO_DEPLOY_IMAGE_URL}"
+    log_info "  (this is usually the longest step)"
+    if ! deploy_import_vdi_from_url "$DEPLOY_ROOT_VDI" "$XO_DEPLOY_IMAGE_URL"; then
+        log_error "Failed to import the cloud image."
+        log_error "Check that the pool master has outbound internet access:"
+        log_error "  ssh ${HOST_USERNAME}@${POOL_MASTER_IP} curl -I ${XO_DEPLOY_IMAGE_URL}"
+        log_error "Then re-run tests/probe-xapi-deploy.sh to see which import paths work."
+        exit 1
+    fi
+    log_success "Root disk imported"
+
+    # Config drive. 16 MiB is comfortably above the ~400 KB ISO and above the
+    # allocation granularity of every SR type.
+    log_info "Attaching the cloud-init config drive..."
+    DEPLOY_CIDATA_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${DEPLOY_VM_NAME}-cidata' virtual-size=16MiB type=user")
+    if ! deploy_import_vdi_from_file "$DEPLOY_CIDATA_VDI" "$DEPLOY_CIDATA_ISO"; then
+        log_error "Failed to import the cloud-init config drive."
+        exit 1
+    fi
+    dom0_xe "vbd-create vm-uuid=${DEPLOY_VM_UUID} vdi-uuid=${DEPLOY_CIDATA_VDI} device=1 type=Disk mode=RO" >/dev/null
+
+    # Network interface.
+    dom0_xe "vif-create vm-uuid=${DEPLOY_VM_UUID} network-uuid=${DEPLOY_NETWORK_UUID} device=0" >/dev/null
+
+    log_info "Starting the VM..."
+    dom0_xe "vm-start uuid=${DEPLOY_VM_UUID}" >/dev/null
+    log_success "VM started"
+}
+
+# Wait until the guest finishes cloud-init and accepts our key over SSH.
+deploy_wait_for_guest() {
+    local ssh_opts=(
+        -i "$DEPLOY_SSH_KEY"
+        -o IdentitiesOnly=yes
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o LogLevel=ERROR
+        -o ConnectTimeout=5
+    )
+
+    echo ""
+    log_info "Waiting for the VM to boot and finish cloud-init..."
+    log_info "(first boot installs packages and clones this repo; allow a few minutes)"
+
+    local waited=0
+    local limit=600
+    while (( waited < limit )); do
+        if ssh "${ssh_opts[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" true 2>/dev/null; then
+            log_success "SSH is up on ${DEPLOY_IP}"
+            break
+        fi
+        sleep 10
+        waited=$((waited + 10))
+        if (( waited % 60 == 0 )); then
+            log_info "  still waiting... (${waited}s)"
+        fi
+    done
+
+    if (( waited >= limit )); then
+        log_error "The VM did not become reachable at ${DEPLOY_IP} within ${limit}s."
+        log_error "Check its console in XO Lite or XCP-ng Center and verify the network settings."
+        exit 1
+    fi
+
+    # cloud-init may still be installing packages and cloning the repo.
+    log_info "Waiting for cloud-init to finish..."
+    if ! ssh "${ssh_opts[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "sudo cloud-init status --wait >/dev/null 2>&1"; then
+        log_warning "cloud-init reported a non-zero status; continuing anyway."
+        log_warning "If the install fails, check /var/log/cloud-init-output.log in the VM."
+    fi
+
+    if ! ssh "${ssh_opts[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "test -x /opt/install_xen_orchestra/install-xen-orchestra.sh"; then
+        log_error "The repository was not cloned into the VM as expected."
+        log_error "Check /var/log/cloud-init-output.log in the VM for the reason."
+        exit 1
+    fi
+
+    DEPLOY_SSH_OPTS=("${ssh_opts[@]}")
+    log_success "Guest is ready"
+}
+
+# Copy the generated config into the VM and run the installer over SSH.
+deploy_install_xo_in_vm() {
+    echo ""
+    echo "=============================================="
+    echo "  Installing Xen Orchestra in the VM"
+    echo "=============================================="
+    echo ""
+
+    scp "${DEPLOY_SSH_OPTS[@]}" "$DEPLOY_XO_CONFIG" \
+        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}:/opt/install_xen_orchestra/xo-config.cfg" >/dev/null
+
+    log_info "Running the installer in the VM — output follows."
+    echo ""
+
+    # -t gives the remote script a TTY so its progress output renders normally.
+    # XO_NO_SELF_UPDATE stops the remote copy from re-execing mid-install; the
+    # clone is already at the tip of whatever branch it was cloned from.
+    if ! ssh -t "${DEPLOY_SSH_OPTS[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "cd /opt/install_xen_orchestra && XO_NO_SELF_UPDATE=1 ./install-xen-orchestra.sh --install --non-interactive"; then
+        log_error "The Xen Orchestra install failed inside the VM."
+        log_error "The VM is still running — connect and investigate with:"
+        log_error "  ssh -i ${DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
+        exit 1
+    fi
+}
+
+# Confirm XO actually answers before declaring success.
+deploy_verify_xo() {
+    echo ""
+    log_info "Verifying that Xen Orchestra is responding..."
+
+    local code
+    code=$(ssh "${DEPLOY_SSH_OPTS[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "curl -s -k -o /dev/null -w '%{http_code}' https://127.0.0.1:${DEPLOY_HTTPS_PORT}/signin" 2>/dev/null || echo "000")
+
+    if [[ "$code" == "200" ]]; then
+        log_success "Xen Orchestra is serving its sign-in page"
+        return 0
+    fi
+
+    log_warning "Xen Orchestra returned HTTP ${code} instead of 200."
+    log_warning "The service may still be starting. Check with:"
+    log_warning "  ssh -i ${DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP} sudo systemctl status xo-server"
+    return 0
+}
+
+# Persist the generated SSH key next to the script so the user can still reach
+# the VM after this run exits (DEPLOY_WORKDIR is removed by deploy_cleanup).
+deploy_save_ssh_key() {
+    local dest="${SCRIPT_DIR}/xo-deploy-${DEPLOY_HOSTNAME}.key"
+    cp "$DEPLOY_SSH_KEY" "$dest"
+    chmod 600 "$dest"
+    DEPLOY_SAVED_KEY="$dest"
+}
+
+deploy_print_summary() {
+    local url_host="$DEPLOY_IP"
+    local url="https://${url_host}"
+    [[ "$DEPLOY_HTTPS_PORT" != "443" ]] && url="https://${url_host}:${DEPLOY_HTTPS_PORT}"
+
+    echo ""
+    echo "=============================================="
+    log_success "Xen Orchestra deployed"
+    echo "=============================================="
+    echo ""
+    echo "  Web UI:      ${url}"
+    echo "  Default login: admin@admin.net / admin"
+    echo ""
+    echo "  VM name:     ${DEPLOY_VM_NAME}"
+    echo "  VM UUID:     ${DEPLOY_VM_UUID}"
+    echo "  Address:     ${DEPLOY_IP}/${DEPLOY_PREFIX}"
+    echo ""
+    echo "  SSH:         ssh -i ${DEPLOY_SAVED_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
+    echo ""
+    echo "  This repo lives at /opt/install_xen_orchestra inside the VM."
+    echo "  To update Xen Orchestra later, run there:"
+    echo ""
+    echo "    cd /opt/install_xen_orchestra && ./install-xen-orchestra.sh --update"
+    echo ""
+    log_warning "Change the default admin@admin.net password before using this in production."
+    echo ""
+}
+
+# Orchestrator for --deploy.
+deploy_xo_vm() {
+    echo ""
+    echo "=============================================="
+    echo "  Deploy Xen Orchestra to a new VM"
+    echo "=============================================="
+    echo ""
+    echo "This creates a Debian ${XO_DEPLOY_IMAGE_VERSION} VM on a XenServer/XCP-ng pool and"
+    echo "installs Xen Orchestra from source into it. Nothing is installed on"
+    echo "this machine."
+    echo ""
+    echo "You will need:"
+    echo "  - the pool master's IP and root password"
+    echo "  - a free static IP on the network the VM will use"
+    echo "  - a pool master with outbound internet access"
+    echo ""
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warning "[DRY-RUN] --deploy creates a VM on a remote host and cannot be"
+        log_warning "[DRY-RUN] meaningfully simulated. No changes were made."
+        return 0
+    fi
+
+    confirm_or_skip "Continue?" || { log_info "Deploy cancelled."; return 0; }
+
+    DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-deploy-XXXXXX)
+    chmod 700 "$DEPLOY_WORKDIR"
+    trap deploy_cleanup EXIT
+
+    # Deploy whatever fork this checkout came from, so the VM ends up tracking
+    # the same repository the user is running.
+    DEPLOY_REPO_URL=$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null \
+        || echo "https://github.com/acebmxer/install_xen_orchestra.git")
+
+    deploy_check_local_deps
+    deploy_connect_pool_master
+    deploy_pick_sr
+    deploy_pick_network
+    deploy_prompt_vm_specs
+    deploy_prompt_network_settings
+    deploy_prompt_xo_settings
+
+    echo ""
+    echo "=============================================="
+    echo "  Review"
+    echo "=============================================="
+    echo ""
+    echo "  Pool master:  ${HOST_USERNAME}@${POOL_MASTER_IP}"
+    echo "  VM name:      ${DEPLOY_VM_NAME}"
+    echo "  Resources:    ${DEPLOY_VCPUS} vCPU / ${DEPLOY_RAM_GB} GB RAM / ${DEPLOY_DISK_GB} GB disk"
+    echo "  Address:      ${DEPLOY_IP}/${DEPLOY_PREFIX} via ${DEPLOY_GATEWAY} (DNS ${DEPLOY_DNS})"
+    echo "  Admin user:   ${DEPLOY_ADMIN_USER}"
+    echo "  XO ports:     ${DEPLOY_HTTP_PORT} / ${DEPLOY_HTTPS_PORT}  (branch ${DEPLOY_GIT_BRANCH})"
+    echo "  Repository:   ${DEPLOY_REPO_URL}"
+    echo ""
+    confirm_or_skip "Create this VM?" || { log_info "Deploy cancelled."; return 0; }
+
+    deploy_build_config_drive
+    deploy_build_xo_config
+    deploy_create_vm
+    deploy_wait_for_guest
+    deploy_save_ssh_key
+    deploy_install_xo_in_vm
+    deploy_verify_xo
+    deploy_print_summary
+}
+
 # Uninstall Xen Orchestra: stop/disable the service, remove the install
 # directory, systemd unit, sudoers file, SSL certs, and optionally the
 # service user and Redis data.
@@ -3578,6 +4609,7 @@ show_help() {
     echo "  --rebuild              Fresh clone + clean build on the current branch (backup taken first)"
     echo "  --reconfigure          Regenerate config, systemd service, sudoers, and file ownership"
     echo "  --proxy                Install XO Proxy on a Xen pool master"
+    echo "  --deploy               Create a Debian VM on a XenServer/XCP-ng pool and install XO into it"
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
     echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
@@ -3595,6 +4627,11 @@ show_help() {
     echo "Environment Variables:"
     echo "  XO_DEBUG=1              Enable debug mode (prints all commands with 'set -x')"
     echo "  XO_NO_SELF_UPDATE=1     Skip automatic script self-update check"
+    echo ""
+    echo "Deploy Environment Variables (--deploy only):"
+    echo "  XO_DEPLOY_IMAGE_VERSION  Debian major version for the guest (default: 13)"
+    echo "  XO_DEPLOY_IMAGE_RELEASE  Debian codename for the guest (default: trixie)"
+    echo "  XO_DEPLOY_IMAGE_URL      Full URL of a raw cloud image, overriding the two above"
     echo ""
     echo "Configuration:"
     echo "  Copy sample-xo-config.cfg to xo-config.cfg and edit as needed."
@@ -3632,6 +4669,7 @@ MENU_NAMES=(
     "Update Xen Orchestra"
     "Rename Sample-xo-config.cfg"
     "Install XO Proxy"
+    "Deploy Xen Orchestra to a new VM"
     "Reconfigure Xen Orchestra"
     "Rebuild Xen Orchestra"
     "Edit xo-config.cfg"
@@ -3643,6 +4681,7 @@ MENU_HINTS=(
     ""
     ""
     ""
+    "(creates the VM for you)"
     "(made changes to config)"
     "(wipe & reinstall maintain settings)"
     ""
@@ -3652,11 +4691,14 @@ MENU_HINTS=(
 
 MENU_TITLE="Install Xen Orchestra from Sources Setup and Update"
 
-MENU_LEFT_COUNT=4
+# The left column carries the extra item: draw_menu iterates rows up to
+# MENU_LEFT_COUNT and skips right-column slots past MENU_RIGHT_COUNT, so the
+# left column must be the longer of the two for every row to render.
+MENU_LEFT_COUNT=5
 MENU_RIGHT_COUNT=4
-MENU_TOTAL=9
+MENU_TOTAL=10
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0)
 MCOL=0
 MROW=0
 # Last key read by menu_read_key (set as a global so the read can stay out of a
@@ -4409,7 +5451,7 @@ process_menu_selections() {
         menu_rename_config && config_changed=true
     fi
 
-    if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
         menu_edit_config && config_changed=true
     fi
 
@@ -4445,7 +5487,7 @@ process_menu_selections() {
     fi
 
     # Reconfigure Xen Orchestra
-    if [[ ${MENU_SELECTED[4]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[5]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -4455,7 +5497,7 @@ process_menu_selections() {
     fi
 
     # Rebuild Xen Orchestra
-    if [[ ${MENU_SELECTED[5]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -4477,7 +5519,7 @@ process_menu_selections() {
     fi
 
     # Restore Backup
-    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[8]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -4486,8 +5528,16 @@ process_menu_selections() {
         restore_xo
     fi
 
+    # Deploy Xen Orchestra to a new VM
+    if [[ ${MENU_SELECTED[4]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        deploy_xo_vm
+    fi
+
     # Adjust Xen Orchestra Memory Allocation
-    if [[ ${MENU_SELECTED[8]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[9]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -4685,7 +5735,7 @@ main() {
                 show_version
                 exit 0
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--adjust-memory|--flush-tokens|--uninstall|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--adjust-memory|--flush-tokens|--uninstall|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -4709,12 +5759,24 @@ main() {
     fi
 
     if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
-        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --flush-tokens, --uninstall)"
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --deploy, --adjust-memory, --flush-tokens, --uninstall)"
         exit 1
     fi
 
-    # Acquire exclusive lock for all mutating operations (not --help)
-    if [[ "$OPERATION" != "--help" ]]; then
+    # --deploy is a guided, prompt-driven operation: there is no config file to
+    # read the pool master address, credentials, or guest network out of, so
+    # there is nothing sensible to fall back to without a terminal.
+    if [[ "$NON_INTERACTIVE" == "true" ]] && [[ "$OPERATION" == "--deploy" ]]; then
+        log_error "--deploy cannot be combined with --non-interactive."
+        log_error "It needs connection details that only exist as answers to its prompts."
+        exit 1
+    fi
+
+    # Acquire exclusive lock for all mutating operations (not --help).
+    # --deploy is excluded: it changes nothing on this machine, and holding the
+    # install lock for the length of a remote deploy would block unrelated
+    # local operations for no reason.
+    if [[ "$OPERATION" != "--help" ]] && [[ "$OPERATION" != "--deploy" ]]; then
         acquire_lock
     fi
 
@@ -4762,6 +5824,16 @@ main() {
             detect_package_manager
             load_config
             install_xo_proxy
+            ;;
+        --deploy)
+            # Deliberately no check_systemctl or load_config: this operation
+            # targets a VM that does not exist yet, and reads nothing from the
+            # local install. check_sudo is still needed to install sshpass and
+            # the ISO writer if they are missing.
+            check_required_commands
+            check_not_root
+            check_sudo
+            deploy_xo_vm
             ;;
         --adjust-memory)
             check_required_commands
