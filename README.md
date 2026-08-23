@@ -564,4 +564,4 @@ This project is licensed under the [MIT License](LICENSE). Xen Orchestra itself 
 ## Credits
 
 - [Xen Orchestra](https://xen-orchestra.com/) by [Vates](https://vates.tech/)
-- [Installation Documentation](https://docs.xen-orchestra.com/installation#from-the-sources)
+- [Installation Documentation](https://docs.xen-orchestra.com/install-from-sources)

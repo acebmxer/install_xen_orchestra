@@ -5,7 +5,7 @@ Thanks for helping improve the Xen Orchestra installation script!
 ## Ground rule: follow upstream documentation
 
 This installer must not drift from the official Xen Orchestra
-[installation documentation](https://docs.xen-orchestra.com/installation#from-the-sources).
+[installation documentation](https://docs.xen-orchestra.com/install-from-sources).
 When you change install, build, or configuration behavior, cite the relevant
 upstream docs in your pull request. Only deviate where upstream gives no
 guidance — and say so explicitly.

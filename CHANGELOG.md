@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 This installer builds Xen Orchestra from source and tracks the official
-[XO installation documentation](https://docs.xen-orchestra.com/installation#from-the-sources).
+[XO installation documentation](https://docs.xen-orchestra.com/install-from-sources).
 
 ## [Unreleased]
 

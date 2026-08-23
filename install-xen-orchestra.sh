@@ -12,7 +12,7 @@ fi
 trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
 #
 # Xen Orchestra Installation Script
-# Based on: https://docs.xen-orchestra.com/installation#from-the-sources
+# Based on: https://docs.xen-orchestra.com/install-from-sources
 #
 # This script installs Xen Orchestra from source with:
 # - Node.js (latest LTS by default; configurable via NODE_VERSION in xo-config.cfg)
@@ -1807,7 +1807,7 @@ EOF
 }
 
 # Configure sudo for non-root user
-# Per official docs: https://docs.xen-orchestra.com/installation#from-the-sources
+# Per official docs: https://docs.xen-orchestra.com/install-from-sources
 # Only mount, umount, and findmnt are required for NFS/CIFS remote operations
 configure_sudo() {
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
@@ -1820,7 +1820,7 @@ configure_sudo() {
         else
         sudo tee "$SUDOERS_FILE" > /dev/null << EOF
 # Allow ${SERVICE_USER} to mount/unmount for XO remote storage operations
-# Ref: https://docs.xen-orchestra.com/installation#from-the-sources
+# Ref: https://docs.xen-orchestra.com/install-from-sources
 ${SERVICE_USER} ALL=(root) NOPASSWD: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount, /bin/findmnt, /usr/bin/findmnt
 EOF
         fi # end DRY_RUN check
@@ -1873,7 +1873,7 @@ configure_xenstore_access() {
 # non-root xo-server can read/write XenStore for credential encryption.
 # Installed by install-xen-orchestra.sh when SERVICE_USER is non-root and
 # ENCRYPT_REDIS_CREDENTIALS=true.
-# Ref: https://docs.xen-orchestra.com/xo5/credential-encryption
+# Ref: https://docs.xen-orchestra.com/credential-encryption
 #
 # The xenbus device (/dev/xen/xenbus) is a 'misc' char device whose kernel
 # sysname is 'xen!xenbus' (udev encodes the '/' in xen/xenbus as '!'), verified
@@ -6237,7 +6237,7 @@ show_version() {
     else
         echo "  Version: unknown (not a git checkout)"
     fi
-    echo "  Based on: https://docs.xen-orchestra.com/installation#from-the-sources"
+    echo "  Based on: https://docs.xen-orchestra.com/install-from-sources"
 }
 
 show_help() {
