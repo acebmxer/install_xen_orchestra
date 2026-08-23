@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-23
+
 ### Changed
 - **The cloud image is staged on the pool master by default instead of being
   streamed.** Staging is the only path that can resume a broken download, retry
@@ -60,6 +62,42 @@ This installer builds Xen Orchestra from source and tracks the official
 - **A failed deploy names the VM it left behind**, with the `xe vm-destroy`
   command, instead of leaving a half-built VM to be rediscovered later in the
   pool's VM list. Nothing is destroyed automatically.
+
+- **`--update`/`--reconfigure`/`--rebuild` no longer abort on a root install.**
+  Reading `User=` from a systemd unit that has no such line (which is what a
+  root install looks like) failed the pipeline under `set -o pipefail` and took
+  the script down before the fallback could run.
+- **Deploy prompts validate values, not just their shape.** `999.999.999.999`
+  was accepted as an address and `70000` as a port; both were only rejected
+  after the VM existed, by an unreachable guest or by the installer inside it.
+- **Prompted settings are no longer lost when the base config omits the key.**
+  The generated `xo-config.cfg` was patched with `sed`, which silently does
+  nothing for a key that is not there — so the VM installed on the default
+  while the summary showed the value you typed. Missing keys are now appended.
+- **An `$EDITOR` with arguments works.** `code --wait` passed the availability
+  check and then failed with "No such file", since the whole string was treated
+  as one executable path.
+- **Values edited into the config are validated.** An unusable port or branch
+  was silently ignored, leaving the summary showing one thing and the VM
+  installing another.
+- **Troubleshooting commands point at a key that still exists.** The `ssh -i`
+  lines printed on a failed install and on a non-200 health check named the
+  temporary key, which the exit trap had already deleted.
+- **A second VM with the same hostname no longer overwrites the first one's
+  SSH key**, which was the only way into that machine.
+- The disk-space check before staging an image on the pool master is derived
+  from the image's actual size instead of a hard-coded 4 GiB, which rejected
+  small images and let large ones fill `/var/tmp` mid-download.
+- `tests/probe-xapi-deploy.sh` acquires its XAPI session from the pool master,
+  the way `--deploy` does, so a firewall that blocks port 443 from your
+  workstation no longer skips the HTTP transport probes that matter. It also
+  validates `--host`, `--user`, `--sr`, `--image` and `--payload-mb` before
+  they reach a shell, drops the `eval` in the workstation-side transport, and
+  exits non-zero when any probe failed rather than whenever one transport
+  worked.
+- The menu example in the README and the layout comment above `MENU_NAMES`
+  described the old fixed 5/4/centered grid; with ten items the menu draws five
+  entries in each column.
 
 ### Security
 - **The cloud image is verified against its published checksum.** The size
@@ -219,43 +257,6 @@ This installer builds Xen Orchestra from source and tracks the official
 - Passwords containing `&`, `<` or `>` are XML-escaped before being sent to
   XAPI, instead of producing a malformed request and an unexplained login
   failure. Same fix in `tests/probe-xapi-deploy.sh`.
-
-### Fixed
-- **`--update`/`--reconfigure`/`--rebuild` no longer abort on a root install.**
-  Reading `User=` from a systemd unit that has no such line (which is what a
-  root install looks like) failed the pipeline under `set -o pipefail` and took
-  the script down before the fallback could run.
-- **Deploy prompts validate values, not just their shape.** `999.999.999.999`
-  was accepted as an address and `70000` as a port; both were only rejected
-  after the VM existed, by an unreachable guest or by the installer inside it.
-- **Prompted settings are no longer lost when the base config omits the key.**
-  The generated `xo-config.cfg` was patched with `sed`, which silently does
-  nothing for a key that is not there — so the VM installed on the default
-  while the summary showed the value you typed. Missing keys are now appended.
-- **An `$EDITOR` with arguments works.** `code --wait` passed the availability
-  check and then failed with "No such file", since the whole string was treated
-  as one executable path.
-- **Values edited into the config are validated.** An unusable port or branch
-  was silently ignored, leaving the summary showing one thing and the VM
-  installing another.
-- **Troubleshooting commands point at a key that still exists.** The `ssh -i`
-  lines printed on a failed install and on a non-200 health check named the
-  temporary key, which the exit trap had already deleted.
-- **A second VM with the same hostname no longer overwrites the first one's
-  SSH key**, which was the only way into that machine.
-- The disk-space check before staging an image on the pool master is derived
-  from the image's actual size instead of a hard-coded 4 GiB, which rejected
-  small images and let large ones fill `/var/tmp` mid-download.
-- `tests/probe-xapi-deploy.sh` acquires its XAPI session from the pool master,
-  the way `--deploy` does, so a firewall that blocks port 443 from your
-  workstation no longer skips the HTTP transport probes that matter. It also
-  validates `--host`, `--user`, `--sr`, `--image` and `--payload-mb` before
-  they reach a shell, drops the `eval` in the workstation-side transport, and
-  exits non-zero when any probe failed rather than whenever one transport
-  worked.
-- The menu example in the README and the layout comment above `MENU_NAMES`
-  described the old fixed 5/4/centered grid; with ten items the menu draws five
-  entries in each column.
 
 ## [0.3.0] - 2026-08-22
 
@@ -504,7 +505,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.3...v0.2.0
