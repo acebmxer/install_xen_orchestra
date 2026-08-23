@@ -10,6 +10,77 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Security
+- **`--deploy` no longer writes the pool password to dom0's disk.** The XAPI
+  login body went to a fixed `/tmp` path on the pool master, readable by any
+  other local account for the duration of the request and liable to collide
+  with a concurrent deploy. It is now piped straight into `curl` over the
+  existing SSH connection, so it exists only in memory on both ends.
+- **`XO_DEBUG=1` no longer traces passwords.** Tracing was switched back on
+  immediately after the pool password was read, so `set -x` then printed it on
+  every `sshpass` call and in the XAPI request body, contradicting the "sensitive
+  values are masked" note at the top of the script. Every function that handles
+  the pool password or the guest's console password now keeps tracing off for
+  its duration.
+- **Credentials and SSH remotes are no longer copied into the guest.** The VM
+  clones from this checkout's `origin`; an HTTPS remote carrying a token would
+  have put that token in the guest's world-readable cloud-init data, and an SSH
+  remote would simply have failed to clone in a VM that has none of your keys.
+  Origins are now rewritten to a plain HTTPS URL with any userinfo stripped.
+- **The guest's SSH host key is pinned after the first connection.** The
+  installer used to accept any host key on every connection to the new VM,
+  leaving a window in which something else at that address could receive
+  `xo-config.cfg`.
+- **An aborted deploy no longer abandons the cloud-init config drive.** It
+  carries the guest's private key and, if you set one, the admin password hash.
+  When the VM was never started the drive is removed outright; once it is
+  running (where destroying the drive could break a machine you are about to
+  debug) the exact removal commands are printed.
+- **Switching `SERVICE_USER` to root now fully revokes the old account's
+  XenStore access.** Removing the udev rule left the previous user in the
+  `xenstore` group and left `/dev/xen/xenbus` group-owned by it; both are now
+  undone.
+- Passwords containing `&`, `<` or `>` are XML-escaped before being sent to
+  XAPI, instead of producing a malformed request and an unexplained login
+  failure. Same fix in `tests/probe-xapi-deploy.sh`.
+
+### Fixed
+- **`--update`/`--reconfigure`/`--rebuild` no longer abort on a root install.**
+  Reading `User=` from a systemd unit that has no such line (which is what a
+  root install looks like) failed the pipeline under `set -o pipefail` and took
+  the script down before the fallback could run.
+- **Deploy prompts validate values, not just their shape.** `999.999.999.999`
+  was accepted as an address and `70000` as a port; both were only rejected
+  after the VM existed, by an unreachable guest or by the installer inside it.
+- **Prompted settings are no longer lost when the base config omits the key.**
+  The generated `xo-config.cfg` was patched with `sed`, which silently does
+  nothing for a key that is not there — so the VM installed on the default
+  while the summary showed the value you typed. Missing keys are now appended.
+- **An `$EDITOR` with arguments works.** `code --wait` passed the availability
+  check and then failed with "No such file", since the whole string was treated
+  as one executable path.
+- **Values edited into the config are validated.** An unusable port or branch
+  was silently ignored, leaving the summary showing one thing and the VM
+  installing another.
+- **Troubleshooting commands point at a key that still exists.** The `ssh -i`
+  lines printed on a failed install and on a non-200 health check named the
+  temporary key, which the exit trap had already deleted.
+- **A second VM with the same hostname no longer overwrites the first one's
+  SSH key**, which was the only way into that machine.
+- The disk-space check before staging an image on the pool master is derived
+  from the image's actual size instead of a hard-coded 4 GiB, which rejected
+  small images and let large ones fill `/var/tmp` mid-download.
+- `tests/probe-xapi-deploy.sh` acquires its XAPI session from the pool master,
+  the way `--deploy` does, so a firewall that blocks port 443 from your
+  workstation no longer skips the HTTP transport probes that matter. It also
+  validates `--host`, `--user`, `--sr`, `--image` and `--payload-mb` before
+  they reach a shell, drops the `eval` in the workstation-side transport, and
+  exits non-zero when any probe failed rather than whenever one transport
+  worked.
+- The menu example in the README and the layout comment above `MENU_NAMES`
+  described the old fixed 5/4/centered grid; with ten items the menu draws five
+  entries in each column.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added

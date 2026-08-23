@@ -1873,7 +1873,11 @@ get_previous_service_user() {
     local prev=""
 
     if [[ -f "$unit" ]]; then
-        prev=$(grep -m1 '^User=' "$unit" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
+        # A unit without a User= line is normal (that is what a root install
+        # looks like), so grep's exit 1 must not take the script down with it:
+        # under `set -e -o pipefail` the failed pipeline would abort the caller
+        # before the install-directory fallback below ever runs.
+        prev=$(grep -m1 '^User=' "$unit" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]' || true)
     fi
 
     if [[ -z "$prev" && -d "$INSTALL_DIR" ]]; then
@@ -1920,6 +1924,28 @@ cleanup_stale_service_user() {
         run_cmd sudo rm -f "$udev_rule"
         run_cmd sudo udevadm control --reload || true
         cleaned=true
+    fi
+
+    # The udev rule is only one third of what configure_xenstore_access granted.
+    # The account is also in the 'xenstore' group, and the live device node was
+    # chgrp'd to that group — dropping the rule alone leaves the old account
+    # with XenStore access on this boot and on every boot until the node is
+    # recreated. Revoke both.
+    if id -nG "$prev" 2>/dev/null | tr ' ' '\n' | grep -qx 'xenstore'; then
+        log_info "Removing '${prev}' from the 'xenstore' group..."
+        run_cmd sudo gpasswd -d "$prev" xenstore >/dev/null 2>&1 || true
+        cleaned=true
+    fi
+
+    if [[ -e /dev/xen/xenbus ]]; then
+        local dev_group=""
+        dev_group=$(stat -c '%G' /dev/xen/xenbus 2>/dev/null || echo "")
+        if [[ "$dev_group" == "xenstore" ]]; then
+            log_info "Restoring root-only permissions on /dev/xen/xenbus..."
+            run_cmd sudo chgrp root /dev/xen/xenbus || true
+            run_cmd sudo chmod 0600 /dev/xen/xenbus || true
+            cleaned=true
+        fi
     fi
 
     if [[ "$cleaned" == "true" ]]; then
@@ -3383,6 +3409,77 @@ DEPLOY_CIDATA_VDI=""
 DEPLOY_CIDATA_VBD=""
 DEPLOY_CONFIG_BASE=""
 DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
+DEPLOY_VM_STARTED="false"
+DEPLOY_SAVED_KEY=""
+
+# Suppressing `set -x` around anything that touches the pool password.
+#
+# XO_DEBUG=1 traces the whole run, and the deploy path hands the password to
+# sshpass and into XAPI's XML-RPC body on nearly every call — all of which
+# xtrace prints verbatim, which is exactly what the "sensitive values are
+# masked" note at the top of this file promises it does not do. The functions
+# that touch the password therefore open with:
+#
+#     local -     # bash restores the shell options when this function returns
+#     set +x
+#
+# which is nesting-safe: each function restores the state it was called with,
+# so deploy_xapi_login calling dom0_exec puts tracing back exactly once.
+
+# Escape a value for an XML text node.
+#
+# XAPI is spoken to over XML-RPC, so a perfectly valid password containing &,
+# < or > would otherwise produce a malformed request and a login failure with
+# no visible cause.
+xml_escape() {
+    local s="$1"
+    # The backslashes matter: since bash 5.2 an unquoted & in the replacement
+    # of ${var//pat/repl} stands for the matched text, so "&lt;" would expand
+    # to "<lt;". \& is the literal ampersand on every bash that runs this.
+    s="${s//&/\&amp;}"
+    s="${s//</\&lt;}"
+    s="${s//>/\&gt;}"
+    printf '%s' "$s"
+}
+
+# Validate a dotted-quad IPv4 address, octet by octet.
+#
+# The shape regex used at the prompts accepts 999.999.999.999, which would go
+# straight into cloud-init's network-config and produce a guest that never
+# comes up — and that we would then wait 10 minutes for.
+is_ipv4() {
+    local addr="$1" octet
+    [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    for octet in $addr; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    return 0
+}
+
+# Validate a TCP port. The installer inside the VM rejects anything outside
+# 1-65535, but by the time it runs the VM already exists — so the same bound
+# is enforced at the prompt.
+is_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# Accept only a URL we are willing to hand to a remote shell.
+#
+# The image URL reaches the pool master inside a single-quoted `curl` argument.
+# Inside single quotes the one character that can break out is another single
+# quote; whitespace and control characters are never valid in a URL anyway and
+# would split the argument.
+is_safe_url() {
+    case "$1" in
+        http://*|https://*) ;;
+        *) return 1 ;;
+    esac
+    [[ "$1" != *"'"* ]] || return 1
+    [[ "$1" != *[[:space:]]* ]] || return 1
+    return 0
+}
 
 # Run a command on the pool master.
 #
@@ -3397,6 +3494,11 @@ DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
 DEPLOY_AUTH_MODE="prompt"
 
 dom0_exec() {
+    # sshpass reads the password from the environment, which xtrace would print.
+    local -
+    set +x
+
+    local rc=0
     local common=(
         -o ControlMaster=auto
         -o ControlPath="$DEPLOY_SSH_CTL"
@@ -3406,10 +3508,11 @@ dom0_exec() {
     )
     if [[ "$DEPLOY_AUTH_MODE" == "sshpass" ]]; then
         SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${common[@]}" \
-            "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@"
+            "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@" || rc=$?
     else
-        ssh "${common[@]}" "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@"
+        ssh "${common[@]}" "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@" || rc=$?
     fi
+    return $rc
 }
 
 # Run an `xe` command on the pool master and return its output with the
@@ -3449,21 +3552,24 @@ DEPLOY_SESSION=""
 #
 # The login runs on the pool master against localhost, so --deploy needs only
 # SSH to the host and never requires the operator's machine to reach port 443.
-# The XML body goes over stdin rather than argv so the password never appears
-# in dom0's process list.
+# The XML body goes over stdin and straight into curl's stdin on the far end:
+# it never appears in dom0's process list and never lands on dom0's disk, where
+# a fixed /tmp path would have been readable by any other local account for the
+# duration of the request (and would have collided with a concurrent deploy).
 deploy_xapi_login() {
+    local -
+    set +x
+
     local xml
     xml=$(printf '<?xml version="1.0"?><methodCall><methodName>session.login_with_password</methodName><params><param><value><string>%s</string></value></param><param><value><string>%s</string></value></param></params></methodCall>' \
-        "$HOST_USERNAME" "$HOST_PASSWORD")
+        "$(xml_escape "$HOST_USERNAME")" "$(xml_escape "$HOST_PASSWORD")")
 
     local reply
     reply=$(printf '%s' "$xml" | dom0_exec \
-        "cat > /tmp/xo-deploy-login.xml && \
-         curl -sk --max-time 30 -H 'Content-Type: text/xml' \
-              --data-binary @/tmp/xo-deploy-login.xml https://localhost/ ; \
-         rm -f /tmp/xo-deploy-login.xml" 2>/dev/null)
+        "curl -sk --max-time 30 -H 'Content-Type: text/xml' \
+              --data-binary @- https://localhost/" 2>/dev/null) || true
 
-    DEPLOY_SESSION=$(grep -o 'OpaqueRef:[a-f0-9-]*' <<< "$reply" | head -1)
+    DEPLOY_SESSION=$(grep -o 'OpaqueRef:[a-f0-9-]*' <<< "$reply" | head -1 || true)
 
     if [[ -z "$DEPLOY_SESSION" ]]; then
         log_error "Could not log in to XAPI on the pool master."
@@ -3477,12 +3583,10 @@ deploy_xapi_logout() {
     [[ -n "$DEPLOY_SESSION" ]] || return 0
     local xml
     xml=$(printf '<?xml version="1.0"?><methodCall><methodName>session.logout</methodName><params><param><value><string>%s</string></value></param></params></methodCall>' \
-        "$DEPLOY_SESSION")
+        "$(xml_escape "$DEPLOY_SESSION")")
     printf '%s' "$xml" | dom0_exec \
-        "cat > /tmp/xo-deploy-logout.xml && \
-         curl -sk --max-time 10 -H 'Content-Type: text/xml' \
-              --data-binary @/tmp/xo-deploy-logout.xml https://localhost/ >/dev/null ; \
-         rm -f /tmp/xo-deploy-logout.xml" >/dev/null 2>&1 || true
+        "curl -sk --max-time 10 -H 'Content-Type: text/xml' \
+              --data-binary @- https://localhost/ >/dev/null" >/dev/null 2>&1 || true
     DEPLOY_SESSION=""
 }
 
@@ -3521,11 +3625,23 @@ deploy_import_vdi_staged() {
     local vdi="$1" url="$2"
     local tmp="/var/tmp/xo-deploy-image-$$.raw"
 
+    # Size the check on the image actually being staged, not on the stock
+    # Debian one: XO_DEPLOY_IMAGE_URL and the release overrides can point at
+    # something much larger (which would fill /var/tmp mid-download) or much
+    # smaller (which a flat 4 GiB floor would reject for no reason). Only when
+    # the origin refuses to report a length do we fall back to that floor.
+    local need_mb=4096 size=""
+    size=$(dom0_exec "curl -fsSLI '${url}' 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -1 | awk '{print \$2}'" 2>/dev/null | tr -d '\r' || true)
+    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
+        # A little headroom over the image itself for filesystem overhead.
+        need_mb=$(( size / 1048576 + 256 ))
+    fi
+
     local free_mb
     free_mb=$(dom0_exec "df -BM --output=avail /var/tmp 2>/dev/null | tail -1 | tr -d ' M'" | tr -d '\r')
-    if [[ -n "$free_mb" ]] && (( free_mb < 4096 )); then
+    if [[ -n "$free_mb" ]] && (( free_mb < need_mb )); then
         log_error "The pool master has only ${free_mb} MiB free in /var/tmp;"
-        log_error "staging the image needs about 3 GiB. Free some space and retry."
+        log_error "staging this image needs about ${need_mb} MiB. Free some space and retry."
         return 1
     fi
 
@@ -3564,10 +3680,47 @@ deploy_import_vdi_from_file() {
     return $rc
 }
 
+# Deal with a config drive left behind by an aborted deploy.
+#
+# The drive carries the guest's private key and, when one was set, the admin
+# account's password hash — so an abort must not simply walk away from it. What
+# it must not do either is destroy a drive the guest may still be reading:
+# after vm-start, cloud-init may not have run yet, and the operator is being
+# told to go look at the console. So the drive is only removed outright when
+# the VM was never started; otherwise the exact removal commands are printed.
+deploy_cleanup_config_drive() {
+    [[ -n "${DEPLOY_CIDATA_VDI:-}" ]] || return 0
+
+    if [[ "${DEPLOY_VM_STARTED}" != "true" ]]; then
+        if [[ -n "${DEPLOY_CIDATA_VBD:-}" ]]; then
+            dom0_xe "vbd-destroy uuid=${DEPLOY_CIDATA_VBD}" >/dev/null 2>&1 || true
+        fi
+        if dom0_xe "vdi-destroy uuid=${DEPLOY_CIDATA_VDI}" >/dev/null 2>&1; then
+            log_info "Removed the cloud-init config drive left by the aborted deploy."
+            DEPLOY_CIDATA_VDI=""
+            DEPLOY_CIDATA_VBD=""
+            return 0
+        fi
+    fi
+
+    log_warning "The cloud-init config drive is still on the pool. It holds the VM's"
+    log_warning "SSH key and your admin password hash — remove it once you are done:"
+    if [[ -n "${DEPLOY_CIDATA_VBD:-}" ]]; then
+        log_warning "  xe vbd-unplug uuid=${DEPLOY_CIDATA_VBD}"
+        log_warning "  xe vbd-destroy uuid=${DEPLOY_CIDATA_VBD}"
+    fi
+    log_warning "  xe vdi-destroy uuid=${DEPLOY_CIDATA_VDI}"
+    return 0
+}
+
 # Close the shared SSH connection and remove the deploy scratch directory.
 # Registered as an EXIT trap by deploy_xo_vm so an abort doesn't leave a live
 # master socket, an XAPI session, or a config drive containing an SSH key.
+#
+# Runs before the SSH connection is torn down, since the config-drive cleanup
+# needs `xe` on the pool master.
 deploy_cleanup() {
+    deploy_cleanup_config_drive
     deploy_xapi_logout
     if [[ -n "$DEPLOY_SSH_CTL" && -S "$DEPLOY_SSH_CTL" ]]; then
         ssh -o ControlPath="$DEPLOY_SSH_CTL" -O exit \
@@ -3619,10 +3772,15 @@ deploy_choose() {
     done
 }
 
-# Prompt for a value, re-asking until it matches a regex.
-# Arguments: prompt, regex, default (may be empty), variable name to set
+# Prompt until the answer matches a regex and, optionally, a validator.
+#
+# Arguments: prompt, regex, default, variable name, [validator function]
+#
+# The validator exists because a regex can only check shape: it is what stops
+# 999.999.999.999 or port 70000 being accepted here and only rejected later,
+# after the VM has been created.
 deploy_read_validated() {
-    local prompt="$1" regex="$2" default="$3" varname="$4"
+    local prompt="$1" regex="$2" default="$3" varname="$4" validator="${5:-}"
     local reply
     while true; do
         if [[ -n "$default" ]]; then
@@ -3632,7 +3790,7 @@ deploy_read_validated() {
         fi
         read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
         reply="${reply:-$default}"
-        if [[ "$reply" =~ $regex ]]; then
+        if [[ "$reply" =~ $regex ]] && { [[ -z "$validator" ]] || "$validator" "$reply"; }; then
             printf -v "$varname" '%s' "$reply"
             return 0
         fi
@@ -3713,6 +3871,12 @@ deploy_check_local_deps() {
 
 # Collect pool master connection details and open the shared SSH connection.
 deploy_connect_pool_master() {
+    # HOST_PASSWORD is read here and used by every dom0_exec from here on, so
+    # tracing stays off for the whole function rather than being flipped back
+    # on immediately after the read. See the note above dom0_exec.
+    local -
+    set +x
+
     echo ""
     echo "=============================================="
     echo "  Pool Master Connection"
@@ -3726,7 +3890,6 @@ deploy_connect_pool_master() {
 
     deploy_read_validated "Host username" '^[a-z_][a-z0-9_-]*$' "root" HOST_USERNAME
 
-    { set +x; } 2>/dev/null
     echo -n "Host password: "
     read -rs HOST_PASSWORD < /dev/tty
     echo ""
@@ -3734,7 +3897,6 @@ deploy_connect_pool_master() {
         log_error "Host password is required"
         exit 1
     fi
-    [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
 
     DEPLOY_SSH_CTL="${DEPLOY_WORKDIR}/ssh-ctl"
 
@@ -3861,6 +4023,9 @@ deploy_prompt_vm_specs() {
 # SHA-512 ($6$) is what both tools below produce and what Debian expects.
 # The password is fed over stdin so it never appears in the process list.
 deploy_hash_password() {
+    local -
+    set +x
+
     local pw="$1" hash=""
 
     if command -v openssl >/dev/null 2>&1; then
@@ -3882,6 +4047,11 @@ deploy_hash_password() {
 # where no key can be offered, and what `su` asks for. SSH stays key-only
 # unless you ask for password logins as well.
 deploy_prompt_admin_password() {
+    # The console password is compared and hashed in here, both of which xtrace
+    # would print. See the note above dom0_exec for why `local -` is enough.
+    local -
+    set +x
+
     DEPLOY_ADMIN_PASSWORD_HASH=""
     DEPLOY_ADMIN_SSH_PWAUTH="false"
 
@@ -3972,10 +4142,10 @@ deploy_prompt_network_settings() {
     echo "this script would have no address to install over."
     echo ""
 
-    deploy_read_validated "IP address for the VM" "$ipregex" "" DEPLOY_IP
-    deploy_read_validated "Netmask" "$ipregex" "255.255.255.0" DEPLOY_NETMASK
-    deploy_read_validated "Gateway" "$ipregex" "" DEPLOY_GATEWAY
-    deploy_read_validated "DNS server" "$ipregex" "1.1.1.1" DEPLOY_DNS
+    deploy_read_validated "IP address for the VM" "$ipregex" "" DEPLOY_IP is_ipv4
+    deploy_read_validated "Netmask" "$ipregex" "255.255.255.0" DEPLOY_NETMASK is_ipv4
+    deploy_read_validated "Gateway" "$ipregex" "" DEPLOY_GATEWAY is_ipv4
+    deploy_read_validated "DNS server" "$ipregex" "1.1.1.1" DEPLOY_DNS is_ipv4
 
     DEPLOY_PREFIX=$(netmask_to_prefix "$DEPLOY_NETMASK")
     if [[ -z "$DEPLOY_PREFIX" ]]; then
@@ -4035,8 +4205,8 @@ deploy_prompt_xo_settings() {
     https=$(deploy_config_value "$DEPLOY_CONFIG_BASE" HTTPS_PORT)
     branch=$(deploy_config_value "$DEPLOY_CONFIG_BASE" GIT_BRANCH)
 
-    deploy_read_validated "HTTP port" '^[1-9][0-9]*$' "${http:-80}" DEPLOY_HTTP_PORT
-    deploy_read_validated "HTTPS port" '^[1-9][0-9]*$' "${https:-443}" DEPLOY_HTTPS_PORT
+    deploy_read_validated "HTTP port" '^[1-9][0-9]*$' "${http:-80}" DEPLOY_HTTP_PORT is_port
+    deploy_read_validated "HTTPS port" '^[1-9][0-9]*$' "${https:-443}" DEPLOY_HTTPS_PORT is_port
     deploy_read_validated "Git branch to build" '^[A-Za-z0-9._/-]+$' "${branch:-master}" DEPLOY_GIT_BRANCH
 }
 
@@ -4141,6 +4311,23 @@ EOF
     log_success "Config drive built"
 }
 
+# Set KEY=value in a config file, appending the line when the key is absent.
+#
+# A plain `sed s|^KEY=.*|` silently does nothing for a key the base config never
+# had — and a missing key is perfectly legal, because load_config supplies a
+# default for every one of them. The prompted answer would then vanish and the
+# guest would install with that default while the review screen showed the
+# value you typed.
+deploy_set_config_key() {
+    local file="$1" key="$2" value="$3"
+
+    if grep -qE "^${key}=" "$file"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
 # Generate the xo-config.cfg the VM will be installed with, starting from the
 # sample so every default and explanatory comment carries over, then applying
 # the answers collected above.
@@ -4154,11 +4341,9 @@ deploy_build_xo_config() {
     fi
 
     cp "$base" "$out"
-    sed -i \
-        -e "s|^HTTP_PORT=.*|HTTP_PORT=${DEPLOY_HTTP_PORT}|" \
-        -e "s|^HTTPS_PORT=.*|HTTPS_PORT=${DEPLOY_HTTPS_PORT}|" \
-        -e "s|^GIT_BRANCH=.*|GIT_BRANCH=${DEPLOY_GIT_BRANCH}|" \
-        "$out"
+    deploy_set_config_key "$out" HTTP_PORT  "$DEPLOY_HTTP_PORT"
+    deploy_set_config_key "$out" HTTPS_PORT "$DEPLOY_HTTPS_PORT"
+    deploy_set_config_key "$out" GIT_BRANCH "$DEPLOY_GIT_BRANCH"
 
     DEPLOY_XO_CONFIG="$out"
 }
@@ -4187,37 +4372,69 @@ deploy_edit_xo_config() {
     if [[ -z "$editor" ]]; then
         editor=$(deploy_config_value "$DEPLOY_CONFIG_BASE" PREFERRED_EDITOR)
     fi
-    if [[ -z "$editor" ]] || ! command -v "${editor%% *}" >/dev/null 2>&1; then
+
+    # $EDITOR routinely carries arguments ("code --wait", "emacsclient -nw").
+    # Split it into argv so the flags are passed as flags — treating the whole
+    # string as one executable path would fail with "No such file" on exactly
+    # the values that pass a `command -v ${editor%% *}` check.
+    local -a editor_cmd=()
+    [[ -n "$editor" ]] && read -r -a editor_cmd <<< "$editor"
+
+    if [[ ${#editor_cmd[@]} -eq 0 ]] || ! command -v "${editor_cmd[0]}" >/dev/null 2>&1; then
         local candidate
-        editor=""
+        editor_cmd=()
         for candidate in nano vim vi; do
             if command -v "$candidate" >/dev/null 2>&1; then
-                editor="$candidate"
+                editor_cmd=("$candidate")
                 break
             fi
         done
     fi
 
-    if [[ -z "$editor" ]]; then
+    if [[ ${#editor_cmd[@]} -eq 0 ]]; then
         log_warning "No editor found (tried \$EDITOR, nano, vim, vi)."
         log_warning "Edit ${DEPLOY_XO_CONFIG} from another terminal, or set \$EDITOR and re-run."
         return 0
     fi
 
-    "$editor" "$DEPLOY_XO_CONFIG" < /dev/tty || {
-        log_warning "The editor exited with an error; keeping the config as generated."
-        return 0
-    }
+    # The edited file is what the VM installs from, and the three prompted
+    # values also drive the review screen, the post-install check and the
+    # summary. Reading them back is therefore not optional bookkeeping: a value
+    # that cannot be read or is out of range would install differently from
+    # what the summary claims, or fail an hour into the build. Nothing has been
+    # created on the pool yet, so an unusable edit can still be sent back.
+    local http https branch invalid=() bad
+    while true; do
+        "${editor_cmd[@]}" "$DEPLOY_XO_CONFIG" < /dev/tty || {
+            log_warning "The editor exited with an error; keeping the config as generated."
+            return 0
+        }
 
-    # The three prompted values also drive the review screen, the post-install
-    # check and the summary, so take back whatever the edit left behind.
-    local http https branch
-    http=$(deploy_config_value "$DEPLOY_XO_CONFIG" HTTP_PORT)
-    https=$(deploy_config_value "$DEPLOY_XO_CONFIG" HTTPS_PORT)
-    branch=$(deploy_config_value "$DEPLOY_XO_CONFIG" GIT_BRANCH)
-    [[ "$http" =~ ^[1-9][0-9]*$ ]] && DEPLOY_HTTP_PORT="$http"
-    [[ "$https" =~ ^[1-9][0-9]*$ ]] && DEPLOY_HTTPS_PORT="$https"
-    [[ -n "$branch" ]] && DEPLOY_GIT_BRANCH="$branch"
+        invalid=()
+        http=$(deploy_config_value "$DEPLOY_XO_CONFIG" HTTP_PORT)
+        https=$(deploy_config_value "$DEPLOY_XO_CONFIG" HTTPS_PORT)
+        branch=$(deploy_config_value "$DEPLOY_XO_CONFIG" GIT_BRANCH)
+
+        is_port "$http"  || invalid+=("HTTP_PORT=${http:-<missing>} (must be 1-65535)")
+        is_port "$https" || invalid+=("HTTPS_PORT=${https:-<missing>} (must be 1-65535)")
+        [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || invalid+=("GIT_BRANCH=${branch:-<missing>}")
+
+        if [[ ${#invalid[@]} -eq 0 ]]; then
+            DEPLOY_HTTP_PORT="$http"
+            DEPLOY_HTTPS_PORT="$https"
+            DEPLOY_GIT_BRANCH="$branch"
+            break
+        fi
+
+        log_warning "The edited config has values the install would choke on:"
+        for bad in "${invalid[@]}"; do
+            log_warning "  ${bad}"
+        done
+        confirm_or_skip "Open it again to fix them?" || {
+            log_error "Deploy cancelled — nothing was created on the pool."
+            exit 1
+        }
+    done
 
     log_success "Config saved for the new VM"
 }
@@ -4305,16 +4522,31 @@ deploy_create_vm() {
 
     log_info "Starting the VM..."
     dom0_xe "vm-start uuid=${DEPLOY_VM_UUID}" >/dev/null
+    # From here on the guest may be reading the config drive, so an aborted run
+    # warns about it rather than destroying it (see deploy_cleanup_config_drive).
+    DEPLOY_VM_STARTED="true"
     log_success "VM started"
 }
 
 # Wait until the guest finishes cloud-init and accepts our key over SSH.
 deploy_wait_for_guest() {
+    # Trust on first use, then pin. The guest's host key is generated on its
+    # first boot, so there is nothing to verify against beforehand — but
+    # accepting a *different* key on every subsequent connection would let
+    # anything sitting on that address swap itself in partway through, after
+    # the wait loop and before xo-config.cfg is uploaded. Recording the first
+    # key in a run-scoped known_hosts file closes that window; the remaining
+    # exposure is an attacker already at the address when we first connect,
+    # which shows up as an IP conflict the operator can see.
+    local known_hosts="${DEPLOY_WORKDIR}/guest_known_hosts"
+    : > "$known_hosts"
+    chmod 600 "$known_hosts"
+
     local ssh_opts=(
         -i "$DEPLOY_SSH_KEY"
         -o IdentitiesOnly=yes
-        -o StrictHostKeyChecking=no
-        -o UserKnownHostsFile=/dev/null
+        -o StrictHostKeyChecking=accept-new
+        -o UserKnownHostsFile="$known_hosts"
         -o LogLevel=ERROR
         -o ConnectTimeout=5
     )
@@ -4383,7 +4615,10 @@ deploy_install_xo_in_vm() {
         "cd ${DEPLOY_REPO_DIR} && XO_NO_SELF_UPDATE=1 ./install-xen-orchestra.sh --install --non-interactive"; then
         log_error "The Xen Orchestra install failed inside the VM."
         log_error "The VM is still running — connect and investigate with:"
-        log_error "  ssh -i ${DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
+        # DEPLOY_SSH_KEY lives in DEPLOY_WORKDIR, which the EXIT trap deletes on
+        # the way out, so the command the user is handed must name the copy
+        # deploy_save_ssh_key already persisted.
+        log_error "  ssh -i ${DEPLOY_SAVED_KEY:-$DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
         exit 1
     fi
 }
@@ -4404,7 +4639,7 @@ deploy_verify_xo() {
 
     log_warning "Xen Orchestra returned HTTP ${code} instead of 200."
     log_warning "The service may still be starting. Check with:"
-    log_warning "  ssh -i ${DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP} sudo systemctl status xo-server"
+    log_warning "  ssh -i ${DEPLOY_SAVED_KEY:-$DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP} sudo systemctl status xo-server"
     return 0
 }
 
@@ -4432,6 +4667,10 @@ deploy_remove_config_drive() {
             log_warning "  xe vbd-unplug uuid=${DEPLOY_CIDATA_VBD}"
             log_warning "  xe vbd-destroy uuid=${DEPLOY_CIDATA_VBD}"
             log_warning "  xe vdi-destroy uuid=${DEPLOY_CIDATA_VDI}"
+            # The operator has the commands; don't have the EXIT trap repeat
+            # them a second time on the way out.
+            DEPLOY_CIDATA_VDI=""
+            DEPLOY_CIDATA_VBD=""
             return 0
         fi
         dom0_xe "vbd-destroy uuid=${DEPLOY_CIDATA_VBD}" >/dev/null 2>&1 || true
@@ -4443,12 +4682,28 @@ deploy_remove_config_drive() {
         log_warning "Could not destroy the config drive VDI ${DEPLOY_CIDATA_VDI}."
         log_warning "Remove it by hand with: xe vdi-destroy uuid=${DEPLOY_CIDATA_VDI}"
     fi
+    DEPLOY_CIDATA_VDI=""
+    DEPLOY_CIDATA_VBD=""
 }
 
 # Persist the generated SSH key next to the script so the user can still reach
 # the VM after this run exits (DEPLOY_WORKDIR is removed by deploy_cleanup).
 deploy_save_ssh_key() {
     local dest="${SCRIPT_DIR}/xo-deploy-${DEPLOY_HOSTNAME}.key"
+
+    # Deploying a second VM with the same hostname must not overwrite the first
+    # one's key: that file is the only way into that machine, and the command
+    # printed at the end of its deploy still points at it.
+    if [[ -e "$dest" ]]; then
+        local n=2
+        while [[ -e "${SCRIPT_DIR}/xo-deploy-${DEPLOY_HOSTNAME}-${n}.key" ]]; do
+            n=$((n + 1))
+        done
+        dest="${SCRIPT_DIR}/xo-deploy-${DEPLOY_HOSTNAME}-${n}.key"
+        log_warning "A key named xo-deploy-${DEPLOY_HOSTNAME}.key already exists (it belongs to"
+        log_warning "an earlier VM). Saving this one as $(basename "$dest") instead."
+    fi
+
     cp "$DEPLOY_SSH_KEY" "$dest"
     chmod 600 "$dest"
     DEPLOY_SAVED_KEY="$dest"
@@ -4492,6 +4747,51 @@ deploy_print_summary() {
     echo ""
 }
 
+# Turn this checkout's origin into a URL the new VM can actually clone from.
+#
+# Two things make a local origin unusable in the guest:
+#
+#   - an SSH remote (git@host:owner/repo.git, ssh://git@host/owner/repo.git)
+#     authenticates with the operator's key, which the VM does not have and is
+#     not given — the clone would fail on first boot with a permission error
+#     buried in the cloud-init log;
+#   - an HTTPS remote carrying userinfo (https://user:token@host/...) would
+#     copy that credential into the guest's user-data, where it is readable by
+#     anyone on the VM and echoed into cloud-init's logs.
+#
+# Both are rewritten to a plain, credential-free HTTPS URL. Echoes the result;
+# the caller compares it against the original to decide what to report.
+deploy_guest_clone_url() {
+    local url="$1" rest host path scheme
+
+    if [[ "$url" != *"://"* && "$url" == *@*:* ]]; then
+        # scp-style SSH remote: user@host:path
+        host="${url#*@}"; host="${host%%:*}"
+        path="${url#*:}"
+        url="https://${host}/${path}"
+    elif [[ "$url" == ssh://* || "$url" == git+ssh://* || "$url" == git://* ]]; then
+        rest="${url#*://}"
+        rest="${rest#*@}"
+        host="${rest%%/*}"
+        path="${rest#*/}"
+        host="${host%%:*}"          # drop any port; the HTTPS one differs anyway
+        url="https://${host}/${path}"
+    fi
+
+    # Strip userinfo from an http(s) URL, whether it was there all along or
+    # arrived via one of the rewrites above.
+    if [[ "$url" == http://* || "$url" == https://* ]]; then
+        scheme="${url%%://*}"
+        rest="${url#*://}"
+        if [[ "${rest%%/*}" == *@* ]]; then
+            rest="${rest#*@}"
+        fi
+        url="${scheme}://${rest}"
+    fi
+
+    printf '%s' "$url"
+}
+
 # Orchestrator for --deploy.
 deploy_xo_vm() {
     echo ""
@@ -4515,6 +4815,16 @@ deploy_xo_vm() {
         return 0
     fi
 
+    # The image URL is interpolated into a single-quoted argument in a shell on
+    # the pool master, so it is checked before anything else happens — an
+    # override that cannot be sent safely is a mistake to report now, not after
+    # the operator has answered a dozen prompts.
+    if ! is_safe_url "$XO_DEPLOY_IMAGE_URL"; then
+        log_error "XO_DEPLOY_IMAGE_URL is not a usable http(s) URL:"
+        log_error "  ${XO_DEPLOY_IMAGE_URL}"
+        exit 1
+    fi
+
     confirm_or_skip "Continue?" || { log_info "Deploy cancelled."; return 0; }
 
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-deploy-XXXXXX)
@@ -4523,8 +4833,20 @@ deploy_xo_vm() {
 
     # Deploy whatever fork this checkout came from, so the VM ends up tracking
     # the same repository the user is running.
-    DEPLOY_REPO_URL=$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null \
-        || echo "https://github.com/acebmxer/install_xen_orchestra.git")
+    local origin_url upstream_url="https://github.com/acebmxer/install_xen_orchestra.git"
+    origin_url=$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || echo "$upstream_url")
+    DEPLOY_REPO_URL=$(deploy_guest_clone_url "$origin_url")
+
+    if [[ "$DEPLOY_REPO_URL" != http://* && "$DEPLOY_REPO_URL" != https://* ]]; then
+        log_warning "This checkout's origin is not a URL the VM could clone from."
+        log_warning "Falling back to ${upstream_url}"
+        DEPLOY_REPO_URL="$upstream_url"
+    elif [[ "$DEPLOY_REPO_URL" != "$origin_url" ]]; then
+        # Deliberately prints only the rewritten URL — the original may hold a
+        # token, and this line goes to the terminal and to any log capturing it.
+        log_info "Origin rewritten for the guest (no key or credentials of yours"
+        log_info "are copied into the VM): ${DEPLOY_REPO_URL}"
+    fi
 
     deploy_check_local_deps
     deploy_connect_pool_master
@@ -4967,8 +5289,10 @@ M_CYAN="${M_CSI}36m"
 M_BLINK="${M_CSI}5m"
 M_REVERSE="${M_CSI}7m"
 
-# Menu item names (left column indices 0-3, right column indices 4-7,
-# index 8 is a full-width centered row below both columns)
+# Menu item names, in draw order: the first half fills the left column top to
+# bottom, the second half the right column. With an odd number of items the
+# last one is drawn full-width and centered below both columns. The split is
+# computed by menu_derive_layout, so adding an item here is all that is needed.
 MENU_NAMES=(
     "Install Xen Orchestra"
     "Update Xen Orchestra"

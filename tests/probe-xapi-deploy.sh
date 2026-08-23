@@ -54,6 +54,20 @@ fail() {
 }
 detail() { echo "        ${*}"; }
 
+# Escape a value for an XML text node — XAPI is spoken to over XML-RPC, and a
+# password containing &, < or > would otherwise produce a malformed request and
+# a login failure this probe would report as "XAPI refused the credentials".
+xml_escape() {
+    local s="$1"
+    # The backslashes matter: since bash 5.2 an unquoted & in the replacement
+    # of ${var//pat/repl} stands for the matched text, so "&lt;" would expand
+    # to "<lt;". \& is the literal ampersand on every bash that runs this.
+    s="${s//&/\&amp;}"
+    s="${s//</\&lt;}"
+    s="${s//>/\&gt;}"
+    printf '%s' "$s"
+}
+
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
@@ -103,6 +117,28 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$POOL_HOST" ]] || { usage; die "--host is required"; }
+
+# Validate everything that later reaches a shell — locally or, worse, on the
+# pool master. These are all interpolated into command strings, so a value
+# carrying shell syntax would run as the SSH account on dom0.
+[[ "$POOL_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] \
+    || die "--host must be a hostname or IP address, got: ${POOL_HOST}"
+[[ "$POOL_USER" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "--user must be a plain username, got: ${POOL_USER}"
+if [[ -n "$SR_UUID" ]]; then
+    [[ "$SR_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+        || die "--sr must be an XAPI UUID, got: ${SR_UUID}"
+fi
+[[ "$PAYLOAD_MB" =~ ^[1-9][0-9]*$ ]] \
+    || die "--payload-mb must be a positive integer, got: ${PAYLOAD_MB}"
+# The image URL is single-quoted inside a remote command; a single quote would
+# close it, and whitespace is never valid in a URL anyway.
+case "$IMAGE_URL" in
+    http://*|https://*) ;;
+    *) die "--image must be an http(s) URL, got: ${IMAGE_URL}" ;;
+esac
+[[ "$IMAGE_URL" != *"'"* && "$IMAGE_URL" != *[[:space:]]* ]] \
+    || die "--image contains characters that are not valid in a URL"
 
 RUN_ID="$(date +%s)-$$"
 PROBE_TAG="xo-probe-${RUN_ID}"
@@ -197,9 +233,10 @@ cleanup() {
     fi
 
     if [[ -n "$XAPI_SESSION" ]]; then
-        curl -sk --max-time 10 -H 'Content-Type: text/xml' --data-binary \
-            "<?xml version=\"1.0\"?><methodCall><methodName>session.logout</methodName><params><param><value><string>${XAPI_SESSION}</string></value></param></params></methodCall>" \
-            "https://${POOL_HOST}/" >/dev/null 2>&1
+        # Logged in from dom0, so log out from there too — the workstation may
+        # have no route to port 443 at all.
+        printf '%s' "<?xml version=\"1.0\"?><methodCall><methodName>session.logout</methodName><params><param><value><string>${XAPI_SESSION}</string></value></param></params></methodCall>" \
+            | dom0 "curl -sk --max-time 10 -H 'Content-Type: text/xml' --data-binary @- https://localhost/" >/dev/null 2>&1
     fi
 
     if [[ -S "$SSH_CTL" ]]; then
@@ -245,25 +282,11 @@ verify_vdi() {
     [[ "$got" == "$expect" ]]
 }
 
-# Run one candidate transport end to end and report the verdict.
-# Arguments: label, description, the shell command to perform the transfer
-#            (with %VDI% substituted for the scratch VDI's UUID)
-try_transport() {
-    local label="$1" desc="$2" cmd="$3" is_local="${4:-remote}"
-    local vdi
-
-    make_scratch_vdi "$label" || { fail "${desc}: could not create a scratch VDI"; return 1; }
-    vdi="$SCRATCH_VDI"
-
-    local run_cmd="${cmd//%VDI%/$vdi}"
-    local err
-
-    if [[ "$is_local" == "local" ]]; then
-        err=$(eval "$run_cmd" 2>&1 >/dev/null)
-    else
-        err=$(dom0 "$run_cmd" 2>&1 >/dev/null)
-    fi
-    local rc=$?
+# Judge one completed transfer: check the exit status, then round-trip the VDI
+# through vdi-export and compare the digest. Shared by both runners below.
+# Arguments: description, VDI uuid, transfer exit status, captured stderr
+transport_verdict() {
+    local desc="$1" vdi="$2" rc="$3" err="$4"
 
     if [[ $rc -ne 0 ]]; then
         fail "${desc}"
@@ -288,6 +311,52 @@ try_transport() {
             return 0
             ;;
     esac
+}
+
+# Run one candidate transport on the pool master and report the verdict.
+# Arguments: label, description, the shell command to perform the transfer
+#            (with %VDI% substituted for the scratch VDI's UUID)
+#
+# The command is a string because it is executed by a shell on dom0 either way
+# — that is what SSH does with it.
+try_transport() {
+    local label="$1" desc="$2" cmd="$3"
+    local vdi
+
+    make_scratch_vdi "$label" || { fail "${desc}: could not create a scratch VDI"; return 1; }
+    vdi="$SCRATCH_VDI"
+
+    local err rc=0
+    err=$(dom0 "${cmd//%VDI%/$vdi}" 2>&1 >/dev/null) || rc=$?
+
+    transport_verdict "$desc" "$vdi" "$rc" "$err"
+}
+
+# Run one candidate transport here on the workstation.
+# Arguments: label, description, then the command argv, with %VDI% substituted
+#            in any element.
+#
+# Takes an argv array rather than a command string precisely so nothing here
+# reaches a shell: the earlier string-and-`eval` form put CLI-supplied values
+# (the pool host, the session reference, local paths) back through the parser,
+# where a stray quote in any of them would have executed as code.
+try_transport_local() {
+    local label="$1" desc="$2"; shift 2
+    local vdi
+
+    make_scratch_vdi "$label" || { fail "${desc}: could not create a scratch VDI"; return 1; }
+    vdi="$SCRATCH_VDI"
+
+    local -a argv=()
+    local arg
+    for arg in "$@"; do
+        argv+=("${arg//%VDI%/$vdi}")
+    done
+
+    local err rc=0
+    err=$("${argv[@]}" 2>&1 >/dev/null) || rc=$?
+
+    transport_verdict "$desc" "$vdi" "$rc" "$err"
 }
 
 # ---------------------------------------------------------------------------
@@ -398,15 +467,22 @@ fi
 if [[ -z "$POOL_PASS" ]]; then
     skip "no password supplied; HTTP transports will be skipped"
 else
-    LOGIN_XML="<?xml version=\"1.0\"?><methodCall><methodName>session.login_with_password</methodName><params><param><value><string>${POOL_USER}</string></value></param><param><value><string>${POOL_PASS}</string></value></param></params></methodCall>"
-    XAPI_SESSION=$(curl -sk --max-time 20 -H 'Content-Type: text/xml' \
-        --data-binary "$LOGIN_XML" "https://${POOL_HOST}/" 2>/dev/null \
+    # Log in the way deploy does: from the pool master, against localhost, with
+    # the body on stdin. Logging in from the workstation instead would make the
+    # whole HTTP half of this probe (D-H) depend on the operator's machine
+    # reaching port 443 — a firewall that allows SSH but not 443 would skip the
+    # very transports deploy relies on and report a host as unusable that is
+    # perfectly fine. Sessions are pool-wide, so probe D can still use this one
+    # from the workstation.
+    LOGIN_XML="<?xml version=\"1.0\"?><methodCall><methodName>session.login_with_password</methodName><params><param><value><string>$(xml_escape "$POOL_USER")</string></value></param><param><value><string>$(xml_escape "$POOL_PASS")</string></value></param></params></methodCall>"
+    XAPI_SESSION=$(printf '%s' "$LOGIN_XML" \
+        | dom0 "curl -sk --max-time 20 -H 'Content-Type: text/xml' --data-binary @- https://localhost/" 2>/dev/null \
         | grep -o 'OpaqueRef:[a-f0-9-]*' | head -1)
 
     if [[ -z "$XAPI_SESSION" ]]; then
-        fail "Could not obtain an XAPI session over HTTPS"
+        fail "Could not obtain an XAPI session from the pool master"
     else
-        pass "Session acquired (${XAPI_SESSION:0:20}...)"
+        pass "Session acquired on dom0 (${XAPI_SESSION:0:20}...)"
     fi
 fi
 
@@ -467,9 +543,9 @@ try_transport "c" "C: xe vdi-import filename=<file on dom0>" \
 if [[ -n "$XAPI_SESSION" ]]; then
     echo ""
     detail "${BOLD}D. HTTPS PUT from this workstation${NC}  (known length)"
-    try_transport "d" "D: PUT /import_raw_vdi from workstation" \
-        "curl -sk -f --max-time 300 -T '${LOCAL_PAYLOAD}' 'https://${POOL_HOST}/import_raw_vdi?session_id=${XAPI_SESSION}&vdi=%VDI%&format=raw'" \
-        "local"
+    try_transport_local "d" "D: PUT /import_raw_vdi from workstation" \
+        curl -sk -f --max-time 300 -T "$LOCAL_PAYLOAD" \
+        "https://${POOL_HOST}/import_raw_vdi?session_id=${XAPI_SESSION}&vdi=%VDI%&format=raw"
 
     echo ""
     detail "${BOLD}E. HTTPS PUT from dom0 to itself${NC}  (known length)"
@@ -498,7 +574,7 @@ if [[ -n "$XAPI_SESSION" ]]; then
     try_transport "h" "H: PUT /import_raw_vdi from dom0, streamed + forced Content-Length" \
         "cat ${REMOTE_PAYLOAD} | curl -sk -f --max-time 300 -T - -H 'Transfer-Encoding:' -H 'Content-Length: ${PAYLOAD_BYTES}' 'https://localhost/import_raw_vdi?session_id=${XAPI_SESSION}&vdi=%VDI%&format=raw'"
 else
-    skip "D–G: HTTP transports need an XAPI session"
+    skip "D–H: HTTP transports need an XAPI session"
 fi
 
 # --- Probe 6: template and VM creation ------------------------------------
@@ -610,4 +686,8 @@ if [[ $FAIL_COUNT -gt 0 ]]; then
 fi
 echo ""
 
-[[ ${#WORKING_TRANSPORTS[@]} -gt 0 ]]
+# Exit 0 only when the host is genuinely ready: a working disk transport is
+# necessary but not sufficient, since an SR, network, internet or VM-parameter
+# failure alongside it still means deploy cannot finish here. Reporting success
+# on "one transport worked" would wave through an unusable host in CI.
+[[ ${#WORKING_TRANSPORTS[@]} -gt 0 && $FAIL_COUNT -eq 0 ]]

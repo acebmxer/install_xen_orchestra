@@ -307,3 +307,143 @@ _deploy_drive_fixture() {
     run deploy_hash_password "correct horse battery staple"
     [ "$output" != "$second" ]
 }
+
+# --- input validation -----------------------------------------------------
+#
+# The prompts pair a shape regex with these validators. The regex alone accepts
+# values that look like addresses and ports but are not, and every one of them
+# is only rejected after the VM exists — by cloud-init producing an unreachable
+# guest, or by the installer inside it refusing the port.
+
+@test "is_ipv4 accepts real addresses and rejects out-of-range octets" {
+    is_ipv4 192.168.1.50
+    is_ipv4 0.0.0.0
+    is_ipv4 255.255.255.255
+
+    ! is_ipv4 999.999.999.999
+    ! is_ipv4 192.168.1.256
+    ! is_ipv4 192.168.1
+    ! is_ipv4 192.168.1.1.1
+    ! is_ipv4 ""
+    ! is_ipv4 "not-an-ip"
+}
+
+# Leading zeros must not be read as octal: 010 is 10, not 8, and 08 is not an
+# error.
+@test "is_ipv4 treats zero-padded octets as decimal" {
+    is_ipv4 010.008.001.050
+    ! is_ipv4 010.008.001.300
+}
+
+@test "is_port enforces the full 1-65535 range" {
+    is_port 1
+    is_port 80
+    is_port 65535
+
+    ! is_port 0
+    ! is_port 70000
+    ! is_port 65536
+    ! is_port -1
+    ! is_port ""
+    ! is_port abc
+}
+
+# --- xml_escape -----------------------------------------------------------
+
+@test "xml_escape escapes the characters that break an XML-RPC body" {
+    [ "$(xml_escape 'a&b')" = 'a&amp;b' ]
+    [ "$(xml_escape 'a<b>c')" = 'a&lt;b&gt;c' ]
+    [ "$(xml_escape 'plain')" = 'plain' ]
+
+    # & must be escaped first, or the ampersands introduced by the later
+    # substitutions get escaped a second time.
+    [ "$(xml_escape '<&>')" = '&lt;&amp;&gt;' ]
+}
+
+# --- deploy_set_config_key ------------------------------------------------
+
+@test "deploy_set_config_key appends a key the base config never had" {
+    local f="${TMPDIR_TEST}/cfg"
+    printf 'HTTPS_PORT=443\n' > "$f"
+
+    deploy_set_config_key "$f" HTTP_PORT 8080
+
+    grep -qx "HTTP_PORT=8080" "$f"
+    grep -qx "HTTPS_PORT=443" "$f"
+}
+
+@test "deploy_set_config_key replaces an existing key in place" {
+    local f="${TMPDIR_TEST}/cfg"
+    printf '# comment\nHTTP_PORT=80\nGIT_BRANCH=master\n' > "$f"
+
+    deploy_set_config_key "$f" HTTP_PORT 8080
+
+    [ "$(grep -c '^HTTP_PORT=' "$f")" -eq 1 ]
+    grep -qx "HTTP_PORT=8080" "$f"
+    grep -qx "# comment" "$f"
+}
+
+# A base config that omits a prompted key is legal — load_config defaults it —
+# so the generated config must still carry the answer, or the guest installs on
+# the default while the summary shows what was typed.
+@test "generated config carries prompted keys the base config omits" {
+    local base="${TMPDIR_TEST}/base.cfg"
+    printf 'INSTALL_DIR=/opt/xo\n' > "$base"
+    DEPLOY_CONFIG_BASE="$base"
+    DEPLOY_HTTP_PORT=8080
+    DEPLOY_HTTPS_PORT=8443
+    DEPLOY_GIT_BRANCH=stable
+
+    deploy_build_xo_config
+
+    grep -qx "HTTP_PORT=8080" "$DEPLOY_XO_CONFIG"
+    grep -qx "HTTPS_PORT=8443" "$DEPLOY_XO_CONFIG"
+    grep -qx "GIT_BRANCH=stable" "$DEPLOY_XO_CONFIG"
+    grep -qx "INSTALL_DIR=/opt/xo" "$DEPLOY_XO_CONFIG"
+}
+
+# --- deploy_guest_clone_url -----------------------------------------------
+#
+# The VM gets neither the operator's SSH key nor their credentials, so an
+# origin that works on the workstation is not necessarily one the guest can
+# clone — and one that carries a token must not be copied into user-data.
+
+@test "an SSH origin becomes an HTTPS URL the guest can reach" {
+    [ "$(deploy_guest_clone_url 'git@github.com:acebmxer/install_xen_orchestra.git')" \
+        = "https://github.com/acebmxer/install_xen_orchestra.git" ]
+    [ "$(deploy_guest_clone_url 'ssh://git@github.com/acebmxer/repo.git')" \
+        = "https://github.com/acebmxer/repo.git" ]
+    [ "$(deploy_guest_clone_url 'ssh://git@git.example.com:2222/team/repo.git')" \
+        = "https://git.example.com/team/repo.git" ]
+}
+
+@test "credentials embedded in an HTTPS origin are stripped" {
+    [ "$(deploy_guest_clone_url 'https://user:ghp_secret@github.com/o/repo.git')" \
+        = "https://github.com/o/repo.git" ]
+    [ "$(deploy_guest_clone_url 'https://token@github.com/o/repo.git')" \
+        = "https://github.com/o/repo.git" ]
+}
+
+@test "a plain HTTPS origin is passed through untouched" {
+    local url="https://github.com/acebmxer/install_xen_orchestra.git"
+    [ "$(deploy_guest_clone_url "$url")" = "$url" ]
+
+    # A port on an HTTPS origin is part of the address, not an SSH artefact.
+    [ "$(deploy_guest_clone_url 'https://git.example.com:8443/o/repo.git')" \
+        = "https://git.example.com:8443/o/repo.git" ]
+}
+
+# --- is_safe_url ----------------------------------------------------------
+#
+# The image URL is interpolated into a single-quoted argument in a shell on the
+# pool master.
+
+@test "is_safe_url rejects anything that could escape a remote single quote" {
+    is_safe_url "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.raw"
+    is_safe_url "http://mirror.local/img.raw?token=abc&v=1"
+
+    ! is_safe_url "https://host/img.raw'; rm -rf /; echo '"
+    ! is_safe_url "https://host/img raw"
+    ! is_safe_url "file:///etc/passwd"
+    ! is_safe_url ""
+}

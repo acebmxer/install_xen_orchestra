@@ -55,26 +55,25 @@ Running without flags launches an interactive menu. All flags also work directly
 Running the script with no arguments opens a two-column menu with keyboard navigation:
 
 ```
-  ╔══════════════════════════════════════════════════════════════════════════════════╗
-  ║              Install Xen Orchestra from Sources Setup and Update                 ║
-  ╚══════════════════════════════════════════════════════════════════════════════════╝
+  ╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                                     Install Xen Orchestra from Sources Setup and Update                                     ║
+  ╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 
-                        Current Script Commit : 693f4 (Branch: main)
-                        Master Script Commit  : 693f4 (Branch: main)
-                        Current XO Commit     : a1b2c (Branch: master)
-                      ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 commits behind
-                        Current Node          : v24.15.0
+                                 Current Script Commit : 693f4 (Branch: main)
+                                 Master Script Commit  : 693f4 (Branch: main)
+                                 Current XO Commit     : a1b2c (Branch: master)
+                               ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 commits behind
+                                 Current Node          : v24.15.0
 
-  ──────────────────────────────────────────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  ▸ [ ] Install Xen Orchestra          [ ] Reconfigure Xen Orchestra (made changes to config)
-    [ ] Update Xen Orchestra           [ ] Rebuild Xen Orchestra (wipe & reinstall maintain settings)
-    [ ] Rename Sample-xo-config.cfg    [ ] Edit xo-config.cfg
-    [ ] Install XO Proxy               [ ] Restore Backup
-    [ ] Deploy Xen Orchestra to a new VM (creates the VM for you)
-                       [ ] Adjust Xen Orchestra Memory Allocation
+  ▸ [ ] Install Xen Orchestra                                      [ ] Reconfigure Xen Orchestra (made changes to config)
+    [ ] Update Xen Orchestra                                       [ ] Rebuild Xen Orchestra (wipe & reinstall maintain settings)
+    [ ] Rename Sample-xo-config.cfg                                [ ] Edit xo-config.cfg
+    [ ] Install XO Proxy                                           [ ] Restore Backup
+    [ ] Deploy Xen Orchestra to a new VM (creates the VM for you)  [ ] Adjust Xen Orchestra Memory Allocation
 
-  ──────────────────────────────────────────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
   Selected: 0
 
@@ -157,13 +156,15 @@ anything is created on the pool:
   machine it came from, not a fresh Debian VM.)
 - Right after the prompts, `--deploy` offers to open the generated config in
   your editor (`$EDITOR`/`$VISUAL`, else the base config's `PREFERRED_EDITOR`,
-  else nano/vim/vi). Save and quit and the VM is built with exactly what you
-  left there.
+  else nano/vim/vi — including one with arguments, such as `code --wait`).
+  Save and quit and the VM is built with exactly what you left there.
 
 The edit happens on a throwaway copy in a temp directory, so neither the
 tracked sample nor your own `xo-config.cfg` is modified. Changing the ports in
 the editor is picked up too — the review screen, the post-install check and the
-summary all follow what the file ends up saying.
+summary all follow what the file ends up saying. If the file comes back with a
+port or branch the install could not use, the problem is named and the editor
+reopens; nothing has been created on the pool at that point.
 
 **Requirements**
 
@@ -187,7 +188,17 @@ cd <clone dir> && ./install-xen-orchestra.sh --update
 
 The generated SSH private key is saved next to the script as
 `xo-deploy-<hostname>.key` (git-ignored). Keep it, or add your own key to the VM
-and delete it.
+and delete it. Deploying a second VM with a hostname you have used before does
+not overwrite the first key — that file is the only way into that machine — so
+the new one is saved as `xo-deploy-<hostname>-2.key` and the summary tells you
+which key belongs to the VM just built.
+
+The VM clones this repository from whatever `origin` your checkout uses, so a
+fork deploys itself. An SSH remote (`git@github.com:...`) is converted to the
+equivalent HTTPS URL first, since the VM has none of your keys, and any
+credentials embedded in an HTTPS remote are stripped rather than copied into
+the guest's cloud-init data. The URL the VM will actually use is shown on the
+review screen before anything is created.
 
 **The admin account's password** is optional and asked for during the prompts.
 The account always gets the generated SSH key, so a password only matters for
