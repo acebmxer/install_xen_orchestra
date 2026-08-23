@@ -3376,6 +3376,9 @@ XO_DEPLOY_MIN_DISK_GB=10
 DEPLOY_SSH_CTL=""
 DEPLOY_WORKDIR=""
 DEPLOY_CHOICE=""
+DEPLOY_ADMIN_PASSWORD_HASH=""
+DEPLOY_ADMIN_SSH_PWAUTH="false"
+DEPLOY_REPO_DIR="/opt/install_xen_orchestra"
 
 # Run a command on the pool master.
 #
@@ -3845,6 +3848,106 @@ deploy_prompt_vm_specs() {
 
     deploy_read_validated "Admin username for the VM (used for SSH)" \
         '^[a-z_][a-z0-9_-]*$' "xo" DEPLOY_ADMIN_USER
+
+    deploy_prompt_admin_password
+    deploy_prompt_repo_dir
+}
+
+# Hash a password for cloud-init's hashed_passwd, printing the crypt string.
+# SHA-512 ($6$) is what both tools below produce and what Debian expects.
+# The password is fed over stdin so it never appears in the process list.
+deploy_hash_password() {
+    local pw="$1" hash=""
+
+    if command -v openssl >/dev/null 2>&1; then
+        # -6 needs OpenSSL 1.1.1 or newer; older builds fail and fall through.
+        hash=$(printf '%s' "$pw" | openssl passwd -6 -stdin 2>/dev/null) || hash=""
+    fi
+    if [[ -z "$hash" ]] && command -v mkpasswd >/dev/null 2>&1; then
+        hash=$(printf '%s\n' "$pw" | mkpasswd -m sha-512 --stdin 2>/dev/null) || hash=""
+    fi
+
+    [[ -n "$hash" ]] || return 1
+    printf '%s' "$hash"
+}
+
+# Optionally set a password on the guest's admin account.
+#
+# The account always gets the SSH key this script generates, so a password is
+# strictly extra: it is what lets you log in on the XCP-ng/XenServer console,
+# where no key can be offered, and what `su` asks for. SSH stays key-only
+# unless you ask for password logins as well.
+deploy_prompt_admin_password() {
+    DEPLOY_ADMIN_PASSWORD_HASH=""
+    DEPLOY_ADMIN_SSH_PWAUTH="false"
+
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_info "Non-interactive: leaving ${DEPLOY_ADMIN_USER} SSH-key-only (no password)."
+        return 0
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1 && ! command -v mkpasswd >/dev/null 2>&1; then
+        log_warning "Neither openssl nor mkpasswd is installed, so no password can be hashed."
+        log_warning "The ${DEPLOY_ADMIN_USER} account will be SSH-key-only."
+        return 0
+    fi
+
+    echo ""
+    echo "A password lets you log in as ${DEPLOY_ADMIN_USER} on the VM's console, where an"
+    echo "SSH key cannot be offered. SSH keeps using the key this script generates."
+    echo "Leave it empty for a key-only account."
+    echo ""
+
+    local pw1 pw2
+    while true; do
+        read -t 300 -rsp "Password for ${DEPLOY_ADMIN_USER} (empty to skip): " pw1 < /dev/tty \
+            || { log_error "Input timeout"; exit 1; }
+        echo ""
+
+        if [[ -z "$pw1" ]]; then
+            log_info "No password set; ${DEPLOY_ADMIN_USER} stays SSH-key-only."
+            return 0
+        fi
+        if (( ${#pw1} < 8 )); then
+            log_warning "Use at least 8 characters."
+            continue
+        fi
+
+        read -t 300 -rsp "Confirm password: " pw2 < /dev/tty \
+            || { log_error "Input timeout"; exit 1; }
+        echo ""
+        if [[ "$pw1" != "$pw2" ]]; then
+            log_warning "Passwords do not match, please try again."
+            continue
+        fi
+        break
+    done
+
+    if ! DEPLOY_ADMIN_PASSWORD_HASH=$(deploy_hash_password "$pw1"); then
+        log_error "Could not hash the password with openssl or mkpasswd."
+        exit 1
+    fi
+    pw1=""; pw2=""
+
+    if confirm_or_skip "Also allow SSH logins with this password?"; then
+        DEPLOY_ADMIN_SSH_PWAUTH="true"
+    else
+        log_info "SSH stays key-only; the password is for the console and su."
+    fi
+}
+
+# Ask where the repo should be cloned inside the VM.
+#
+# /opt keeps it out of the admin's home directory (and survives that user being
+# removed); the home directory keeps everything under one owner and needs no
+# root privileges to edit afterwards.
+deploy_prompt_repo_dir() {
+    local home_dir="/home/${DEPLOY_ADMIN_USER}/install_xen_orchestra"
+
+    deploy_choose "Where should this repo be cloned inside the VM?" \
+        "/opt/install_xen_orchestra|/opt/install_xen_orchestra (system-wide)" \
+        "${home_dir}|${home_dir} (${DEPLOY_ADMIN_USER}'s home directory)"
+    DEPLOY_REPO_DIR="$DEPLOY_CHOICE"
 }
 
 # Collect the guest's static network settings.
@@ -3936,6 +4039,18 @@ ethernets:
         - ${DEPLOY_DNS}
 EOF
 
+    # The account's password lines, built here because an unset password and a
+    # set one need different keys. chpasswd/expire keeps the guest from
+    # demanding a password change on the first console login.
+    local password_lines="    lock_passwd: true" expire_lines=""
+    if [[ -n "${DEPLOY_ADMIN_PASSWORD_HASH:-}" ]]; then
+        password_lines="    lock_passwd: false
+    hashed_passwd: '${DEPLOY_ADMIN_PASSWORD_HASH}'"
+        expire_lines="chpasswd:
+  expire: false
+"
+    fi
+
     # Passwordless sudo is a requirement, not a convenience: check_sudo and
     # --non-interactive both need it for the unattended install below.
     cat > "${dir}/user-data" <<EOF
@@ -3948,12 +4063,11 @@ users:
   - name: ${DEPLOY_ADMIN_USER}
     shell: /bin/bash
     sudo: "ALL=(ALL) NOPASSWD:ALL"
-    lock_passwd: true
+${password_lines}
     ssh_authorized_keys:
       - ${pubkey}
 
-# Key-only access; no password is ever set on this account.
-ssh_pwauth: false
+${expire_lines}ssh_pwauth: ${DEPLOY_ADMIN_SSH_PWAUTH:-false}
 disable_root: true
 
 package_update: true
@@ -3964,8 +4078,8 @@ packages:
   - ca-certificates
 
 runcmd:
-  - [git, clone, "${DEPLOY_REPO_URL}", /opt/install_xen_orchestra]
-  - [chown, -R, "${DEPLOY_ADMIN_USER}:${DEPLOY_ADMIN_USER}", /opt/install_xen_orchestra]
+  - [git, clone, "${DEPLOY_REPO_URL}", "${DEPLOY_REPO_DIR}"]
+  - [chown, -R, "${DEPLOY_ADMIN_USER}:${DEPLOY_ADMIN_USER}", "${DEPLOY_REPO_DIR}"]
 EOF
 
     log_info "Building the cloud-init config drive..."
@@ -4133,7 +4247,7 @@ deploy_wait_for_guest() {
     fi
 
     if ! ssh "${ssh_opts[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
-        "test -x /opt/install_xen_orchestra/install-xen-orchestra.sh"; then
+        "test -x ${DEPLOY_REPO_DIR}/install-xen-orchestra.sh"; then
         log_error "The repository was not cloned into the VM as expected."
         log_error "Check /var/log/cloud-init-output.log in the VM for the reason."
         exit 1
@@ -4152,7 +4266,7 @@ deploy_install_xo_in_vm() {
     echo ""
 
     scp "${DEPLOY_SSH_OPTS[@]}" "$DEPLOY_XO_CONFIG" \
-        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}:/opt/install_xen_orchestra/xo-config.cfg" >/dev/null
+        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}:${DEPLOY_REPO_DIR}/xo-config.cfg" >/dev/null
 
     log_info "Running the installer in the VM — output follows."
     echo ""
@@ -4161,7 +4275,7 @@ deploy_install_xo_in_vm() {
     # XO_NO_SELF_UPDATE stops the remote copy from re-execing mid-install; the
     # clone is already at the tip of whatever branch it was cloned from.
     if ! ssh -t "${DEPLOY_SSH_OPTS[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
-        "cd /opt/install_xen_orchestra && XO_NO_SELF_UPDATE=1 ./install-xen-orchestra.sh --install --non-interactive"; then
+        "cd ${DEPLOY_REPO_DIR} && XO_NO_SELF_UPDATE=1 ./install-xen-orchestra.sh --install --non-interactive"; then
         log_error "The Xen Orchestra install failed inside the VM."
         log_error "The VM is still running — connect and investigate with:"
         log_error "  ssh -i ${DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
@@ -4216,11 +4330,21 @@ deploy_print_summary() {
     echo "  Address:     ${DEPLOY_IP}/${DEPLOY_PREFIX}"
     echo ""
     echo "  SSH:         ssh -i ${DEPLOY_SAVED_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
+    if [[ -n "${DEPLOY_ADMIN_PASSWORD_HASH:-}" ]]; then
+        if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" == "true" ]]; then
+            echo "  Console/SSH: user ${DEPLOY_ADMIN_USER} with the password you chose"
+        else
+            echo "  Console:     user ${DEPLOY_ADMIN_USER} with the password you chose"
+            echo "               (SSH itself accepts the key above only)"
+        fi
+    else
+        echo "  Console:     no password was set — the key above is the only way in"
+    fi
     echo ""
-    echo "  This repo lives at /opt/install_xen_orchestra inside the VM."
+    echo "  This repo lives at ${DEPLOY_REPO_DIR} inside the VM."
     echo "  To update Xen Orchestra later, run there:"
     echo ""
-    echo "    cd /opt/install_xen_orchestra && ./install-xen-orchestra.sh --update"
+    echo "    cd ${DEPLOY_REPO_DIR} && ./install-xen-orchestra.sh --update"
     echo ""
     log_warning "Change the default admin@admin.net password before using this in production."
     echo ""
@@ -4277,9 +4401,18 @@ deploy_xo_vm() {
     echo "  VM name:      ${DEPLOY_VM_NAME}"
     echo "  Resources:    ${DEPLOY_VCPUS} vCPU / ${DEPLOY_RAM_GB} GB RAM / ${DEPLOY_DISK_GB} GB disk"
     echo "  Address:      ${DEPLOY_IP}/${DEPLOY_PREFIX} via ${DEPLOY_GATEWAY} (DNS ${DEPLOY_DNS})"
-    echo "  Admin user:   ${DEPLOY_ADMIN_USER}"
+    local admin_auth="SSH key only"
+    if [[ -n "${DEPLOY_ADMIN_PASSWORD_HASH:-}" ]]; then
+        if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" == "true" ]]; then
+            admin_auth="SSH key + password (password SSH logins allowed)"
+        else
+            admin_auth="SSH key + console password"
+        fi
+    fi
+    echo "  Admin user:   ${DEPLOY_ADMIN_USER}  (${admin_auth})"
     echo "  XO ports:     ${DEPLOY_HTTP_PORT} / ${DEPLOY_HTTPS_PORT}  (branch ${DEPLOY_GIT_BRANCH})"
     echo "  Repository:   ${DEPLOY_REPO_URL}"
+    echo "  Clone into:   ${DEPLOY_REPO_DIR}"
     echo ""
     confirm_or_skip "Create this VM?" || { log_info "Deploy cancelled."; return 0; }
 

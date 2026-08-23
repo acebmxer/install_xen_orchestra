@@ -126,7 +126,8 @@ cd install_xen_orchestra
 
 It will ask for your pool master's address and root password, let you pick a
 storage repository and network from what the pool actually has, then ask for
-the VM's size and static address. From there it:
+the VM's size, admin account (optionally with a password), where to clone this
+repository inside the guest, and its static address. From there it:
 
 1. Creates the VM and streams a stock **Debian 13 cloud image** from
    `cloud.debian.org` straight into its disk. The download runs *on the pool
@@ -134,7 +135,8 @@ the VM's size and static address. From there it:
    on dom0's root filesystem.
 2. Attaches a cloud-init config drive that creates your admin user, installs a
    freshly generated SSH key, applies the static address, and clones this
-   repository to `/opt/install_xen_orchestra` in the guest.
+   repository into the guest — either `/opt/install_xen_orchestra` or
+   `/home/<admin>/install_xen_orchestra`, whichever you pick.
 3. SSHes in and runs `--install --non-interactive`, streaming the output to
    your terminal so you see the build as it happens.
 4. Verifies XO answers on `/signin` before reporting success.
@@ -156,12 +158,23 @@ updates work there exactly as anywhere else:
 
 ```bash
 ssh -i xo-deploy-<hostname>.key <admin>@<ip>
-cd /opt/install_xen_orchestra && ./install-xen-orchestra.sh --update
+cd <clone dir> && ./install-xen-orchestra.sh --update
 ```
 
 The generated SSH private key is saved next to the script as
-`xo-deploy-<hostname>.key`. Keep it, or add your own key to the VM and delete
-it. The VM is created with `SERVICE_USER=root` (the current default) and XO's
+`xo-deploy-<hostname>.key` (git-ignored). Keep it, or add your own key to the VM
+and delete it.
+
+**The admin account's password** is optional and asked for during the prompts.
+The account always gets the generated SSH key, so a password only matters for
+the VM's console in XO Lite or XCP-ng Center, where no key can be offered, and
+for `su`. Leave the prompt empty for a key-only account. If you do set one, a
+second prompt asks whether SSH should accept it too; the default is no, keeping
+SSH key-only. Setting the password needs `openssl` (or `mkpasswd`) on your
+workstation — without either, the prompt is skipped and the account stays
+key-only.
+
+The VM is created with `SERVICE_USER=root` (the current default) and XO's
 usual `admin@admin.net` / `admin` starting credentials — **change that password
 before putting the VM to use.**
 

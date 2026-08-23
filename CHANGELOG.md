@@ -29,7 +29,12 @@ This installer builds Xen Orchestra from source and tracks the official
   whole body in RAM and dies with "out of memory" well below a 3 GB image.
   A cloud-init config drive creates the admin user, installs a
   generated SSH key, applies the static address, and clones this repository
-  into the guest; the install itself then runs over SSH as
+  into the guest — either `/opt/install_xen_orchestra` or the admin's home
+  directory, whichever you pick at the prompt. The admin account can also be
+  given a password (hashed locally with `openssl passwd -6`, or `mkpasswd`):
+  it is optional, since the account always gets the SSH key, and exists for the
+  VM's console where no key can be offered. SSH stays key-only unless you
+  answer yes to the follow-up prompt. The install itself then runs over SSH as
   `--install --non-interactive` with its output streamed to your terminal, so
   failures are visible instead of buried in the guest's cloud-init log.
   Available as `--deploy` or from the interactive menu. A static IP is
