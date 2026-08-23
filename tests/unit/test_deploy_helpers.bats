@@ -75,41 +75,38 @@ teardown() {
 
 # --- deploy_build_xo_config ----------------------------------------------
 
-@test "generated config applies the deploy answers over the sample" {
-    DEPLOY_HTTP_PORT=8080
-    DEPLOY_HTTPS_PORT=8443
-    DEPLOY_GIT_BRANCH=stable
-
+@test "the generated config is a verbatim copy of the base" {
     deploy_build_xo_config
 
     [ -f "$DEPLOY_XO_CONFIG" ]
-    grep -qx "HTTP_PORT=8080" "$DEPLOY_XO_CONFIG"
-    grep -qx "HTTPS_PORT=8443" "$DEPLOY_XO_CONFIG"
-    grep -qx "GIT_BRANCH=stable" "$DEPLOY_XO_CONFIG"
+    # Nothing is rewritten on the way through. Rewriting three keys and
+    # carrying the other twenty untouched was an arbitrary split.
+    diff -q "$SAMPLE_CONFIG" "$DEPLOY_XO_CONFIG"
 }
 
-@test "a chosen base config is used instead of the sample" {
-    # What a user gets when they point the deploy at their own xo-config.cfg:
-    # the prompted keys still win, everything else comes from their file.
+@test "every setting in a chosen base config reaches the VM unchanged" {
     # Not named xo-config.cfg: that is what deploy_build_xo_config writes
     # into the same work dir.
     local base="${TMPDIR_TEST}/local-xo-config.cfg"
     cp "$SAMPLE_CONFIG" "$base"
     sed -i -e 's|^INSTALL_DIR=.*|INSTALL_DIR=/srv/xen-orchestra|' \
            -e 's|^SERVICE_USER=.*|SERVICE_USER=xo-service|' \
-           -e 's|^HTTP_PORT=.*|HTTP_PORT=8080|' "$base"
+           -e 's|^NODE_VERSION=.*|NODE_VERSION=22|' \
+           -e 's|^HTTP_PORT=.*|HTTP_PORT=8080|' \
+           -e 's|^GIT_BRANCH=.*|GIT_BRANCH=stable|' "$base"
 
     DEPLOY_CONFIG_BASE="$base"
-    DEPLOY_HTTP_PORT=80
-    DEPLOY_HTTPS_PORT=443
-    DEPLOY_GIT_BRANCH=master
 
     deploy_build_xo_config
 
+    # Ports and branch are settings like any other. They used to be overwritten
+    # from prompts, which meant a config that said 8080 deployed as 80.
+    grep -qx "HTTP_PORT=8080" "$DEPLOY_XO_CONFIG"
+    grep -qx "GIT_BRANCH=stable" "$DEPLOY_XO_CONFIG"
     grep -qx "INSTALL_DIR=/srv/xen-orchestra" "$DEPLOY_XO_CONFIG"
     grep -qx "SERVICE_USER=xo-service" "$DEPLOY_XO_CONFIG"
-    # The prompt is the authority for the three keys it collects.
-    grep -qx "HTTP_PORT=80" "$DEPLOY_XO_CONFIG"
+    grep -qx "NODE_VERSION=22" "$DEPLOY_XO_CONFIG"
+    diff -q "$base" "$DEPLOY_XO_CONFIG"
 }
 
 @test "a missing base config is an error, not a silent fallback" {
@@ -854,20 +851,17 @@ _seed_keys() {
 # A base config that omits a prompted key is legal — load_config defaults it —
 # so the generated config must still carry the answer, or the guest installs on
 # the default while the summary shows what was typed.
-@test "generated config carries prompted keys the base config omits" {
+@test "a trimmed-down base config is copied as-is, not padded out" {
     local base="${TMPDIR_TEST}/base.cfg"
     printf 'INSTALL_DIR=/opt/xo\n' > "$base"
     DEPLOY_CONFIG_BASE="$base"
-    DEPLOY_HTTP_PORT=8080
-    DEPLOY_HTTPS_PORT=8443
-    DEPLOY_GIT_BRANCH=stable
 
     deploy_build_xo_config
 
-    grep -qx "HTTP_PORT=8080" "$DEPLOY_XO_CONFIG"
-    grep -qx "HTTPS_PORT=8443" "$DEPLOY_XO_CONFIG"
-    grep -qx "GIT_BRANCH=stable" "$DEPLOY_XO_CONFIG"
     grep -qx "INSTALL_DIR=/opt/xo" "$DEPLOY_XO_CONFIG"
+    # Keys the file leaves out are the VM's own load_config to default, the
+    # same as any other install. Nothing is injected here.
+    [ "$(wc -l < "$DEPLOY_XO_CONFIG")" -eq 1 ]
 }
 
 # --- deploy_guest_clone_url -----------------------------------------------

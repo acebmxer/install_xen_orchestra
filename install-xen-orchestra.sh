@@ -4622,39 +4622,56 @@ deploy_config_value() {
 # you already keep a tuned xo-config.cfg beside the script, in which case you
 # are asked which one the VM should start from.
 deploy_prompt_xo_settings() {
-    echo ""
-    echo "=============================================="
-    echo "  Xen Orchestra Settings"
-    echo "=============================================="
-    echo ""
-
     DEPLOY_CONFIG_BASE="$SAMPLE_CONFIG"
     DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
 
-    if [[ -f "$CONFIG_FILE" ]]; then
+    # Ports and branch are settings, and settings live in the config file. They
+    # used to be prompted for here as well, which meant answering questions the
+    # chosen file had already answered. They are read from it now instead --
+    # override them by editing the config, same as every other setting.
+    if [[ -f "$CONFIG_FILE" && "$NON_INTERACTIVE" != "true" ]]; then
+        echo ""
+        echo "=============================================="
+        echo "  Xen Orchestra Settings"
+        echo "=============================================="
+        echo ""
         echo "You have an xo-config.cfg on this machine. The VM can start from it"
         echo "instead of the sample — check that its paths and users suit a fresh"
         echo "Debian VM, since they were written for wherever it came from."
-        deploy_choose "Which config should the VM be built from?" \
-            "${SAMPLE_CONFIG}|sample-xo-config.cfg (defaults)" \
-            "${CONFIG_FILE}|xo-config.cfg (this machine's settings)"
-        DEPLOY_CONFIG_BASE="$DEPLOY_CHOICE"
-        if [[ "$DEPLOY_CONFIG_BASE" == "$CONFIG_FILE" ]]; then
+        echo ""
+        if prompt_yes_no "Build the VM from your xo-config.cfg?"; then
+            DEPLOY_CONFIG_BASE="$CONFIG_FILE"
             DEPLOY_CONFIG_BASE_LABEL="xo-config.cfg (this machine's settings)"
         fi
-        echo ""
     fi
 
-    # Offer the base config's own values as the defaults, so choosing a tuned
-    # config does not mean silently reverting its ports on the next prompt.
     local http https branch
     http=$(deploy_config_value "$DEPLOY_CONFIG_BASE" HTTP_PORT)
     https=$(deploy_config_value "$DEPLOY_CONFIG_BASE" HTTPS_PORT)
     branch=$(deploy_config_value "$DEPLOY_CONFIG_BASE" GIT_BRANCH)
 
-    deploy_read_validated "HTTP port" '^[1-9][0-9]*$' "${http:-80}" DEPLOY_HTTP_PORT is_port
-    deploy_read_validated "HTTPS port" '^[1-9][0-9]*$' "${https:-443}" DEPLOY_HTTPS_PORT is_port
-    deploy_read_validated "Git branch to build" '^[A-Za-z0-9._/-]+$' "${branch:-master}" DEPLOY_GIT_BRANCH
+    # A key the file does not carry falls back to the same default the sample
+    # ships, so a trimmed-down config still deploys.
+    DEPLOY_HTTP_PORT="${http:-80}"
+    DEPLOY_HTTPS_PORT="${https:-443}"
+    DEPLOY_GIT_BRANCH="${branch:-master}"
+
+    # Nothing prompts for these any more, so a bad value in the file would
+    # otherwise surface as a failed install inside the VM.
+    local bad=()
+    is_port "$DEPLOY_HTTP_PORT"  || bad+=("HTTP_PORT=${DEPLOY_HTTP_PORT} (must be 1-65535)")
+    is_port "$DEPLOY_HTTPS_PORT" || bad+=("HTTPS_PORT=${DEPLOY_HTTPS_PORT} (must be 1-65535)")
+    [[ "$DEPLOY_GIT_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || bad+=("GIT_BRANCH=${DEPLOY_GIT_BRANCH}")
+
+    if [[ ${#bad[@]} -gt 0 ]]; then
+        log_error "${DEPLOY_CONFIG_BASE_LABEL} has values the install would choke on:"
+        local b
+        for b in "${bad[@]}"; do
+            log_error "  ${b}"
+        done
+        log_error "Fix them in $(basename "$DEPLOY_CONFIG_BASE") and run --deploy again."
+        exit 1
+    fi
 }
 
 # Write the cloud-init config drive.
@@ -4819,10 +4836,11 @@ deploy_build_xo_config() {
         exit 1
     fi
 
+    # A straight copy. No key is rewritten on the way through: singling out
+    # three of them was arbitrary, and left every other setting in the file --
+    # SERVICE_USER, INSTALL_DIR, NODE_VERSION, BIND_ADDRESS and the rest --
+    # being carried across untouched anyway. The VM gets the config as written.
     cp "$base" "$out"
-    deploy_set_config_key "$out" HTTP_PORT  "$DEPLOY_HTTP_PORT"
-    deploy_set_config_key "$out" HTTPS_PORT "$DEPLOY_HTTPS_PORT"
-    deploy_set_config_key "$out" GIT_BRANCH "$DEPLOY_GIT_BRANCH"
 
     DEPLOY_XO_CONFIG="$out"
 }
@@ -5631,7 +5649,6 @@ deploy_xo_vm() {
     else
         echo "  SSH key:      none (the install key is destroyed when the deploy ends)"
     fi
-    echo "  XO ports:     ${DEPLOY_HTTP_PORT} / ${DEPLOY_HTTPS_PORT}  (branch ${DEPLOY_GIT_BRANCH})"
     echo "  Repository:   ${DEPLOY_REPO_URL}"
     echo "  Clone into:   ${DEPLOY_REPO_DIR}"
     echo "  XO config:    from ${DEPLOY_CONFIG_BASE_LABEL}"
