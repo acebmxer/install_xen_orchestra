@@ -3379,18 +3379,30 @@ DEPLOY_CHOICE=""
 
 # Run a command on the pool master.
 #
-# The first invocation authenticates with sshpass and opens a master socket;
-# every later call rides the same connection, so the password is handed to ssh
-# exactly once and each `xe` call costs no extra round trip. sshpass -e reads
-# from $SSHPASS rather than argv, keeping the password out of `ps`.
+# Every call multiplexes over one master SSH connection, so authentication
+# happens exactly once no matter how many `xe` commands the deploy runs.
+#
+# sshpass is used when present — it feeds the password from $SSHPASS rather
+# than argv, keeping it out of `ps`, and means a single prompt for the whole
+# run. It is not required though: without it plain ssh asks for the password
+# itself when the master connection opens, which is one extra prompt and no
+# package to install. Set by deploy_connect_pool_master.
+DEPLOY_AUTH_MODE="prompt"
+
 dom0_exec() {
-    SSHPASS="$HOST_PASSWORD" sshpass -e ssh \
-        -o ControlMaster=auto \
-        -o ControlPath="$DEPLOY_SSH_CTL" \
-        -o ControlPersist=600 \
-        -o StrictHostKeyChecking=accept-new \
-        -o ConnectTimeout=15 \
-        "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@"
+    local common=(
+        -o ControlMaster=auto
+        -o ControlPath="$DEPLOY_SSH_CTL"
+        -o ControlPersist=600
+        -o StrictHostKeyChecking=accept-new
+        -o ConnectTimeout=15
+    )
+    if [[ "$DEPLOY_AUTH_MODE" == "sshpass" ]]; then
+        SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${common[@]}" \
+            "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@"
+    else
+        ssh "${common[@]}" "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@"
+    fi
 }
 
 # Run an `xe` command on the pool master and return its output with the
@@ -3662,22 +3674,21 @@ netmask_to_prefix() {
 # Note this is the *workstation's* dependency list — it is deliberately short,
 # because all the XAPI work happens on the pool master.
 deploy_check_local_deps() {
-    detect_package_manager
-
-    # sshpass authenticates the initial connection to the pool master.
-    if ! command -v sshpass >/dev/null 2>&1; then
-        log_info "Installing sshpass..."
+    # An ISO9660 writer is the one thing we may genuinely have to install, for
+    # the cloud-init config drive. Either tool will do and most systems already
+    # have one; xorriso is packaged on both Debian and RHEL families, so that
+    # is what we reach for when neither is present.
+    #
+    # sudo is requested here rather than up front in main(): --deploy changes
+    # nothing on this machine, so asking for a password before we know we need
+    # one is pure friction.
+    if ! command -v genisoimage >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then
+        log_info "The cloud-init config drive needs an ISO writer, which is not installed."
+        detect_package_manager
+        check_sudo
+        log_info "Installing xorriso..."
         # shellcheck disable=SC2086
         run_cmd $PKG_UPDATE
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL sshpass
-    fi
-
-    # An ISO9660 writer for the cloud-init config drive. Either of these will
-    # do and most systems already have one; xorriso is packaged on both Debian
-    # and RHEL families, so that is what we install when neither is present.
-    if ! command -v genisoimage >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then
-        log_info "Installing xorriso (builds the cloud-init config drive)..."
         # shellcheck disable=SC2086
         run_cmd $PKG_INSTALL xorriso
     fi
@@ -3720,8 +3731,21 @@ deploy_connect_pool_master() {
 
     DEPLOY_SSH_CTL="${DEPLOY_WORKDIR}/ssh-ctl"
 
+    # The password is needed either way: XAPI's HTTP endpoint authenticates
+    # with it, not with an SSH key. sshpass just saves ssh asking again.
+    if command -v sshpass >/dev/null 2>&1; then
+        DEPLOY_AUTH_MODE="sshpass"
+    else
+        DEPLOY_AUTH_MODE="prompt"
+        echo ""
+        log_info "sshpass is not installed, so ssh will ask for that password once more."
+        log_info "Installing sshpass avoids the second prompt; nothing else changes."
+    fi
+
     log_info "Connecting to ${HOST_USERNAME}@${POOL_MASTER_IP}..."
-    if ! dom0_exec "true" >/dev/null 2>&1; then
+    # Not redirected: in prompt mode this is where ssh asks for the password,
+    # and hiding its prompt would look like a hang.
+    if ! dom0_exec "true"; then
         log_error "Could not connect to the pool master. Check the address and credentials."
         exit 1
     fi
@@ -5529,10 +5553,11 @@ process_menu_selections() {
     fi
 
     # Deploy Xen Orchestra to a new VM
+    # No check_sudo: nothing is installed on this machine unless an ISO writer
+    # is missing, and deploy_check_local_deps asks for sudo then.
     if [[ ${MENU_SELECTED[4]} -eq 1 ]]; then
         check_required_commands
         check_not_root
-        check_sudo
         deploy_xo_vm
     fi
 
@@ -5826,13 +5851,13 @@ main() {
             install_xo_proxy
             ;;
         --deploy)
-            # Deliberately no check_systemctl or load_config: this operation
-            # targets a VM that does not exist yet, and reads nothing from the
-            # local install. check_sudo is still needed to install sshpass and
-            # the ISO writer if they are missing.
+            # Deliberately minimal: this operation targets a VM that does not
+            # exist yet, reads nothing from the local install, and changes
+            # nothing on this machine. No check_systemctl, no load_config, and
+            # no check_sudo — deploy_check_local_deps asks for sudo only if an
+            # ISO writer actually has to be installed.
             check_required_commands
             check_not_root
-            check_sudo
             deploy_xo_vm
             ;;
         --adjust-memory)

@@ -145,8 +145,11 @@ the VM's size and static address. From there it:
 - A free **static IP** — this is required, not optional. A stock Debian cloud
   image has no `xe-guest-utilities`, so the host cannot report a DHCP lease
   back and the script would have no address to install over.
-- On your workstation: `ssh`, `scp`, `ssh-keygen`, plus `sshpass` and an ISO
-  writer (`genisoimage` or `xorriso`), which the script installs if missing.
+- On your workstation: `ssh`, `scp`, `ssh-keygen`, and an ISO writer
+  (`genisoimage` or `xorriso`). Only the ISO writer might need installing, and
+  that is the sole reason `--deploy` would ask for sudo — nothing else about
+  this operation touches your machine. `sshpass` is optional: with it you are
+  asked for the pool master password once, without it `ssh` asks a second time.
 
 **Afterwards** the VM contains an ordinary checkout of this repository, so
 updates work there exactly as anywhere else:
