@@ -4856,8 +4856,6 @@ deploy_edit_xo_config() {
 
     echo ""
     echo "The VM's xo-config.cfg is built from ${DEPLOY_CONFIG_BASE_LABEL}."
-    echo "Everything not asked about above -- install dir, service user, Node"
-    echo "version, SSL and backup paths -- comes from there."
     echo ""
 
     confirm_or_skip "Review it in an editor before the VM is created?" || return 0
