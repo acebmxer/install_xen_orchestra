@@ -171,3 +171,88 @@ teardown() {
 
     [ "$(stat -c '%a' "$DEPLOY_SSH_KEY")" = "600" ]
 }
+
+# Set the variables deploy_build_config_drive reads, so each test below only
+# has to override the one thing it is about.
+_deploy_drive_fixture() {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available"
+    command -v genisoimage >/dev/null || command -v xorriso >/dev/null \
+        || skip "no ISO writer available"
+
+    DEPLOY_VM_NAME=test-vm
+    DEPLOY_HOSTNAME=test-vm
+    DEPLOY_ADMIN_USER=xo
+    DEPLOY_IP=192.168.1.50
+    DEPLOY_PREFIX=24
+    DEPLOY_GATEWAY=192.168.1.1
+    DEPLOY_DNS=1.1.1.1
+    DEPLOY_REPO_URL="https://example.invalid/repo.git"
+}
+
+@test "no password leaves the account locked and key-only" {
+    _deploy_drive_fixture
+    DEPLOY_ADMIN_PASSWORD_HASH=""
+    DEPLOY_ADMIN_SSH_PWAUTH=false
+
+    deploy_build_config_drive
+
+    local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
+    grep -q "lock_passwd: true" "$user_data"
+    ! grep -q "hashed_passwd" "$user_data"
+    grep -q "ssh_pwauth: false" "$user_data"
+}
+
+@test "a password hash is embedded and the account unlocked" {
+    _deploy_drive_fixture
+    DEPLOY_ADMIN_PASSWORD_HASH='$6$abcdefgh$0123456789'
+    DEPLOY_ADMIN_SSH_PWAUTH=false
+
+    deploy_build_config_drive
+
+    local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
+    grep -q "lock_passwd: false" "$user_data"
+    grep -qF "hashed_passwd: '\$6\$abcdefgh\$0123456789'" "$user_data"
+
+    # A password must not silently open up SSH...
+    grep -q "ssh_pwauth: false" "$user_data"
+    # ...and must not expire on the first console login.
+    grep -q "expire: false" "$user_data"
+}
+
+@test "password SSH logins are enabled only when asked for" {
+    _deploy_drive_fixture
+    DEPLOY_ADMIN_PASSWORD_HASH='$6$abcdefgh$0123456789'
+    DEPLOY_ADMIN_SSH_PWAUTH=true
+
+    deploy_build_config_drive
+
+    grep -q "ssh_pwauth: true" "${DEPLOY_WORKDIR}/cidata/user-data"
+}
+
+@test "the repo is cloned into the chosen directory" {
+    _deploy_drive_fixture
+    DEPLOY_REPO_DIR=/home/xo/install_xen_orchestra
+
+    deploy_build_config_drive
+
+    local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
+    grep -q 'git, clone, "https://example.invalid/repo.git", "/home/xo/install_xen_orchestra"' "$user_data"
+    grep -q 'chown, -R, "xo:xo", "/home/xo/install_xen_orchestra"' "$user_data"
+    ! grep -q "/opt/install_xen_orchestra" "$user_data"
+}
+
+@test "deploy_hash_password produces a SHA-512 crypt string" {
+    command -v openssl >/dev/null || command -v mkpasswd >/dev/null \
+        || skip "no password hashing tool available"
+
+    run deploy_hash_password "correct horse battery staple"
+    [ "$status" -eq 0 ]
+    [[ "$output" == '$6$'* ]]
+
+    # The same password twice must not give the same hash, or the salt is
+    # not being applied.
+    run deploy_hash_password "correct horse battery staple"
+    local second="$output"
+    run deploy_hash_password "correct horse battery staple"
+    [ "$output" != "$second" ]
+}

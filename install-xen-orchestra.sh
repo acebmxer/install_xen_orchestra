@@ -3379,6 +3379,8 @@ DEPLOY_CHOICE=""
 DEPLOY_ADMIN_PASSWORD_HASH=""
 DEPLOY_ADMIN_SSH_PWAUTH="false"
 DEPLOY_REPO_DIR="/opt/install_xen_orchestra"
+DEPLOY_CIDATA_VDI=""
+DEPLOY_CIDATA_VBD=""
 
 # Run a command on the pool master.
 #
@@ -4193,7 +4195,7 @@ deploy_create_vm() {
         log_error "Failed to import the cloud-init config drive."
         exit 1
     fi
-    dom0_xe "vbd-create vm-uuid=${DEPLOY_VM_UUID} vdi-uuid=${DEPLOY_CIDATA_VDI} device=1 type=Disk mode=RO" >/dev/null
+    DEPLOY_CIDATA_VBD=$(dom0_xe "vbd-create vm-uuid=${DEPLOY_VM_UUID} vdi-uuid=${DEPLOY_CIDATA_VDI} device=1 type=Disk mode=RO")
 
     # Network interface.
     dom0_xe "vif-create vm-uuid=${DEPLOY_VM_UUID} network-uuid=${DEPLOY_NETWORK_UUID} device=0" >/dev/null
@@ -4301,6 +4303,43 @@ deploy_verify_xo() {
     log_warning "The service may still be starting. Check with:"
     log_warning "  ssh -i ${DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP} sudo systemctl status xo-server"
     return 0
+}
+
+# Detach and destroy the cloud-init config drive once the guest no longer
+# needs it.
+#
+# It has done its job by this point: cloud-init has run and cached its result
+# in /var/lib/cloud, and netplan's config is written to the root disk, so the
+# static address survives without it. Leaving it attached would leave the
+# admin account's password hash sitting on a 16 MiB disk that anyone able to
+# attach a VDI could read and crack offline, and would re-seed cloud-init on
+# any clone of this VM — giving the clone the same static IP as the original.
+#
+# Best-effort: the install has already succeeded, so a hot-unplug that the
+# guest refuses is a warning with the manual commands, never a failed deploy.
+deploy_remove_config_drive() {
+    [[ -n "${DEPLOY_CIDATA_VDI:-}" ]] || return 0
+
+    log_info "Removing the cloud-init config drive from the VM..."
+
+    if [[ -n "${DEPLOY_CIDATA_VBD:-}" ]]; then
+        if ! dom0_xe "vbd-unplug uuid=${DEPLOY_CIDATA_VBD}" >/dev/null 2>&1; then
+            log_warning "The guest did not release the config drive; leaving it attached."
+            log_warning "Remove it later (it holds your admin password hash) with:"
+            log_warning "  xe vbd-unplug uuid=${DEPLOY_CIDATA_VBD}"
+            log_warning "  xe vbd-destroy uuid=${DEPLOY_CIDATA_VBD}"
+            log_warning "  xe vdi-destroy uuid=${DEPLOY_CIDATA_VDI}"
+            return 0
+        fi
+        dom0_xe "vbd-destroy uuid=${DEPLOY_CIDATA_VBD}" >/dev/null 2>&1 || true
+    fi
+
+    if dom0_xe "vdi-destroy uuid=${DEPLOY_CIDATA_VDI}" >/dev/null 2>&1; then
+        log_success "Config drive detached and destroyed"
+    else
+        log_warning "Could not destroy the config drive VDI ${DEPLOY_CIDATA_VDI}."
+        log_warning "Remove it by hand with: xe vdi-destroy uuid=${DEPLOY_CIDATA_VDI}"
+    fi
 }
 
 # Persist the generated SSH key next to the script so the user can still reach
@@ -4423,6 +4462,7 @@ deploy_xo_vm() {
     deploy_save_ssh_key
     deploy_install_xo_in_vm
     deploy_verify_xo
+    deploy_remove_config_drive
     deploy_print_summary
 }
 

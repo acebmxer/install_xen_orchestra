@@ -139,7 +139,10 @@ repository inside the guest, and its static address. From there it:
    `/home/<admin>/install_xen_orchestra`, whichever you pick.
 3. SSHes in and runs `--install --non-interactive`, streaming the output to
    your terminal so you see the build as it happens.
-4. Verifies XO answers on `/signin` before reporting success.
+4. Verifies XO answers on `/signin`, then detaches and destroys the cloud-init
+   config drive — it has served its purpose, and it holds the admin password
+   hash. If the guest refuses the hot-unplug, you get the `xe` commands to
+   remove it by hand rather than a failed deploy.
 
 **Requirements**
 

@@ -34,7 +34,12 @@ This installer builds Xen Orchestra from source and tracks the official
   given a password (hashed locally with `openssl passwd -6`, or `mkpasswd`):
   it is optional, since the account always gets the SSH key, and exists for the
   VM's console where no key can be offered. SSH stays key-only unless you
-  answer yes to the follow-up prompt. The install itself then runs over SSH as
+  answer yes to the follow-up prompt. The config drive is detached and
+  destroyed once the install succeeds — cloud-init has cached its result and
+  netplan's config lives on the root disk by then, so keeping it would only
+  leave the password hash readable to anyone who can attach a VDI, and re-seed
+  cloud-init (static IP included) on any clone of the VM. The install itself
+  then runs over SSH as
   `--install --non-interactive` with its output streamed to your terminal, so
   failures are visible instead of buried in the guest's cloud-init log.
   Available as `--deploy` or from the interactive menu. A static IP is
