@@ -3667,59 +3667,104 @@ deploy_xapi_logout() {
 
 # Stream a remote image straight into a VDI, entirely on the pool master.
 # Arguments: VDI uuid, source URL
+# The streaming import's remote program, in its own function so it survives one
+# round of shell quoting instead of three, and so the tests can read it.
+#
+# The pipeline is built by hand rather than written as `curl | curl` because a
+# plain pipe deadlocks when the download dies: the upload has already promised
+# XAPI an exact Content-Length, so it sits waiting to send bytes that are never
+# coming while XAPI waits for them, and neither notices. --speed-time does not
+# save it -- by then curl is waiting for a response, not transferring, so the
+# speed meter has stopped ticking and only --max-time 3600 eventually fires.
+# Watching the download's exit status and killing the upload ends it at once.
+deploy_stream_script() {
+    cat <<'STREAM_EOF'
+set -o pipefail
+url=$1; size=$2; target=$3
+
+fifo=$(mktemp -u) || exit 1
+mkfifo "$fifo" || exit 1
+trap 'rm -f "$fifo"' EXIT
+
+curl -fsS -L --speed-limit 1024 --speed-time 60 --max-time 3600 "$url" > "$fifo" &
+dl=$!
+
+curl -sk -f --speed-limit 1024 --speed-time 60 --max-time 3600 -T - \
+     -H 'Transfer-Encoding:' -H "Content-Length: $size" "$target" < "$fifo" &
+ul=$!
+
+if ! wait "$dl"; then
+    kill "$ul" 2>/dev/null
+    wait "$ul" 2>/dev/null
+    exit 1
+fi
+wait "$ul"
+STREAM_EOF
+}
+
+# Get the cloud image into a VDI, staging it on the host by preference.
+#
+# Staging wins on every count that matters. The download lands in a file, so it
+# can be resumed with -C - and retried, and its size can be checked against
+# what the server advertised before a byte reaches the disk. Streaming can do
+# none of those: one dropped TLS record and the transfer is gone, with no way
+# to resume a pipe that has already fed bytes to a fixed-Content-Length PUT.
+# Over a link that drops the occasional record -- which a multi-gigabyte
+# transfer will eventually meet -- streaming fails every attempt while staging
+# rides it out.
+#
+# So streaming is now what it should always have been: the fallback for a host
+# without the few gigabytes of scratch space staging needs.
 deploy_import_vdi_from_url() {
     local vdi="$1" url="$2"
+
+    # `|| rc=$?` rather than a bare call: under `set -e` a function returning
+    # non-zero on its own line takes the script down with it, so the fallback
+    # below would never be reached -- a host short on scratch space would fail
+    # the whole deploy instead of streaming the image in.
+    local rc=0
+    deploy_import_vdi_staged "$vdi" "$url" || rc=$?
+
+    # Anything but "no room to stage" is a real failure. Falling through to
+    # streaming after a download that already exhausted its retries would just
+    # spend another few minutes arriving at the same place.
+    if (( rc != 2 )); then
+        return $rc
+    fi
+
+    log_warning "Not enough scratch space on the pool master to stage the image."
+    log_warning "Falling back to streaming it straight into the disk."
+    log_warning "This cannot resume a broken transfer, so a flaky link may fail it."
 
     # The PUT needs an exact Content-Length, so ask the origin how big the
     # image is before starting. -L follows the redirects Debian's mirrors use.
     local size
-    size=$(dom0_exec "curl -fsSLI '${url}' 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -1 | awk '{print \$2}'")
+    size=$(dom0_exec "curl -fsSLI '${url}' 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -1 | awk '{print \$2}'" | tr -d '\r')
 
     if [[ -z "$size" || ! "$size" =~ ^[0-9]+$ ]]; then
-        log_warning "The image server did not report a size; falling back to staging on disk."
-        deploy_import_vdi_staged "$vdi" "$url"
-        return $?
+        log_error "The image server did not report a size, so it cannot be streamed"
+        log_error "either. Free up space in /var/tmp on the pool master and retry."
+        return 1
     fi
 
     log_info "  image is $(( size / 1048576 )) MiB; streaming it into the disk"
 
-    # Three things this pipeline has to get right, all of them learned the hard
-    # way from a transfer that died at 33%:
-    #
-    #   - pipefail. Without it the remote shell reports only the *upload*
-    #     curl's status, so a download that failed halfway looks like a
-    #     successful import and the VM boots from a truncated disk. Silent
-    #     corruption is the worst outcome available here, so the pipeline runs
-    #     under bash -o pipefail rather than dom0's default sh behaviour.
-    #
-    #   - the stall guards. When the download dies, the upload curl has already
-    #     promised XAPI ${size} bytes and sits waiting to send the rest.
-    #     XAPI waits for data that is never coming, and --max-time alone means
-    #     that deadlock lasts a full hour before anything gives. Aborting when
-    #     throughput sits under 1 KiB/s for 60s turns that into a minute.
-    #
-    #   - no --retry. It is tempting, and it is wrong here: curl retries by
-    #     re-issuing the request from byte 0, and in a pipe feeding a
-    #     fixed-Content-Length PUT those bytes are appended to what was already
-    #     sent. The result is a corrupt image that imports cleanly. Retrying is
-    #     the staged path's job, where the download lands in a file and -C -
-    #     can resume it properly.
-    local stall="--speed-limit 1024 --speed-time 60"
-    if dom0_exec "bash -o pipefail -c \"curl -fsSL ${stall} --max-time 3600 '${url}' \
-            | curl -sk -f ${stall} --max-time 3600 -T - \
-              -H 'Transfer-Encoding:' -H 'Content-Length: ${size}' \
-              'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'\""; then
-        return 0
-    fi
-
-    log_warning "Streaming import failed; retrying by staging the image on the host."
-    log_info "  (the staged path can resume a broken download; streaming cannot)"
-    deploy_import_vdi_staged "$vdi" "$url"
+    local target="https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw"
+    # A here-string, not a pipe: if the remote shell ever exits before reading
+    # the program, a pipe hands back SIGPIPE (141) instead of whatever actually
+    # went wrong. This is also how the config-drive upload feeds dom0_exec.
+    dom0_exec "bash -s -- '${url}' '${size}' '${target}'" <<< "$(deploy_stream_script)"
 }
 
-# Fallback import: download to dom0, PUT from the file, delete it.
-# Slower and needs free space on the host, but survives an origin that will not
-# report a Content-Length.
+# The default import path: download to dom0, PUT from the file, delete it.
+#
+# Needs the image's size free in /var/tmp, and pays an extra disk round trip
+# for it. What that buys is every property the streaming path cannot have -- a
+# download that resumes and retries, and a size that can be checked before
+# anything is written into the VDI.
+#
+# Returns 0 on success, 2 when there is not enough scratch space to try (the
+# caller falls back to streaming), and 1 on any other failure.
 deploy_import_vdi_staged() {
     local vdi="$1" url="$2"
     local tmp="/var/tmp/xo-deploy-image-$$.raw"
@@ -3736,12 +3781,14 @@ deploy_import_vdi_staged() {
         need_mb=$(( size / 1048576 + 256 ))
     fi
 
+    # Returns 2, not 1, when there is no room: this is the one failure the
+    # caller can do something about, by falling back to a streaming import that
+    # needs no scratch space. Every other failure here is terminal.
     local free_mb
     free_mb=$(dom0_exec "df -BM --output=avail /var/tmp 2>/dev/null | tail -1 | tr -d ' M'" | tr -d '\r')
     if [[ -n "$free_mb" ]] && (( free_mb < need_mb )); then
-        log_error "The pool master has only ${free_mb} MiB free in /var/tmp;"
-        log_error "staging this image needs about ${need_mb} MiB. Free some space and retry."
-        return 1
+        log_info "  /var/tmp on the pool master has ${free_mb} MiB free; staging needs ${need_mb} MiB."
+        return 2
     fi
 
     # Unlike the streaming path, this one lands in a file, so a broken transfer

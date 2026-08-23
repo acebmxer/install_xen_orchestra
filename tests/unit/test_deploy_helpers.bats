@@ -352,50 +352,112 @@ _import_stub() {
     DEPLOY_SESSION="OpaqueRef:test"
     HOST_USERNAME=root
     POOL_MASTER_IP=10.0.0.1
+    FREE_MB="${FREE_MB:-999999}"
     dom0_exec() {
         printf '%s\n' "$*" >> "$CMDLOG"
         case "$*" in
             *content-length*) echo "3221225472" ;;
-            *"df -BM"*)       echo "999999" ;;
+            *"df -BM"*)       echo "$FREE_MB" ;;
             *"stat -c %s"*)   echo "$STAGED_SIZE" ;;
+            *"--progress-bar"*) [[ -z "${DOWNLOAD_FAILS:-}" ]] || return 1 ;;
         esac
         return 0
     }
 }
 
-@test "the streaming import runs under pipefail" {
+@test "staging is the default path, not the fallback" {
     _import_stub
 
     deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
 
-    # Without this the remote shell reports only the upload curl's status, so a
-    # download that died halfway imports a truncated disk and reports success.
-    grep -q -- "-o pipefail" "$CMDLOG"
+    # Staging is the only path that can resume, retry and size-check, so it is
+    # what a normal deploy should use. Streaming must not be attempted at all
+    # when there is room to stage.
+    grep -q -- "--progress-bar" "$CMDLOG"
+    ! grep -q -- "bash -s --" "$CMDLOG"
 }
 
-@test "both ends of the streaming pipeline abort on a stall" {
+@test "streaming is used only when there is no room to stage" {
     _import_stub
+    FREE_MB=10
 
     deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
 
-    # When the download dies, the upload sits waiting to send bytes that are
-    # never coming and XAPI waits with it. --max-time alone makes that deadlock
-    # last an hour; the stall guard ends it in a minute.
-    local line
-    line=$(grep -- "-o pipefail" "$CMDLOG")
-    [ "$(grep -c -- "--speed-time 60" <<< "$line")" -ge 1 ]
-    [[ "$line" == *"--speed-limit 1024"* ]]
+    grep -q -- "bash -s --" "$CMDLOG"
+}
+
+@test "a staged download that fails for any other reason does not fall through" {
+    _import_stub
+    DOWNLOAD_FAILS=1
+
+    run deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
+    [ "$status" -ne 0 ]
+
+    # Retrying by streaming after the download already exhausted its retries
+    # just spends minutes reaching the same failure.
+    ! grep -q -- "bash -s --" "$CMDLOG"
+}
+
+# --- deploy_stream_script -------------------------------------------------
+
+_stream_stub_curl() {
+    mkdir -p "${TMPDIR_TEST}/bin"
+    cat > "${TMPDIR_TEST}/bin/curl" <<'STUB'
+#!/bin/sh
+case "$*" in
+  *-T\ -*)
+      # The upload: drain what arrives, then block the way curl does while it
+      # waits for a response XAPI will never send.
+      cat >/dev/null
+      echo "upload-still-running" >> "$STREAM_MARK"
+      sleep 60
+      exit 0 ;;
+  *)
+      # The download: emit a little, then die like the TLS error did.
+      echo "partial"
+      [ -n "$DL_FAILS" ] && exit 56
+      exit 0 ;;
+esac
+STUB
+    chmod +x "${TMPDIR_TEST}/bin/curl"
+}
+
+# The bug this pins: with a plain `curl | curl`, a download that dies leaves the
+# upload waiting on a response until --max-time 3600. An hour of apparent hang,
+# which in practice means the operator interrupts the deploy.
+@test "a dead download kills the upload instead of waiting it out" {
+    _stream_stub_curl
+    export STREAM_MARK="${TMPDIR_TEST}/mark"
+    : > "$STREAM_MARK"
+
+    local start_ts end_ts status=0
+    start_ts=$(date +%s)
+    DL_FAILS=1 PATH="${TMPDIR_TEST}/bin:$PATH" \
+        bash -s -- "https://example.invalid/img.raw" 100 "https://localhost/import" \
+        <<< "$(deploy_stream_script)" >/dev/null 2>&1 || status=$?
+    end_ts=$(date +%s)
+
+    [ "$status" -ne 0 ]
+    # The stub upload sleeps 60s. Returning promptly proves it was killed
+    # rather than waited on.
+    [ $(( end_ts - start_ts )) -lt 20 ]
+}
+
+@test "the stream script runs under pipefail and guards against stalls" {
+    run deploy_stream_script
+
+    [[ "$output" == *"set -o pipefail"* ]]
+    [ "$(grep -c -- "--speed-time 60" <<< "$output")" -eq 2 ]
+    [ "$(grep -c -- "--speed-limit 1024" <<< "$output")" -eq 2 ]
 }
 
 # curl retries by re-issuing from byte 0. Piped into a PUT with a fixed
 # Content-Length, those bytes land *after* the ones already sent: a corrupt
 # image that imports without complaint. Resuming is the staged path's job.
-@test "the streaming import never uses --retry" {
-    _import_stub
+@test "the stream script never uses --retry" {
+    run deploy_stream_script
 
-    deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
-
-    ! grep -q -- "--retry" "$CMDLOG"
+    [[ "$output" != *"--retry"* ]]
 }
 
 @test "the staged download resumes and retries" {

@@ -10,7 +10,28 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Changed
+- **The cloud image is staged on the pool master by default instead of being
+  streamed.** Staging is the only path that can resume a broken download, retry
+  a transient failure, and check the downloaded size before anything reaches the
+  VDI; streaming can do none of those, because a pipe already feeding a
+  fixed-`Content-Length` PUT cannot be rewound. On a link that drops the
+  occasional TLS record — which any multi-gigabyte transfer eventually meets —
+  streaming failed every attempt while staging rode it out. Streaming is now
+  what it should always have been: the fallback for a host without the few
+  gigabytes of scratch space staging needs.
+
 ### Fixed
+- **A stalled streaming import no longer has to be interrupted by hand.** When
+  the download end died, the upload sat waiting for a response XAPI would never
+  send. `--speed-time` could not help — by that point curl is waiting, not
+  transferring, so the speed meter has stopped ticking and only `--max-time
+  3600` would eventually fire. The two transfers now run as separate processes
+  with the download's exit status watched, and the upload is killed the moment
+  it fails.
+- **A pool master short on scratch space no longer fails the whole deploy.**
+  The staged path signalled "no room" with a plain non-zero return, which under
+  `set -e` took the script down before the fallback could be reached.
 - **A failed cloud-image download no longer looks like a successful import.**
   The streaming import piped one `curl` into another, and the remote shell
   reported only the *upload* side's exit status. A download that died partway —
