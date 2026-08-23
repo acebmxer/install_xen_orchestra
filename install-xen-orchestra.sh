@@ -30,7 +30,7 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 ORIGINAL_ARGS=("$@")
 CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
-LATEST_CONFIG_VERSION=2
+LATEST_CONFIG_VERSION=3
 
 # Runtime mode flags (set via CLI flags in main())
 NON_INTERACTIVE=false
@@ -402,6 +402,7 @@ load_config() {
     SSL_CERT_DIR=${SSL_CERT_DIR:-/etc/ssl/xo}
     SSL_CERT_FILE=${SSL_CERT_FILE:-xo-cert.pem}
     SSL_KEY_FILE=${SSL_KEY_FILE:-xo-key.pem}
+    SSL_CERT_DAYS=${SSL_CERT_DAYS:-825}
     GIT_BRANCH=${GIT_BRANCH:-master}
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
@@ -466,6 +467,13 @@ validate_config() {
     # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1)
     if ! [[ "$NODE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
         errors+=("NODE_VERSION must be a valid version number (e.g. 22, 22.3), got: $NODE_VERSION")
+    fi
+
+    # Validate SSL_CERT_DAYS is a sane certificate lifetime
+    if ! [[ "${SSL_CERT_DAYS:-825}" =~ ^[0-9]+$ ]]; then
+        errors+=("SSL_CERT_DAYS must be a number, got: ${SSL_CERT_DAYS:-}")
+    elif [[ ${SSL_CERT_DAYS:-825} -lt 1 ]]; then
+        errors+=("SSL_CERT_DAYS must be at least 1, got: ${SSL_CERT_DAYS:-}")
     fi
 
     # Validate ENCRYPT_REDIS_CREDENTIALS is a boolean
@@ -558,6 +566,25 @@ migrate_config() {
             } >> "$cfg_file"
         fi
         CONFIG_VERSION=2
+    fi
+
+    # v2 → v3: add SSL_CERT_DAYS. Existing installs keep the certificate they
+    # already have (generate_ssl_certificate never overwrites one), so this
+    # only takes effect when a cert is reissued — but the key needs to be in
+    # the file for anyone who goes looking for the knob.
+    if [[ "$current_ver" -lt 3 ]]; then
+        if ! grep -q '^[[:space:]]*SSL_CERT_DAYS=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# Validity of the generated self-signed certificate, in days."
+                echo "# 825 is the ceiling most security policies inherited from the"
+                echo "# CA/Browser Forum; a longer-lived certificate is a common audit"
+                echo "# finding. Existing certificates are never regenerated — delete the"
+                echo "# files in SSL_CERT_DIR and run --reconfigure to reissue."
+                echo "SSL_CERT_DAYS=825"
+            } >> "$cfg_file"
+        fi
+        CONFIG_VERSION=3
     fi
 
     # Stamp the new schema version.
@@ -1537,7 +1564,24 @@ generate_ssl_certificate() {
     local CERT_CN
     CERT_CN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "xen-orchestra")
 
-    run_cmd sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    # 825 days is the longest lifetime the CA/Browser Forum ever allowed for a
+    # public certificate, and the ceiling most internal policies inherited. The
+    # old 3650-day default outlived any reasonable key-rotation window and is
+    # a standing audit finding; regenerate with --reconfigure after deleting
+    # the files in SSL_CERT_DIR, or raise SSL_CERT_DAYS if you accept the risk.
+    # validate_config rejects a non-numeric or zero value before this runs; the
+    # fallback here only covers a caller that never loaded a config.
+    local cert_days="${SSL_CERT_DAYS:-825}"
+    if [[ ! "$cert_days" =~ ^[0-9]+$ ]] || (( cert_days < 1 )); then
+        log_warning "SSL_CERT_DAYS='${cert_days}' is not a positive number; using 825."
+        cert_days=825
+    fi
+    if (( cert_days > 825 )); then
+        log_warning "SSL_CERT_DAYS=${cert_days} exceeds the 825-day maximum most policies"
+        log_warning "allow for a TLS certificate. Continuing because you asked for it."
+    fi
+
+    run_cmd sudo openssl req -x509 -nodes -days "$cert_days" -newkey rsa:2048 \
         -keyout "${SSL_CERT_DIR}/${SSL_KEY_FILE}" \
         -out "${SSL_CERT_DIR}/${SSL_CERT_FILE}" \
         -subj "/CN=${CERT_CN}" \
@@ -1552,7 +1596,7 @@ generate_ssl_certificate() {
         run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$SSL_CERT_DIR"
     fi
 
-    log_success "SSL certificates generated in $SSL_CERT_DIR"
+    log_success "SSL certificates generated in $SSL_CERT_DIR (valid ${cert_days} days)"
 }
 
 # Configure Xen Orchestra
@@ -3053,6 +3097,16 @@ print_summary() {
     echo "  - Username: admin@admin.net"
     echo "  - Password: admin"
     echo ""
+    echo "  These are Xen Orchestra's published defaults - every install starts"
+    echo "  with them, so anyone who can reach ${HTTPS_URL} can log in"
+    echo "  as a full administrator until you change them. Xen Orchestra holds"
+    echo "  your pool's root credentials, so treat this as the first task, not"
+    echo "  a later one:"
+    echo ""
+    echo "    1. Open ${HTTPS_URL} and sign in as admin@admin.net / admin"
+    echo "    2. Go to Settings -> Users, or the account menu -> Profile"
+    echo "    3. Set a strong, unique password (and enable OTP while you are there)"
+    echo ""
     echo "Service Management:"
     echo "  - Start:   sudo systemctl start xo-server"
     echo "  - Stop:    sudo systemctl stop xo-server"
@@ -3062,7 +3116,8 @@ print_summary() {
     echo "To update Xen Orchestra, run:"
     echo "  $0 --update"
     echo ""
-    log_warning "Please change the default password immediately!"
+    log_warning "HIGHLY RECOMMENDED: change the default admin@admin.net password now."
+    log_warning "Until you do, this installation accepts a publicly known login."
     echo ""
 }
 
@@ -3397,6 +3452,10 @@ XO_DEPLOY_IMAGE_URL="${XO_DEPLOY_IMAGE_URL:-https://cloud.debian.org/images/clou
 # import to fit, and cloud-init's growpart expands the filesystem to whatever
 # size we actually create.
 XO_DEPLOY_MIN_DISK_GB=10
+# The admin password is the credential the finished VM is left with -- the
+# deploy key is destroyed on the way out -- so it carries more weight than a
+# convenience password and the floor is set accordingly.
+XO_DEPLOY_MIN_PASSWORD_LEN=12
 
 # Populated by the deploy_* prompt functions below.
 DEPLOY_SSH_CTL=""
@@ -3410,7 +3469,16 @@ DEPLOY_CIDATA_VBD=""
 DEPLOY_CONFIG_BASE=""
 DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
 DEPLOY_VM_STARTED="false"
-DEPLOY_SAVED_KEY=""
+DEPLOY_SUDO_HARDENED="false"
+# The operator's own public key, if they gave one, and the throwaway deployment
+# key's public half, which deploy_revoke_deploy_key needs in order to find and
+# remove exactly its own line from the guest's authorized_keys.
+DEPLOY_USER_PUBKEY=""
+DEPLOY_PUBKEY=""
+DEPLOY_KEY_REVOKED="false"
+# Declared here so the post-install hardening steps can test it under `set -u`
+# even on a path that never reached deploy_wait_for_guest.
+DEPLOY_SSH_OPTS=()
 
 # Suppressing `set -x` around anything that touches the pool password.
 #
@@ -3727,6 +3795,13 @@ deploy_cleanup() {
             "${HOST_USERNAME}@${POOL_MASTER_IP}" 2>/dev/null || true
     fi
     if [[ -n "$DEPLOY_WORKDIR" && -d "$DEPLOY_WORKDIR" ]]; then
+        # The deployment key's private half lives here and is never copied out,
+        # so this is where it dies. rm alone is enough for a mode-700 directory
+        # under /tmp, but shred costs nothing when it is available and closes
+        # the gap on filesystems that hand the blocks straight back.
+        if [[ -f "${DEPLOY_WORKDIR}/id_ed25519" ]] && command -v shred >/dev/null 2>&1; then
+            shred -u "${DEPLOY_WORKDIR}/id_ed25519" 2>/dev/null || true
+        fi
         rm -rf "$DEPLOY_WORKDIR"
     fi
 }
@@ -3859,12 +3934,83 @@ deploy_check_local_deps() {
     fi
 
     local missing=()
-    for cmd in ssh scp ssh-keygen; do
+    for cmd in ssh scp ssh-keygen ssh-keyscan; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing required commands: ${missing[*]}"
         log_error "Install your distribution's openssh-client package and retry."
+        exit 1
+    fi
+}
+
+# Show the pool master's SSH host key the first time we see it.
+#
+# Every dom0_exec after this carries the host's root password, so the very
+# first connection is the one that matters: ssh rejects a *changed* key on its
+# own, but on first contact there is nothing to compare against, and anything
+# answering on that address would collect the password. Once the key is in
+# known_hosts, ssh enforces it and this is a no-op.
+#
+# Set XO_DEPLOY_POOL_FINGERPRINT to the expected SHA256 fingerprint to check it
+# without a prompt -- the only form of this that works under --non-interactive.
+deploy_verify_host_key() {
+    local expected="${XO_DEPLOY_POOL_FINGERPRINT:-}"
+
+    if ssh-keygen -F "$POOL_MASTER_IP" >/dev/null 2>&1; then
+        [[ -n "$expected" ]] || return 0
+    fi
+
+    local scan="${DEPLOY_WORKDIR}/pool_hostkey"
+    if ! ssh-keyscan -T 10 "$POOL_MASTER_IP" > "$scan" 2>/dev/null || [[ ! -s "$scan" ]]; then
+        log_warning "Could not read the SSH host key of ${POOL_MASTER_IP} in advance."
+        log_warning "ssh will still verify it against your known_hosts when it connects."
+        return 0
+    fi
+
+    # Prefer the ed25519 key when the host offers several, so the fingerprint
+    # shown is the same one on every run rather than whichever ssh-keyscan
+    # happened to return first.
+    local fp_line
+    fp_line=$(ssh-keygen -lf "$scan" 2>/dev/null | grep -i 'ED25519' | head -1)
+    [[ -n "$fp_line" ]] || fp_line=$(ssh-keygen -lf "$scan" 2>/dev/null | head -1)
+    if [[ -z "$fp_line" ]]; then
+        log_warning "Could not fingerprint the host key of ${POOL_MASTER_IP}; continuing."
+        return 0
+    fi
+
+    local fp
+    fp=$(awk '{print $2}' <<< "$fp_line")
+
+    if [[ -n "$expected" ]]; then
+        if [[ "$fp" == "$expected" ]]; then
+            log_success "Pool master host key matches XO_DEPLOY_POOL_FINGERPRINT."
+            return 0
+        fi
+        log_error "The host key of ${POOL_MASTER_IP} does not match XO_DEPLOY_POOL_FINGERPRINT."
+        log_error "  expected: ${expected}"
+        log_error "  offered:  ${fp}"
+        log_error "Refusing to send the host password. Investigate before retrying."
+        exit 1
+    fi
+
+    echo ""
+    log_warning "First connection to ${POOL_MASTER_IP} — its SSH host key is not known yet."
+    echo ""
+    echo "  ${fp_line}"
+    echo ""
+    echo "  The host password you just entered is sent over this connection, so it is"
+    echo "  worth one check. On the pool master's console, run:"
+    echo ""
+    echo "    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
+    echo ""
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_warning "Non-interactive: accepting this key without confirmation."
+        log_warning "Set XO_DEPLOY_POOL_FINGERPRINT to have it verified instead."
+        return 0
+    fi
+    if ! confirm_or_skip "Does that fingerprint match?"; then
+        log_error "Host key not confirmed. Nothing has been sent to ${POOL_MASTER_IP}."
         exit 1
     fi
 }
@@ -3910,6 +4056,8 @@ deploy_connect_pool_master() {
         log_info "sshpass is not installed, so ssh will ask for that password once more."
         log_info "Installing sshpass avoids the second prompt; nothing else changes."
     fi
+
+    deploy_verify_host_key
 
     log_info "Connecting to ${HOST_USERNAME}@${POOL_MASTER_IP}..."
     # Not redirected: in prompt mode this is where ssh asks for the password,
@@ -4016,7 +4164,71 @@ deploy_prompt_vm_specs() {
         '^[a-z_][a-z0-9_-]*$' "xo" DEPLOY_ADMIN_USER
 
     deploy_prompt_admin_password
+    deploy_prompt_admin_ssh_key
     deploy_prompt_repo_dir
+}
+
+# Read and validate an SSH public key, echoing the single line to install.
+#
+# Takes a file path or the key text itself. Two checks, because either alone
+# lets something through that matters here:
+#
+#   - the first field must be a known public key type, which is what stops a
+#     *private* key being accepted. `ssh-keygen -l` happily fingerprints a
+#     private key file, and the key ends up in cloud-init's user-data, which is
+#     world-readable inside the guest -- the exact leak this whole change is
+#     about;
+#   - ssh-keygen must then agree it parses, which catches truncation and the
+#     line-wrapping that copying a key through a chat window introduces.
+#
+# Returns 1 and echoes nothing when the input is not a usable public key.
+deploy_load_pubkey() {
+    local src="$1" line=""
+
+    if [[ -f "$src" ]]; then
+        line=$(head -1 "$src" 2>/dev/null) || return 1
+    else
+        line="$src"
+    fi
+
+    # Strip a trailing CR from a key that has been through a Windows editor,
+    # plus surrounding whitespace.
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+
+    [[ -n "$line" ]] || return 1
+
+    case "${line%% *}" in
+        ssh-ed25519|ssh-rsa|ssh-dss| \
+        ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521| \
+        sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+        *) return 1 ;;
+    esac
+
+    local check="${DEPLOY_WORKDIR}/pubkey.check"
+    printf '%s\n' "$line" > "$check"
+    if ! ssh-keygen -l -f "$check" >/dev/null 2>&1; then
+        rm -f "$check"
+        return 1
+    fi
+    rm -f "$check"
+
+    printf '%s' "$line"
+}
+
+# Describe a public key for a prompt or the summary: "ed25519 SHA256:... (comment)".
+deploy_pubkey_label() {
+    local line="$1" check="${DEPLOY_WORKDIR}/pubkey.label" out=""
+    printf '%s\n' "$line" > "$check"
+    out=$(ssh-keygen -l -f "$check" 2>/dev/null || true)
+    rm -f "$check"
+    if [[ -n "$out" ]]; then
+        # ssh-keygen prints "<bits> <fingerprint> <comment> (<TYPE>)".
+        printf '%s' "$out"
+    else
+        printf '%s' "${line%% *}"
+    fi
 }
 
 # Hash a password for cloud-init's hashed_passwd, printing the crypt string.
@@ -4042,10 +4254,12 @@ deploy_hash_password() {
 
 # Optionally set a password on the guest's admin account.
 #
-# The account always gets the SSH key this script generates, so a password is
-# strictly extra: it is what lets you log in on the XCP-ng/XenServer console,
-# where no key can be offered, and what `su` asks for. SSH stays key-only
-# unless you ask for password logins as well.
+# The password is required, not optional. The keypair this script generates is
+# a deployment credential that deploy_revoke_deploy_key destroys when the
+# install finishes, so the password is what remains: it is the console login on
+# the XCP-ng/XenServer console where no key can be offered, what `su` asks for,
+# and what sudo asks for once deploy_harden_guest_sudo has run. An account
+# without one would be unreachable the moment the deploy key goes away.
 deploy_prompt_admin_password() {
     # The console password is compared and hashed in here, both of which xtrace
     # would print. See the note above dom0_exec for why `local -` is enough.
@@ -4055,35 +4269,57 @@ deploy_prompt_admin_password() {
     DEPLOY_ADMIN_PASSWORD_HASH=""
     DEPLOY_ADMIN_SSH_PWAUTH="false"
 
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
-        log_info "Non-interactive: leaving ${DEPLOY_ADMIN_USER} SSH-key-only (no password)."
-        return 0
+    # Hashing is mandatory now, so a missing tool is a hard failure rather than
+    # the quiet downgrade to a key-only account this used to be.
+    if ! command -v openssl >/dev/null 2>&1 && ! command -v mkpasswd >/dev/null 2>&1; then
+        log_error "The admin account needs a password, and hashing one needs openssl"
+        log_error "or mkpasswd. Neither is installed."
+        log_error "  Debian/Ubuntu: sudo apt-get install openssl"
+        log_error "  RHEL family:   sudo dnf install openssl"
+        exit 1
     fi
 
-    if ! command -v openssl >/dev/null 2>&1 && ! command -v mkpasswd >/dev/null 2>&1; then
-        log_warning "Neither openssl nor mkpasswd is installed, so no password can be hashed."
-        log_warning "The ${DEPLOY_ADMIN_USER} account will be SSH-key-only."
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        if [[ -z "${XO_DEPLOY_ADMIN_PASSWORD:-}" ]]; then
+            log_error "A password for ${DEPLOY_ADMIN_USER} is required, and there is no terminal"
+            log_error "to ask for one. Set XO_DEPLOY_ADMIN_PASSWORD and retry."
+            exit 1
+        fi
+        if (( ${#XO_DEPLOY_ADMIN_PASSWORD} < XO_DEPLOY_MIN_PASSWORD_LEN )); then
+            log_error "XO_DEPLOY_ADMIN_PASSWORD is shorter than ${XO_DEPLOY_MIN_PASSWORD_LEN} characters."
+            exit 1
+        fi
+        if ! DEPLOY_ADMIN_PASSWORD_HASH=$(deploy_hash_password "$XO_DEPLOY_ADMIN_PASSWORD"); then
+            log_error "Could not hash XO_DEPLOY_ADMIN_PASSWORD with openssl or mkpasswd."
+            exit 1
+        fi
+        if [[ "${XO_DEPLOY_ADMIN_SSH_PWAUTH:-false}" == "true" ]]; then
+            DEPLOY_ADMIN_SSH_PWAUTH="true"
+        fi
+        log_info "Non-interactive: admin password taken from XO_DEPLOY_ADMIN_PASSWORD."
         return 0
     fi
 
     echo ""
-    echo "A password lets you log in as ${DEPLOY_ADMIN_USER} on the VM's console, where an"
-    echo "SSH key cannot be offered. SSH keeps using the key this script generates."
-    echo "Leave it empty for a key-only account."
+    echo "The ${DEPLOY_ADMIN_USER} account needs a password. This is not optional:"
+    echo ""
+    echo "  - it is the only way in on the VM's console, where no SSH key can be offered;"
+    echo "  - sudo asks for it once the install finishes and the passwordless rule the"
+    echo "    unattended install needed is revoked;"
+    echo "  - the SSH key this script generates is a deployment credential and is"
+    echo "    destroyed when the deploy finishes, so it will not be there for you."
+    echo ""
+    echo "Minimum ${XO_DEPLOY_MIN_PASSWORD_LEN} characters. Use a password manager."
     echo ""
 
     local pw1 pw2
     while true; do
-        read -t 300 -rsp "Password for ${DEPLOY_ADMIN_USER} (empty to skip): " pw1 < /dev/tty \
+        read -t 300 -rsp "Password for ${DEPLOY_ADMIN_USER}: " pw1 < /dev/tty \
             || { log_error "Input timeout"; exit 1; }
         echo ""
 
-        if [[ -z "$pw1" ]]; then
-            log_info "No password set; ${DEPLOY_ADMIN_USER} stays SSH-key-only."
-            return 0
-        fi
-        if (( ${#pw1} < 8 )); then
-            log_warning "Use at least 8 characters."
+        if (( ${#pw1} < XO_DEPLOY_MIN_PASSWORD_LEN )); then
+            log_warning "Use at least ${XO_DEPLOY_MIN_PASSWORD_LEN} characters."
             continue
         fi
 
@@ -4106,8 +4342,96 @@ deploy_prompt_admin_password() {
     if confirm_or_skip "Also allow SSH logins with this password?"; then
         DEPLOY_ADMIN_SSH_PWAUTH="true"
     else
-        log_info "SSH stays key-only; the password is for the console and su."
+        log_info "SSH stays key-only; the password is for the console, su and sudo."
     fi
+}
+
+# Ask for a public key to install on the admin account.
+#
+# The keypair this script generates exists so the unattended install can run,
+# and deploy_revoke_deploy_key removes it from the VM when that is done -- it
+# is never saved to disk for you to look after, because an unencrypted private
+# key granting root-equivalent access is exactly the credential an audit picks
+# up on. Anything you want to keep using has to be your own key, so this asks
+# for one instead of handing you ours.
+#
+# Declining is fine: the account still has its password for the console, and
+# for SSH too if you enabled password logins.
+deploy_prompt_admin_ssh_key() {
+    DEPLOY_USER_PUBKEY=""
+
+    local candidate=""
+
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        candidate="${XO_DEPLOY_ADMIN_SSH_KEY:-}"
+        if [[ -z "$candidate" ]]; then
+            log_info "Non-interactive: no XO_DEPLOY_ADMIN_SSH_KEY set."
+            log_warning "The VM will have no SSH key. Console access uses the admin password."
+            return 0
+        fi
+        if ! DEPLOY_USER_PUBKEY=$(deploy_load_pubkey "$candidate"); then
+            log_error "XO_DEPLOY_ADMIN_SSH_KEY is not a usable SSH public key: ${candidate}"
+            exit 1
+        fi
+        log_info "Installing the public key from XO_DEPLOY_ADMIN_SSH_KEY."
+        return 0
+    fi
+
+    # Offer the operator's own key rather than making them type a path.
+    local default="" f
+    for f in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub" "$HOME/.ssh/id_rsa.pub"; do
+        if [[ -r "$f" ]]; then default="$f"; break; fi
+    done
+
+    echo ""
+    echo "SSH access to the finished VM uses a key you own."
+    echo ""
+    echo "The key this script generates for the install is destroyed at the end of the"
+    echo "deploy, so it will not be left on your disk and cannot be used afterwards."
+    echo "Give a public key here to keep SSH access; leave it empty for console-only."
+    echo ""
+
+    local reply
+    while true; do
+        if [[ -n "$default" ]]; then
+            echo -n "Public key file to install [${default}] (empty for none): "
+        else
+            echo -n "Public key file to install (empty for none): "
+        fi
+        read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+
+        # A bare Enter takes the offered default when there is one; "-" is the
+        # escape hatch for wanting no key at all despite having one on disk.
+        if [[ -z "$reply" && -n "$default" ]]; then
+            reply="$default"
+        elif [[ "$reply" == "-" ]]; then
+            reply=""
+        fi
+
+        if [[ -z "$reply" ]]; then
+            log_warning "No SSH key will be installed. Console access uses the admin password."
+            if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" != "true" ]]; then
+                log_warning "SSH password logins are off, so the console is the only way in."
+            fi
+            confirm_or_skip "Continue without an SSH key?" && return 0
+            continue
+        fi
+
+        # `read` does not do tilde expansion, so a path typed as ~/.ssh/id.pub
+        # arrives with a literal tilde and would not be found. The quoted "~/"
+        # below is deliberately literal -- it is the text being matched, not a
+        # path being expanded.
+        # shellcheck disable=SC2088
+        if [[ "$reply" == "~/"* ]]; then
+            reply="${HOME}/${reply#\~/}"
+        fi
+
+        if DEPLOY_USER_PUBKEY=$(deploy_load_pubkey "$reply"); then
+            log_success "Will install: $(deploy_pubkey_label "$DEPLOY_USER_PUBKEY")"
+            return 0
+        fi
+        log_warning "That is not a usable SSH public key file. Try again, or empty for none."
+    done
 }
 
 # Ask where the repo should be cloned inside the VM.
@@ -4222,13 +4546,25 @@ deploy_build_config_drive() {
     local dir="${DEPLOY_WORKDIR}/cidata"
     mkdir -p "$dir"
 
-    log_info "Generating an SSH keypair for the new VM..."
-    ssh-keygen -t ed25519 -N "" -C "install-xen-orchestra deploy" \
+    # A throwaway credential for the install itself. It never leaves
+    # DEPLOY_WORKDIR (removed by the EXIT trap), and deploy_revoke_deploy_key
+    # takes its public half back out of the guest when the install finishes,
+    # so it is dead by the time the deploy is over.
+    log_info "Generating a temporary SSH keypair for the install..."
+    ssh-keygen -t ed25519 -N "" -C "install-xen-orchestra deploy (temporary)" \
         -f "${DEPLOY_WORKDIR}/id_ed25519" >/dev/null
     DEPLOY_SSH_KEY="${DEPLOY_WORKDIR}/id_ed25519"
 
-    local pubkey
-    pubkey=$(<"${DEPLOY_SSH_KEY}.pub")
+    DEPLOY_PUBKEY=$(<"${DEPLOY_SSH_KEY}.pub")
+    DEPLOY_PUBKEY="${DEPLOY_PUBKEY%$'\n'}"
+
+    # The operator's own key, when they gave one, goes in alongside it and is
+    # what remains after the deploy key is revoked.
+    local pubkey_lines="      - ${DEPLOY_PUBKEY}"
+    if [[ -n "${DEPLOY_USER_PUBKEY:-}" ]]; then
+        pubkey_lines="${pubkey_lines}
+      - ${DEPLOY_USER_PUBKEY}"
+    fi
 
     cat > "${dir}/meta-data" <<EOF
 instance-id: ${DEPLOY_VM_NAME}-$(date +%s)
@@ -4266,8 +4602,19 @@ EOF
 "
     fi
 
-    # Passwordless sudo is a requirement, not a convenience: check_sudo and
-    # --non-interactive both need it for the unattended install below.
+    # Passwordless sudo is a requirement of the install, not a convenience:
+    # check_sudo and --non-interactive both need it for the unattended run
+    # below, which happens over SSH with no TTY to answer a password prompt.
+    #
+    # It is also temporary. deploy_harden_guest_sudo tightens this rule to
+    # "ALL=(ALL:ALL) ALL" once the install returns, so the finished VM asks for
+    # a password like any other machine. That step needs a password to ask for,
+    # so it only runs when the admin account has one -- see the note there.
+    #
+    # package_upgrade brings the image up to its distribution's current
+    # security patches before anything is exposed; the stock cloud image is
+    # only patched to its build date. unattended-upgrades keeps it that way,
+    # configured explicitly below rather than left to debconf defaults.
     cat > "${dir}/user-data" <<EOF
 #cloud-config
 hostname: ${DEPLOY_HOSTNAME}
@@ -4280,17 +4627,26 @@ users:
     sudo: "ALL=(ALL) NOPASSWD:ALL"
 ${password_lines}
     ssh_authorized_keys:
-      - ${pubkey}
+${pubkey_lines}
 
 ${expire_lines}ssh_pwauth: ${DEPLOY_ADMIN_SSH_PWAUTH:-false}
 disable_root: true
 
 package_update: true
+package_upgrade: true
 packages:
   - git
   - curl
   - sudo
   - ca-certificates
+  - unattended-upgrades
+
+write_files:
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    permissions: '0644'
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
 
 runcmd:
   - [git, clone, "${DEPLOY_REPO_URL}", "${DEPLOY_REPO_DIR}"]
@@ -4594,6 +4950,22 @@ deploy_wait_for_guest() {
     log_success "Guest is ready"
 }
 
+# How the operator reaches the VM once this run is over.
+#
+# Never the deployment key: by the time any of these messages are read it has
+# either been revoked or gone with DEPLOY_WORKDIR on the EXIT trap. What is
+# left is whatever the operator brought -- their own key, a password login if
+# they enabled one, or the console.
+deploy_access_hint() {
+    if [[ -n "${DEPLOY_USER_PUBKEY:-}" ]]; then
+        echo "  ssh ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}   (using the key you supplied)"
+    elif [[ "${DEPLOY_ADMIN_SSH_PWAUTH:-false}" == "true" ]]; then
+        echo "  ssh ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}   (password login, as you enabled)"
+    else
+        echo "  the VM's console in XO Lite or XCP-ng Center, as ${DEPLOY_ADMIN_USER}"
+    fi
+}
+
 # Copy the generated config into the VM and run the installer over SSH.
 deploy_install_xo_in_vm() {
     echo ""
@@ -4614,11 +4986,11 @@ deploy_install_xo_in_vm() {
     if ! ssh -t "${DEPLOY_SSH_OPTS[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
         "cd ${DEPLOY_REPO_DIR} && XO_NO_SELF_UPDATE=1 ./install-xen-orchestra.sh --install --non-interactive"; then
         log_error "The Xen Orchestra install failed inside the VM."
-        log_error "The VM is still running — connect and investigate with:"
-        # DEPLOY_SSH_KEY lives in DEPLOY_WORKDIR, which the EXIT trap deletes on
-        # the way out, so the command the user is handed must name the copy
-        # deploy_save_ssh_key already persisted.
-        log_error "  ssh -i ${DEPLOY_SAVED_KEY:-$DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
+        log_error "The VM is still running. Reach it through:"
+        # Not the deployment key: it lives in DEPLOY_WORKDIR, which the EXIT
+        # trap deletes on the way out of this very failure.
+        log_error "$(deploy_access_hint)"
+        log_error "Then look at ${DEPLOY_REPO_DIR} and /var/log/cloud-init-output.log."
         exit 1
     fi
 }
@@ -4638,9 +5010,165 @@ deploy_verify_xo() {
     fi
 
     log_warning "Xen Orchestra returned HTTP ${code} instead of 200."
-    log_warning "The service may still be starting. Check with:"
-    log_warning "  ssh -i ${DEPLOY_SAVED_KEY:-$DEPLOY_SSH_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP} sudo systemctl status xo-server"
+    log_warning "The service may still be starting. Check it from:"
+    log_warning "$(deploy_access_hint)"
+    log_warning "with: sudo systemctl status xo-server"
     return 0
+}
+
+# Redact the copies of the cloud-init user-data that survive the config drive.
+#
+# Destroying the VDI removes the drive, but cloud-init has already cached the
+# user-data it read from it inside the guest -- /var/lib/cloud/instance and
+# /var/lib/cloud/instances/<id>, plus the DEBUG-level cloud-init log Debian
+# ships enabled. Those copies hold the admin account's password hash, so the
+# drive being gone is only half the cleanup.
+#
+# Both paths are best-effort: a VM that is otherwise fine should not fail the
+# deploy because a log could not be rewritten, but the operator is told.
+deploy_scrub_guest_cloudinit_cache() {
+    # The hash is fed to the guest over stdin below; xtrace would print it.
+    local -
+    set +x
+
+    [[ ${#DEPLOY_SSH_OPTS[@]} -gt 0 ]] || return 0
+
+    log_info "Redacting the cached cloud-init user-data in the VM..."
+
+    # A valid, empty cloud-config replaces the cached user-data rather than the
+    # files being deleted: cloud-init reads them on a later boot and an empty
+    # document is understood, where a missing or malformed one logs errors.
+    local scrub_files='
+set -e
+for f in /var/lib/cloud/instance/user-data.txt \
+         /var/lib/cloud/instance/user-data.txt.i \
+         /var/lib/cloud/instances/*/user-data.txt \
+         /var/lib/cloud/instances/*/user-data.txt.i; do
+    [ -f "$f" ] || continue
+    printf "#cloud-config\n# Redacted by install-xen-orchestra --deploy.\n" > "$f"
+    chmod 0600 "$f"
+    chown root:root "$f"
+done
+'
+    if ! ssh "${DEPLOY_SSH_OPTS[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "sudo sh -c '${scrub_files}'" >/dev/null 2>&1; then
+        log_warning "Could not redact the cached cloud-init user-data in the VM."
+        log_warning "It holds the admin password hash. Remove it by hand with:"
+        log_warning "  sudo truncate -s 0 /var/lib/cloud/instance/user-data.txt"
+    fi
+
+    # Nothing to strip from the logs when no password was set: the only other
+    # thing user-data carries is the public key and the repository URL.
+    [[ -n "${DEPLOY_ADMIN_PASSWORD_HASH:-}" ]] || return 0
+
+    # The hash goes over stdin, never onto the guest's command line, where it
+    # would sit in the process list for anyone running ps during the rewrite.
+    # That rules out a heredoc for the program itself -- it would take the same
+    # stdin -- so the program travels base64-encoded in the command instead,
+    # which also spares it a round of shell quoting. cloud-init requires
+    # python3, so the guest is guaranteed to have it.
+    local py_prog py_b64
+    py_prog='
+import glob, os, sys
+secret = sys.stdin.readline().strip()
+if secret:
+    paths = glob.glob("/var/log/cloud-init.log*")
+    paths += glob.glob("/var/log/cloud-init-output.log*")
+    for path in paths:
+        try:
+            with open(path, "r", errors="replace") as fh:
+                data = fh.read()
+            if secret in data:
+                with open(path, "w") as fh:
+                    fh.write(data.replace(secret, "<redacted>"))
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+'
+    py_b64=$(printf '%s' "$py_prog" | base64 | tr -d '\n')
+
+    if ! printf '%s\n' "$DEPLOY_ADMIN_PASSWORD_HASH" | ssh "${DEPLOY_SSH_OPTS[@]}" \
+        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "sudo python3 -c \"import base64;exec(base64.b64decode('${py_b64}'))\"" >/dev/null 2>&1; then
+        log_warning "Could not scan the VM's cloud-init logs for the password hash."
+        log_warning "Check /var/log/cloud-init.log in the VM if that matters to you."
+    else
+        log_success "Cached cloud-init user-data redacted"
+    fi
+}
+
+# Revoke the passwordless sudo the unattended install needed.
+#
+# cloud-init grants "ALL=(ALL) NOPASSWD:ALL" because the install runs over SSH
+# with no TTY to answer a password prompt. That grant has no reason to outlive
+# the install, and leaving it turns the deploy key into unauthenticated root on
+# the appliance -- the finding every baseline (CIS Debian 5.3.4 among them)
+# raises. So it is rewritten to the ordinary "ALL=(ALL:ALL) ALL" here.
+#
+# It only runs when the admin account actually has a password. Requiring one
+# from an account created with lock_passwd would not harden the VM, it would
+# lock the operator out of root entirely, recoverable only from the console in
+# single-user mode. deploy_prompt_admin_password now insists on a password, so
+# this guard should never fire on a normal deploy -- it stays because the cost
+# of being wrong about that is an unrecoverable VM.
+#
+# The rewrite is validated before and after it lands, and rolled back if the
+# resulting sudoers tree does not parse: a broken /etc/sudoers.d file is the
+# same lockout by a different route.
+deploy_harden_guest_sudo() {
+    [[ ${#DEPLOY_SSH_OPTS[@]} -gt 0 ]] || return 0
+
+    DEPLOY_SUDO_HARDENED="false"
+
+    if [[ -z "${DEPLOY_ADMIN_PASSWORD_HASH:-}" ]]; then
+        log_warning "Leaving passwordless sudo in place for ${DEPLOY_ADMIN_USER}."
+        log_warning "The account has no password, so requiring one for sudo would lock"
+        log_warning "you out of root. Set a password in the VM, then tighten it with:"
+        log_warning "  sudo passwd ${DEPLOY_ADMIN_USER}"
+        log_warning "  echo '${DEPLOY_ADMIN_USER} ALL=(ALL:ALL) ALL' | sudo tee /etc/sudoers.d/90-cloud-init-users"
+        return 0
+    fi
+
+    log_info "Revoking the passwordless sudo used for the install..."
+
+    # DEPLOY_ADMIN_USER is validated against ^[a-z_][a-z0-9_-]*$ when it is
+    # read, so it is safe to interpolate into the remote script.
+    local harden='
+set -e
+f=/etc/sudoers.d/90-cloud-init-users
+b=$(mktemp) || exit 1
+t=$(mktemp) || exit 1
+if [ -f "$f" ]; then cp -a "$f" "$b"; fi
+{
+    echo "# Rewritten by install-xen-orchestra --deploy once the install finished."
+    echo "# cloud-init granted NOPASSWD for the unattended install; that is over."
+    echo "'"${DEPLOY_ADMIN_USER}"' ALL=(ALL:ALL) ALL"
+} > "$t"
+chmod 0440 "$t"
+visudo -cf "$t" >/dev/null 2>&1 || { rm -f "$b" "$t"; exit 2; }
+install -o root -g root -m 0440 "$t" "$f"
+if ! visudo -c >/dev/null 2>&1; then
+    # Remove before restoring: the file we just wrote is 0440, and cp onto a
+    # read-only destination fails. Unlinking it only needs write permission on
+    # /etc/sudoers.d, which we have. cp -a puts back the original mode and owner.
+    rm -f "$f"
+    if [ -s "$b" ]; then cp -a "$b" "$f" || true; fi
+    rm -f "$b" "$t"
+    exit 3
+fi
+rm -f "$b" "$t"
+'
+    if ssh "${DEPLOY_SSH_OPTS[@]}" "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "sudo sh -c '${harden}'" >/dev/null 2>&1; then
+        DEPLOY_SUDO_HARDENED="true"
+        log_success "sudo now requires ${DEPLOY_ADMIN_USER}'s password (ALL=(ALL:ALL) ALL)"
+    else
+        log_warning "Could not tighten sudo in the VM; the passwordless rule is still there."
+        log_warning "The VM is otherwise fine. Change it by hand with:"
+        log_warning "  sudo visudo -f /etc/sudoers.d/90-cloud-init-users"
+        log_warning "  # replace the NOPASSWD line with:"
+        log_warning "  ${DEPLOY_ADMIN_USER} ALL=(ALL:ALL) ALL"
+    fi
 }
 
 # Detach and destroy the cloud-init config drive once the guest no longer
@@ -4686,27 +5214,70 @@ deploy_remove_config_drive() {
     DEPLOY_CIDATA_VBD=""
 }
 
-# Persist the generated SSH key next to the script so the user can still reach
-# the VM after this run exits (DEPLOY_WORKDIR is removed by deploy_cleanup).
-deploy_save_ssh_key() {
-    local dest="${SCRIPT_DIR}/xo-deploy-${DEPLOY_HOSTNAME}.key"
+# The program deploy_revoke_deploy_key runs on the guest, kept in its own
+# function so the tests can exercise it directly -- it edits authorized_keys,
+# and a bug here locks the operator out of a VM they just paid to build.
+#
+# The key to remove arrives on stdin rather than on the command line: it is
+# long enough to be awkward to quote, and this keeps the guest's process list
+# clean. An empty pattern aborts instead of matching every line, which is the
+# difference between revoking one key and wiping the file.
+deploy_revoke_script() {
+    cat <<'REVOKE_EOF'
+p=$(cat) || exit 1
+[ -n "$p" ] || exit 1
+f="$HOME/.ssh/authorized_keys"
+[ -f "$f" ] || exit 0
+t=$(mktemp) || exit 1
+grep -vxF "$p" "$f" > "$t" 2>/dev/null || true
+cat "$t" > "$f"
+rm -f "$t"
+chmod 600 "$f"
+REVOKE_EOF
+}
 
-    # Deploying a second VM with the same hostname must not overwrite the first
-    # one's key: that file is the only way into that machine, and the command
-    # printed at the end of its deploy still points at it.
-    if [[ -e "$dest" ]]; then
-        local n=2
-        while [[ -e "${SCRIPT_DIR}/xo-deploy-${DEPLOY_HOSTNAME}-${n}.key" ]]; do
-            n=$((n + 1))
-        done
-        dest="${SCRIPT_DIR}/xo-deploy-${DEPLOY_HOSTNAME}-${n}.key"
-        log_warning "A key named xo-deploy-${DEPLOY_HOSTNAME}.key already exists (it belongs to"
-        log_warning "an earlier VM). Saving this one as $(basename "$dest") instead."
+# Take the deployment key back out of the VM.
+#
+# This is the last remote step of a deploy, and it is what makes the generated
+# keypair a deployment credential rather than a login. Until now the key was
+# needed: it is how the installer, the config upload, the cache scrub and the
+# sudo rewrite all reached the guest. Once those are done it has no further
+# purpose, and leaving it would mean an unencrypted, passphraseless private key
+# granting root-equivalent access -- which is precisely the finding this
+# replaces. The private half never leaves DEPLOY_WORKDIR and goes with it when
+# the EXIT trap fires; this removes the public half from the guest so that even
+# a copy that leaked in the meantime opens nothing.
+#
+# Only our own line is removed, matched in full and literally, so a key the
+# operator asked for stays exactly where cloud-init put it.
+deploy_revoke_deploy_key() {
+    [[ ${#DEPLOY_SSH_OPTS[@]} -gt 0 ]] || return 0
+    [[ -n "${DEPLOY_PUBKEY:-}" ]] || return 0
+
+    log_info "Removing the temporary deployment key from the VM..."
+
+    if ! printf '%s\n' "$DEPLOY_PUBKEY" | ssh "${DEPLOY_SSH_OPTS[@]}" \
+        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" "sh -c '$(deploy_revoke_script)'" >/dev/null 2>&1; then
+        log_warning "Could not remove the deployment key from the VM."
+        log_warning "It is still in ~${DEPLOY_ADMIN_USER}/.ssh/authorized_keys, commented"
+        log_warning "'install-xen-orchestra deploy (temporary)'. Delete that line by hand."
+        return 0
     fi
 
-    cp "$DEPLOY_SSH_KEY" "$dest"
-    chmod 600 "$dest"
-    DEPLOY_SAVED_KEY="$dest"
+    # Verify rather than assume: a revocation that silently did nothing is
+    # worse than no revocation, because the summary would report it as done.
+    # BatchMode stops ssh falling back to a password prompt and hanging here.
+    if ssh -o BatchMode=yes "${DEPLOY_SSH_OPTS[@]}" \
+        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" true >/dev/null 2>&1; then
+        log_warning "The deployment key still opens a session on the VM."
+        log_warning "Check ~${DEPLOY_ADMIN_USER}/.ssh/authorized_keys and remove the line"
+        log_warning "commented 'install-xen-orchestra deploy (temporary)'."
+        return 0
+    fi
+
+    DEPLOY_KEY_REVOKED="true"
+    DEPLOY_SSH_OPTS=()
+    log_success "Deployment key revoked; it no longer opens the VM"
 }
 
 deploy_print_summary() {
@@ -4720,22 +5291,34 @@ deploy_print_summary() {
     echo "=============================================="
     echo ""
     echo "  Web UI:      ${url}"
-    echo "  Default login: admin@admin.net / admin"
+    echo "  Login:       admin@admin.net / admin  (default — change it, see below)"
     echo ""
     echo "  VM name:     ${DEPLOY_VM_NAME}"
     echo "  VM UUID:     ${DEPLOY_VM_UUID}"
     echo "  Address:     ${DEPLOY_IP}/${DEPLOY_PREFIX}"
     echo ""
-    echo "  SSH:         ssh -i ${DEPLOY_SAVED_KEY} ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
-    if [[ -n "${DEPLOY_ADMIN_PASSWORD_HASH:-}" ]]; then
-        if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" == "true" ]]; then
-            echo "  Console/SSH: user ${DEPLOY_ADMIN_USER} with the password you chose"
-        else
-            echo "  Console:     user ${DEPLOY_ADMIN_USER} with the password you chose"
-            echo "               (SSH itself accepts the key above only)"
-        fi
+    if [[ -n "${DEPLOY_USER_PUBKEY:-}" ]]; then
+        echo "  SSH:         ssh ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}"
+        echo "               (your key: $(deploy_pubkey_label "$DEPLOY_USER_PUBKEY"))"
+    elif [[ "$DEPLOY_ADMIN_SSH_PWAUTH" == "true" ]]; then
+        echo "  SSH:         ssh ${DEPLOY_ADMIN_USER}@${DEPLOY_IP}  (password login)"
     else
-        echo "  Console:     no password was set — the key above is the only way in"
+        echo "  SSH:         none — no key was installed and password logins are off"
+    fi
+    if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" == "true" ]]; then
+        echo "  Console/SSH: user ${DEPLOY_ADMIN_USER} with the password you chose"
+    else
+        echo "  Console:     user ${DEPLOY_ADMIN_USER} with the password you chose"
+    fi
+    if [[ "$DEPLOY_KEY_REVOKED" == "true" ]]; then
+        echo "  Deploy key:  revoked — the temporary install key no longer opens the VM"
+    else
+        echo "  Deploy key:  NOT revoked — see the warning below"
+    fi
+    if [[ "$DEPLOY_SUDO_HARDENED" == "true" ]]; then
+        echo "  sudo:        asks for ${DEPLOY_ADMIN_USER}'s password (ALL=(ALL:ALL) ALL)"
+    else
+        echo "  sudo:        passwordless for ${DEPLOY_ADMIN_USER} — see the warning below"
     fi
     echo ""
     echo "  This repo lives at ${DEPLOY_REPO_DIR} inside the VM."
@@ -4743,7 +5326,52 @@ deploy_print_summary() {
     echo ""
     echo "    cd ${DEPLOY_REPO_DIR} && ./install-xen-orchestra.sh --update"
     echo ""
-    log_warning "Change the default admin@admin.net password before using this in production."
+    echo "=============================================="
+    echo "  Before you put this VM to use"
+    echo "=============================================="
+    echo ""
+    log_warning "1. HIGHLY RECOMMENDED: change the Xen Orchestra web login."
+    echo "     admin@admin.net / admin are Xen Orchestra's published defaults, so"
+    echo "     anyone who can reach ${url} is an administrator until you"
+    echo "     change them — and this appliance holds your pool's root credentials."
+    echo "     Sign in, open Settings -> Users (or the account menu -> Profile),"
+    echo "     set a strong unique password, and enable OTP while you are there."
+    echo ""
+    local n=2
+    if [[ "$DEPLOY_KEY_REVOKED" != "true" ]]; then
+        log_warning "${n}. The temporary deployment key was NOT removed from the VM."
+        echo "     It is an unencrypted key with no passphrase and it still opens a"
+        echo "     root-capable session. Delete its line from"
+        echo "     ~${DEPLOY_ADMIN_USER}/.ssh/authorized_keys — the one commented"
+        echo "     'install-xen-orchestra deploy (temporary)':"
+        echo "       sed -i '/install-xen-orchestra deploy (temporary)/d' ~/.ssh/authorized_keys"
+        echo ""
+        n=$((n + 1))
+    fi
+    if [[ -z "${DEPLOY_USER_PUBKEY:-}" && "$DEPLOY_ADMIN_SSH_PWAUTH" != "true" ]]; then
+        log_warning "${n}. This VM has no SSH access at all."
+        echo "     No key was installed and password logins are off, which is the most"
+        echo "     locked-down outcome but also means the console is the only way in."
+        echo "     To add your key later, from the console:"
+        echo "       mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+        echo "       echo '<your public key>' >> ~/.ssh/authorized_keys"
+        echo "       chmod 600 ~/.ssh/authorized_keys"
+        echo ""
+        n=$((n + 1))
+    fi
+    if [[ "$DEPLOY_SUDO_HARDENED" != "true" ]]; then
+        log_warning "${n}. ${DEPLOY_ADMIN_USER} still has passwordless sudo."
+        echo "     The rewrite could not be applied, so the rule cloud-init used for the"
+        echo "     unattended install is still in place. Tighten it with:"
+        echo "       sudo visudo -f /etc/sudoers.d/90-cloud-init-users"
+        echo "       # replace the NOPASSWD line with:"
+        echo "       ${DEPLOY_ADMIN_USER} ALL=(ALL:ALL) ALL"
+        echo ""
+        n=$((n + 1))
+    fi
+    echo "  The web UI uses a self-signed certificate, so the browser warning on"
+    echo "  first visit is expected. Replace it with your own certificate in"
+    echo "  /etc/ssl/xo inside the VM if you have one."
     echo ""
 }
 
@@ -4870,15 +5498,16 @@ deploy_xo_vm() {
     echo "  VM name:      ${DEPLOY_VM_NAME}"
     echo "  Resources:    ${DEPLOY_VCPUS} vCPU / ${DEPLOY_RAM_GB} GB RAM / ${DEPLOY_DISK_GB} GB disk"
     echo "  Address:      ${DEPLOY_IP}/${DEPLOY_PREFIX} via ${DEPLOY_GATEWAY} (DNS ${DEPLOY_DNS})"
-    local admin_auth="SSH key only"
-    if [[ -n "${DEPLOY_ADMIN_PASSWORD_HASH:-}" ]]; then
-        if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" == "true" ]]; then
-            admin_auth="SSH key + password (password SSH logins allowed)"
-        else
-            admin_auth="SSH key + console password"
-        fi
+    local admin_auth="console password"
+    if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" == "true" ]]; then
+        admin_auth="password (console and SSH)"
     fi
     echo "  Admin user:   ${DEPLOY_ADMIN_USER}  (${admin_auth})"
+    if [[ -n "${DEPLOY_USER_PUBKEY:-}" ]]; then
+        echo "  SSH key:      $(deploy_pubkey_label "$DEPLOY_USER_PUBKEY")"
+    else
+        echo "  SSH key:      none (the install key is destroyed when the deploy ends)"
+    fi
     echo "  XO ports:     ${DEPLOY_HTTP_PORT} / ${DEPLOY_HTTPS_PORT}  (branch ${DEPLOY_GIT_BRANCH})"
     echo "  Repository:   ${DEPLOY_REPO_URL}"
     echo "  Clone into:   ${DEPLOY_REPO_DIR}"
@@ -4889,10 +5518,15 @@ deploy_xo_vm() {
     deploy_build_config_drive
     deploy_create_vm
     deploy_wait_for_guest
-    deploy_save_ssh_key
     deploy_install_xo_in_vm
     deploy_verify_xo
     deploy_remove_config_drive
+    deploy_scrub_guest_cloudinit_cache
+    # Last of the steps that need passwordless sudo in the guest.
+    deploy_harden_guest_sudo
+    # Last step that needs the deployment key, and the one that destroys it.
+    # Nothing below reaches the VM.
+    deploy_revoke_deploy_key
     deploy_print_summary
 }
 

@@ -40,6 +40,44 @@ EOF
     [ "$count" -eq 1 ]
 }
 
+@test "a v2 config gains SSL_CERT_DAYS on migration" {
+    cat > "$CONFIG_FILE" <<'EOF'
+CONFIG_VERSION=2
+HTTP_PORT=80
+HTTPS_PORT=443
+INSTALL_DIR=/opt/xen-orchestra
+BACKUP_KEEP=5
+NODE_VERSION=22
+SERVICE_USER=xo-service
+EOF
+    CONFIG_VERSION=2
+    run migrate_config "$CONFIG_FILE"
+    [ "$status" -eq 0 ]
+
+    grep -q "^SSL_CERT_DAYS=825" "$CONFIG_FILE"
+    grep -q "^CONFIG_VERSION=${LATEST_CONFIG_VERSION}" "$CONFIG_FILE"
+    [ "$(grep -c "^SSL_CERT_DAYS=" "$CONFIG_FILE")" -eq 1 ]
+}
+
+@test "migration does not overwrite an SSL_CERT_DAYS the user already set" {
+    cat > "$CONFIG_FILE" <<'EOF'
+CONFIG_VERSION=2
+HTTP_PORT=80
+HTTPS_PORT=443
+INSTALL_DIR=/opt/xen-orchestra
+BACKUP_KEEP=5
+NODE_VERSION=22
+SERVICE_USER=xo-service
+SSL_CERT_DAYS=90
+EOF
+    CONFIG_VERSION=2
+    run migrate_config "$CONFIG_FILE"
+    [ "$status" -eq 0 ]
+
+    grep -q "^SSL_CERT_DAYS=90" "$CONFIG_FILE"
+    [ "$(grep -c "^SSL_CERT_DAYS=" "$CONFIG_FILE")" -eq 1 ]
+}
+
 @test "legacy config without CONFIG_VERSION is migrated to the latest schema version" {
     # Write a config with no CONFIG_VERSION (legacy)
     cat > "$CONFIG_FILE" <<'EOF'

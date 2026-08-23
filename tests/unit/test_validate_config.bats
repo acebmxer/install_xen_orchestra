@@ -57,3 +57,22 @@ setup() {
     run validate_config
     [ "$status" -eq 1 ]
 }
+
+@test "non-numeric SSL_CERT_DAYS fails with SSL_CERT_DAYS in output" {
+    SSL_CERT_DAYS="forever"
+    run validate_config
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"SSL_CERT_DAYS"* ]]
+}
+
+@test "SSL_CERT_DAYS=0 fails" {
+    SSL_CERT_DAYS=0
+    run validate_config
+    [ "$status" -eq 1 ]
+}
+
+@test "an unset SSL_CERT_DAYS falls back to the default rather than failing" {
+    unset SSL_CERT_DAYS
+    run validate_config
+    [ "$status" -eq 0 ]
+}

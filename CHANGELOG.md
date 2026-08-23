@@ -11,6 +11,67 @@ This installer builds Xen Orchestra from source and tracks the official
 ## [Unreleased]
 
 ### Security
+- **The deployment SSH key is destroyed at the end of a deploy.** It used to be
+  saved next to the script as `xo-deploy-<hostname>.key` and handed to the
+  operator as the way into the VM — an unencrypted, passphraseless private key
+  granting root-equivalent access, sitting in a git working tree for the life
+  of the machine. It is now a throwaway credential for the install only: the
+  private half never leaves the run's mode-700 temporary directory and is
+  shredded on exit, and the public half is removed from the guest's
+  `authorized_keys` as the deploy's last step, with the removal verified by a
+  connection attempt that must fail. **Any `xo-deploy-*.key` left by an earlier
+  version still works against its VM** — remove its line from that VM's
+  `authorized_keys` and delete the file.
+- **`--deploy` installs a public key you own instead.** A prompt offers your
+  `~/.ssh/id_ed25519.pub` (or ECDSA/RSA equivalent), accepts any path, and takes
+  `XO_DEPLOY_ADMIN_SSH_KEY` under `--non-interactive`. Private keys are rejected
+  rather than embedded into cloud-init's user-data, where they would be readable
+  by anyone on the guest. Declining is supported and leaves a console-only VM,
+  which the summary states plainly along with how to add a key later.
+- **The VM's admin password is now required, minimum 12 characters.** It was
+  optional, and skipping it produced an account reachable only by the generated
+  key — which is now destroyed, so such an account would be unreachable and its
+  `sudo` could not be hardened. `--non-interactive` takes it from
+  `XO_DEPLOY_ADMIN_PASSWORD` and refuses to run without it, rather than silently
+  creating a passwordless account. A missing `openssl`/`mkpasswd` is now a hard
+  error instead of a quiet downgrade.
+- **`--deploy` revokes the passwordless sudo it needed for the install.**
+  cloud-init grants `ALL=(ALL) NOPASSWD:ALL` because the unattended install runs
+  over SSH with no TTY to answer a password prompt, but that grant used to
+  outlive the install, turning the (passphraseless) deploy key into
+  unauthenticated root on the appliance. The rule is now rewritten to the
+  ordinary `ALL=(ALL:ALL) ALL` once the install returns, validated with `visudo`
+  before and after and rolled back if the sudoers tree stops parsing. It is
+  skipped for a key-only admin account, where requiring a password would be a
+  lockout rather than hardening, and the summary says which mode the VM is in.
+- **The admin password hash no longer survives the config drive.** Destroying
+  the cloud-init VDI left the copies cloud-init had already cached in the guest
+  (`/var/lib/cloud/instance/user-data.txt` and friends) plus any occurrence in
+  the DEBUG-level cloud-init log Debian ships enabled. Both are now redacted
+  after the install.
+- **Deployed VMs are patched on first boot and stay patched.** The stock cloud
+  image is only current to its build date, so the web UI came up on a package
+  set that could be a month or more behind. `--deploy` now performs a full
+  package upgrade during cloud-init and installs `unattended-upgrades`, with
+  `/etc/apt/apt.conf.d/20auto-upgrades` written explicitly rather than left to
+  a debconf default that varies between releases.
+- **The pool master's SSH host key is checked on first contact.** The host
+  password is sent over that connection, and while `ssh` rejects a *changed*
+  key on its own, first contact had nothing to compare against. The fingerprint
+  is now shown for confirmation, or verified without a prompt against
+  `XO_DEPLOY_POOL_FINGERPRINT`, aborting before the password is sent on a
+  mismatch.
+- **Self-signed certificates are no longer issued for ten years.** The default
+  lifetime drops from 3650 days to 825, the ceiling most security policies
+  inherited from the CA/Browser Forum, and is configurable through the new
+  `SSL_CERT_DAYS` setting. Existing certificates are untouched; delete them and
+  run `--reconfigure` to reissue.
+- **The default web login is called out as a first-run task.** `admin@admin.net`
+  / `admin` are Xen Orchestra's published defaults, and this appliance holds the
+  root credentials of every pool connected to it. The install summary, the
+  `--deploy` summary, and the README now spell out what is at stake and give the
+  steps to change it, including enabling OTP. The deploy summary also warns that
+  the saved SSH key has no passphrase and shows how to add one.
 - **`--deploy` no longer writes the pool password to dom0's disk.** The XAPI
   login body went to a fixed `/tmp` path on the pool master, readable by any
   other local account for the duration of the request and liable to collide

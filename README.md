@@ -200,18 +200,89 @@ credentials embedded in an HTTPS remote are stripped rather than copied into
 the guest's cloud-init data. The URL the VM will actually use is shown on the
 review screen before anything is created.
 
-**The admin account's password** is optional and asked for during the prompts.
-The account always gets the generated SSH key, so a password only matters for
-the VM's console in XO Lite or XCP-ng Center, where no key can be offered, and
-for `su`. Leave the prompt empty for a key-only account. If you do set one, a
-second prompt asks whether SSH should accept it too; the default is no, keeping
-SSH key-only. Setting the password needs `openssl` (or `mkpasswd`) on your
-workstation — without either, the prompt is skipped and the account stays
-key-only.
+**The admin account's password is required.** It is asked for during the
+prompts and there is no way to skip it, because it is the credential the
+finished VM is left with: the console login in XO Lite or XCP-ng Center where
+no key can be offered, what `su` asks for, and what `sudo` asks for once the
+deploy finishes. The minimum is 12 characters. A second prompt asks whether SSH
+should accept the password too; the default is no. Hashing it needs `openssl`
+(or `mkpasswd`) on your workstation — without either, the deploy stops rather
+than quietly creating an account you cannot log in to.
+
+For `--non-interactive`, supply it as `XO_DEPLOY_ADMIN_PASSWORD` (and
+optionally `XO_DEPLOY_ADMIN_SSH_PWAUTH=true`). The deploy refuses to run
+without it.
+
+**SSH access uses your own key, not one this script leaves lying around.** The
+deploy generates a temporary keypair because the unattended install has to
+reach the guest somehow, but that key is a deployment credential, not a login:
+
+- the private half is written only to a mode-700 temporary directory and is
+  shredded and deleted when the run ends — it is never saved next to the
+  script;
+- its public half is removed from the VM's `authorized_keys` as the last step
+  of the deploy, and the removal is *verified* by attempting a connection that
+  must now fail.
+
+So when the deploy is over, that key opens nothing. To keep SSH access, give
+the deploy a public key of your own at the prompt — it offers
+`~/.ssh/id_ed25519.pub` (or your ECDSA/RSA equivalent) if you have one, and
+accepts any path. Press Enter to take the offered key, or type `-` for none.
+Under `--non-interactive`, set `XO_DEPLOY_ADMIN_SSH_KEY` to a path or to the
+key text itself.
+
+Declining a key is supported and is the most locked-down outcome: the account
+still has its password for the console, and for SSH too if you enabled password
+logins. If you enabled neither, the console is the only way in — the summary
+says so plainly, and tells you how to add a key afterwards.
+
+> [!NOTE]
+> Only public keys are accepted. Handing it a *private* key by mistake is
+> rejected rather than embedded into the VM's cloud-init data, where it would
+> be readable by anyone on the guest.
 
 The VM is created with `SERVICE_USER=root` (the current default) and XO's
-usual `admin@admin.net` / `admin` starting credentials — **change that password
-before putting the VM to use.**
+usual `admin@admin.net` / `admin` starting credentials — **changing that login
+is highly recommended before putting the VM to use.** See
+[Default Credentials](#default-credentials) for why this one matters more than
+a typical default password.
+
+**What the deploy hardens on its way out.** The unattended install needs
+passwordless `sudo` in the guest — it runs over SSH with no terminal to answer
+a password prompt — so cloud-init grants `ALL=(ALL) NOPASSWD:ALL` while it
+runs. That grant is revoked when the install finishes: the rule is rewritten to
+the ordinary `ALL=(ALL:ALL) ALL`, validated with `visudo` before and after, and
+rolled back automatically if the resulting sudoers tree does not parse. The
+summary tells you which mode the VM ended up in.
+
+Because the admin password is now mandatory, there is always a password for
+`sudo` to ask for and this step always runs. (The guard that skips it for a
+passwordless account is still in the code — requiring a password from an
+account that has none would lock you out of root rather than harden anything —
+but a normal deploy no longer reaches it.)
+
+The deploy also brings the guest up to its distribution's current security
+patches on first boot (the stock cloud image is only patched to its build date)
+and installs `unattended-upgrades` so it stays that way. Once the install is
+done, the cloud-init config drive is detached and destroyed, and the copies of
+the user-data that cloud-init cached inside the guest — which hold the admin
+password hash — are redacted along with any occurrence in its logs.
+
+> [!NOTE]
+> Earlier versions saved the deployment key as `xo-deploy-<hostname>.key` next
+> to the script. They no longer do, and any such file left over from a previous
+> run is a passphraseless private key granting root-equivalent access to that
+> VM. Remove its line from that VM's `~/.ssh/authorized_keys` and delete the
+> file.
+
+**Verifying the pool master.** The host password you type is sent to the pool
+master over SSH, so on the first connection to a host that is not yet in your
+`known_hosts`, the script shows the host key fingerprint and asks you to
+confirm it against `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the
+host's console. Once the key is known, `ssh` enforces it and no prompt appears.
+For unattended runs, set `XO_DEPLOY_POOL_FINGERPRINT` to the expected SHA256
+fingerprint and the deploy verifies it instead of prompting, aborting before
+the password is sent if it does not match.
 
 To deploy a different Debian release, set `XO_DEPLOY_IMAGE_VERSION` and
 `XO_DEPLOY_IMAGE_RELEASE`, or point `XO_DEPLOY_IMAGE_URL` at any raw cloud
@@ -245,6 +316,7 @@ Key settings:
 | `HTTP_PORT` | 80 | HTTP port |
 | `HTTPS_PORT` | 443 | HTTPS port |
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
+| `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days. 825 is the maximum most security policies allow; a longer-lived certificate is a common audit finding. Existing certificates are never regenerated — delete the files in `SSL_CERT_DIR` and run `--reconfigure` to reissue. |
 | `GIT_BRANCH` | master | Git branch or tag |
 | `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
 | `SERVICE_USER` | root | Service user. Root is the default because it avoids permission issues with privileged ports, NFS/CIFS mounts, XenStore, and VMware V2V import. Set to any username to run non-root (recommended by the official XO docs) — the script configures the required sudoers, capability, group, and udev rules automatically. V2V import requires root. |
@@ -270,7 +342,23 @@ After installation, access the web interface at `https://your-server-ip`.
 - **Username:** `admin@admin.net`
 - **Password:** `admin`
 
-> Change the default password immediately after first login.
+> [!WARNING]
+> **Changing this login is highly recommended, and it is the first thing to do
+> after the install finishes — not a later cleanup task.**
+>
+> These are Xen Orchestra's own published defaults. Every installation in the
+> world starts with them, so until you change them, anyone who can reach the
+> web interface is a full administrator. Xen Orchestra stores the root
+> credentials for every pool you connect to it, so an unchanged default login
+> hands over the hypervisors, not just the UI.
+>
+> 1. Sign in at `https://your-server-ip` as `admin@admin.net` / `admin`
+> 2. Open **Settings → Users**, or the account menu → **Profile**
+> 3. Set a strong, unique password
+> 4. Enable **OTP** (two-factor) on the account while you are there
+>
+> The installer prints the same reminder when it finishes, and `--deploy`
+> repeats it in the deployment summary.
 
 ## Supported Operating Systems
 
@@ -374,6 +462,10 @@ XO_TASK_CHECK_PASS=changeme
 | `XO_DEPLOY_IMAGE_VERSION` | `--deploy`: Debian major version for the guest (default `13`) |
 | `XO_DEPLOY_IMAGE_RELEASE` | `--deploy`: Debian codename for the guest (default `trixie`) |
 | `XO_DEPLOY_IMAGE_URL` | `--deploy`: full URL of a raw cloud image, overriding the two above |
+| `XO_DEPLOY_POOL_FINGERPRINT` | `--deploy`: expected SHA256 host-key fingerprint of the pool master (e.g. `SHA256:abc…`). Verified instead of prompting on first connection; the deploy aborts before the host password is sent if it does not match. |
+| `XO_DEPLOY_ADMIN_PASSWORD` | `--deploy --non-interactive`: password for the VM's admin account. Required — the deploy refuses to run without it. Minimum 12 characters. |
+| `XO_DEPLOY_ADMIN_SSH_PWAUTH` | `--deploy --non-interactive`: set to `true` to allow SSH logins with that password (default `false`, key/console only). |
+| `XO_DEPLOY_ADMIN_SSH_KEY` | `--deploy --non-interactive`: path to, or text of, a public key to install on the admin account. Without it the VM ends up console-only, since the deployment key is destroyed at the end of the run. |
 
 ## Troubleshooting
 
