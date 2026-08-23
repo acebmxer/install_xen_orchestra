@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-22
+
 ### Added
 - **`--deploy`: create a VM and install Xen Orchestra into it.** Aimed at
   newcomers who have a XenServer/XCP-ng pool but no Linux VM to install onto,
@@ -255,7 +257,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.1.2...v0.1.3
