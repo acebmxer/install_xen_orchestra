@@ -3469,6 +3469,13 @@ DEPLOY_CIDATA_VBD=""
 DEPLOY_CONFIG_BASE=""
 DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
 DEPLOY_VM_STARTED="false"
+DEPLOY_VM_UUID=""
+DEPLOY_ROOT_VDI=""
+# Set once the deploy has actually finished. deploy_cleanup runs on every exit,
+# success included, so the failure paths it drives need a way to tell the two
+# apart -- without this, a perfectly good deploy ends by offering to destroy
+# the VM it just built.
+DEPLOY_SUCCEEDED="false"
 DEPLOY_SUDO_HARDENED="false"
 # The operator's own public key, if they gave one, and the throwaway deployment
 # key's public half, which deploy_revoke_deploy_key needs in order to find and
@@ -3676,13 +3683,37 @@ deploy_import_vdi_from_url() {
 
     log_info "  image is $(( size / 1048576 )) MiB; streaming it into the disk"
 
-    if dom0_exec "curl -fsSL '${url}' | curl -sk -f --max-time 3600 -T - \
-            -H 'Transfer-Encoding:' -H 'Content-Length: ${size}' \
-            'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'"; then
+    # Three things this pipeline has to get right, all of them learned the hard
+    # way from a transfer that died at 33%:
+    #
+    #   - pipefail. Without it the remote shell reports only the *upload*
+    #     curl's status, so a download that failed halfway looks like a
+    #     successful import and the VM boots from a truncated disk. Silent
+    #     corruption is the worst outcome available here, so the pipeline runs
+    #     under bash -o pipefail rather than dom0's default sh behaviour.
+    #
+    #   - the stall guards. When the download dies, the upload curl has already
+    #     promised XAPI ${size} bytes and sits waiting to send the rest.
+    #     XAPI waits for data that is never coming, and --max-time alone means
+    #     that deadlock lasts a full hour before anything gives. Aborting when
+    #     throughput sits under 1 KiB/s for 60s turns that into a minute.
+    #
+    #   - no --retry. It is tempting, and it is wrong here: curl retries by
+    #     re-issuing the request from byte 0, and in a pipe feeding a
+    #     fixed-Content-Length PUT those bytes are appended to what was already
+    #     sent. The result is a corrupt image that imports cleanly. Retrying is
+    #     the staged path's job, where the download lands in a file and -C -
+    #     can resume it properly.
+    local stall="--speed-limit 1024 --speed-time 60"
+    if dom0_exec "bash -o pipefail -c \"curl -fsSL ${stall} --max-time 3600 '${url}' \
+            | curl -sk -f ${stall} --max-time 3600 -T - \
+              -H 'Transfer-Encoding:' -H 'Content-Length: ${size}' \
+              'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'\""; then
         return 0
     fi
 
     log_warning "Streaming import failed; retrying by staging the image on the host."
+    log_info "  (the staged path can resume a broken download; streaming cannot)"
     deploy_import_vdi_staged "$vdi" "$url"
 }
 
@@ -3713,16 +3744,43 @@ deploy_import_vdi_staged() {
         return 1
     fi
 
-    log_info "  downloading the image to the pool master..."
-    if ! dom0_exec "curl -fsSL -o '${tmp}' '${url}'"; then
+    # Unlike the streaming path, this one lands in a file, so a broken transfer
+    # can be resumed rather than restarted: -C - picks up from the bytes
+    # already on disk and --retry handles the transient TLS and connection
+    # failures that a multi-gigabyte download over one connection will
+    # eventually hit ("decryption failed or bad record mac" being the classic).
+    # The stall guard is here too, so a connection that goes quiet is retried
+    # in a minute instead of hanging until --max-time.
+    #
+    # --progress-bar because this is several minutes of silence otherwise, and
+    # silence on the longest step of the deploy reads as a hang worth killing.
+    log_info "  downloading the image to the pool master (resumable)..."
+    if ! dom0_exec "curl -fL --progress-bar -o '${tmp}' -C - \
+            --retry 5 --retry-delay 3 --retry-all-errors \
+            --speed-limit 1024 --speed-time 60 --max-time 3600 '${url}'"; then
         log_error "Failed to download the image on the pool master."
+        log_error "Check outbound access from the host:"
+        log_error "  ssh ${HOST_USERNAME}@${POOL_MASTER_IP} curl -I '${url}'"
         dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
         return 1
     fi
 
+    # A truncated download that curl reported as fine still has to be caught:
+    # importing it would produce a VM that boots to a corrupt filesystem.
+    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
+        local got
+        got=$(dom0_exec "stat -c %s '${tmp}' 2>/dev/null" | tr -d '\r')
+        if [[ "$got" =~ ^[0-9]+$ ]] && (( got != size )); then
+            log_error "The staged image is ${got} bytes; the server said ${size}."
+            log_error "Refusing to import a truncated image."
+            dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
+
     log_info "  importing it into the disk..."
     local rc=0
-    dom0_exec "curl -sk -f --max-time 3600 -T '${tmp}' \
+    dom0_exec "curl -sk -f --speed-limit 1024 --speed-time 60 --max-time 3600 -T '${tmp}' \
         'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'" || rc=$?
     dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
     return $rc
@@ -3746,6 +3804,23 @@ deploy_import_vdi_from_file() {
         'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'" || rc=$?
     dom0_exec "rm -f '${remote}'" >/dev/null 2>&1 || true
     return $rc
+}
+
+# Name the VM left behind when a deploy dies, so it is not left to be
+# rediscovered later in the pool's VM list.
+#
+# Deliberately does not destroy anything: the half-built VM is the operator's
+# to remove, and a deploy that just failed is a bad moment for a script to
+# start deleting disks on someone's pool. This only makes sure the UUID is the
+# last thing on screen rather than something to scroll back for.
+deploy_report_failed_vm() {
+    [[ "${DEPLOY_SUCCEEDED}" == "true" ]] && return 0
+    [[ -n "${DEPLOY_VM_UUID:-}" ]] || return 0
+
+    log_warning "The VM ${DEPLOY_VM_NAME} (${DEPLOY_VM_UUID}) was left on the pool."
+    log_warning "Delete it when you are done with it -- a retry with the same name"
+    log_warning "will otherwise sit alongside it:"
+    log_warning "  xe vm-destroy uuid=${DEPLOY_VM_UUID}"
 }
 
 # Deal with a config drive left behind by an aborted deploy.
@@ -3789,6 +3864,7 @@ deploy_cleanup_config_drive() {
 # needs `xe` on the pool master.
 deploy_cleanup() {
     deploy_cleanup_config_drive
+    deploy_report_failed_vm
     deploy_xapi_logout
     if [[ -n "$DEPLOY_SSH_CTL" && -S "$DEPLOY_SSH_CTL" ]]; then
         ssh -o ControlPath="$DEPLOY_SSH_CTL" -O exit \
@@ -5527,6 +5603,10 @@ deploy_xo_vm() {
     # Last step that needs the deployment key, and the one that destroys it.
     # Nothing below reaches the VM.
     deploy_revoke_deploy_key
+
+    # Everything that could fail has now succeeded, so the EXIT trap must stop
+    # treating this VM as wreckage to clear up.
+    DEPLOY_SUCCEEDED="true"
     deploy_print_summary
 }
 

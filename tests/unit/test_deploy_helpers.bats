@@ -337,6 +337,100 @@ _deploy_drive_fixture() {
     grep -q "NOPASSWD:ALL" "${DEPLOY_WORKDIR}/cidata/user-data"
 }
 
+# --- image import ---------------------------------------------------------
+#
+# These run against a stubbed dom0_exec that records the commands rather than
+# executing them, so the shape of what gets sent to the pool master is pinned.
+# Every assertion here corresponds to a way a 3 GB transfer has actually gone
+# wrong: a truncated image imported as if it were whole, an hour-long hang, or
+# a retry that silently duplicated bytes.
+
+_import_stub() {
+    CMDLOG="${TMPDIR_TEST}/cmds"
+    : > "$CMDLOG"
+    STAGED_SIZE="${STAGED_SIZE:-3221225472}"
+    DEPLOY_SESSION="OpaqueRef:test"
+    HOST_USERNAME=root
+    POOL_MASTER_IP=10.0.0.1
+    dom0_exec() {
+        printf '%s\n' "$*" >> "$CMDLOG"
+        case "$*" in
+            *content-length*) echo "3221225472" ;;
+            *"df -BM"*)       echo "999999" ;;
+            *"stat -c %s"*)   echo "$STAGED_SIZE" ;;
+        esac
+        return 0
+    }
+}
+
+@test "the streaming import runs under pipefail" {
+    _import_stub
+
+    deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
+
+    # Without this the remote shell reports only the upload curl's status, so a
+    # download that died halfway imports a truncated disk and reports success.
+    grep -q -- "-o pipefail" "$CMDLOG"
+}
+
+@test "both ends of the streaming pipeline abort on a stall" {
+    _import_stub
+
+    deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
+
+    # When the download dies, the upload sits waiting to send bytes that are
+    # never coming and XAPI waits with it. --max-time alone makes that deadlock
+    # last an hour; the stall guard ends it in a minute.
+    local line
+    line=$(grep -- "-o pipefail" "$CMDLOG")
+    [ "$(grep -c -- "--speed-time 60" <<< "$line")" -ge 1 ]
+    [[ "$line" == *"--speed-limit 1024"* ]]
+}
+
+# curl retries by re-issuing from byte 0. Piped into a PUT with a fixed
+# Content-Length, those bytes land *after* the ones already sent: a corrupt
+# image that imports without complaint. Resuming is the staged path's job.
+@test "the streaming import never uses --retry" {
+    _import_stub
+
+    deploy_import_vdi_from_url "vdi-1" "https://example.invalid/img.raw"
+
+    ! grep -q -- "--retry" "$CMDLOG"
+}
+
+@test "the staged download resumes and retries" {
+    _import_stub
+
+    deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+
+    local line
+    line=$(grep -- "--progress-bar" "$CMDLOG")
+    [[ "$line" == *"-C -"* ]]
+    [[ "$line" == *"--retry 5"* ]]
+    [[ "$line" == *"--retry-all-errors"* ]]
+}
+
+@test "a truncated staged download is refused, not imported" {
+    _import_stub
+    # curl exits 0 but the file on disk is short of what the server advertised.
+    STAGED_SIZE=1000
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"truncated"* ]]
+
+    # It must not have attempted the import with a short file.
+    ! grep -q "import_raw_vdi" "$CMDLOG"
+}
+
+@test "a staged download matching the advertised size is imported" {
+    _import_stub
+    STAGED_SIZE=3221225472
+
+    run deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
+    [ "$status" -eq 0 ]
+}
+
 # --- deploy_load_pubkey ---------------------------------------------------
 
 @test "a public key is accepted from a file and from a literal" {

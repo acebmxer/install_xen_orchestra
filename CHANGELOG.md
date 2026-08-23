@@ -10,6 +10,36 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+- **A failed cloud-image download no longer looks like a successful import.**
+  The streaming import piped one `curl` into another, and the remote shell
+  reported only the *upload* side's exit status. A download that died partway —
+  a transient `SSL_read ... bad record mac` on a 3 GB transfer is the usual
+  cause — therefore produced a truncated disk that the deploy reported as
+  imported, and a VM that booted into a corrupt filesystem. The pipeline now
+  runs under `bash -o pipefail`.
+- **A broken image download no longer hangs the deploy for an hour.** When the
+  download end died, the upload `curl` had already promised XAPI an exact
+  `Content-Length` and sat waiting to send bytes that were never coming, with
+  XAPI waiting alongside it until `--max-time 3600` expired — the visible
+  symptom being a XAPI task frozen at partial progress and a script that had to
+  be interrupted. Both ends now abort after 60s below 1 KiB/s.
+- **The staged image download resumes instead of starting over.** It now uses
+  `-C -` with `--retry 5 --retry-delay 3 --retry-all-errors`, so the transient
+  TLS failures that a multi-gigabyte single-connection download eventually hits
+  are ridden out rather than failing the deploy. The streaming path deliberately
+  does *not* retry: `curl` re-issues from byte 0, and piped into a
+  fixed-`Content-Length` PUT those bytes would be appended to the ones already
+  sent, corrupting the image while appearing to succeed.
+- **A short staged download is refused rather than imported.** The file's size
+  is now checked against the length the server advertised before anything is
+  written into the VDI.
+- **The staged download reports progress.** It was silent for several minutes
+  on the longest step of the deploy, which reads as a hang worth killing.
+- **A failed deploy names the VM it left behind**, with the `xe vm-destroy`
+  command, instead of leaving a half-built VM to be rediscovered later in the
+  pool's VM list. Nothing is destroyed automatically.
+
 ### Security
 - **The deployment SSH key is destroyed at the end of a deploy.** It used to be
   saved next to the script as `xo-deploy-<hostname>.key` and handed to the
