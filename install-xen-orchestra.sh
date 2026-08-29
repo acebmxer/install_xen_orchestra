@@ -623,6 +623,22 @@ detect_package_manager() {
     log_info "Detected package manager: $PKG_MANAGER"
 }
 
+# Refresh the package lists, tolerating failure.
+#
+# A single broken third-party repo (a PPA with no Release file for the running
+# release, say) makes apt-get update exit non-zero even though every other
+# source refreshed fine. Under `set -e` that aborted the script before it could
+# try the install that actually matters -- and the install usually works, since
+# the package is in the lists we did manage to fetch, or already cached. So warn
+# and carry on; the install is the step allowed to be fatal.
+pkg_update_soft() {
+    # shellcheck disable=SC2086
+    if ! run_cmd $PKG_UPDATE; then
+        log_warning "Refreshing the package lists failed (a broken repository, most likely)."
+        log_warning "Continuing anyway -- the install below will fail if the package is unreachable."
+    fi
+}
+
 # Detect OS distribution
 detect_os() {
     # OS_VERSION_ID is parsed for reference/diagnostics; not read by the script today.
@@ -651,8 +667,7 @@ install_dependencies() {
     log_info "Installing system dependencies..."
 
     detect_os
-    # shellcheck disable=SC2086
-    run_cmd $PKG_UPDATE
+    pkg_update_soft
 
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         # Common packages for all Debian/Ubuntu
@@ -3161,8 +3176,7 @@ install_xo_proxy() {
     # Check if expect is installed
     if ! command -v expect &> /dev/null; then
         log_info "Installing expect for automated SSH interaction..."
-        # shellcheck disable=SC2086
-        run_cmd $PKG_UPDATE
+        pkg_update_soft
         # shellcheck disable=SC2086
         run_cmd $PKG_INSTALL expect
     fi
@@ -4209,10 +4223,15 @@ deploy_check_local_deps() {
         detect_package_manager
         check_sudo
         log_info "Installing xorriso..."
+        pkg_update_soft
         # shellcheck disable=SC2086
-        run_cmd $PKG_UPDATE
-        # shellcheck disable=SC2086
-        run_cmd $PKG_INSTALL xorriso
+        if ! run_cmd $PKG_INSTALL xorriso; then
+            log_error "Could not install xorriso."
+            log_error "Install an ISO9660 writer yourself and rerun --deploy:"
+            log_error "  Debian/Ubuntu: sudo apt-get install xorriso"
+            log_error "  RHEL family:   sudo dnf install xorriso"
+            exit 1
+        fi
     fi
 
     local missing=()
