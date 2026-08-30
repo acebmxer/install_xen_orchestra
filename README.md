@@ -3,9 +3,11 @@
 [![CI](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml/badge.svg)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Automated installation and management of [Xen Orchestra](https://xen-orchestra.com/) from source.
+Automated installation and management of [Xen
+Orchestra](https://xen-orchestra.com/) from source.
 
-> ## ⚠️ Upgrading from an earlier version of this script? Read this first.
+> [!IMPORTANT]
+> **⚠️ Upgrading from an earlier version of this script? Read this first.**
 >
 > This version bumps the config schema to **v2** (adds `PUBLIC_URL` and
 > `ENCRYPT_REDIS_CREDENTIALS`) and corrects two `config.toml` generation bugs.
@@ -107,7 +109,9 @@ nano xo-config.cfg   # edit to your liking
 ./install-xen-orchestra.sh
 ```
 
-> **Do NOT run with `sudo`.** Run as a normal user with sudo privileges — the script handles `sudo` internally.
+> [!WARNING]
+> **Do NOT run with `sudo`.** Run as a normal user with sudo privileges — the
+> script handles `sudo` internally.
 
 If `xo-config.cfg` doesn't exist, it will be created automatically from the sample.
 
@@ -324,7 +328,9 @@ failure; it never touches objects it did not create, and never starts a VM.
 
 ## Configuration
 
-All settings live in `xo-config.cfg`. See [sample-xo-config.cfg](sample-xo-config.cfg) for full documentation of every option.
+All settings live in `xo-config.cfg`. See
+[sample-xo-config.cfg](sample-xo-config.cfg) for full documentation of every
+option.
 
 Key settings:
 
@@ -333,38 +339,110 @@ Key settings:
 | `HTTP_PORT` | 80 | HTTP port |
 | `HTTPS_PORT` | 443 | HTTPS port |
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
-| `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days. 825 is the maximum most security policies allow; a longer-lived certificate is a common audit finding. Existing certificates are never regenerated — delete the files in `SSL_CERT_DIR` and run `--reconfigure` to reissue. |
+| `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days (see below) |
 | `GIT_BRANCH` | master | Git branch or tag |
 | `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
-| `SERVICE_USER` | root | Service user. Root is the default because it avoids permission issues with privileged ports, NFS/CIFS mounts, XenStore, and VMware V2V import. Set to any username to run non-root (recommended by the official XO docs) — the script configures the required sudoers, capability, group, and udev rules automatically. V2V import requires root. |
-| `BACKUP_KEEP` | 5 | Number of backups to retain |
+| `SERVICE_USER` | root | Service user (see below) |
+| `BACKUP_KEEP` | 5 | Number of backups to retain (see below) |
 | `TURBO_CACHE_ENABLED` | true | Reuse turbo's local build cache on `--update` instead of rebuilding every package (`--rebuild` always builds cold) |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
 | `PUBLIC_URL` | *(unset)* | Public URL advertised to external entities (e.g. XO Lite) |
-| `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see note below) |
+| `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see below) |
 
-> **Note on `BACKUP_KEEP` rotation:** The retention policy only applies to backups created by the current version of the script. Backups made by older script versions may use a different naming convention and will **not** be counted or pruned by the rotation logic. If you are upgrading from an older version, manually review your backup directory (`BACKUP_DIR` in config, default `/var/lib/xo-backups`) and remove any legacy-named archives you no longer need.
+### `SSL_CERT_DAYS`
 
-> **Note on `ENCRYPT_REDIS_CREDENTIALS`:** This is an opt-in xo-server feature that encrypts credentials stored in Redis at rest (AES-256-GCM). It **only works when Xen Orchestra runs as a VM on a XenServer/XCP-ng host**, because half of the encryption key is stored in XenStore. It will **not** work on bare metal or on other hypervisors (KVM, VMware, Hyper-V). Leave it `false` unless XO is an XCP-ng guest.
->
-> **Why the default is `false`, and why plaintext is normal.** The credential this protects is the one xo-server uses to log into XAPI on your pool. xo-server has to replay it to XAPI on every connect and auto-reconnect, so it must be **reversible** — it cannot be hashed the way a login password is. Storing it in a form xo-server can read back is therefore expected behaviour, not a defect in XO or in this installer. The security boundary for a default install is **Redis itself** (bound to localhost, never exposed to the network) plus **root access on the XO VM**: anyone with either can read the credentials regardless of this setting. Enabling encryption narrows the blast radius of an offline disk or snapshot; it does not protect against an attacker who is already root on a running XO.
->
-> **Works with either `SERVICE_USER`:** root reaches XenStore directly. For a **non-root** `SERVICE_USER`, the xenbus device is root-only by default, so the installer adds the user to a `xenstore` group and installs a udev rule (`/etc/udev/rules.d/40-xen-xenbus-xo.rules`) granting access — without this, xo-server cannot derive the key and credential encryption fails at startup. Group membership applies on the next service restart; verify with `sudo -u <SERVICE_USER> xenstore-ls vm-data`. XO's own docs cover only "run as root or grant access to the xenstored socket" and do not specify the device permissions, so this part is handled by the installer.
->
-> **Requires the Xen guest utilities.** Being a Xen guest is not enough — `xenstore-read` / `xenstore-write` must be installed (`xe-guest-utilities` on XCP-ng, or your distro's `xen-guest-utilities` / `xen-utils` package). The installer warns if they are missing; without them xo-server cannot store its key half.
+825 is the maximum most security policies allow; a longer-lived certificate is
+a common audit finding. Existing certificates are never regenerated — delete
+the files in `SSL_CERT_DIR` and run `--reconfigure` to reissue.
+
+### `SERVICE_USER`
+
+Root is the default because it avoids permission issues with privileged ports,
+NFS/CIFS mounts, XenStore, and VMware V2V import. Set to any username to run
+non-root (recommended by the official XO docs) — the script configures the
+required sudoers, capability, group, and udev rules automatically. V2V import
+requires root.
+
+### `BACKUP_KEEP` rotation
+
+The retention policy only applies to backups created by the current version of
+the script. Backups made by older script versions may use a different naming
+convention and will **not** be counted or pruned by the rotation logic. If you
+are upgrading from an older version, manually review your backup directory
+(`BACKUP_DIR` in config, default `/var/lib/xo-backups`) and remove any
+legacy-named archives you no longer need.
+
+### `ENCRYPT_REDIS_CREDENTIALS`
+
+This is an opt-in xo-server feature that encrypts credentials stored in Redis
+at rest (AES-256-GCM). It **only works when Xen Orchestra runs as a VM on a
+XenServer/XCP-ng host**, because half of the encryption key is stored in
+XenStore. It will **not** work on bare metal or on other hypervisors (KVM,
+VMware, Hyper-V). Leave it `false` unless XO is an XCP-ng guest.
+
+**Why the default is `false`, and why plaintext is normal.** The credential
+this protects is the one xo-server uses to log into XAPI on your pool.
+xo-server has to replay it to XAPI on every connect and auto-reconnect, so it
+must be **reversible** — it cannot be hashed the way a login password is.
+Storing it in a form xo-server can read back is therefore expected behaviour,
+not a defect in XO or in this installer. The security boundary for a default
+install is **Redis itself** (bound to localhost, never exposed to the network)
+plus **root access on the XO VM**: anyone with either can read the credentials
+regardless of this setting. Enabling encryption narrows the blast radius of an
+offline disk or snapshot; it does not protect against an attacker who is
+already root on a running XO.
+
+**Works with either `SERVICE_USER`:** root reaches XenStore directly. For a
+**non-root** `SERVICE_USER`, the xenbus device is root-only by default, so the
+installer adds the user to a `xenstore` group and installs a udev rule
+(`/etc/udev/rules.d/40-xen-xenbus-xo.rules`) granting access — without this,
+xo-server cannot derive the key and credential encryption fails at startup.
+Group membership applies on the next service restart; verify with
+`sudo -u <SERVICE_USER> xenstore-ls vm-data`. XO's own docs cover only "run as
+root or grant access to the xenstored socket" and do not specify the device
+permissions, so this part is handled by the installer.
+
+**Requires the Xen guest utilities.** Being a Xen guest is not enough —
+`xenstore-read` / `xenstore-write` must be installed (`xe-guest-utilities` on
+XCP-ng, or your distro's `xen-guest-utilities` / `xen-utils` package). The
+installer warns if they are missing; without them xo-server cannot store its
+key half.
 
 > [!WARNING]
-> **Before you enable `ENCRYPT_REDIS_CREDENTIALS`, understand the recovery story.**
+> **Before you enable `ENCRYPT_REDIS_CREDENTIALS`, understand the recovery
+> story.**
 >
-> - **Losing one key half is unrecoverable.** The key is split between XenStore (`vm-data/xo-encryption-key`) and `/var/lib/xo-server/data/xo-encryption-key`. If either half goes missing while encryption is on, **do not restart xo-server** — on startup XO treats a missing half as a fresh setup, generates two new halves, overwrites the surviving one, and re-runs the migration while skipping already-encrypted records. Those records become permanently undecryptable. Note that migrating or rebuilding the VM can lose the XenStore half.
-> - **`--backup` does not cover the key.** This script's backups copy the install directory only; neither key half lives there. An in-place `--restore` is unaffected (it never touches `/var/lib/xo-server`), but a backup alone **cannot** restore an encrypted database onto a rebuilt VM. The installer prints this reminder when it makes a backup.
-> - **Use the config export as your recovery artifact.** With encryption on, exporting the XO config (**Settings → Config** in the web UI) requires a passphrase and produces an OpenPGP-encrypted file. Export a fresh one immediately after enabling encryption, and store it somewhere other than the XO VM.
-> - **`--uninstall` destroys the on-disk key half** along with `/var/lib/xo-server`. Redis is left in place, so its records survive as unreadable ciphertext. The installer warns before this when it detects a key file.
+> - **Losing one key half is unrecoverable.** The key is split between
+>   XenStore (`vm-data/xo-encryption-key`) and
+>   `/var/lib/xo-server/data/xo-encryption-key`. If either half goes missing
+>   while encryption is on, **do not restart xo-server** — on startup XO
+>   treats a missing half as a fresh setup, generates two new halves,
+>   overwrites the surviving one, and re-runs the migration while skipping
+>   already-encrypted records. Those records become permanently
+>   undecryptable. Note that migrating or rebuilding the VM can lose the
+>   XenStore half.
+> - **`--backup` does not cover the key.** This script's backups copy the
+>   install directory only; neither key half lives there. An in-place
+>   `--restore` is unaffected (it never touches `/var/lib/xo-server`), but a
+>   backup alone **cannot** restore an encrypted database onto a rebuilt VM.
+>   The installer prints this reminder when it makes a backup.
+> - **Use the config export as your recovery artifact.** With encryption on,
+>   exporting the XO config (**Settings → Config** in the web UI) requires a
+>   passphrase and produces an OpenPGP-encrypted file. Export a fresh one
+>   immediately after enabling encryption, and store it somewhere other than
+>   the XO VM.
+> - **`--uninstall` destroys the on-disk key half** along with
+>   `/var/lib/xo-server`. Redis is left in place, so its records survive as
+>   unreadable ciphertext. The installer warns before this when it detects a
+>   key file.
 >
-> Full upstream reference: <https://docs.xen-orchestra.com/credential-encryption>
+> Full upstream reference:
+> <https://docs.xen-orchestra.com/credential-encryption>
 
-> **Opting out:** set `ENCRYPT_REDIS_CREDENTIALS` back to `false` and run `--reconfigure` — xo-server decrypts the records and removes the key files automatically. Do this **while both key halves are still intact**.
+**Opting out:** set `ENCRYPT_REDIS_CREDENTIALS` back to `false` and run
+`--reconfigure` — xo-server decrypts the records and removes the key files
+automatically. Do this **while both key halves are still intact**.
 
 ## Default Credentials
 
@@ -398,10 +476,12 @@ After installation, access the web interface at `https://your-server-ip`.
 - RHEL / CentOS Stream / AlmaLinux / Rocky
 - Fedora
 
+> [!NOTE]
 > Continuously smoke-tested in CI on Debian 11/12/13, Ubuntu 24.04, Rocky Linux 9,
 > AlmaLinux 9, CentOS Stream 9, and Fedora. RHEL uses the same `dnf` path as its
 > rebuilds; other Ubuntu releases use the same `apt` path.
 
+> [!NOTE]
 > **Firewall:** On Fedora and RHEL-family systems (which enable `firewalld` by
 > default and block inbound HTTP/HTTPS), the installer opens the configured
 > `HTTP_PORT`/`HTTPS_PORT` automatically. Debian/Ubuntu ship no active firewall,
@@ -410,11 +490,14 @@ After installation, access the web interface at `https://your-server-ip`.
 
 ## Running Task Detection (Update Safety)
 
-Before applying an update, the script queries the Xen Orchestra REST API for active tasks (e.g. running backups, VM exports). If any are found, the update is aborted to prevent data loss or corruption.
+Before applying an update, the script queries the Xen Orchestra REST API for
+active tasks (e.g. running backups, VM exports). If any are found, the update
+is aborted to prevent data loss or corruption.
 
 ### Authentication
 
-Only **admin-level** XO accounts can access the REST API. Authentication is resolved in priority order:
+Only **admin-level** XO accounts can access the REST API. Authentication is
+resolved in priority order:
 
 | Priority | Method | Source |
 |----------|--------|--------|
@@ -424,28 +507,38 @@ Only **admin-level** XO accounts can access the REST API. Authentication is reso
 
 ### Recommended: Dedicated XO Account
 
-It is recommended to create a **dedicated XO web UI account** solely for the task check (e.g. `task-checker@local.net`). This account:
+It is recommended to create a **dedicated XO web UI account** solely for the
+task check (e.g. `task-checker@local.net`). This account:
 
 - Must have **Admin** privileges (required by the REST API)
-- Exists only within the XO web interface — no shell access, SSH keys, or OS-level permissions are needed
+- Exists only within the XO web interface — no shell access, SSH keys, or
+  OS-level permissions are needed
 - Provides a clear audit trail separate from personal accounts
 - Prevents shared credentials from being used for unrelated actions
 
-You are free to use any admin account you choose, but a dedicated account is the safest approach.
+You are free to use any admin account you choose, but a dedicated account is
+the safest approach.
 
 ### Using an Auth Token (Recommended)
 
-Tokens are more secure than storing a password — they can be revoked independently and expire after 30 days by default.
+Tokens are more secure than storing a password — they can be revoked
+independently and expire after 30 days by default.
 
 > [!IMPORTANT]
 > **Tokens must have a description or they will be deleted during updates.**
 >
-> During an update the installer flushes stale session tokens from Redis to prevent schema-mismatch 401 errors after XO restarts. It tells session tokens apart from API tokens by checking for a non-empty `description` field in the token's stored JSON:
+> During an update the installer flushes stale session tokens from Redis to
+> prevent schema-mismatch 401 errors after XO restarts. It tells session
+> tokens apart from API tokens by checking for a non-empty `description` field
+> in the token's stored JSON:
 >
 > - Tokens **with** a description → treated as API/integration tokens → **kept**
 > - Tokens **without** a description → treated as browser session tokens → **deleted**
 >
-> This applies to `XO_TASK_CHECK_TOKEN` and to **any other API tokens** used by third-party tools (monitoring agents, Terraform, scripts, etc.) that connect to this XO server. Always create tokens with a meaningful description.
+> This applies to `XO_TASK_CHECK_TOKEN` and to **any other API tokens** used
+> by third-party tools (monitoring agents, Terraform, scripts, etc.) that
+> connect to this XO server. Always create tokens with a meaningful
+> description.
 
 **Option 1 — XO web UI (always prompts for a description):**
 
@@ -482,7 +575,9 @@ XO_TASK_CHECK_USER=task-checker@local.net
 XO_TASK_CHECK_PASS=changeme
 ```
 
-> If neither token nor credentials are configured, the script will prompt interactively during each update.
+> [!NOTE]
+> If neither token nor credentials are configured, the script will prompt
+> interactively during each update.
 
 ## Environment Variables
 
@@ -493,11 +588,23 @@ XO_TASK_CHECK_PASS=changeme
 | `XO_DEPLOY_IMAGE_VERSION` | `--deploy`: Debian major version for the guest (default `13`) |
 | `XO_DEPLOY_IMAGE_RELEASE` | `--deploy`: Debian codename for the guest (default `trixie`) |
 | `XO_DEPLOY_IMAGE_URL` | `--deploy`: full URL of a raw cloud image, overriding the two above |
-| `XO_DEPLOY_IMAGE_SHA512` | `--deploy`: expected SHA-512 digest of the cloud image (128 hex characters). Makes verification mandatory — a digest that cannot be checked aborts the deploy, and the streaming import is refused outright since it cannot be hashed. Without it, the origin's published `SHA512SUMS` is used when available. |
-| `XO_DEPLOY_POOL_FINGERPRINT` | `--deploy`: expected SHA256 host-key fingerprint of the pool master (e.g. `SHA256:abc…`). Verified instead of prompting on first connection; the deploy aborts before the host password is sent if it does not match. |
+| `XO_DEPLOY_IMAGE_SHA512` | `--deploy`: expected SHA-512 digest of the cloud image (128 hex characters). See the notes below. |
+| `XO_DEPLOY_POOL_FINGERPRINT` | `--deploy`: expected SHA256 host-key fingerprint of the pool master (e.g. `SHA256:abc…`). See the notes below. |
 | `XO_DEPLOY_ADMIN_PASSWORD` | `--deploy --non-interactive`: password for the VM's admin account. Required — the deploy refuses to run without it. Minimum 12 characters. |
 | `XO_DEPLOY_ADMIN_SSH_PWAUTH` | `--deploy --non-interactive`: set to `true` to allow SSH logins with that password (default `false`, key/console only). |
-| `XO_DEPLOY_ADMIN_SSH_KEY` | `--deploy --non-interactive`: path to, or text of, a public key to install on the admin account. Without it the VM ends up console-only, since the deployment key is destroyed at the end of the run. |
+| `XO_DEPLOY_ADMIN_SSH_KEY` | `--deploy --non-interactive`: path to, or text of, a public key to install on the admin account. See the notes below. |
+
+Notes on the `--deploy` variables:
+
+- **`XO_DEPLOY_IMAGE_SHA512`**: Makes verification mandatory — a digest that
+  cannot be checked aborts the deploy, and the streaming import is refused
+  outright since it cannot be hashed. Without it, the origin's published
+  `SHA512SUMS` is used when available.
+- **`XO_DEPLOY_POOL_FINGERPRINT`**: Verified instead of prompting on first
+  connection; the deploy aborts before the host password is sent if it does
+  not match.
+- **`XO_DEPLOY_ADMIN_SSH_KEY`**: Without it the VM ends up console-only, since
+  the deployment key is destroyed at the end of the run.
 
 ## Troubleshooting
 
@@ -515,7 +622,9 @@ If the build is broken, rebuild (takes a backup first):
 
 ### Build fails with OOM / out-of-memory error
 
-The Yarn build is memory-intensive. On hosts with less than 2 GB RAM the Node.js process can be killed by the kernel OOM killer mid-build, leaving an incomplete install.
+The Yarn build is memory-intensive. On hosts with less than 2 GB RAM the
+Node.js process can be killed by the kernel OOM killer mid-build, leaving an
+incomplete install.
 
 Add or increase swap to give the build room:
 
@@ -526,19 +635,28 @@ sudo mkswap /swapfile
 sudo swapon /swapfile
 ```
 
-Re-run the install or `--rebuild` after the swap is active. To make it permanent across reboots, add `/swapfile none swap sw 0 0` to `/etc/fstab`.
+Re-run the install or `--rebuild` after the swap is active. To make it
+permanent across reboots, add `/swapfile none swap sw 0 0` to `/etc/fstab`.
 
 ### NodeSource GPG key failure (air-gapped / offline hosts)
 
-On hosts without internet access (or with strict egress firewall rules) the NodeSource repository setup script fails because it cannot reach `keyserver.ubuntu.com` or `deb.nodesource.com`.
+On hosts without internet access (or with strict egress firewall rules) the
+NodeSource repository setup script fails because it cannot reach
+`keyserver.ubuntu.com` or `deb.nodesource.com`.
 
-**Option A** — pre-download and import the key manually, then copy the `.deb`/`.rpm` packages to the host.
+**Option A** — pre-download and import the key manually, then copy the
+`.deb`/`.rpm` packages to the host.
 
-**Option B** — set `NODE_VERSION` to a specific patch version (e.g. `24.15.0`) in `xo-config.cfg`. The script will then download a pre-built binary directly from `nodejs.org` instead of using the NodeSource package repository.
+**Option B** — set `NODE_VERSION` to a specific patch version (e.g. `24.15.0`)
+in `xo-config.cfg`. The script will then download a pre-built binary directly
+from `nodejs.org` instead of using the NodeSource package repository.
 
 ### `git` reports "dubious ownership" and exits
 
-Recent versions of Git refuse to operate on a repository owned by a different user than the one running the command. This can happen when `sudo` is used inconsistently or when the install directory was created by `root` but the script is run as a normal user.
+Recent versions of Git refuse to operate on a repository owned by a different
+user than the one running the command. This can happen when `sudo` is used
+inconsistently or when the install directory was created by `root` but the
+script is run as a normal user.
 
 Fix it by resetting ownership to match your `SERVICE_USER`:
 
@@ -546,11 +664,13 @@ Fix it by resetting ownership to match your `SERVICE_USER`:
 sudo chown -R root:root /opt/xen-orchestra
 ```
 
-Replace `root` with the value of `SERVICE_USER` in `xo-config.cfg` if you changed it. Re-running the script afterwards will resolve the rest.
+Replace `root` with the value of `SERVICE_USER` in `xo-config.cfg` if you
+changed it. Re-running the script afterwards will resolve the rest.
 
 ### RedHat / Rocky / AlmaLinux: SELinux denials or systemd capability errors
 
-On SELinux-enforcing systems the `xo-server` service may fail to bind ports or access network resources. Check for AVC denials:
+On SELinux-enforcing systems the `xo-server` service may fail to bind ports or
+access network resources. Check for AVC denials:
 
 ```bash
 sudo ausearch -m avc -ts recent | grep xo-server
@@ -569,11 +689,14 @@ Alternatively, set the service to `permissive` mode while investigating:
 sudo semanage permissive -a xo_server_t
 ```
 
-`audit2allow` and `semanage` are provided by the `policycoreutils-python-utils` package on RHEL/Rocky/Alma.
+`audit2allow` and `semanage` are provided by the
+`policycoreutils-python-utils` package on RHEL/Rocky/Alma.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE). Xen Orchestra itself is licensed under [AGPL-3.0](https://github.com/vatesfr/xen-orchestra/blob/master/LICENSE).
+This project is licensed under the [MIT License](LICENSE). Xen Orchestra
+itself is licensed under
+[AGPL-3.0](https://github.com/vatesfr/xen-orchestra/blob/master/LICENSE).
 
 ## Credits
 

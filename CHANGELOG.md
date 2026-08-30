@@ -106,7 +106,6 @@ This installer builds Xen Orchestra from source and tracks the official
 - **A failed deploy names the VM it left behind**, with the `xe vm-destroy`
   command, instead of leaving a half-built VM to be rediscovered later in the
   pool's VM list. Nothing is destroyed automatically.
-
 - **`--update`/`--reconfigure`/`--rebuild` no longer abort on a root install.**
   Reading `User=` from a systemd unit that has no such line (which is what a
   root install looks like) failed the pipeline under `set -o pipefail` and took
@@ -142,6 +141,9 @@ This installer builds Xen Orchestra from source and tracks the official
 - The menu example in the README and the layout comment above `MENU_NAMES`
   described the old fixed 5/4/centered grid; with ten items the menu draws five
   entries in each column.
+- Passwords containing `&`, `<` or `>` are XML-escaped before being sent to
+  XAPI, instead of producing a malformed request and an unexplained login
+  failure. Same fix in `tests/probe-xapi-deploy.sh`.
 
 ### Security
 - **The cloud image is verified against its published checksum.** The size
@@ -298,9 +300,6 @@ This installer builds Xen Orchestra from source and tracks the official
   XenStore access.** Removing the udev rule left the previous user in the
   `xenstore` group and left `/dev/xen/xenbus` group-owned by it; both are now
   undone.
-- Passwords containing `&`, `<` or `>` are XML-escaped before being sent to
-  XAPI, instead of producing a malformed request and an unexplained login
-  failure. Same fix in `tests/probe-xapi-deploy.sh`.
 
 ## [0.3.0] - 2026-08-22
 
@@ -418,6 +417,12 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [0.2.1] - 2026-07-29
 
+### Added
+- Menu header: the `Master XO Commit` line now shows how many commits the
+  installation trails master by (e.g. `efbfb (Branch: master) - 12 commits
+  behind`). Shown only when the installed commit is behind; the count is
+  computed locally from the install directory's git history.
+
 ### Fixed
 - Swap check no longer deletes and recreates the swap file on every build:
   `free -m` reports a 2048MB swap file as 2047MB (mkswap header + rounding), so
@@ -431,12 +436,6 @@ This installer builds Xen Orchestra from source and tracks the official
   `error: unknown option '--concurrency=1'` and aborted low-memory updates —
   while turbo itself never received the limit.
 
-### Added
-- Menu header: the `Master XO Commit` line now shows how many commits the
-  installation trails master by (e.g. `efbfb (Branch: master) - 12 commits
-  behind`). Shown only when the installed commit is behind; the count is
-  computed locally from the install directory's git history.
-
 ## [0.2.0] - 2026-07-15
 
 ### Added
@@ -448,12 +447,12 @@ This installer builds Xen Orchestra from source and tracks the official
 - CI: expanded the integration matrix to Debian 11/13, AlmaLinux 9,
   CentOS Stream 9, and Fedora (alongside the existing Debian 12, Ubuntu 24.04,
   and Rocky Linux 9) so every supported distro family is smoke-tested.
+- Added `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, and Dependabot for
+  GitHub Actions.
 
 ### Changed
 - CI ShellCheck now runs at `-S warning` (was `-S error`); intentional
   suppressions live in `.shellcheckrc` and narrowly-scoped inline directives.
-- Added `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, and Dependabot for
-  GitHub Actions.
 
 ### Fixed
 - Guard the `free`-based memory/swap detection so a missing `free` (e.g. minimal
