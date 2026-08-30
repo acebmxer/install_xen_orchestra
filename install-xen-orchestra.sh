@@ -562,6 +562,17 @@ migrate_config() {
                 echo "# Only works when XO runs as a VM on a XenServer/XCP-ng host with"
                 echo "# xenstore-read/xenstore-write access — NOT on bare metal or other"
                 echo "# hypervisors. Set back to false to decrypt and opt out. Default: false"
+                echo "#"
+                echo "# The default (false) stores XAPI credentials readably. That is expected:"
+                echo "# xo-server replays them to XAPI on every reconnect, so they cannot be"
+                echo "# hashed. The perimeter is localhost-bound Redis plus root on this VM."
+                echo "#"
+                echo "# BEFORE ENABLING: the key is split between XenStore and"
+                echo "# /var/lib/xo-server/data. Losing either half while encryption is on"
+                echo "# makes the records permanently undecryptable, and this script's"
+                echo "# --backup does not include either half — use the passphrase-protected"
+                echo "# XO config export as your recovery artifact. See the README and"
+                echo "# https://docs.xen-orchestra.com/credential-encryption"
                 echo "ENCRYPT_REDIS_CREDENTIALS=false"
             } >> "$cfg_file"
         fi
@@ -1630,13 +1641,34 @@ configure_xo() {
             log_warning "  a XenServer/XCP-ng guest (detected virtualization: ${VIRT_TYPE})."
             log_warning "  xo-server will fail to start credential encryption without XenStore."
             log_warning "  Set ENCRYPT_REDIS_CREDENTIALS=false unless XO is an XCP-ng VM."
-        elif [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]]; then
-            # On a Xen guest the xenbus device is root-only by default, so a
-            # non-root xo-server cannot reach XenStore. configure_xenstore_access()
-            # grants the service user access (group + udev rule) so encryption works
-            # without running the whole service as root. Just note it here.
-            log_info "Non-root SERVICE_USER with encryption enabled — will grant"
-            log_info "  ${SERVICE_USER} XenStore access (group 'xenstore' + udev rule)."
+        else
+            # Being a Xen guest is necessary but not sufficient: the guest
+            # utilities that expose XenStore to userspace must also be present,
+            # or xo-server cannot read/write its key half. A Xen guest without
+            # them passes the virt check above and then fails at startup, so
+            # check for the tools rather than just the hypervisor.
+            local missing_xenstore_tools=()
+            local tool
+            for tool in xenstore-read xenstore-write; do
+                command -v "$tool" >/dev/null 2>&1 || missing_xenstore_tools+=("$tool")
+            done
+            if [[ ${#missing_xenstore_tools[@]} -gt 0 ]]; then
+                log_warning "ENCRYPT_REDIS_CREDENTIALS=true but the XenStore guest tools are"
+                log_warning "  missing: ${missing_xenstore_tools[*]}"
+                log_warning "  Install the Xen guest utilities (xe-guest-utilities on XCP-ng,"
+                log_warning "  or the distro's xen-guest-utilities / xen-utils package) before"
+                log_warning "  enabling encryption — without them xo-server cannot store its"
+                log_warning "  half of the encryption key and credential encryption will fail."
+            fi
+
+            if [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]]; then
+                # On a Xen guest the xenbus device is root-only by default, so a
+                # non-root xo-server cannot reach XenStore. configure_xenstore_access()
+                # grants the service user access (group + udev rule) so encryption works
+                # without running the whole service as root. Just note it here.
+                log_info "Non-root SERVICE_USER with encryption enabled — will grant"
+                log_info "  ${SERVICE_USER} XenStore access (group 'xenstore' + udev rule)."
+            fi
         fi
     fi
 
@@ -1715,6 +1747,13 @@ echo "# Encrypt credentials stored in Redis at rest (AES-256-GCM)."
 echo "# NOTE: requires XO to run as a VM on a XenServer/XCP-ng host with"
 echo "# xenstore-read/xenstore-write access — it does NOT work on bare metal"
 echo "# or non-XCP-ng hypervisors. Set ENCRYPT_REDIS_CREDENTIALS=false to disable."
+echo "#"
+echo "# WARNING: the encryption key is split between XenStore"
+echo "# (vm-data/xo-encryption-key) and /var/lib/xo-server/data/xo-encryption-key."
+echo "# If either half is lost while this is enabled, DO NOT restart xo-server:"
+echo "# it will regenerate both halves and the existing records become"
+echo "# permanently undecryptable. Keep a passphrase-protected XO config export"
+echo "# off this VM. Ref: https://docs.xen-orchestra.com/credential-encryption"
 echo "encryptCredentialDatabase = true"
 fi)
 
@@ -2082,6 +2121,23 @@ create_backup() {
     run_cmd sudo rm -rf "${BACKUP_PATH}/node_modules"
 
     log_success "Backup created: $BACKUP_PATH"
+
+    # This backup copies $INSTALL_DIR only. Neither half of the credential
+    # encryption key lives there (one half is in XenStore, the other in
+    # /var/lib/xo-server/data), so it is not a recovery artifact for an
+    # encrypted Redis database. An in-place restore is unaffected — restore_xo()
+    # never touches /var/lib/xo-server — but rebuilding the VM from this backup
+    # alone would leave the records permanently undecryptable. Upstream's
+    # recovery path for an encrypted install is the passphrase-protected
+    # config export, so point at it rather than implying coverage we lack.
+    if [[ "${ENCRYPT_REDIS_CREDENTIALS:-false}" == "true" ]]; then
+        log_warning "Credential encryption is enabled. This backup does NOT contain"
+        log_warning "  either half of the encryption key, so it cannot by itself restore"
+        log_warning "  an encrypted Redis database onto a rebuilt VM."
+        log_warning "  Also export the XO config from the web UI (Settings -> Config) —"
+        log_warning "  it prompts for a passphrase and is the portable copy of the data."
+        log_warning "  Ref: https://docs.xen-orchestra.com/credential-encryption"
+    fi
 
     # Purge old backups, keep only the latest BACKUP_KEEP
     log_info "Cleaning old backups (keeping ${BACKUP_KEEP})..."
@@ -5959,6 +6015,19 @@ cleanup_xo() {
         echo "  - sudoers file:     /etc/sudoers.d/xo-server-${SERVICE_USER}"
     fi
     echo ""
+
+    # Removing the data dir destroys this host's half of the credential
+    # encryption key. Redis itself is left alone by the uninstall, so the
+    # encrypted records survive as unreadable ciphertext unless the operator
+    # exported the config first. Say so before asking to proceed.
+    if [[ -f /var/lib/xo-server/data/xo-encryption-key ]]; then
+        log_warning "Credential encryption is in use on this host."
+        log_warning "  Removing the data dir deletes this host's half of the encryption"
+        log_warning "  key. Any encrypted records left in Redis become permanently"
+        log_warning "  undecryptable. If you still need that data, cancel now and export"
+        log_warning "  the XO config (Settings -> Config, passphrase-protected) first."
+        echo ""
+    fi
 
     if ! confirm_or_skip "Proceed with uninstall? This cannot be undone."; then
         log_info "Uninstall cancelled."

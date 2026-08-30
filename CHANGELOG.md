@@ -10,6 +10,50 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+- **Preflight check for the Xen guest utilities when credential encryption is
+  enabled.** `ENCRYPT_REDIS_CREDENTIALS=true` previously only checked that
+  `systemd-detect-virt` reported `xen`. A Xen guest without
+  `xenstore-read`/`xenstore-write` installed passed that check and then failed
+  at xo-server startup, because there was no way to store the key half that
+  lives in XenStore. The installer now names the missing tools and the package
+  that provides them.
+- **`--backup` says what it does not cover.** With credential encryption on,
+  the backup now warns that it contains neither half of the encryption key and
+  points at the passphrase-protected XO config export as the actual recovery
+  artifact. The backup copies the install directory only; an in-place
+  `--restore` is unaffected, but a backup alone cannot bring an encrypted
+  database back onto a rebuilt VM.
+- **`--uninstall` warns before destroying the on-disk key half.** Removing
+  `/var/lib/xo-server` deletes this host's half of the encryption key while
+  leaving Redis in place, so the records survive as unreadable ciphertext. The
+  confirmation prompt now says so when a key file is present.
+
+### Changed
+- **Documented why plaintext credentials in Redis are expected, not a defect.**
+  The credential xo-server stores is the one it uses to log into XAPI, and it
+  is replayed on every connect and auto-reconnect, so it must be reversible and
+  cannot be hashed. The README and sample config now explain that the perimeter
+  on a default install is localhost-bound Redis plus root on the XO VM, and
+  what enabling encryption does and does not buy. This was the single most
+  common question about the setting and the docs did not answer it.
+- **Documented the credential-encryption recovery caveats.** The README, the
+  sample config, the comments written into migrated `xo-config.cfg` files, and
+  the generated `/etc/xo-server/config.toml` now all carry the same warnings:
+  the key is split between XenStore and `/var/lib/xo-server/data`, losing
+  either half while encryption is on makes the records permanently
+  undecryptable (do not restart xo-server in that state), and the config export
+  requires a passphrase once encryption is enabled.
+- **Flagged the network exposure of a remote `REDIS_URI`.** The sample config
+  offered `redis://redis.company.lan:6379/42` as an example with no comment.
+  Redis speaks an unencrypted protocol and holds the pool credentials, so
+  pointing it off-host sends them over the network in cleartext and moves them
+  outside XO's trust boundary. The example is still there, now with the warning
+  it needed and the loopback/socket alternatives listed first.
+- Softened an unverified claim that a non-root xo-server without XenStore
+  access "rejects logins (degraded mode)"; the observable behaviour documented
+  is now that credential encryption fails at startup.
+
 ## [0.4.0] - 2026-08-23
 
 ### Changed

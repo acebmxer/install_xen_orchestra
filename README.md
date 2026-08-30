@@ -348,9 +348,23 @@ Key settings:
 
 > **Note on `ENCRYPT_REDIS_CREDENTIALS`:** This is an opt-in xo-server feature that encrypts credentials stored in Redis at rest (AES-256-GCM). It **only works when Xen Orchestra runs as a VM on a XenServer/XCP-ng host**, because half of the encryption key is stored in XenStore. It will **not** work on bare metal or on other hypervisors (KVM, VMware, Hyper-V). Leave it `false` unless XO is an XCP-ng guest.
 >
-> **Works with either `SERVICE_USER`:** root reaches XenStore directly. For a **non-root** `SERVICE_USER`, the xenbus device is root-only by default, so the installer adds the user to a `xenstore` group and installs a udev rule (`/etc/udev/rules.d/40-xen-xenbus-xo.rules`) granting access — without this, xo-server cannot derive the key and rejects logins (degraded mode). Group membership applies on the next service restart; verify with `sudo -u <SERVICE_USER> xenstore-ls vm-data`.
+> **Why the default is `false`, and why plaintext is normal.** The credential this protects is the one xo-server uses to log into XAPI on your pool. xo-server has to replay it to XAPI on every connect and auto-reconnect, so it must be **reversible** — it cannot be hashed the way a login password is. Storing it in a form xo-server can read back is therefore expected behaviour, not a defect in XO or in this installer. The security boundary for a default install is **Redis itself** (bound to localhost, never exposed to the network) plus **root access on the XO VM**: anyone with either can read the credentials regardless of this setting. Enabling encryption narrows the blast radius of an offline disk or snapshot; it does not protect against an attacker who is already root on a running XO.
 >
-> To opt out later, set it back to `false` and run `--reconfigure` — xo-server decrypts the records and removes the key files automatically.
+> **Works with either `SERVICE_USER`:** root reaches XenStore directly. For a **non-root** `SERVICE_USER`, the xenbus device is root-only by default, so the installer adds the user to a `xenstore` group and installs a udev rule (`/etc/udev/rules.d/40-xen-xenbus-xo.rules`) granting access — without this, xo-server cannot derive the key and credential encryption fails at startup. Group membership applies on the next service restart; verify with `sudo -u <SERVICE_USER> xenstore-ls vm-data`. XO's own docs cover only "run as root or grant access to the xenstored socket" and do not specify the device permissions, so this part is handled by the installer.
+>
+> **Requires the Xen guest utilities.** Being a Xen guest is not enough — `xenstore-read` / `xenstore-write` must be installed (`xe-guest-utilities` on XCP-ng, or your distro's `xen-guest-utilities` / `xen-utils` package). The installer warns if they are missing; without them xo-server cannot store its key half.
+
+> [!WARNING]
+> **Before you enable `ENCRYPT_REDIS_CREDENTIALS`, understand the recovery story.**
+>
+> - **Losing one key half is unrecoverable.** The key is split between XenStore (`vm-data/xo-encryption-key`) and `/var/lib/xo-server/data/xo-encryption-key`. If either half goes missing while encryption is on, **do not restart xo-server** — on startup XO treats a missing half as a fresh setup, generates two new halves, overwrites the surviving one, and re-runs the migration while skipping already-encrypted records. Those records become permanently undecryptable. Note that migrating or rebuilding the VM can lose the XenStore half.
+> - **`--backup` does not cover the key.** This script's backups copy the install directory only; neither key half lives there. An in-place `--restore` is unaffected (it never touches `/var/lib/xo-server`), but a backup alone **cannot** restore an encrypted database onto a rebuilt VM. The installer prints this reminder when it makes a backup.
+> - **Use the config export as your recovery artifact.** With encryption on, exporting the XO config (**Settings → Config** in the web UI) requires a passphrase and produces an OpenPGP-encrypted file. Export a fresh one immediately after enabling encryption, and store it somewhere other than the XO VM.
+> - **`--uninstall` destroys the on-disk key half** along with `/var/lib/xo-server`. Redis is left in place, so its records survive as unreadable ciphertext. The installer warns before this when it detects a key file.
+>
+> Full upstream reference: <https://docs.xen-orchestra.com/credential-encryption>
+
+> **Opting out:** set `ENCRYPT_REDIS_CREDENTIALS` back to `false` and run `--reconfigure` — xo-server decrypts the records and removes the key files automatically. Do this **while both key halves are still intact**.
 
 ## Default Credentials
 
