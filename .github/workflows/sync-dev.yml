@@ -1,0 +1,58 @@
+name: Sync dev
+
+# After a pull request is merged into main, GitHub's merge commit exists only on
+# main, leaving dev "behind". This fast-forwards dev back to main so the next
+# pull request contains only real work.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-dev
+  cancel-in-progress: false
+
+jobs:
+  fast-forward:
+    name: Fast-forward dev to main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # Pinned to a commit SHA: a tag can be retargeted, a SHA cannot.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward dev
+        run: |
+          set -euo pipefail
+
+          # Ask the remote directly. actions/checkout only fetches the ref that
+          # triggered the run, so a local origin/dev is not there to be read.
+          if [ -z "$(git ls-remote --heads origin dev)" ]; then
+            echo "No dev branch on origin — nothing to do."
+            exit 0
+          fi
+
+          git fetch --no-tags origin +refs/heads/dev:refs/remotes/origin/dev
+
+          ahead=$(git rev-list --count HEAD..origin/dev)
+          behind=$(git rev-list --count origin/dev..HEAD)
+
+          if [ "$ahead" -gt 0 ]; then
+            echo "::error::dev has $ahead commit(s) main does not — refusing to move it."
+            echo "Merge dev into main first, then re-run this workflow."
+            exit 1
+          fi
+
+          if [ "$behind" -eq 0 ]; then
+            echo "dev is already level with main."
+            exit 0
+          fi
+
+          echo "Fast-forwarding dev by $behind commit(s)."
+          git push origin "HEAD:refs/heads/dev"
