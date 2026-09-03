@@ -10,6 +10,17 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+- **Three repository-activity badges in the README.** The badge row now also
+  shows GitHub star and fork counts, both read live from the shields.io GitHub
+  endpoints and linking to the stargazers and forks pages, plus a clone-count
+  badge. GitHub does not expose clone traffic to shields.io — it is visible only
+  to the repository owner through an authenticated call to the traffic API and
+  is a rolling 14-day figure rather than a running total — so the clone badge is
+  a static `brightgreen` badge hard-coded to 263, the current 14-day count, and
+  will not update on its own. It links to the repository's traffic graph. A
+  scheduled workflow to keep it current was considered and deferred.
+
 ## [0.4.2] - 2026-09-02
 
 ### Changed
