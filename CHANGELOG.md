@@ -10,6 +10,38 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-02
+
+### Changed
+- **Expanded the README badge row.** The README carried only CI and licence
+  badges. It now also shows the current release tag (read live from the
+  repository's tags, linking to the changelog), last commit, open issues, the
+  shell and platform it targets, the unit test count, the number of
+  distributions the container matrix covers, and ShellCheck status. The last
+  three reflect what this project's CI actually enforces on every push and have
+  no equivalent in the sibling projects, which run no workflow. The licence
+  badge was recoloured from yellow to blue for consistency across the projects.
+  Both asserted numbers were verified rather than estimated: 118 unit tests by
+  running `bats tests/unit/`, and 8 distributions by cross-checking the CI
+  matrix against `tests/integration/`. The ShellCheck badge was confirmed by
+  running `shellcheck -S warning install-xen-orchestra.sh`, which is the exact
+  invocation CI uses. The test and ShellCheck badges link to the workflow that
+  proves them rather than to a directory listing.
+- **Split the README into topic pages under `docs/`.** The README had grown to
+  704 lines, roughly triple the front page of the sibling projects, with the
+  `--deploy` walkthrough alone taking over 200 of them — so the things a
+  first-time reader needs (what it does, quick start, the menu, supported
+  systems) were buried behind reference material they had not asked for yet.
+  Four sections moved out to `docs/deployment.md`, `docs/configuration.md`,
+  `docs/authentication.md` and `docs/troubleshooting.md`, and the README now
+  carries a `Read next` table pointing at them plus a short summary of each,
+  bringing it to 332 lines. No documentation was removed; the moved text is
+  unchanged apart from heading levels and link paths.
+  `ENCRYPT_REDIS_CREDENTIALS` is deliberately kept in full in both places — it
+  is the section a reader most needs to meet without going looking for it, and
+  `docs/configuration.md` is meant to stand alone as the complete configuration
+  reference.
+
 ## [0.4.1] - 2026-08-30
 
 ### Added
@@ -550,7 +582,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.1...v0.3.0
