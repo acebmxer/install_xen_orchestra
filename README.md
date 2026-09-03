@@ -1,7 +1,15 @@
 # Xen Orchestra Installation Script
 
 [![CI](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml/badge.svg)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/github/v/tag/acebmxer/install_xen_orchestra?label=version&sort=semver&color=brightgreen)](CHANGELOG.md)
+[![Last commit](https://img.shields.io/github/last-commit/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/commits)
+[![Issues](https://img.shields.io/github/issues/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/issues)
+[![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
+[![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
+[![Tests](https://img.shields.io/badge/tests-118%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Distros tested](https://img.shields.io/badge/distros%20tested-8-informational)](#supported-operating-systems)
+[![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
 Automated installation and management of [Xen
 Orchestra](https://xen-orchestra.com/) from source.

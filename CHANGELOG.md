@@ -11,6 +11,20 @@ This installer builds Xen Orchestra from source and tracks the official
 ## [Unreleased]
 
 ### Changed
+- **Expanded the README badge row.** The README carried only CI and licence
+  badges. It now also shows the current release tag (read live from the
+  repository's tags, linking to the changelog), last commit, open issues, the
+  shell and platform it targets, the unit test count, the number of
+  distributions the container matrix covers, and ShellCheck status. The last
+  three reflect what this project's CI actually enforces on every push and have
+  no equivalent in the sibling projects, which run no workflow. The licence
+  badge was recoloured from yellow to blue for consistency across the projects.
+  Both asserted numbers were verified rather than estimated: 118 unit tests by
+  running `bats tests/unit/`, and 8 distributions by cross-checking the CI
+  matrix against `tests/integration/`. The ShellCheck badge was confirmed by
+  running `shellcheck -S warning install-xen-orchestra.sh`, which is the exact
+  invocation CI uses. The test and ShellCheck badges link to the workflow that
+  proves them rather than to a directory listing.
 - **Split the README into topic pages under `docs/`.** The README had grown to
   704 lines, roughly triple the front page of the sibling projects, with the
   `--deploy` walkthrough alone taking over 200 of them — so the things a
