@@ -10,6 +10,22 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Changed
+- **Split the README into topic pages under `docs/`.** The README had grown to
+  704 lines, roughly triple the front page of the sibling projects, with the
+  `--deploy` walkthrough alone taking over 200 of them — so the things a
+  first-time reader needs (what it does, quick start, the menu, supported
+  systems) were buried behind reference material they had not asked for yet.
+  Four sections moved out to `docs/deployment.md`, `docs/configuration.md`,
+  `docs/authentication.md` and `docs/troubleshooting.md`, and the README now
+  carries a `Read next` table pointing at them plus a short summary of each,
+  bringing it to 332 lines. No documentation was removed; the moved text is
+  unchanged apart from heading levels and link paths.
+  `ENCRYPT_REDIS_CREDENTIALS` is deliberately kept in full in both places — it
+  is the section a reader most needs to meet without going looking for it, and
+  `docs/configuration.md` is meant to stand alone as the complete configuration
+  reference.
+
 ## [0.4.1] - 2026-08-30
 
 ### Added
