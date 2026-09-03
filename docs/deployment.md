@@ -14,7 +14,7 @@ cd install_xen_orchestra
 
 It will ask for your pool master's address and root password, let you pick a
 storage repository and network from what the pool actually has, then ask for
-the VM's size, admin account (optionally with a password), where to clone this
+the VM's size, admin account (with a required password), where to clone this
 repository inside the guest, and its static address. From there it:
 
 1. Creates the VM and streams a stock **Debian 13 cloud image** from
