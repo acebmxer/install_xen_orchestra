@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-02
+
 ### Changed
 - **Expanded the README badge row.** The README carried only CI and licence
   badges. It now also shows the current release tag (read live from the
@@ -580,7 +582,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.2.1...v0.3.0
