@@ -5566,6 +5566,30 @@ deploy_create_vm() {
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-policy='BIOS order'" >/dev/null
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-params:order=c" >/dev/null
 
+    # Identify this VM as ours. Without a stamp there is nothing on a deployed
+    # appliance that says where it came from: XAPI writes its own generic
+    # name-description for vm-install, and the platform corrections above are
+    # only circumstantial — anyone setting the same values by hand produces an
+    # identical record. The template builder already stamps its output (see
+    # tpl_publish_template); this is the deploy path's equivalent, and the key
+    # is deliberately distinct so the two are never confused.
+    local deploy_stamp_version=""
+    if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
+        deploy_stamp_version=$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null) || deploy_stamp_version=""
+    fi
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} other-config:xo_deployed_by='install-xen-orchestra.sh'" >/dev/null 2>&1 || true
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} other-config:xo_deploy_version='${deploy_stamp_version:-unknown}'" >/dev/null 2>&1 || true
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} other-config:xo_deploy_date='$(date -u +%Y-%m-%dT%H:%M:%SZ)'" >/dev/null 2>&1 || true
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} name-description='Xen Orchestra appliance deployed by install-xen-orchestra.sh'" >/dev/null 2>&1 || true
+
+    # A tag as well, because it is the only one of these XO surfaces in its own
+    # interface: tags render as chips on the VM and are filterable in the VM
+    # list, whereas other-config is readable through the API and `xe` but has no
+    # screen anywhere in XO that displays it. tags is a set, so it takes
+    # param-add rather than param-set — param-set would replace any tags the
+    # operator had already applied.
+    dom0_xe "vm-param-add uuid=${DEPLOY_VM_UUID} param-name=tags param-key='xo-deployed'" >/dev/null 2>&1 || true
+
     # Root disk.
     log_info "Creating a ${DEPLOY_DISK_GB} GB root disk..."
     DEPLOY_ROOT_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${DEPLOY_VM_NAME}-root' virtual-size=${DEPLOY_DISK_GB}GiB type=user")
@@ -5954,13 +5978,17 @@ deploy_remove_config_drive() {
 # function so the tests can exercise it directly -- it edits authorized_keys,
 # and a bug here locks the operator out of a VM they just paid to build.
 #
-# The key to remove arrives on stdin rather than on the command line: it is
-# long enough to be awkward to quote, and this keeps the guest's process list
-# clean. An empty pattern aborts instead of matching every line, which is the
+# The key to remove arrives as the first positional argument. stdin carries
+# this script itself -- it is piped into `sh -s` rather than embedded in a
+# quoted `sh -c` string, because the comments below contain apostrophes and
+# those closed the single-quoting early, sending the guest a truncated program
+# that could not parse and left the key in place.
+#
+# An empty pattern aborts instead of matching every line, which is the
 # difference between revoking one key and wiping the file.
 deploy_revoke_script() {
     cat <<'REVOKE_EOF'
-p=$(cat) || exit 1
+p=$1
 [ -n "$p" ] || exit 1
 f="$HOME/.ssh/authorized_keys"
 [ -f "$f" ] || exit 0
@@ -6005,8 +6033,28 @@ deploy_revoke_deploy_key() {
 
     log_info "Removing the temporary deployment key from the VM..."
 
-    if ! printf '%s\n' "$DEPLOY_PUBKEY" | ssh "${DEPLOY_SSH_OPTS[@]}" \
-        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" "sh -c '$(deploy_revoke_script)'" >/dev/null 2>&1; then
+    # The script goes to the remote `sh` on stdin, not inside a quoted -c
+    # argument. Wrapping it in single quotes was silently broken: the body
+    # carries apostrophes in its comments, and the first one closed the quoting
+    # early, so the guest received a truncated program, failed to parse it, and
+    # left the key in place. Feeding it on stdin means nothing in the script is
+    # re-parsed by the local shell or the login shell on the far side.
+    #
+    # That frees stdin, so the key to match now arrives as a positional
+    # argument instead. It is base64 plus a comment, quoted here and read back
+    # with "$1" on the guest, so it is not word-split or globbed either.
+    # ssh hands its command to a login shell on the guest, so the key has to
+    # survive one round of shell parsing there. Each embedded ' is closed,
+    # escaped and reopened ('\''), which is the only form safe inside single
+    # quotes. An OpenSSH public key never contains one, but the escaping costs
+    # nothing and the alternative is a quoting bug that silently skips the
+    # revocation -- which is exactly the failure this function just had.
+    local quoted_pubkey
+    quoted_pubkey=$(printf "%s" "$DEPLOY_PUBKEY" | sed "s/'/'\\\\''/g")
+
+    if ! ssh "${DEPLOY_SSH_OPTS[@]}" \
+        "${DEPLOY_ADMIN_USER}@${DEPLOY_IP}" \
+        "sh -s -- '${quoted_pubkey}'" < <(deploy_revoke_script) >/dev/null 2>&1; then
         log_warning "Could not remove the deployment key from the VM."
         log_warning "It is still in ~${DEPLOY_ADMIN_USER}/.ssh/authorized_keys, commented"
         log_warning "'install-xen-orchestra deploy (temporary)'. Delete that line by hand."
@@ -6088,12 +6136,23 @@ deploy_print_summary() {
     echo ""
     local n=2
     if [[ "$DEPLOY_KEY_REVOKED" != "true" ]]; then
+        # Boxed, unlike its neighbours. Every other item here is something to
+        # tighten at leisure; this one is a live passphraseless credential that
+        # opens a root-capable session on an appliance holding the pool's root
+        # password, and it is the only item the operator must act on before the
+        # VM is safe to leave. It was being missed in the run of warnings.
+        echo -e "${RED}  ┌────────────────────────────────────────────────────────────────────┐${NC}"
+        echo -e "${RED}  │  ${YELLOW}!!  ACTION REQUIRED — DEPLOYMENT KEY STILL LIVE  !!${RED}                │${NC}"
+        echo -e "${RED}  └────────────────────────────────────────────────────────────────────┘${NC}"
         log_warning "${n}. The temporary deployment key was NOT removed from the VM."
         echo "     It is an unencrypted key with no passphrase and it still opens a"
         echo "     root-capable session. Delete its line from"
         echo "     ~${DEPLOY_ADMIN_USER}/.ssh/authorized_keys — the one commented"
         echo "     'install-xen-orchestra deploy (temporary)':"
-        echo "       sed -i '/install-xen-orchestra deploy (temporary)/d' ~/.ssh/authorized_keys"
+        echo ""
+        echo -e "       ${YELLOW}sed -i '/install-xen-orchestra deploy (temporary)/d' ~/.ssh/authorized_keys${NC}"
+        echo ""
+        echo -e "${RED}  ────────────────────────────────────────────────────────────────────${NC}"
         echo ""
         n=$((n + 1))
     fi

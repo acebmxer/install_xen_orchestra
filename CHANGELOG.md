@@ -10,6 +10,73 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--deploy` never actually removed the temporary deployment key, leaving a
+  passphraseless root-capable credential on every appliance it built.** The
+  revocation step sent its program to the guest as `sh -c '<script>'`, embedding
+  the script inside a single-quoted argument. Three of the script's own comments
+  contain apostrophes — `grep's`, `operator's`, `caller's` — and the first of
+  them closed that quoting early, so the guest received a truncated program that
+  died on `unexpected EOF while looking for matching '`, having never reached
+  the line that writes the edited `authorized_keys` back. The failure was
+  invisible in the code because the revoke logic itself is correct: run
+  directly, it removes exactly the intended line and preserves the operator's
+  own keys. Only the transport was broken, and it broke silently on every
+  deploy, with `2>&1` discarding the parse error and the caller reporting the
+  generic "could not remove" warning. The script is now piped to `sh -s` on
+  stdin, where nothing re-parses it, and the key to match moves to a positional
+  argument single-quoted with embedded `'` escaped as `'\''`. Verified against
+  the real key format plus keys containing apostrophes, double quotes, `$`,
+  backticks, semicolons and globs. **Appliances deployed before this fix still
+  have the key**; remove it with `sed -i '/install-xen-orchestra deploy
+  (temporary)/d' ~/.ssh/authorized_keys` in the VM.
+
+### Changed
+
+- **The deployment-key warning in the post-deploy summary is now boxed and
+  colour-highlighted.** It was one bullet in a run of similar-looking advisory
+  items, and it is the only one that is not advisory: the others are settings to
+  tighten at leisure, while this one reports a live unencrypted credential that
+  opens a root-capable session on an appliance holding the pool's root password.
+  It now carries a red border and an "ACTION REQUIRED — DEPLOYMENT KEY STILL
+  LIVE" header, and the `sed` command that fixes it is set off on its own
+  highlighted line rather than buried at the end of a paragraph.
+
+### Added
+
+- **VMs created by the "Deploy Xen Orchestra VM" menu option are now stamped
+  with their provenance, so a deployed appliance can be identified as this
+  script's work after the fact.** Nothing on a deployed VM previously recorded
+  where it came from. `deploy_create_vm` set only the operator's own choices
+  (vCPU count, memory, disk size) and three platform corrections to the "Other
+  install media" scaffolding — `viridian=false`, `vga=std`, `videoram=8` — and
+  left `name-description` as whatever XAPI writes for `xe vm-install`, which is
+  the generic "Installed via xe CLI". Those corrections do distinguish a
+  deployed appliance from an untouched stock-template VM, but only
+  circumstantially: they are ordinary parameters, and anyone setting the same
+  three by hand produces a byte-identical record. Asked to confirm that a
+  running appliance had come from the deploy path, the honest answer off the
+  XAPI record was "consistent with, but not provable" — and the template
+  builder, which does stamp its output via `other-config:base_template_name`,
+  made the omission on the deploy side the inconsistent half. The deploy path
+  now writes three `other-config` keys — `xo_deployed_by`, holding the script
+  name; `xo_deploy_version`, the `git describe` revision resolved the same way
+  `show_version` resolves it, falling back to `unknown` outside a checkout; and
+  `xo_deploy_date`, a UTC ISO-8601 timestamp — plus a real `name-description`
+  identifying the VM as a Xen Orchestra appliance deployed by this script. The
+  keys are deliberately distinct from the template builder's
+  `base_template_name` so the two paths are never conflated, and every write is
+  `|| true` so a XAPI that rejects one cannot fail a deployment that has already
+  imported its disks. The VM is also tagged `xo-deployed`, which is the only
+  part of the stamp Xen Orchestra puts on screen: tags render as chips on the VM
+  and are filterable in the VM list, whereas `other-config` is returned by the
+  API but has no view anywhere in XO, so on its own it would have been invisible
+  to anyone not querying XAPI directly. The tag is written with `vm-param-add`
+  rather than `vm-param-set` because `tags` is a set and `param-set` would
+  discard any tags the operator had already applied. Existing appliances are
+  unaffected; the stamp applies to VMs deployed from this version onward.
+
 ### Changed
 
 - **The README's clone badge now reports unique cloners (57) rather than the raw

@@ -151,10 +151,13 @@ hands back the address. Run it from your own workstation:
 
 It asks for your pool master, a storage repository, a network, and a **static
 IP** (required — a stock cloud image cannot report a DHCP lease back), then
-does the rest unattended. The full walkthrough — requirements, the admin
-account and SSH key handling, image verification, what it hardens on the way
-out, and the pre-flight probe — is in
-[docs/deployment.md](docs/deployment.md).
+does the rest unattended. The VM it creates is tagged `xo-deployed` and stamped
+with `other-config` keys recording that this script deployed it, which version,
+and when — so an appliance can be identified as the script's work later, and
+filtered for by tag in XO's VM list. The full walkthrough —
+requirements, the admin account and SSH key handling, image verification, what
+it hardens on the way out, reading the deployment stamp back, and the pre-flight
+probe — is in [docs/deployment.md](docs/deployment.md).
 
 ## Building VM Templates (`--build-templates`)
 
