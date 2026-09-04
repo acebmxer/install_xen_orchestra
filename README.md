@@ -5,6 +5,9 @@
 [![Version](https://img.shields.io/github/v/tag/acebmxer/install_xen_orchestra?label=version&sort=semver&color=brightgreen)](CHANGELOG.md)
 [![Last commit](https://img.shields.io/github/last-commit/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/commits)
 [![Issues](https://img.shields.io/github/issues/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/issues)
+[![Stars](https://img.shields.io/github/stars/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/stargazers)
+[![Forks](https://img.shields.io/github/forks/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/forks)
+[![Clones](https://img.shields.io/badge/clones-263-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
 [![Tests](https://img.shields.io/badge/tests-118%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
@@ -42,6 +45,7 @@ Orchestra](https://xen-orchestra.com/) from source.
 | Topic | Page |
 | --- | --- |
 | Building the VM for you (`--deploy`) | [docs/deployment.md](docs/deployment.md) |
+| Building cloud-init VM templates (`--build-templates`) | [docs/templates.md](docs/templates.md) |
 | Every config option, and the environment variables | [docs/configuration.md](docs/configuration.md) |
 | Update-safety task detection and REST API auth | [docs/authentication.md](docs/authentication.md) |
 | Something went wrong | [docs/troubleshooting.md](docs/troubleshooting.md) |
@@ -52,6 +56,7 @@ Orchestra](https://xen-orchestra.com/) from source.
 | Function | CLI Flag | Description |
 |----------|----------|-------------|
 | Deploy | `--deploy` | Create a Debian VM on a XenServer/XCP-ng pool and install XO into it |
+| Build Templates | `--build-templates` | Build cloud-init VM templates on a XenServer/XCP-ng pool |
 | Install | `--install` | Fresh install of Xen Orchestra |
 | Update | `--update` | Update existing installation (with backup) |
 | Restore | `--restore` | Restore from a previous backup |
@@ -92,6 +97,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
     [ ] Rename Sample-xo-config.cfg                                [ ] Edit xo-config.cfg
     [ ] Install XO Proxy                                           [ ] Restore Backup
     [ ] Deploy Xen Orchestra to a new VM (creates the VM for you)  [ ] Adjust Xen Orchestra Memory Allocation
+    [ ] VM Template Library
 
   ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -149,6 +155,28 @@ does the rest unattended. The full walkthrough — requirements, the admin
 account and SSH key handling, image verification, what it hardens on the way
 out, and the pre-flight probe — is in
 [docs/deployment.md](docs/deployment.md).
+
+## Building VM Templates (`--build-templates`)
+
+Xen Orchestra's Hub does not work on an install from sources — the `cloud.*`
+API behind it has no open-source implementation, so there is nothing to
+unlock. `--build-templates` builds the equivalent on your pool instead, from
+each distribution's own published cloud image:
+
+```bash
+./install-xen-orchestra.sh --build-templates
+```
+
+Pick the templates you want and it does the rest — verifying the image against
+the origin's published checksum, installing the XCP-ng guest tools, scrubbing
+the machine identity a clone must not inherit, and sealing the result. Once
+built they appear in Xen Orchestra under **New → VM**, alongside any Hub
+templates you already have.
+
+Debian 13 (Trixie) ships first; further distributions are additive. The full
+walkthrough — what each template contains, how the boot firmware is chosen,
+requirements, and what to do when a build fails — is in
+[docs/templates.md](docs/templates.md).
 
 ## Configuration
 

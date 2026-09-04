@@ -10,6 +10,235 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-04
+
+### Added
+- **A "VM Template Library" menu entry and `--build-templates` flag that build
+  cloud-init VM templates on an XCP-ng pool.** Xen Orchestra's Hub — the curated catalogue of
+  ready-to-deploy Linux templates — is inert on an install from sources, and
+  cannot be unlocked. The gate is not the plan check in the web client but the
+  `cloud.*` API behind it: `xo-web` calls `cloud.getResourceCatalog` and
+  `cloud.downloadAndInstallResource`, and neither has an implementation
+  anywhere in the open-source tree. The `xo-server-cloud` package that provides
+  them is not among the 37 packages published in the repository, so patching
+  the client's `getXoaPlan() === 'Community'` check would render the Hub page
+  and then fail on an unknown API method. The catalogue is served from Vates'
+  own infrastructure, and the XVAs it distributes are hosted there too — the
+  same mechanism `proxies.mjs` uses to fetch the proxy appliance streams a real
+  image out of `requestResource`, not a redirect to an upstream mirror.
+
+  This builds the equivalent from upstream instead. The catalogue lives in
+  `TPL_CATALOG`, one row per distribution naming the image URL, the default
+  account and the in-guest preparation function. **Debian 13 (Trixie) is the
+  first distribution shipped, and is a starting point rather than the intended
+  limit** — further distributions are additive, each one a row in that table,
+  and need no change to the build itself. Images come from the distribution's
+  own mirror, so nothing is redistributed and the operator can pin a version.
+  Checksums are not written into the table: every origin listed publishes a
+  `SHA512SUMS` beside the image, and the existing
+  `deploy_verify_image_checksum` reads it at build time, so upstream releases
+  are picked up without the table being edited.
+
+  A template is not a file that can be copied onto a pool — it is a VM object
+  whose disk has been prepared and which is then flagged as a template — so
+  each build imports the image, boots it exactly once, and seals the result.
+  The boot is not avoidable: XCP-ng's guest agent has to be installed *inside*
+  the image for XO to report a VM's IP address, and no amount of API work
+  installs it from outside. That single boot also runs the scrub that stops
+  clones sharing an identity — `cloud-init clean --logs --seed`, truncating
+  `/etc/machine-id` and dbus's copy, and deleting the SSH host keys — without
+  which every VM built from the template collides on DHCP leases and presents
+  the same SSH fingerprint. `cloud-initramfs-growroot` is installed in the same
+  pass so a larger disk requested at deploy time is actually filled.
+
+  The guest agent is installed from the guest tools ISO rather than from the
+  distribution's package. On Debian 13 there is no `xe-guest-utilities` package
+  at all, and the failure is silent: cloud-init does not abort on a failed
+  package install, so an apt-first ordering produces a template that looks
+  correct and never reports an IP. The ISO path is also what XCP-ng's own
+  documentation prescribes; the package remains as a fallback for releases that
+  do ship it.
+
+  One template serves both BIOS and UEFI rather than two being built. The
+  generic cloud images carry an EFI system partition *and* a BIOS boot
+  partition on the same disk, so the same template boots either way and the
+  operator flips "Boot firmware" in New VM's advanced settings. The build runs
+  under BIOS deliberately: a UEFI VM boots from entries recorded in its own
+  NVRAM, written on first boot, so building under UEFI would bake the build
+  VM's boot entries into the template. Templates are also given
+  `platform:vga=std` with 16 MiB of video memory instead of the stock 4 MiB
+  cirrus adapter, and both settings are inherited by every VM cloned from them.
+
+  Choosing what to build is its own submenu rather than a numbered prompt,
+  driven by the same keys as the main menu — arrows, space, enter — so the two
+  do not teach different habits for the same job. It draws its own rows instead
+  of reusing `draw_menu`, which is bound to the main menu's two-column grid and
+  its parallel `MENU_*` arrays, and it marks each entry that is already present
+  on the pool so a re-run is not a guess about what a build would do. Backing
+  out with Q returns success with an empty selection: a non-zero return would
+  be caught by the script's `ERR` trap and printed as a failure on what is a
+  normal way to leave a menu.
+
+  The feature reuses the `--deploy` path's pool connection, host-key pinning,
+  SR and network pickers, and resumable checksum-verified image import rather
+  than introducing a second way to reach the pool. Like `--deploy` it takes no
+  sudo on the local machine and does not touch the local XO install. A template
+  whose name already exists is skipped rather than rebuilt, and a build that
+  fails partway destroys its own half-built VM — except when the preparation
+  boot times out, where the VM is deliberately left running because it holds
+  the log at `/var/log/xo-template-prep.log` that says why.
+
+- **Documentation for `--build-templates`.** A new
+  [docs/templates.md](docs/templates.md) covering what a built template
+  contains, why the Hub cannot be unlocked on an install from sources, how the
+  boot firmware is chosen from the image, the requirements on the pool, and what
+  to do when a build fails. The README gains a section, a Read-next row, an
+  Available Functions row, and the menu entry.
+- **Three repository-activity badges in the README.** The badge row now also
+  shows GitHub star and fork counts, both read live from the shields.io GitHub
+  endpoints and linking to the stargazers and forks pages, plus a clone-count
+  badge. GitHub does not expose clone traffic to shields.io — it is visible only
+  to the repository owner through an authenticated call to the traffic API and
+  is a rolling 14-day figure rather than a running total — so the clone badge is
+  a static `brightgreen` badge hard-coded to 263, the current 14-day count, and
+  will not update on its own. It links to the repository's traffic graph. A
+  scheduled workflow to keep it current was considered and deferred.
+
+### Changed
+
+- **The main menu is now always two columns, with no full-width centered row.**
+  With an odd number of entries the grid split the list into two equal columns
+  and drew the leftover item full-width and centered beneath them, so the menu
+  changed shape every time an entry was added or removed. `menu_derive_layout`
+  now gives the extra item to the left column instead — the left column runs at
+  most one row longer than the right, and `MENU_CENTER_COUNT` is always 0. The
+  drawing and navigation code already handled unequal columns and an absent
+  centered row, so the grid, the cursor mapping and the up/down wrap all follow
+  from the new counts without a special case.
+
+- **Settings inherited from the scaffolding template are now set deliberately,
+  in both `--build-templates` and `--deploy`.** Both start from
+  `Other install media`, whose defaults target an unknown guest; anything not
+  explicitly overridden travelled into the finished template — and, in
+  `--deploy`'s case, into the XO appliance itself, permanently. Found by
+  comparing a built template against the VMs already running on a live pool:
+    - `platform:vga=std` with `platform:videoram=8`. Both halves are needed:
+      `vga=std` on its own leaves videoram at the base template's 4 MiB. The
+      stock 4 MiB cirrus adapter is what leaves XO's console at 640x480, and
+      every working VM on the pool surveyed runs `std` with 8. XAPI accepts any
+      videoram value without complaint, so a wrong one fails silently. This was
+      *not* the cause of the scrambled UEFI console — see the image-variant
+      entry above — but 8 is the correct value regardless. `--deploy` had never
+      set `vga` at all.
+    - `platform:viridian=false`. Viridian is Hyper-V enlightenment, meant for
+      Windows guests; the base template enables it and nothing turned it back
+      off, so every template produced here advertised itself to Linux as a
+      Hyper-V machine. On the pool surveyed, the only VMs with it enabled are
+      the Windows ones and the ones this script built.
+    - `platform:cores-per-socket` now matches the vCPU count. The base template
+      leaves it at 1, so a 2-vCPU VM arrived as a two-socket machine; guests
+      licence and schedule per socket, and every VM on the pool not built from
+      this path has the two equal.
+    - `other-config:base_template_name` is set to the template's own name at
+      seal. Otherwise every VM cloned from it reports "Other install media" in
+      XO's General tab — the scaffolding rather than the template the operator
+      chose. Cosmetic: the field only steers behaviour on the PV install path,
+      which an HVM guest never takes.
+
+  `--deploy` carried the first three of these too and had never set `vga` at
+  all, so the appliance it builds ran with viridian enabled, one core per
+  socket, and the stock 4 MiB cirrus console. It now sets the same three.
+- **Templates are published as UEFI when the image supports it, instead of
+  always as BIOS.** XO's New VM form takes its "Boot firmware" default straight
+  from the template (xo-web's new-vm form: `hvmBootFirmware: defined(() =>
+  template.boot.firmware, '')`), and the templates were leaving it unset, which
+  reads as BIOS. Whether UEFI works is a property of the image rather than of
+  the distribution, so it is now read off the disk that was actually imported:
+  after the build boot, the GPT is scanned for an EFI system partition
+  (`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`) and the template is sealed as `uefi`
+  when one is present and `bios` when it is not. Debian's cloud images carry an
+  ESP *and* a BIOS boot partition, so an operator who wants BIOS still gets a
+  working VM from the same dropdown; the reverse does not hold, since UEFI
+  firmware with no bootloader to load does not fall back. The build boot itself
+  still runs under BIOS, so no NVRAM from the build VM is baked into the
+  template. The catalogue carries a note for whoever adds the next image: judge
+  from the disk, never from the distribution name, and do not read a garbled
+  early-boot console as a missing ESP — that clears once the kernel takes over
+  the framebuffer, and XO's own Hub templates do the same.
+- **The default template disk is 4 GiB rather than 8 GiB.** The 8 GiB came from
+  a belief that a VDI sized close to the image left the raw import "no margin"
+  and made it fail — the same mistaken reading that treated a correctly
+  imported sparse disk as an empty one. XO's own Hub template for this image is
+  3,223,322,624 bytes against a 3,221,225,472-byte image, about two megabytes
+  of headroom, and imports fine. A clone starts at the template's size unless
+  the operator asks for more, so the oversized default inflated every VM built
+  from it.
+
+
+### Fixed
+
+- **The XO console rendered as scrambled colour on UEFI guests, because the
+  images used a kernel with no framebuffer driver.** Debian publishes
+  `genericcloud` and `generic` side by side — same size, nearly the same name —
+  and they do not carry the same kernel. Read out of the images themselves:
+  `genericcloud` ships `vmlinuz-6.12.107+deb13-cloud-amd64` and `generic` ships
+  `vmlinuz-6.12.107+deb13-amd64`. The cloud kernel is trimmed for headless
+  virtual machines and includes neither the `bochs` driver for the VGA card
+  Qemu emulates nor a compiled-in `efi-framebuffer`, so the guest falls back to
+  `simple-framebuffer`, which OVMF's VGA initialisation does not agree with.
+  XCP-ng documents exactly this, at https://xcp-ng.org/docs/guests.html under
+  "Distorted display console on Ubuntu UEFI VMs". Under BIOS the guest uses
+  plain VGA text mode and the problem never appears, which is what made it look
+  like a firmware or video-memory issue rather than a missing driver — the VM
+  boots, gets an IP and runs the guest agent either way, so nothing reports an
+  error. Both `--build-templates` and `--deploy` now use the `generic` image;
+  the checksum source is unchanged, since Debian's `SHA512SUMS` covers both.
+  `platform:vga=std` and `platform:videoram=8` are applied identically to BIOS
+  and UEFI templates and were never the cause.
+
+- **Raw disk imports were not following XAPI's redirect on a multi-host pool.**
+  A real defect, though not the cause of the empty-disk symptom it was found
+  while chasing. XAPI's import handler checks whether the host
+  being asked can actually see the target SR, and when it cannot it answers a
+  302 redirect naming the host that can (`ocaml/xapi/import_raw_vdi.ml`, via
+  `Importexport.check_sr_availability` and `return_302_redirect`). The import
+  calls did not pass `-L`, and `curl -f` fails on 4xx and 5xx only — a 302 is a
+  successful response to it. So curl exited 0 having sent the image nowhere at
+  all, XAPI never started an import and so never recorded a failure, and the
+  only trace was a VDI containing the few kilobytes XAPI writes before the
+  redirect. On a single-host pool, or one whose SR is local to the master, the
+  redirect never fires and the same code works. All three import paths now
+  follow redirects, with `--post301`, `--post302` and `--post303` so the PUT
+  survives the hop as a PUT, and the staged path records `num_redirects` and
+  says when a hop was taken. Affects `--deploy` as much as `--build-templates`;
+  they share the import helpers.
+
+- **Raw disk imports now report failures instead of silently producing an empty
+  disk.** XAPI's `/import_raw_vdi` answers the HTTP request as soon as it has
+  accepted the stream; whether the import then succeeded is reported on a task
+  object and nowhere else. With no task in play, an import that died inside
+  XAPI still returned 200 and still let `curl` exit 0, so the caller believed it
+  had worked. What it left behind was a VDI holding about 19 KB of header — a
+  failure that reads as a disk too small for its image and sends the reader off
+  to fix a sizing problem that does not exist. Every import path now creates a
+  task, passes its reference as `task_id`, and reads `task.get_status` and
+  `task.get_error_info` back afterwards, printing XAPI's own error code and
+  description rather than a guess made from the outside. A task that cannot be
+  created or read is not treated as a failure: the template build still verifies
+  the imported disk's partition table behind it, and a missing task should not
+  turn a good import into a reported one. This affects `--deploy` as much as
+  `--build-templates`; both share the import helpers.
+- **Opaque references containing anything but hex are no longer truncated.** The
+  pattern used to pull an `OpaqueRef` out of an XML-RPC reply matched only
+  `[a-f0-9-]`, so a reference whose body used any other character was cut short
+  at `OpaqueRef:`. XAPI accepts such a value on an import URL and then ignores
+  it, leaving a disk holding only the few kilobytes of header it wrote before
+  stopping — and reporting success. The session login, the
+  VDI reference resolver and the new task helpers all match the full reference.
+- **The test asserting that every import sends an opaque reference was checking
+  two paths, not three.** It iterated over a function name that no longer
+  existed (`deploy_stream_import`; the streaming import lives in
+  `deploy_import_vdi_from_url`) and `continue`d silently past it, so the
 ## [0.4.2] - 2026-09-02
 
 ### Changed
@@ -582,7 +811,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.3.0...v0.4.0

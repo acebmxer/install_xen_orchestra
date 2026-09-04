@@ -361,6 +361,9 @@ _import_stub() {
             *sha512sum*)      printf '%s' "${ACTUAL_SHA:-}" ;;
             *"df -BM"*)       echo "$FREE_MB" ;;
             *"stat -c %s"*)   echo "$STAGED_SIZE" ;;
+            # XAPI's import endpoint takes an opaque ref, so every import
+            # resolves the VDI's uuid to one first.
+            *"param-name=_ref"*) echo "OpaqueRef:00000000-1111-2222-3333-444444444444" ;;
             *"--progress-bar"*) [[ -z "${DOWNLOAD_FAILS:-}" ]] || return 1 ;;
         esac
         return 0
@@ -933,15 +936,43 @@ _seed_keys() {
 @test "a hostile free-space reply is not executed as arithmetic" {
     local marker="${TMPDIR_TEST}/pwned"
 
+    # `stat` answers with a plausible size so the staged-file check does not
+    # short-circuit the function before the free-space probe is reached; the
+    # payload under test is the df reply. Both replies go through the same
+    # regex gate, so the marker proves neither was evaluated.
     dom0_exec() {
         case "$*" in
             *content-length*) echo "" ;;
+            *stat*)           echo "3221225472" ;;
             *df*)             echo "PATH[\$(touch ${marker})]" ;;
             *)                echo "" ;;
         esac
     }
 
     deploy_import_vdi_staged "fake-vdi" "https://example.com/image.raw" >/dev/null 2>&1 || true
+
+    [ ! -e "$marker" ]
+}
+
+@test "a hostile staged-size reply is not executed as arithmetic" {
+    # Same class of vulnerability as the free-space probe: the staged file's
+    # size comes from the pool master and is compared numerically, so it must
+    # pass the same string gate before reaching (( )).
+    local marker="${TMPDIR_TEST}/pwned-stat"
+
+    dom0_exec() {
+        case "$*" in
+            *content-length*) echo "" ;;
+            *df*)             echo "999999" ;;
+            *stat*)           echo "PATH[\$(touch ${marker})]" ;;
+            *)                echo "" ;;
+        esac
+    }
+
+    # `run` rather than a bare call: the staged-size guard correctly returns
+    # non-zero for this reply (it is not a number), and the script's ERR trap
+    # turns a bare failing call into an aborted test before the assertion runs.
+    run deploy_import_vdi_staged "fake-vdi" "https://example.com/image.raw"
 
     [ ! -e "$marker" ]
 }
@@ -1221,4 +1252,43 @@ _sha_b() { printf 'b%.0s' $(seq 128); }
 
     [ "$status" -eq 0 ]
     grep -q -- "bash -s --" "$CMDLOG"
+}
+
+# --- settings inherited from the scaffolding template ----------------------
+#
+# --deploy builds the appliance from "Other install media", the same generic
+# HVM template the template builder starts from, and inherits the same defaults
+# aimed at an unknown guest. Anything not overridden becomes a permanent
+# property of the XO appliance.
+
+@test "the deployed VM is not left advertising Hyper-V enlightenment" {
+    # viridian belongs to Windows guests. The base template enables it, so
+    # without an explicit override the Debian appliance carries it for life.
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"platform:viridian=false"* ]]
+}
+
+@test "the deployed VM presents its vCPUs as cores on one socket" {
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"platform:cores-per-socket=\${DEPLOY_VCPUS}"* ]]
+}
+
+@test "the deployed VM gets a usable console adapter" {
+    # The stock 4 MiB cirrus adapter is what leaves XO's console at 640x480,
+    # and vga=std alone leaves videoram at that same 4 -- which produces an
+    # unreadable console under UEFI. Both halves are set.
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"platform:vga=std"* ]]
+    [[ "$body" == *"platform:videoram=8"* ]]
+}
+
+@test "the deploy image carries a full kernel, not the cloud one" {
+    # See the matching template test: the cloud kernel ships no bochs driver and
+    # no compiled-in efi-framebuffer, which scrambles the XO console on a UEFI
+    # guest while the VM itself runs perfectly.
+    [[ "$XO_DEPLOY_IMAGE_URL" != *genericcloud* ]]
+    [[ "$XO_DEPLOY_IMAGE_URL" == *generic-amd64* ]]
 }
