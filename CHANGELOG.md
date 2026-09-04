@@ -10,6 +10,19 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Changed
+
+- **The README's clone badge now reports unique cloners (57) rather than the raw
+  clone count.** The raw count for the same 14-day window was 433 against only
+  57 unique cloners, and the view figures show the same shape — 434 views from 20
+  unique visitors, 148 of them referred from github.com by a single visitor, with
+  individual repository pages each drawing 20-38 views from one visitor. Totals
+  on that traffic graph are dominated by automated and repeat clients, so the
+  unique figure is the one that means anything to a reader. The badge remains
+  static text baked into its shields.io URL — GitHub does not expose clone
+  traffic to shields.io, and the window is rolling rather than cumulative, so the
+  number has to be edited by hand and goes stale on its own.
+
 ## [0.5.0] - 2026-09-04
 
 ### Added
