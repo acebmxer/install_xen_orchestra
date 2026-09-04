@@ -3521,9 +3521,25 @@ REMOTE_LICENSE_PATCH
 # testing or to pin an older release. The `.raw` variant is deliberate: XAPI
 # imports raw disks natively, so nothing has to convert a qcow2 and no qemu-img
 # is needed on either end.
+#
+# `generic`, not `genericcloud`. The two are published side by side, are the
+# same size, and differ in the kernel they carry:
+#
+#   genericcloud  vmlinuz-6.12.107+deb13-cloud-amd64
+#   generic       vmlinuz-6.12.107+deb13-amd64
+#
+# The cloud kernel is trimmed for headless VMs and ships neither the `bochs`
+# framebuffer driver nor a compiled-in `efi-framebuffer`. XCP-ng documents the
+# consequence (https://xcp-ng.org/docs/guests.html, "Distorted display console
+# on Ubuntu UEFI VMs"): with no suitable driver the guest falls back to
+# simple-framebuffer, which OVMF's VGA initialisation does not agree with, and
+# the console renders as scrambled colour. The VM itself is fine -- it boots,
+# gets an IP and runs the guest agent -- so nothing reports an error. Under BIOS
+# the guest uses plain VGA text mode and the problem does not appear, which is
+# what makes it look like a firmware bug rather than a missing driver.
 XO_DEPLOY_IMAGE_VERSION="${XO_DEPLOY_IMAGE_VERSION:-13}"
 XO_DEPLOY_IMAGE_RELEASE="${XO_DEPLOY_IMAGE_RELEASE:-trixie}"
-XO_DEPLOY_IMAGE_URL="${XO_DEPLOY_IMAGE_URL:-https://cloud.debian.org/images/cloud/${XO_DEPLOY_IMAGE_RELEASE}/latest/debian-${XO_DEPLOY_IMAGE_VERSION}-genericcloud-amd64.raw}"
+XO_DEPLOY_IMAGE_URL="${XO_DEPLOY_IMAGE_URL:-https://cloud.debian.org/images/cloud/${XO_DEPLOY_IMAGE_RELEASE}/latest/debian-${XO_DEPLOY_IMAGE_VERSION}-generic-amd64.raw}"
 
 # The raw image is 3 GB; the root VDI must be at least that large for the
 # import to fit, and cloud-init's growpart expands the filesystem to whatever
@@ -3747,7 +3763,7 @@ deploy_xapi_login() {
         "curl -sk --max-time 30 -H 'Content-Type: text/xml' \
               --data-binary @- https://localhost/" 2>/dev/null) || true
 
-    DEPLOY_SESSION=$(grep -o 'OpaqueRef:[a-f0-9-]*' <<< "$reply" | head -1 || true)
+    DEPLOY_SESSION=$(grep -o 'OpaqueRef:[A-Za-z0-9._-]*' <<< "$reply" | head -1 || true)
 
     if [[ -z "$DEPLOY_SESSION" ]]; then
         log_error "Could not log in to XAPI on the pool master."
@@ -3797,7 +3813,12 @@ mkfifo "$fifo" || exit 1
 curl -fsS -L --speed-limit 1024 --speed-time 60 --max-time 3600 "$url" > "$fifo" &
 dl=$!
 
-curl -sk -f --speed-limit 1024 --speed-time 60 --max-time 3600 -T - \
+# -L: on a multi-host pool XAPI answers 302 to whichever host can see the SR,
+# and an unfollowed redirect uploads nothing while exiting 0. A redirected PUT
+# from a fifo cannot be replayed, so the body is read once and the hop is made
+# before any of it is sent -- which is what --post302 with -T - gives us here.
+curl -sk -f -L --post301 --post302 --post303 \
+     --speed-limit 1024 --speed-time 60 --max-time 3600 -T - \
      -H 'Transfer-Encoding:' -H "Content-Length: $size" "$target" < "$fifo" &
 ul=$!
 
@@ -3960,11 +3981,161 @@ deploy_import_vdi_from_url() {
 
     log_info "  image is $(( size / 1048576 )) MiB; streaming it into the disk"
 
-    local target="https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw"
+    local vdi_ref
+    if ! vdi_ref=$(deploy_vdi_ref "$vdi"); then
+        log_error "Could not resolve the disk ${vdi} to an XAPI reference."
+        return 1
+    fi
+    local task
+    task=$(deploy_task_create "import ${vdi}")
+    local task_q=""
+    [[ "$task" =~ ^OpaqueRef: ]] && task_q="&task_id=${task}"
+
+    local target="https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw${task_q}"
     # A here-string, not a pipe: if the remote shell ever exits before reading
     # the program, a pipe hands back SIGPIPE (141) instead of whatever actually
     # went wrong. This is also how the config-drive upload feeds dom0_exec.
-    dom0_exec "bash -s -- '${url}' '${size}' '${target}'" <<< "$(deploy_stream_script)"
+    local rc=0
+    dom0_exec "bash -s -- '${url}' '${size}' '${target}'" <<< "$(deploy_stream_script)" || rc=$?
+    if (( rc == 0 )) && ! deploy_task_check "$task"; then
+        rc=1
+    fi
+    deploy_task_destroy "$task"
+    return $rc
+}
+
+# Translate a VDI uuid into the opaque reference XAPI's HTTP endpoints expect.
+#
+# `xe vdi-create` returns a uuid, but /import_raw_vdi takes an OpaqueRef. Given
+# a uuid it does not reject the request outright: it accepts the connection,
+# writes a few kilobytes of header, and then stops -- leaving a VDI with about
+# 19 KB in it and an import that reported success. That failure looks exactly
+# like a disk too small for its image, which is the wrong thing to go and fix.
+deploy_vdi_ref() {
+    local uuid="$1" ref=""
+    ref=$(dom0_exec "xe vdi-param-get uuid='${uuid}' param-name=_ref 2>/dev/null" | tr -d '\r')
+
+    # Not every XAPI build exposes _ref as a parameter. Ask the API directly
+    # when it does not, rather than falling back to the uuid and failing in the
+    # confusing way described above.
+    if [[ ! "$ref" =~ ^OpaqueRef: ]]; then
+        local xml
+        xml=$(printf '<?xml version="1.0"?><methodCall><methodName>VDI.get_by_uuid</methodName><params><param><value><string>%s</string></value></param><param><value><string>%s</string></value></param></params></methodCall>' \
+            "$(xml_escape "$DEPLOY_SESSION")" "$(xml_escape "$uuid")")
+        local reply
+        reply=$(dom0_exec "curl -sk -H 'Content-Type: text/xml' --data-binary @- https://localhost/ 2>/dev/null" <<< "$xml" || true)
+        ref=$(grep -o 'OpaqueRef:[A-Za-z0-9._-]*' <<< "$reply" | head -1 || true)
+    fi
+
+    [[ "$ref" =~ ^OpaqueRef: ]] || return 1
+    printf '%s' "$ref"
+}
+
+# ---------------------------------------------------------------------------
+# Watching an import through XAPI's task, not through curl's exit status
+#
+# /import_raw_vdi answers the HTTP request as soon as it has accepted the
+# stream. Whether the import then *worked* is reported on a task object, and
+# only there: an import that dies inside XAPI still returns 200 and still lets
+# curl exit 0, leaving a VDI with a few kilobytes of header in it and a caller
+# that believes it succeeded. That is exactly the failure this code spent
+# several runs mistaking for a disk that was too small.
+#
+# So every import creates a task first, passes its reference as task_id, and
+# reads status and error_info back afterwards. XAPI's own description of the
+# failure is worth more than any guess made from the outside.
+# ---------------------------------------------------------------------------
+
+# Send one XML-RPC call to XAPI on the pool master and print the raw response.
+# Arguments: method name, then each parameter as an already-escaped string.
+deploy_xapi_call() {
+    local method="$1"; shift
+    local xml params=""
+    local p
+    for p in "$@"; do
+        params+="$(printf '<param><value><string>%s</string></value></param>' "$(xml_escape "$p")")"
+    done
+    xml=$(printf '<?xml version="1.0"?><methodCall><methodName>%s</methodName><params>%s</params></methodCall>' \
+        "$method" "$params")
+    dom0_exec "curl -sk --max-time 30 -H 'Content-Type: text/xml' \
+        --data-binary @- https://localhost/ 2>/dev/null" <<< "$xml" || true
+}
+
+# Create a task for an import to report itself through. Prints its OpaqueRef,
+# or nothing when the task could not be made -- in which case the caller goes
+# ahead without one rather than refusing to import at all.
+deploy_task_create() {
+    local label="$1"
+    local reply
+    reply=$(deploy_xapi_call "task.create" "$DEPLOY_SESSION" "$label" "$label")
+    grep -o 'OpaqueRef:[A-Za-z0-9._-]*' <<< "$reply" | tail -1 || true
+}
+
+# Read a finished task and decide whether the import actually worked.
+#
+# Returns 0 when the task says success, 1 otherwise, printing whatever XAPI
+# gave as the reason. A task that cannot be read is not treated as a failure:
+# the template build still reads the imported disk's partition table behind
+# this, and a missing task should not turn a good import into a reported one.
+deploy_task_check() {
+    local task="$1"
+    if [[ ! "$task" =~ ^OpaqueRef: ]]; then
+        # Silence here is not evidence of success: it means the task was never
+        # made, so nothing was watching the import at all. Say so rather than
+        # letting a missing task read as a clean run.
+        log_warning "  no XAPI task was created for this import, so it was not watched."
+        return 0
+    fi
+
+    local reply status
+    reply=$(deploy_xapi_call "task.get_status" "$DEPLOY_SESSION" "$task")
+    status=$(sed -n 's/.*<value>\(pending\|success\|failure\|cancelling\|cancelled\)<\/value>.*/\1/p' <<< "$reply" | head -1)
+
+    # A pending task here means XAPI answered the HTTP request before it had
+    # finished writing. Give it a bounded moment rather than calling it broken.
+    local waited=0
+    while [[ "$status" == "pending" ]] && (( waited < 60 )); do
+        sleep 2; waited=$(( waited + 2 ))
+        reply=$(deploy_xapi_call "task.get_status" "$DEPLOY_SESSION" "$task")
+        status=$(sed -n 's/.*<value>\(pending\|success\|failure\|cancelling\|cancelled\)<\/value>.*/\1/p' <<< "$reply" | head -1)
+    done
+
+    case "$status" in
+        success) return 0 ;;
+        pending)
+            log_warning "  the import task was still pending after 60s; not waiting further."
+            return 0 ;;
+        "")
+            # An unparsed reply is not a success. Print what XAPI actually sent
+            # so the next run does not have to guess at it as well.
+            log_warning "  could not read the import task's status. XAPI replied:"
+            log_warning "    ${reply:0:400}"
+            return 0 ;;
+    esac
+
+    log_error "  XAPI reported the import as ${status}:"
+    local err
+    err=$(deploy_xapi_call "task.get_error_info" "$DEPLOY_SESSION" "$task")
+    # error_info is an array of strings; print each one rather than the XML.
+    # error_info is an array of strings that XAPI returns on a single line, so
+    # each <string> has to be split out rather than matched one per line -- the
+    # first element is the error code (SR_BACKEND_FAILURE_44 and friends) and
+    # dropping it loses the half worth searching for.
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log_error "    ${line}"
+    done < <(printf '%s' "$err" | grep -o '<string>[^<]*</string>' \
+        | sed -e 's/<string>//' -e 's|</string>||' | head -8)
+    return 1
+}
+
+# Release a task once it has been read. XAPI keeps finished tasks around until
+# they are destroyed, and a run that builds several templates would otherwise
+# leave one behind for each import.
+deploy_task_destroy() {
+    local task="$1"
+    [[ "$task" =~ ^OpaqueRef: ]] || return 0
+    deploy_xapi_call "task.destroy" "$DEPLOY_SESSION" "$task" >/dev/null 2>&1 || true
 }
 
 # The default import path: download to dom0, PUT from the file, delete it.
@@ -3978,7 +4149,15 @@ deploy_import_vdi_from_url() {
 # caller falls back to streaming), and 1 on any other failure.
 deploy_import_vdi_staged() {
     local vdi="$1" url="$2"
-    local tmp="/var/tmp/xo-deploy-image-$$.raw"
+    # $$ is this workstation's shell PID, not the pool master's, so the path is
+    # not unique on the host it actually lives on: two runs from the same shell
+    # -- or from different machines whose PIDs happen to coincide -- land on the
+    # same file. That matters because the download resumes with `curl -C -`,
+    # which treats a leftover file as progress: a stale complete one is
+    # "finished" instantly and a stale truncated one is topped up to the wrong
+    # length. Naming the file after the VDI it is destined for makes it unique
+    # per import and self-cleaning across retries of the same build.
+    local tmp="/var/tmp/xo-image-${vdi}.raw"
 
     # Size the check on the image actually being staged, not on the stock
     # Debian one: XO_DEPLOY_IMAGE_URL and the release overrides can point at
@@ -4023,6 +4202,11 @@ deploy_import_vdi_staged() {
     #
     # --progress-bar because this is several minutes of silence otherwise, and
     # silence on the longest step of the deploy reads as a hang worth killing.
+    # Sweep leftovers from the previous naming scheme, which used the calling
+    # shell's PID and so could never be matched again. They are gigabyte-sized
+    # and nothing else will reclaim them.
+    dom0_exec "rm -f /var/tmp/xo-deploy-image-*.raw" >/dev/null 2>&1 || true
+
     log_info "  downloading the image to the pool master (resumable)..."
     if ! dom0_exec "curl -fL --progress-bar -o '${tmp}' -C - \
             --retry 5 --retry-delay 3 --retry-all-errors \
@@ -4054,10 +4238,81 @@ deploy_import_vdi_staged() {
         return 1
     fi
 
+    # Prove the staged file is the whole image before sending it.
+    #
+    # `curl -C -` resumes onto whatever is already at this path, and the path
+    # carries the *local* shell's PID -- which repeats across runs. A leftover
+    # file from an earlier attempt therefore looks complete: curl resumes at its
+    # end, downloads nothing, reports 100% instantly, and the checksum passes
+    # because the bytes that are there are genuine. What gets imported is
+    # whatever that file actually holds, which may be almost nothing.
+    # The `=~ ^[0-9]+$` gate before any arithmetic is the same guard the
+    # free-space probe above carries, and for the same reason: `(( ))` expands
+    # an array subscript before evaluating it, so a reply of `PATH[$(...)]`
+    # from a hostile or impersonated pool master would execute here, on the
+    # workstation. Checked as a string first, and only then as a number.
+    local staged=""
+    staged=$(dom0_exec "stat -c %s '${tmp}' 2>/dev/null" | tr -d '\r')
+    local staged_ok=0
+    if [[ "$staged" =~ ^[0-9]+$ ]] && (( staged >= 104857600 )); then
+        staged_ok=1
+    fi
+    if (( staged_ok == 0 )); then
+        log_error "  the staged image on the pool master is ${staged:-0} bytes."
+        log_error "  A stale file at ${tmp} was resumed instead of downloaded."
+        log_error "  Remove it on the pool master and run this again:"
+        log_error "    ssh ${HOST_USERNAME}@${POOL_MASTER_IP} rm -f '${tmp}'"
+        dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+        return 1
+    fi
+
     log_info "  importing it into the disk..."
-    local rc=0
-    dom0_exec "curl -sk -f --speed-limit 1024 --speed-time 60 --max-time 3600 -T '${tmp}' \
-        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'" || rc=$?
+    local rc=0 out=""
+    # --show-error so a rejected import says why. Without it -s swallows the
+    # message and -f reduces an HTTP error to a bare exit code, which leaves
+    # the caller guessing at a cause it cannot see.
+    local vdi_ref
+    if ! vdi_ref=$(deploy_vdi_ref "$vdi"); then
+        log_error "  could not resolve the disk ${vdi} to an XAPI reference."
+        dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+        return 1
+    fi
+    # The task is what turns a silent server-side failure into a message. See
+    # deploy_task_check: curl exiting 0 says only that XAPI accepted the body.
+    local task
+    task=$(deploy_task_create "import ${vdi}")
+    local task_q=""
+    [[ "$task" =~ ^OpaqueRef: ]] && task_q="&task_id=${task}"
+
+    # -L is load-bearing on a pool with more than one host. XAPI's import
+    # handler checks whether the host being asked can actually see the SR, and
+    # answers 302 to the host that can when it cannot (import_raw_vdi.ml,
+    # `check_sr_availability` / `return_302_redirect`). Without -L, curl treats
+    # that 302 as a successful response -- -f only fails on 4xx and 5xx -- so it
+    # exits 0 having sent the body nowhere, leaving a VDI with a few kilobytes
+    # of header in it. --post301/302/303 keeps the PUT a PUT across the hop.
+    # -w records the redirect count so a silently-swallowed hop cannot happen
+    # again unnoticed.
+    out=$(dom0_exec "curl -sk -f -L --post301 --post302 --post303 --show-error \
+        -w '\nxo-redirects=%{num_redirects} xo-code=%{http_code}\n' \
+        --speed-limit 1024 --speed-time 60 --max-time 3600 -T '${tmp}' \
+        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw${task_q}' 2>&1") || rc=$?
+    local hops
+    hops=$(sed -n 's/.*xo-redirects=\([0-9]*\).*/\1/p' <<< "$out" | tail -1)
+    if [[ "$hops" =~ ^[0-9]+$ ]] && (( hops > 0 )); then
+        log_info "  the pool master redirected the import to the host holding the SR."
+    fi
+    out=$(grep -v 'xo-redirects=' <<< "$out")
+    if (( rc != 0 )) && [[ -n "$out" ]]; then
+        log_error "  the pool master rejected the import:"
+        printf '%s\n' "$out" | head -5 | while IFS= read -r line; do
+            log_error "    ${line}"
+        done
+    fi
+    if (( rc == 0 )) && ! deploy_task_check "$task"; then
+        rc=1
+    fi
+    deploy_task_destroy "$task"
     dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
     return $rc
 }
@@ -4075,9 +4330,28 @@ deploy_import_vdi_from_file() {
         return 1
     }
 
+    local vdi_ref
+    if ! vdi_ref=$(deploy_vdi_ref "$vdi"); then
+        log_error "Could not resolve the config drive ${vdi} to an XAPI reference."
+        dom0_exec "rm -f '${remote}'" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    local task
+    task=$(deploy_task_create "import ${vdi}")
+    local task_q=""
+    [[ "$task" =~ ^OpaqueRef: ]] && task_q="&task_id=${task}"
+
     local rc=0
-    dom0_exec "curl -sk -f --max-time 300 -T '${remote}' \
-        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi}&format=raw'" || rc=$?
+    # -L for the same reason as the image import above: on a multi-host pool the
+    # SR may not be visible from the master, and an unfollowed 302 sends the
+    # config drive nowhere while reporting success.
+    dom0_exec "curl -sk -f -L --post301 --post302 --post303 --max-time 300 -T '${remote}' \
+        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw${task_q}'" || rc=$?
+    if (( rc == 0 )) && ! deploy_task_check "$task"; then
+        rc=1
+    fi
+    deploy_task_destroy "$task"
     dom0_exec "rm -f '${remote}'" >/dev/null 2>&1 || true
     return $rc
 }
@@ -5269,6 +5543,25 @@ deploy_create_vm() {
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} VCPUs-at-startup=${DEPLOY_VCPUS}" >/dev/null
     dom0_xe "vm-memory-limits-set uuid=${DEPLOY_VM_UUID} static-min=${mem} dynamic-min=${mem} dynamic-max=${mem} static-max=${mem}" >/dev/null
 
+    # Settings the "Other install media" template supplies for an unknown guest,
+    # corrected for the Debian appliance this actually builds. The same three
+    # apply to the template builder; see tpl_create_build_vm.
+    #
+    # viridian is Hyper-V enlightenment and belongs to Windows guests only. The
+    # base template turns it on, so without this the XO appliance runs its whole
+    # life advertising itself to Linux as a Hyper-V machine.
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} platform:viridian=false" >/dev/null 2>&1 || true
+
+    # cores-per-socket defaults to 1, which presents an n-vCPU VM as n sockets.
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} platform:cores-per-socket=${DEPLOY_VCPUS}" >/dev/null 2>&1 || true
+
+    # A standard VGA adapter with 8 MiB behind it, rather than the stock 4 MiB
+    # cirrus one that leaves XO's console at 640x480. See tpl_create_build_vm:
+    # vga=std alone leaves videoram at the base template's 4, which produces an
+    # unreadable console under UEFI, and 16 is worse.
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} platform:vga=std" >/dev/null 2>&1 || true
+    dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} platform:videoram=8" >/dev/null 2>&1 || true
+
     # Boot straight from disk — there is no installer to boot from.
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-policy='BIOS order'" >/dev/null
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-params:order=c" >/dev/null
@@ -6343,6 +6636,7 @@ show_help() {
     echo "  --reconfigure          Regenerate config, systemd service, sudoers, and file ownership"
     echo "  --proxy                Install XO Proxy on a Xen pool master"
     echo "  --deploy               Create a Debian VM on a XenServer/XCP-ng pool and install XO into it"
+    echo "  --build-templates      Build cloud-init VM templates on a XenServer/XCP-ng pool"
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
     echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
@@ -6370,6 +6664,1127 @@ show_help() {
     echo "  Copy sample-xo-config.cfg to xo-config.cfg and edit as needed."
     echo "  If xo-config.cfg is not found, it will be created automatically."
     echo "  To switch branches, edit GIT_BRANCH in xo-config.cfg and run --update."
+    echo ""
+}
+
+# ============================================================================
+# Cloud-init VM Templates
+#
+# Builds XCP-ng VM templates from the distributions' own published cloud
+# images, so a pool running XO from sources gets the same "pick a template,
+# fill in the form, deploy" workflow that XOA's Hub provides.
+#
+# The Hub itself cannot be unlocked here: its catalogue is served by Vates and
+# the `cloud.*` API backing it is not part of the open-source tree, so the Hub
+# page is inert on a sources install no matter what the client is told. This
+# builds the equivalent from upstream instead -- the images come from Debian,
+# Ubuntu and friends directly, which means no third-party redistribution and a
+# version the operator can pin.
+#
+# A template is not a file that can be copied in. It is a VM object whose disk
+# has been prepared and which is then flagged as a template, so building one
+# means importing the image, booting it once to install the guest tools, and
+# scrubbing the machine-specific state the clone must not inherit. The boot is
+# the slow part and the reason this is not instant: XCP-ng's guest agent has to
+# be installed *inside* the image for XO to report a VM's IP address, and no
+# amount of API work does that from outside.
+# ============================================================================
+
+# Catalogue of buildable templates. Each entry is:
+#   key|display name|codename|image URL|default user|prep function
+#
+# The URL points at the distribution's own mirror. Checksums are not pinned
+# here: every origin in this list publishes a SHA512SUMS beside the image, and
+# tpl_verify_checksum reads it at build time, so a new upstream release is
+# picked up without this table having to be edited.
+#
+# ---------------------------------------------------------------------------
+# Pick the variant with a full kernel, not the "cloud" one
+# ---------------------------------------------------------------------------
+#
+# Debian publishes genericcloud and generic side by side, identical in size and
+# nearly identical in name. They do not ship the same kernel -- read out of the
+# images themselves:
+#
+#   genericcloud  vmlinuz-6.12.107+deb13-cloud-amd64
+#   generic       vmlinuz-6.12.107+deb13-amd64
+#
+# The cloud kernel is trimmed for headless virtual machines and leaves out the
+# framebuffer and DRM drivers a graphical console needs. A VM built from it runs
+# perfectly -- boots, gets an IP, runs the guest agent -- and its console in XO
+# is unreadable garbage from the first frame, worst under UEFI. Nothing reports
+# an error, because nothing has failed.
+#
+# So this table uses generic. The equivalent trap exists for other
+# distributions under other names; when adding an image, check what kernel it
+# carries rather than taking the most cloud-sounding filename.
+#
+# ---------------------------------------------------------------------------
+# Adding an image: boot firmware is decided from the disk, not from this table
+# ---------------------------------------------------------------------------
+#
+# Nothing about firmware is declared here, and nothing should be. After the
+# build boot, tpl_disk_supports_uefi reads the imported disk's GPT and looks for
+# an EFI system partition; tpl_seal_template then publishes the template as UEFI
+# when one is present and as BIOS when it is not. XO's New VM form offers that
+# as its "Boot firmware" default, so it is what an operator gets without opening
+# advanced settings.
+#
+# UEFI is preferred wherever the image supports it -- it is required for Secure
+# Boot and a vTPM, and the cloud images that ship an ESP ship a BIOS boot
+# partition beside it, so choosing BIOS in the dropdown still produces a working
+# VM. The reverse is not true: UEFI firmware with no bootloader to load does not
+# fall back to BIOS, it fails to boot.
+#
+# So a new entry needs no firmware decision made for it, and none should be
+# hardcoded. Two things worth knowing when adding one:
+#
+#   - Judge from the disk, never from the distribution. Whether an image is
+#     UEFI-bootable is a property of that image, and vendors ship BIOS-only and
+#     UEFI-capable variants under similar names.
+#   - Early boot output can render as coloured noise under UEFI and then correct
+#     itself once the kernel takes over the framebuffer. That is normal and is
+#     not evidence of a failed boot -- XO's own Hub templates do the same thing.
+#     Do not read a garbled console as a missing ESP.
+TPL_CATALOG=(
+    "debian13|Debian 13 (Trixie)|trixie|https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw|debian|tpl_prep_debian"
+)
+
+# Where the guest tools ISO lives. Every XCP-ng host ships this SR; the ISO
+# inside it is what installs the guest agent, and its absence is the one
+# failure that leaves a template XO cannot report an IP for.
+TPL_TOOLS_ISO_NAME="guest-tools.iso"
+
+# Default sizing for the template itself. These are what the New VM form is
+# pre-filled with; the operator overrides them per VM at creation time, so they
+# are starting points rather than limits.
+TPL_DEFAULT_RAM_GB=2
+TPL_DEFAULT_VCPUS=2
+
+# The template's own disk. cloud-init's growpart expands the filesystem to fill
+# whatever the operator asks for at deploy time, so this only has to hold the
+# image.
+#
+# It was 8 GiB, on the belief that a VDI sized close to the image left the raw
+# import "no margin" and made it fail. That was wrong, and it came from the same
+# mistaken reading that treated a correctly imported sparse disk as an empty
+# one. XO's own Hub template for this image is 3,223,322,624 bytes against a
+# 3,221,225,472-byte image -- about two megabytes of headroom -- and imports
+# fine.
+#
+# 4 GiB keeps a real margin over the current 3 GiB images without inflating
+# every VM cloned from the template, since a clone starts at the template's size
+# unless the operator asks for more. Sized in GiB rather than to the image so a
+# slightly larger upstream release does not silently start failing; if an image
+# ever approaches this, the number moves.
+TPL_DEFAULT_DISK_GB=4
+
+# State for the build in progress, cleared between templates.
+TPL_VM_UUID=""
+TPL_ROOT_VDI=""
+TPL_CIDATA_VDI=""
+TPL_CIDATA_ISO=""
+TPL_SSH_KEY=""
+TPL_BUILD_STARTED="false"
+# The guest agent's version, observed while the build VM was still running.
+# XAPI clears PV-drivers-version when the domain goes away, so it cannot be
+# read after the preparation boot powers the VM off.
+TPL_AGENT_SEEN=""
+
+# --- Catalogue helpers ------------------------------------------------------
+
+# Field n of a catalogue row, 1-indexed.
+tpl_field() {
+    local row="$1" n="$2"
+    cut -d'|' -f"$n" <<< "$row"
+}
+
+# Find a catalogue row by its key. Prints the row, or nothing when unknown.
+tpl_row_for_key() {
+    local want="$1" row
+    for row in "${TPL_CATALOG[@]}"; do
+        [[ "$(tpl_field "$row" 1)" == "$want" ]] && { printf '%s\n' "$row"; return 0; }
+    done
+    return 1
+}
+
+# --- Template existence -----------------------------------------------------
+
+# The name a built template carries. Kept in one function because both the
+# build and the "already present" check have to agree on it exactly, and a
+# mismatch would rebuild a template that already exists on every run.
+tpl_template_name() {
+    local display="$1"
+    printf '%s Cloud-init' "$display"
+}
+
+# True when a template of this name is already on the pool. Checked before
+# building rather than after, so a re-run costs one `xe` call instead of a
+# download and a boot.
+tpl_template_exists() {
+    local name="$1" found
+    found=$(dom0_xe "template-list name-label='${name}' params=uuid --minimal" 2>/dev/null | tr -d '\r')
+    [[ -n "$found" ]]
+}
+
+# --- Guest preparation scripts ---------------------------------------------
+#
+# One function per distribution family, emitting the script that runs *inside*
+# the guest on its single boot. These do the work that cannot be done from the
+# outside: install the guest agent, then scrub the identity the clone must
+# generate fresh.
+#
+# Every one of them must end by powering the VM off. The build waits for the
+# VM to halt as its signal that preparation finished, so a script that returns
+# without shutting down hangs the build until the timeout.
+
+# Emit the in-guest preparation script for Debian and derivatives.
+#
+# The guest tools come from the ISO rather than apt. Debian 13 has no
+# xe-guest-utilities package -- the apt path fails with "unable to locate", and
+# silently, because cloud-init does not abort a failed package install -- so
+# the ISO is the only route that works there. It is also the route XCP-ng's own
+# documentation gives.
+tpl_prep_debian() {
+    local user="$1"
+    # The heredoc is quoted so the guest script is emitted verbatim -- nothing
+    # in it should be expanded by this shell. The one value that does have to
+    # be substituted is the account name, done here rather than by unquoting
+    # the heredoc and risking every $ in the script expanding too.
+    cat <<'PREP_EOF' | sed "s/__TPL_USER__/${user}/g"
+#!/bin/bash
+# Prepares a cloud image for use as an XCP-ng template. Runs once, inside the
+# guest, then powers the VM off.
+exec > /var/log/xo-template-prep.log 2>&1
+set -x
+
+export DEBIAN_FRONTEND=noninteractive
+
+# --- guest tools ---
+# From the ISO: the distro package does not exist on every release, and when it
+# is missing apt fails without stopping cloud-init, which produces a template
+# that looks fine and never reports an IP.
+install_guest_tools() {
+    local mnt=/mnt
+    if ! mountpoint -q "$mnt" && mount /dev/cdrom "$mnt" 2>/dev/null; then
+        if [[ -f "$mnt/Linux/install.sh" ]]; then
+            bash "$mnt/Linux/install.sh" -n
+            umount "$mnt" 2>/dev/null || true
+            return 0
+        fi
+        umount "$mnt" 2>/dev/null || true
+    fi
+    # Fallback for images whose release does package it.
+    apt-get install -y xe-guest-utilities || true
+}
+install_guest_tools
+
+# --- cloud-init and disk growth ---
+# growroot is what lets the operator ask for a bigger disk than the image at
+# deploy time and have the filesystem actually fill it.
+apt-get update -qq || true
+apt-get install -y cloud-init cloud-initramfs-growroot || true
+
+# --- shipped login ---
+# The template carries a known password so a freshly deployed VM is reachable
+# without the operator having to supply a cloud-config first. This matches how
+# the equivalent Hub templates behave; anyone wanting key-only access supplies
+# ssh_authorized_keys at VM creation and can lock the password afterwards.
+echo "__TPL_USER__:__TPL_USER__" | chpasswd
+printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-xo-template.conf
+
+# --- scrub machine identity ---
+# Everything below this line exists so that clones do not share an identity.
+# Skipping any of it produces VMs that collide on the network: a shared
+# machine-id breaks DHCP leases and systemd journals, and shared host keys mean
+# every VM presents the same SSH fingerprint.
+cloud-init clean --logs --seed
+rm -rf /var/lib/cloud/instances /var/lib/cloud/instance
+rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
+truncate -s 0 /etc/machine-id
+truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
+find /etc/ssh -type f -name 'ssh_host_*' -delete
+apt-get clean
+rm -f /root/.bash_history /home/*/.bash_history
+
+# The build watches for the VM to halt. This must be the last thing that runs.
+shutdown -h now
+PREP_EOF
+}
+# Decide whether a VDI actually holds a disk image, by reading its first sector.
+#
+# This replaces a check on physical-utilisation, which cannot answer the
+# question: on a thin SR that number is allocated blocks, and XAPI imports raw
+# images with vhd-tool's --prezeroed on anything that is not lvm/lvmoiscsi/
+# lvmohba, so zero blocks are skipped rather than written. A correctly imported
+# cloud image can therefore allocate a few kilobytes and be entirely intact.
+#
+# The disk is read over XAPI's /export_raw_vdi endpoint with a ranged GET.
+# There is no `xe vdi-attach` -- VDI.attach is an API call the CLI does not
+# expose -- and attaching to dom0 would in any case have to be undone before
+# the VBD could be plugged into the build VM. A range request touches nothing
+# and transfers one kilobyte.
+#
+# Every image in the catalogue is a whole-disk image, so sector 0 carries either
+# an MBR (the 0x55AA signature at offset 510) or a protective MBR in front of a
+# GPT ("EFI PART" at offset 512). Absence of both means nothing usable landed.
+tpl_disk_has_partition_table() {
+    local vdi="$1"
+    local vdi_ref sig=""
+
+    if ! vdi_ref=$(deploy_vdi_ref "$vdi"); then
+        # Inconclusive, not failed: refusing a build over a check that could
+        # not run is the mistake this function exists to undo.
+        log_warning "  could not resolve the disk to verify it; skipping the check."
+        return 0
+    fi
+
+    # The read must be capped on the pool master, not by asking politely for a
+    # range. /export_raw_vdi has no Range handling at all (export_raw_vdi.ml
+    # answers a plain 200 and streams the whole disk), so `curl -r 0-1023`
+    # is ignored and the entire VDI comes back -- 8 GiB, expanded about
+    # three-and-a-half times by `od`, into a command substitution. Bash tries to
+    # hold the result in a single string and segfaults. `head -c` in front of od
+    # bounds it at one kilobyte, and closing the pipe stops curl at once.
+    #
+    # od rather than xxd: xxd is not on a stock XCP-ng dom0.
+    sig=$(dom0_exec "curl -sk -f --max-time 120 \
+        'https://localhost/export_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw' \
+        2>/dev/null | head -c 1024 | od -An -tx1 -v | tr -d ' \n'")
+
+    if (( ${#sig} < 1040 )); then
+        log_warning "  could not read the disk to verify it; skipping the check."
+        return 0
+    fi
+
+    # MBR signature 0x55AA lives at offset 510, i.e. hex characters 1020..1023.
+    [[ "${sig:1020:4}" == "55aa" ]] && return 0
+
+    # A GPT disk still carries a protective MBR, so the check above normally
+    # catches it; this covers an image written with a bare GPT header.
+    # "EFI PART" == 4546492050415254, at offset 512 (hex characters 1024..).
+    [[ "${sig:1024:16}" == "4546492050415254" ]] && return 0
+
+    return 1
+}
+# Decide which boot firmware a template should advertise, by looking for an EFI
+# system partition on the disk that was actually imported.
+#
+# This is not a property of the distribution, it is a property of the image, and
+# the two do not track each other: an image can be perfectly good and still have
+# nothing for UEFI firmware to load. So it is read off the disk rather than
+# assumed, per image, every build. If a future catalogue entry ships a BIOS-only
+# image, it gets a BIOS template without anyone having to remember to say so.
+#
+# UEFI is preferred when the disk supports it. It is what XO's own Hub templates
+# end up being used as, it is required for Secure Boot and a vTPM, and the
+# images that carry an ESP carry a BIOS boot partition beside it -- so an
+# operator who wants BIOS still gets a working VM by choosing it in the same
+# dropdown. When no ESP is present the template must say bios: UEFI firmware
+# with no bootloader to load does not fall back, it simply fails to boot.
+#
+# GPT is read from the disk over the same export the partition-table check uses.
+# The partition array starts at LBA 2 by default and each entry is 128 bytes,
+# and a partition's type is the first 16 bytes as a mixed-endian GUID. The ESP
+# type is C12A7328-F81F-11D2-BA4B-00A0C93EC93B, which on the wire is the byte
+# sequence 28732AC11FF8D211BA4B00A0C93EC93B.
+#
+# Reading only the first sectors is what produced a wrong answer once already:
+# a 32 KiB window truncates the 16 KiB partition array often enough to miss the
+# ESP entirely and report an image as BIOS-only when it is not. 40 KiB covers
+# LBA 2 through the whole 128-entry array with room to spare.
+TPL_ESP_GUID_LE="28732ac11ff8d211ba4b00a0c93ec93b"
+
+tpl_disk_supports_uefi() {
+    local vdi="$1"
+    local vdi_ref sig=""
+
+    deploy_vdi_ref "$vdi" >/dev/null 2>&1 || return 1
+    vdi_ref=$(deploy_vdi_ref "$vdi")
+
+    sig=$(dom0_exec "curl -sk -f --max-time 180 \
+        'https://localhost/export_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw' \
+        2>/dev/null | head -c 40960 | od -An -tx1 -v | tr -d ' \n'")
+
+    # No GPT at all means no ESP. "EFI PART" at offset 512.
+    [[ "${sig:1024:16}" == "4546492050415254" ]] || return 1
+
+    # The partition array is scanned as a whole rather than entry by entry:
+    # the type GUID is at a fixed offset inside each 128-byte entry, but a
+    # substring search over the array finds it wherever the entry sits, and the
+    # GUID is long enough that a false positive is not a practical concern.
+    [[ "$sig" == *"${TPL_ESP_GUID_LE}"* ]]
+}
+
+
+tpl_find_tools_iso() {
+    # Exact name only. Pools accumulate "Old version of guest-tools.iso"
+    # alongside the current one, and a substring match would return several
+    # uuids -- which `vm-cd-insert cd-name=` then rejects as ambiguous.
+    local vdi
+    vdi=$(dom0_xe "vdi-list name-label='${TPL_TOOLS_ISO_NAME}' params=uuid --minimal" 2>/dev/null | tr -d '\r' | cut -d',' -f1)
+    printf '%s' "$vdi"
+}
+
+# Attach the guest tools ISO to the build VM.
+#
+# The base template provisions no CD drive, so there is nothing for
+# `vm-cd-insert` to insert into -- it has to be created first. Attaching the
+# VDI by uuid rather than by name also sidesteps the duplicate-name problem
+# entirely.
+tpl_attach_tools_iso() {
+    local vdi="$1"
+
+    # An empty CD VBD. `type=CD mode=RO` with no VDI is how xe models a drive
+    # with no disc in it; `vbd-insert` then loads one.
+    local cd_vbd
+    cd_vbd=$(dom0_xe "vbd-create vm-uuid=${TPL_VM_UUID} device=3 type=CD mode=RO" 2>/dev/null | tr -d '\r')
+    if [[ -z "$cd_vbd" ]]; then
+        return 1
+    fi
+
+    dom0_xe "vbd-insert uuid=${cd_vbd} vdi-uuid=${vdi}" >/dev/null 2>&1
+}
+
+# Build the cloud-init drive that drives the single preparation boot.
+#
+# This is not the config drive the operator's VMs get -- theirs comes from XO
+# at creation time. This one exists only to run the prep script once, and is
+# destroyed before the template is sealed so no trace of it is inherited.
+tpl_build_prep_drive() {
+    local row="$1"
+    local user prep_fn
+    user=$(tpl_field "$row" 5)
+    prep_fn=$(tpl_field "$row" 6)
+
+    local dir="${DEPLOY_WORKDIR}/tpl-cidata"
+    rm -rf "$dir"; mkdir -p "$dir"
+
+    # A throwaway key so the build can reach the guest if it has to be
+    # diagnosed. It never leaves DEPLOY_WORKDIR and dies with it.
+    ssh-keygen -t ed25519 -N "" -C "xo template build (temporary)" \
+        -f "${DEPLOY_WORKDIR}/tpl_key" >/dev/null 2>&1
+    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    local pubkey
+    pubkey=$(<"${TPL_SSH_KEY}.pub")
+    pubkey="${pubkey%$'\n'}"
+
+    printf 'instance-id: xo-template-build\nlocal-hostname: xo-template-build\n' > "${dir}/meta-data"
+    : > "${dir}/network-config"
+
+    # The prep script is embedded rather than fetched. A build that reaches out
+    # to a git host mid-run fails on an air-gapped pool and silently changes
+    # behaviour when the remote does, neither of which belongs in something
+    # that produces a golden image.
+    {
+        printf '#cloud-config\n'
+        printf 'users:\n'
+        printf '  - name: %s\n' "$user"
+        printf '    sudo: ALL=(ALL) NOPASSWD:ALL\n'
+        printf '    shell: /bin/bash\n'
+        printf '    lock_passwd: false\n'
+        printf '    ssh_authorized_keys:\n'
+        printf '      - %s\n' "$pubkey"
+        printf 'write_files:\n'
+        printf '  - path: /root/xo-template-prep.sh\n'
+        printf "    permissions: '0755'\n"
+        printf '    content: |\n'
+        "$prep_fn" "$user" | sed 's/^/      /'
+        printf 'runcmd:\n'
+        printf '  - [ /root/xo-template-prep.sh ]\n'
+    } > "${dir}/user-data"
+
+    local iso="${DEPLOY_WORKDIR}/tpl-cidata.iso"
+    rm -f "$iso"
+    if command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -quiet -output "$iso" -volid cidata -joliet -rock \
+            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config"
+    else
+        xorriso -as mkisofs -quiet -o "$iso" -V cidata -J -r \
+            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config" 2>/dev/null
+    fi
+    TPL_CIDATA_ISO="$iso"
+}
+
+# Create the VM the template is built from, import the image into it, and boot
+# it once so the prep script runs.
+tpl_create_build_vm() {
+    local row="$1" name="$2"
+    local url
+    url=$(tpl_field "$row" 4)
+
+    local base
+    base=$(dom0_xe "template-list name-label='Other install media' params=uuid --minimal" | tr -d '\r')
+    if [[ -z "$base" ]]; then
+        log_error "Could not find the 'Other install media' template on this host."
+        return 1
+    fi
+
+    # Named so it reads as a step in progress rather than a VM someone
+    # abandoned: it is visible in XO for the few minutes the preparation boot
+    # takes, and on failure it is deliberately left behind for its log.
+    TPL_VM_UUID=$(dom0_xe "vm-install template=${base} new-name-label='[building template] ${name}' sr-uuid=${DEPLOY_SR_UUID}" | tr -d '\r')
+    if [[ -z "$TPL_VM_UUID" ]]; then
+        log_error "Failed to create the build VM."
+        return 1
+    fi
+    TPL_BUILD_STARTED="true"
+
+    # Drop any disk the base template provisioned so device 0 is free.
+    local vbd vdi
+    for vbd in $(dom0_xe "vbd-list vm-uuid=${TPL_VM_UUID} type=Disk params=uuid --minimal" | tr ',' ' '); do
+        [[ -n "$vbd" ]] || continue
+        vdi=$(dom0_xe "vbd-param-get uuid=${vbd} param-name=vdi-uuid" 2>/dev/null | tr -d '\r' || echo "")
+        dom0_xe "vbd-destroy uuid=${vbd}" >/dev/null 2>&1 || true
+        [[ -n "$vdi" && "$vdi" != "<not in database>" ]] && dom0_xe "vdi-destroy uuid=${vdi}" >/dev/null 2>&1 || true
+    done
+
+    local mem="${TPL_DEFAULT_RAM_GB}GiB"
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} VCPUs-max=${TPL_DEFAULT_VCPUS}" >/dev/null
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} VCPUs-at-startup=${TPL_DEFAULT_VCPUS}" >/dev/null
+
+    # Present the vCPUs as cores on one socket rather than a socket each.
+    #
+    # The base template leaves cores-per-socket at 1, so a 2-vCPU VM arrives as
+    # a two-socket machine. Guests licence and schedule per socket, and every
+    # VM on a live pool that was not built from this path has
+    # cores-per-socket equal to its vCPU count.
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} platform:cores-per-socket=${TPL_DEFAULT_VCPUS}" >/dev/null 2>&1 || true
+
+    # Viridian is Hyper-V enlightenment, for Windows guests. The
+    # "Other install media" base template turns it on, and nothing in this build
+    # turned it back off, so every template produced here advertised itself to
+    # Linux as a Hyper-V machine. Surveyed against a live pool: the only VMs
+    # with viridian enabled are the Windows ones and the ones this script built.
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} platform:viridian=false" >/dev/null 2>&1 || true
+    dom0_xe "vm-memory-limits-set uuid=${TPL_VM_UUID} static-min=${mem} dynamic-min=${mem} dynamic-max=${mem} static-max=${mem}" >/dev/null
+
+    # Firmware for the *build*: BIOS, always, whatever the finished template
+    # ends up advertising.
+    #
+    # A UEFI guest writes its boot entries into its own NVRAM on first boot.
+    # Building under UEFI would bake this build VM's entries into the template,
+    # where they are at best redundant and at worst point at a disk layout the
+    # clone does not have. BIOS reads the disk directly and records nothing.
+    # tpl_seal_template sets the firmware the operator is offered, after this
+    # boot has happened.
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} HVM-boot-policy='BIOS order'" >/dev/null
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} HVM-boot-params:order=cd" >/dev/null
+
+    # A standard VGA device with 8 MiB behind it, in place of the stock 4 MiB
+    # cirrus adapter that leaves XO's console at 640x480.
+    #
+    # Both halves are needed, and 8 is the number. Setting vga=std alone leaves
+    # videoram at whatever the base template carried, which is 4 -- checked on a
+    # live pool, a template built that way came out std/4 and its UEFI VMs had
+    # an unreadable console. 16 is no better: it renders as coloured noise under
+    # UEFI. Every working UEFI VM on that pool runs std with 8. XAPI accepts any
+    # of these without complaint, so a wrong value fails silently and only shows
+    # up on the console.
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} platform:vga=std" >/dev/null 2>&1 || true
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} platform:videoram=8" >/dev/null 2>&1 || true
+
+    log_info "  creating the root disk..."
+    TPL_ROOT_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${name} root' virtual-size=${TPL_DEFAULT_DISK_GB}GiB type=user" | tr -d '\r')
+    if [[ ! "$TPL_ROOT_VDI" =~ ^[0-9a-f-]{36}$ ]]; then
+        # Anything but a uuid here -- an error string, an empty line -- becomes
+        # a malformed import URL further down, where the endpoint accepts the
+        # connection, writes a few kilobytes and stops. That failure reads as a
+        # sizing problem rather than a bad reference, so it is caught here.
+        log_error "  the pool master did not return a disk uuid: ${TPL_ROOT_VDI:-<empty>}"
+        return 1
+    fi
+    dom0_xe "vbd-create vm-uuid=${TPL_VM_UUID} vdi-uuid=${TPL_ROOT_VDI} device=0 bootable=true type=Disk mode=RW" >/dev/null
+
+    log_info "  importing the cloud image (this is the longest step)..."
+    log_info "    ${url}"
+    if ! deploy_import_vdi_from_url "$TPL_ROOT_VDI" "$url"; then
+        log_error "Failed to import the cloud image."
+        return 1
+    fi
+
+    # Confirm the image actually landed, by reading what is on the disk rather
+    # than by how much of it the SR has allocated.
+    #
+    # physical-utilisation is not a measure of bytes written. On a thin SR it
+    # reports allocated blocks, and XAPI imports a raw image with vhd-tool's
+    # --prezeroed flag on any SR that is not lvm/lvmoiscsi/lvmohba
+    # (sm_fs_ops.ml: must_write_zeroes_into_new_vdi), which skips zero blocks
+    # instead of writing them. A cloud image is a partition table, a bootloader
+    # and a mostly empty filesystem, so a *correct* import of one allocates
+    # almost nothing: the Debian 13 image lands at 19456 bytes on thin NFS, and
+    # a Debian cloud image imported by other means sits at 11264 on the same
+    # pool. A byte threshold therefore condemns every successful import on thin
+    # storage -- which it did, on every run, while the imports were fine.
+    #
+    # What distinguishes an imported disk from a blank one is its content. The
+    # first sector of any of these images carries a partition table, so attach
+    # the disk to dom0 and ask for it. That is true regardless of SR type,
+    # allocation policy or how sparse the image happens to be.
+    if ! tpl_disk_has_partition_table "$TPL_ROOT_VDI"; then
+        log_error "  the image import reported success but the disk has no"
+        log_error "  partition table, so nothing usable was written to it."
+        local vsize sr_uuid sr_type used
+        vsize=$(dom0_xe "vdi-param-get uuid=${TPL_ROOT_VDI} param-name=virtual-size" 2>/dev/null | tr -d '\r')
+        sr_uuid=$(dom0_xe "vdi-param-get uuid=${TPL_ROOT_VDI} param-name=sr-uuid" 2>/dev/null | tr -d '\r')
+        sr_type=$(dom0_xe "sr-param-get uuid=${sr_uuid} param-name=type" 2>/dev/null | tr -d '\r')
+        used=$(dom0_xe "vdi-param-get uuid=${TPL_ROOT_VDI} param-name=physical-utilisation" 2>/dev/null | tr -d '\r')
+        log_error "  disk ${TPL_ROOT_VDI}"
+        log_error "    virtual-size ${vsize:-unknown}, allocated ${used:-unknown}"
+        log_error "    SR ${sr_uuid:-unknown} (type ${sr_type:-unknown})"
+        log_error "  XAPI logs the import on the pool master:"
+        log_error "    ssh ${HOST_USERNAME}@${POOL_MASTER_IP} grep -i vhd-tool /var/log/xensource.log"
+        return 1
+    fi
+    log_success "  image imported and checksum verified"
+
+    # The prep drive.
+    TPL_CIDATA_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${name} cidata' virtual-size=16MiB type=user" | tr -d '\r')
+    if ! deploy_import_vdi_from_file "$TPL_CIDATA_VDI" "$TPL_CIDATA_ISO"; then
+        log_error "Failed to import the preparation config drive."
+        return 1
+    fi
+    dom0_xe "vbd-create vm-uuid=${TPL_VM_UUID} vdi-uuid=${TPL_CIDATA_VDI} device=1 type=Disk mode=RO" >/dev/null
+
+    # The guest tools ISO, mounted for the prep script to install from.
+    local tools_vdi
+    tools_vdi=$(tpl_find_tools_iso)
+    if [[ -z "$tools_vdi" ]]; then
+        # Fatal rather than a warning. On Debian 13 there is no
+        # xe-guest-utilities package for the prep script to fall back to, so
+        # without the ISO the build produces a template whose VMs never report
+        # an IP -- which looks like success and is discovered much later.
+        log_error "  ${TPL_TOOLS_ISO_NAME} was not found on this pool."
+        log_error "  It normally lives in the 'XCP-ng Tools' storage repository."
+        log_error "  Without it the guest agent cannot be installed and XO would"
+        log_error "  never report an IP address for VMs built from this template."
+        return 1
+    fi
+
+    if ! tpl_attach_tools_iso "$tools_vdi"; then
+        log_error "  could not attach ${TPL_TOOLS_ISO_NAME} to the build VM."
+        return 1
+    fi
+
+    dom0_xe "vif-create vm-uuid=${TPL_VM_UUID} network-uuid=${DEPLOY_NETWORK_UUID} device=0" >/dev/null
+
+    log_info "  booting once to install the guest agent and scrub machine state..."
+    log_info "  (this takes a few minutes and the VM powers itself off when done)"
+    dom0_xe "vm-start uuid=${TPL_VM_UUID}" >/dev/null
+    return 0
+}
+
+# Wait for the preparation boot to finish. The prep script ends in a shutdown,
+# so the VM halting is the completion signal -- there is no need to reach into
+# the guest, and nothing to reach it over once the host keys are deleted.
+tpl_wait_for_prep() {
+    local timeout="${1:-900}"
+    local waited=0 interval=15 state=""
+
+    # Wait for the VM to actually start before watching for it to stop.
+    #
+    # Without this the loop below reads "halted" on its first pass -- XAPI has
+    # not necessarily moved the VM out of that state by the time vm-start
+    # returns -- and treats a VM that never booted as a finished preparation.
+    # The template then seals with no guest agent installed and no machine
+    # state scrubbed, which looks exactly like success.
+    local starting=0
+    while (( starting < 120 )); do
+        state=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=power-state" 2>/dev/null | tr -d '\r')
+        [[ "$state" == "running" ]] && break
+        sleep 5
+        starting=$((starting + 5))
+    done
+    if [[ "$state" != "running" ]]; then
+        log_error "The build VM did not start (power state: ${state:-unknown})."
+        return 1
+    fi
+
+    # Watch for the guest agent while the VM is still up.
+    #
+    # PV-drivers-version is populated by the agent from inside the guest and
+    # cleared when the domain goes away, so it cannot be read after the
+    # preparation boot -- which deliberately ends with the VM powering itself
+    # off. Observing it here, in the poll that is already running, is therefore
+    # the only way to see it at all. It is a *secondary* signal: on this pool
+    # every halted VM reports it empty, working ones included, and on guest
+    # tools that ship the management agent without versioned PV drivers it may
+    # never appear even while running. tpl_build_one's check does not depend
+    # on it.
+    TPL_AGENT_SEEN=""
+    local pv=""
+    while (( waited < timeout )); do
+        state=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=power-state" 2>/dev/null | tr -d '\r')
+        if [[ -z "$TPL_AGENT_SEEN" && "$state" == "running" ]]; then
+            pv=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=PV-drivers-version" 2>/dev/null | tr -d '\r')
+            [[ "$pv" =~ [0-9]+\.[0-9]+ ]] && TPL_AGENT_SEEN="$pv"
+        fi
+        if [[ "$state" == "halted" ]]; then
+            return 0
+        fi
+        # Poll quickly until the agent has been seen, then back off.
+        if [[ -n "$TPL_AGENT_SEEN" ]]; then
+            sleep "$interval"
+        else
+            sleep 5
+            waited=$((waited - interval + 5))
+        fi
+        waited=$((waited + interval))
+        if (( waited % 120 == 0 )); then
+            log_info "    still preparing (${waited}s elapsed)..."
+        fi
+    done
+
+    log_error "The preparation boot did not finish within ${timeout}s."
+    log_error "The VM '${TPL_VM_NAME:-build}' is left running for inspection:"
+    log_error "  its prep log is at /var/log/xo-template-prep.log inside the guest."
+    return 1
+}
+
+# Strip the build scaffolding and seal the VM as a template.
+tpl_seal_template() {
+    local name="$1"
+
+    # The preparation drive must not survive into the template: cloud-init
+    # would find a used seed on every clone and skip the operator's own config.
+    local vbd
+    for vbd in $(dom0_xe "vbd-list vm-uuid=${TPL_VM_UUID} type=Disk params=uuid --minimal" | tr ',' ' '); do
+        [[ -n "$vbd" ]] || continue
+        local vdi
+        vdi=$(dom0_xe "vbd-param-get uuid=${vbd} param-name=vdi-uuid" 2>/dev/null | tr -d '\r' || echo "")
+        if [[ "$vdi" == "$TPL_CIDATA_VDI" ]]; then
+            dom0_xe "vbd-destroy uuid=${vbd}" >/dev/null 2>&1 || true
+            dom0_xe "vdi-destroy uuid=${vdi}" >/dev/null 2>&1 || true
+        fi
+    done
+    TPL_CIDATA_VDI=""
+
+    dom0_xe "vm-cd-eject uuid=${TPL_VM_UUID}" >/dev/null 2>&1 || true
+
+    # The firmware the operator is offered.
+    #
+    # XO's New VM form takes its "Boot firmware" default straight from the
+    # template -- xo-web's new-vm form does
+    # `hvmBootFirmware: defined(() => template.boot.firmware, '')`, reading
+    # HVM-boot-params:firmware -- so whatever is set here is what someone gets
+    # without opening advanced settings. Left unset it reads as BIOS.
+    #
+    # Which one is right depends on the image, not on the distribution, so it is
+    # decided by looking at the disk that was actually imported: UEFI when it
+    # carries an EFI system partition, BIOS when it does not. Set after the
+    # build boot, which always runs under BIOS, so no NVRAM from this VM is
+    # baked into the template.
+    if tpl_disk_supports_uefi "$TPL_ROOT_VDI"; then
+        dom0_xe "vm-param-set uuid=${TPL_VM_UUID} HVM-boot-params:firmware=uefi" >/dev/null 2>&1 || true
+        log_info "  the image carries an EFI system partition; publishing as UEFI."
+    else
+        dom0_xe "vm-param-set uuid=${TPL_VM_UUID} HVM-boot-params:firmware=bios" >/dev/null 2>&1 || true
+        log_info "  the image has no EFI system partition; publishing as BIOS."
+    fi
+
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} name-label='${name}'" >/dev/null
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} name-description='${TPL_DESCRIPTION}'" >/dev/null
+
+    # XO's VM General tab reads other-config:base_template_name to show what a
+    # VM was built from. Left as the scaffolding it happens to have been built
+    # on, every VM cloned from this template reports "Other install media"
+    # instead of the template the operator actually picked. Cosmetic -- the
+    # field only steers behaviour on the PV install path, which an HVM guest
+    # never takes -- but it is the field someone reads to answer that question.
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} other-config:base_template_name='${name}'" >/dev/null 2>&1 || true
+    dom0_xe "vm-param-set uuid=${TPL_VM_UUID} is-a-template=true" >/dev/null
+
+    return 0
+}
+
+# Remove a half-built VM. Called when a build fails partway: the wreckage is a
+# VM with a multi-gigabyte disk attached, which is worth clearing rather than
+# leaving for the operator to identify and unpick by hand.
+tpl_cleanup_failed_build() {
+    [[ "$TPL_BUILD_STARTED" == "true" ]] || return 0
+    [[ -n "$TPL_VM_UUID" ]] || return 0
+
+    local state
+    state=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=power-state" 2>/dev/null | tr -d '\r')
+    if [[ "$state" == "running" || "$state" == "paused" ]]; then
+        dom0_xe "vm-shutdown --force uuid=${TPL_VM_UUID}" >/dev/null 2>&1 || true
+    fi
+    # Destroys the VM and every disk that came with it.
+    dom0_xe "vm-uninstall --force uuid=${TPL_VM_UUID}" >/dev/null 2>&1 || true
+
+    TPL_VM_UUID=""; TPL_ROOT_VDI=""; TPL_CIDATA_VDI=""; TPL_BUILD_STARTED="false"
+}
+
+# Build one template: one image, one firmware mode, start to finish.
+tpl_build_one() {
+    local row="$1"
+    local key display user
+    key=$(tpl_field "$row" 1)
+    display=$(tpl_field "$row" 2)
+    user=$(tpl_field "$row" 5)
+
+    local name
+    name=$(tpl_template_name "$display")
+
+    echo ""
+    log_info "Building: ${name}"
+
+    if tpl_template_exists "$name"; then
+        log_info "  a template named '${name}' already exists; skipping."
+        return 0
+    fi
+
+    # Shown in XO under the template name. Says what the operator needs to know
+    # to actually log in to a VM built from it.
+    TPL_DESCRIPTION="${display} with cloud-init and XCP-ng guest tools. Boots under BIOS or UEFI. Default login: ${user} / ${user}. Supply an SSH key or your own cloud-config at VM creation."
+    TPL_VM_NAME="$name"
+
+    TPL_VM_UUID=""; TPL_ROOT_VDI=""; TPL_CIDATA_VDI=""; TPL_BUILD_STARTED="false"
+
+    tpl_build_prep_drive "$row"
+
+    if ! tpl_create_build_vm "$row" "$name"; then
+        # Everything up to the preparation boot is reproducible, so the
+        # wreckage -- a VM with a multi-gigabyte disk -- is cleared rather than
+        # left for the operator to identify and unpick.
+        tpl_cleanup_failed_build
+        return 1
+    fi
+
+    if ! tpl_wait_for_prep 900; then
+        # Deliberately not cleaned up: the guest holds the prep log that says
+        # why it failed, and destroying it would take the evidence with it.
+        TPL_BUILD_STARTED="false"
+        return 1
+    fi
+
+    # Prove the preparation actually happened before sealing.
+    #
+    # A VM that boots and halts is not evidence the prep ran: a kernel panic,
+    # a cloud-init failure or a config drive the guest never read all end the
+    # same way. XAPI records the guest agent's version only when the agent has
+    # run inside the VM, so its presence is the one signal visible from the
+    # host that says the preparation boot did what it was for.
+    # The signal is os-version, not PV-drivers-version.
+    #
+    # Both are written by the guest agent from inside the VM, so either one
+    # proves it ran -- but they do not survive shutdown alike. XAPI clears
+    # PV-drivers-version when the domain goes away, while os-version and the
+    # reported addresses persist. Checked against a live pool: every halted VM
+    # there reports PV-drivers-version empty, working ones included, and a
+    # correctly prepared build VM shows os-version
+    # "Debian GNU/Linux 13 (trixie)" with a kernel string beside it. Guest
+    # tools that ship the management agent without versioned PV drivers may
+    # also never populate PV-drivers-version at all, even while running.
+    #
+    # So the check reads os-version off the halted VM, which is exactly the
+    # state tpl_wait_for_prep leaves it in. TPL_AGENT_SEEN, recorded during the
+    # boot, is accepted as corroboration when it happens to have been caught.
+    # Requiring an empty-string test would pass on a VM with no agent at all,
+    # so the check is for a distro name -- something only the agent supplies.
+    local osv
+    osv=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=os-version" 2>/dev/null | tr -d '\r')
+    if [[ ! "$osv" =~ [A-Za-z] ]] || [[ "$osv" == "<not in database>" ]]; then
+        osv=""
+    fi
+    if [[ -z "$osv" && ! "${TPL_AGENT_SEEN:-}" =~ [0-9]+\.[0-9]+ ]]; then
+        log_error "  the preparation boot finished, but the guest agent is not"
+        log_error "  installed -- so XO would never report an IP for VMs built"
+        log_error "  from this template."
+        log_error "  The build VM is left in place; its log is at"
+        log_error "  /var/log/xo-template-prep.log inside it."
+        TPL_BUILD_STARTED="false"
+        return 1
+    fi
+
+    if ! tpl_seal_template "$name"; then
+        tpl_cleanup_failed_build
+        return 1
+    fi
+
+    TPL_BUILD_STARTED="false"
+    log_success "  ${name} is ready"
+    return 0
+}
+
+# --- Selection --------------------------------------------------------------
+
+# The template library submenu.
+#
+# Driven by the same keys as the main menu — arrows to move, space to select,
+# enter to confirm — rather than a numbered prompt, so the two do not teach
+# different habits for the same job. Multi-select: everything ticked is built
+# in one run.
+#
+# It draws its own rows rather than reusing draw_menu, which is bound to the
+# main menu's two-column grid and its parallel MENU_* arrays. A catalogue that
+# grows one row per distribution wants a plain list.
+tpl_prompt_selection() {
+    local count=${#TPL_CATALOG[@]}
+    local -a picked
+    local i
+    for ((i = 0; i < count; i++)); do picked[i]=0; done
+
+    local cursor=0
+
+    # Terminal state is restored on every exit path, including the ones that
+    # leave through `return`: a submenu that swallows the cursor or leaves echo
+    # off makes the whole script look hung afterwards.
+    local saved_tpl_stty
+    saved_tpl_stty=$(stty -g 2>/dev/null) || saved_tpl_stty=""
+    menu_hide_cursor
+    stty -echo 2>/dev/null || true
+    _tpl_restore_term() {
+        menu_show_cursor
+        [[ -n "$saved_tpl_stty" ]] && stty "$saved_tpl_stty" 2>/dev/null || stty echo 2>/dev/null
+    }
+
+    local row display user
+    while true; do
+        clear
+        echo ""
+        printf '  %sVM Template Library%s\n' "$M_BOLD" "$M_RESET"
+        echo ""
+        printf '  %sCloud-init templates built from each distribution'"'"'s own published%s\n' "$M_DIM" "$M_RESET"
+        printf '  %simage. Once built they appear in Xen Orchestra under New -> VM.%s\n' "$M_DIM" "$M_RESET"
+        echo ""
+
+        for ((i = 0; i < count; i++)); do
+            row="${TPL_CATALOG[$i]}"
+            display=$(tpl_field "$row" 2)
+            user=$(tpl_field "$row" 5)
+
+            local mark="[ ]"
+            [[ ${picked[$i]} -eq 1 ]] && mark="[${M_GREEN}✓${M_RESET}]"
+
+            local pointer="  "
+            local label="$display"
+            if (( i == cursor )); then
+                pointer="${M_CYAN}▸${M_RESET} "
+                label="${M_BOLD}${display}${M_RESET}"
+            fi
+
+            printf '  %s%s %s %s(login: %s)%s\n' \
+                "$pointer" "$mark" "$label" "$M_DIM" "$user" "$M_RESET"
+
+            # Say plainly which of these already exist, so a re-run is not a
+            # guess about what a build would actually do.
+            if tpl_template_exists "$(tpl_template_name "$display")"; then
+                printf '       %salready on this pool%s\n' "$M_DIM" "$M_RESET"
+            fi
+        done
+
+        echo ""
+        local n_sel=0
+        for ((i = 0; i < count; i++)); do (( picked[i] == 1 )) && n_sel=$((n_sel + 1)); done
+        printf '  %sSelected: %d%s\n' "$M_DIM" "$n_sel" "$M_RESET"
+        echo ""
+        printf '  %s↑↓ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Back%s\n' "$M_DIM" "$M_RESET"
+
+        menu_read_key
+        case "$MENU_KEY" in
+            UP)
+                if (( cursor == 0 )); then cursor=$((count - 1)); else cursor=$((cursor - 1)); fi
+                ;;
+            DOWN)
+                cursor=$(( (cursor + 1) % count ))
+                ;;
+            SPACE)
+                picked[$cursor]=$(( 1 - picked[cursor] ))
+                ;;
+            ENTER)
+                break
+                ;;
+            QUIT)
+                # Backing out is a normal outcome, not a failure: returning
+                # non-zero here would be caught by the script's ERR trap and
+                # printed as an error. The empty selection is the signal.
+                _tpl_restore_term
+                clear
+                TPL_SELECTED=()
+                return 0
+                ;;
+        esac
+    done
+
+    _tpl_restore_term
+    clear
+
+    TPL_SELECTED=()
+    for ((i = 0; i < count; i++)); do
+        (( picked[i] == 1 )) && TPL_SELECTED+=("${TPL_CATALOG[$i]}")
+    done
+
+    return 0
+}
+
+# Clean up after a template build run.
+#
+# Mirrors deploy_cleanup: closes the shared SSH connection, then removes the
+# working directory the prep key and config drive live in.
+tpl_cleanup() {
+    tpl_cleanup_failed_build
+    if [[ -n "${DEPLOY_SSH_CTL:-}" && -S "${DEPLOY_SSH_CTL}" ]]; then
+        ssh -o ControlPath="$DEPLOY_SSH_CTL" -O exit \
+            "${HOST_USERNAME}@${POOL_MASTER_IP}" 2>/dev/null || true
+    fi
+    if [[ -n "${DEPLOY_WORKDIR:-}" && -d "$DEPLOY_WORKDIR" ]]; then
+        if [[ -f "${DEPLOY_WORKDIR}/tpl_key" ]] && command -v shred >/dev/null 2>&1; then
+            shred -u "${DEPLOY_WORKDIR}/tpl_key" 2>/dev/null || true
+        fi
+        rm -rf "$DEPLOY_WORKDIR"
+    fi
+}
+
+# Resolve the storage and network the build runs on.
+#
+# Neither is a user-facing choice here, unlike --deploy where the operator is
+# picking where a long-lived VM will live. A template's SR holds only the
+# template's own disk, and its network is used once, for the preparation boot --
+# both are chosen again in New VM every time a VM is created from it. Prompting
+# for them asks the operator to make a decision that does not survive the build.
+tpl_resolve_storage() {
+    local pool
+    pool=$(dom0_xe "pool-list params=uuid --minimal" 2>/dev/null | tr -d '\r' | cut -d',' -f1)
+    DEPLOY_SR_UUID=$(dom0_xe "pool-param-get uuid=${pool} param-name=default-SR" 2>/dev/null | tr -d '\r')
+
+    if [[ -z "$DEPLOY_SR_UUID" || "$DEPLOY_SR_UUID" == "<not in database>" ]]; then
+        # No default set on the pool. Fall back to the user SR with the most
+        # free space rather than failing: any of them can hold the template.
+        DEPLOY_SR_UUID=$(dom0_exec 'best=""; bestfree=0
+            for u in $(xe sr-list content-type=user params=uuid --minimal | tr "," " "); do
+                size=$(xe sr-param-get uuid=$u param-name=physical-size 2>/dev/null)
+                used=$(xe sr-param-get uuid=$u param-name=physical-utilisation 2>/dev/null)
+                free=$(( size - used ))
+                if [ "$free" -gt "$bestfree" ]; then bestfree=$free; best=$u; fi
+            done
+            echo "$best"' | tr -d '\r')
+    fi
+
+    if [[ -z "$DEPLOY_SR_UUID" ]]; then
+        log_error "No usable storage repository found on this pool."
+        return 1
+    fi
+
+    local label
+    label=$(dom0_xe "sr-param-get uuid=${DEPLOY_SR_UUID} param-name=name-label" 2>/dev/null | tr -d '\r')
+    log_info "Storage: ${label:-$DEPLOY_SR_UUID} (the pool default)"
+    return 0
+}
+
+# Pick the network the preparation boot uses.
+#
+# XCP-ng has no "default network" flag, so the management network is the
+# closest thing: it carries the pool's own traffic, so it is reachable and has
+# DHCP wherever the host does. The prep boot needs an address only long enough
+# to install the guest tools from the attached ISO.
+tpl_resolve_network() {
+    DEPLOY_NETWORK_UUID=$(dom0_xe "pif-list management=true params=network-uuid --minimal" 2>/dev/null | tr -d '\r' | cut -d',' -f1)
+
+    if [[ -z "$DEPLOY_NETWORK_UUID" ]]; then
+        DEPLOY_NETWORK_UUID=$(dom0_xe "network-list params=uuid --minimal" 2>/dev/null | tr -d '\r' | cut -d',' -f1)
+    fi
+
+    if [[ -z "$DEPLOY_NETWORK_UUID" ]]; then
+        log_error "No network found on this pool."
+        return 1
+    fi
+
+    local label
+    label=$(dom0_xe "network-param-get uuid=${DEPLOY_NETWORK_UUID} param-name=name-label" 2>/dev/null | tr -d '\r')
+    log_info "Network: ${label:-$DEPLOY_NETWORK_UUID} (the management network)"
+    return 0
+}
+
+# --- Entry point ------------------------------------------------------------
+
+build_vm_templates() {
+    echo ""
+    echo "=============================================="
+    echo "  Build cloud-init VM templates"
+    echo "=============================================="
+    echo ""
+    echo "  Builds ready-to-use VM templates on your XCP-ng pool from the"
+    echo "  distributions' own published cloud images, so 'New VM' in Xen"
+    echo "  Orchestra offers them the way XOA's Hub does."
+    echo ""
+    echo "  A template on XCP-ng is a VM record with its template flag set, so"
+    echo "  each one is built by creating a VM, importing the image into it,"
+    echo "  booting it once, and then sealing it. The boot is what installs the"
+    echo "  XCP-ng guest agent -- without it XO never reports a VM's IP address"
+    echo "  -- and what clears the machine-specific state a clone must not"
+    echo "  inherit. A VM named '[building template] ...' will appear in XO"
+    echo "  while that happens and disappear when it is sealed."
+    echo ""
+    echo "  Expect roughly five to ten minutes per template, most of it the"
+    echo "  image download."
+    echo ""
+    echo "  Nothing is installed on this machine and your XO install is not"
+    echo "  touched; the work happens on the pool."
+    echo ""
+
+    deploy_check_local_deps
+
+    tpl_prompt_selection
+    if [[ ${#TPL_SELECTED[@]} -eq 0 ]]; then
+        log_info "No templates selected."
+        return 0
+    fi
+
+    # Everything below writes into DEPLOY_WORKDIR -- the SSH control socket, the
+    # pinned host key, the generated prep drive -- and the helpers build those
+    # paths by interpolation. An unset workdir does not fail loudly: the paths
+    # resolve to the filesystem root and the run dies on "Permission denied"
+    # from ssh, which reads as a wrong password rather than a missing directory.
+    DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-templates-XXXXXX)
+    chmod 700 "$DEPLOY_WORKDIR"
+    trap tpl_cleanup EXIT
+
+    # Reuses the deploy path's connection: same pool, same host key pinning,
+    # same credentials prompt. Nothing here needs a second way in.
+    deploy_connect_pool_master
+    tpl_resolve_storage || return 1
+    tpl_resolve_network || return 1
+
+    echo ""
+    echo "=============================================="
+    echo "  Summary"
+    echo "=============================================="
+    local row
+    for row in "${TPL_SELECTED[@]}"; do
+        printf '  %s\n' "$(tpl_template_name "$(tpl_field "$row" 2)")"
+    done
+    echo ""
+    local prompt="Build this template?"
+    (( ${#TPL_SELECTED[@]} > 1 )) && prompt="Build these ${#TPL_SELECTED[@]} templates?"
+    confirm_or_skip "$prompt" || { log_info "Cancelled."; return 0; }
+
+    local built=0 failed=0
+    for row in "${TPL_SELECTED[@]}"; do
+        if tpl_build_one "$row"; then
+            built=$((built + 1))
+        else
+            failed=$((failed + 1))
+            log_error "  build failed; continuing with the rest."
+        fi
+    done
+
+    echo ""
+    echo "=============================================="
+    if (( failed == 0 )); then
+        log_success "Done. ${built} template(s) ready."
+    else
+        log_warning "Done. ${built} succeeded, ${failed} failed."
+    fi
+    echo "=============================================="
+    echo ""
+    echo "  In Xen Orchestra: New -> VM, then pick one of these templates."
+    echo "  Set the name, CPU, memory, disk size and network there; the disk"
+    echo "  grows to whatever size you ask for on first boot."
+    echo ""
+    echo "  Log in with the account named in the template's description, or"
+    echo "  supply your own cloud-config at creation time to install an SSH"
+    echo "  key and any packages you want."
     echo ""
 }
 
@@ -6405,6 +7820,7 @@ MENU_NAMES=(
     "Rename Sample-xo-config.cfg"
     "Install XO Proxy"
     "Deploy Xen Orchestra to a new VM"
+    "VM Template Library"
     "Reconfigure Xen Orchestra"
     "Rebuild Xen Orchestra"
     "Edit xo-config.cfg"
@@ -6417,6 +7833,7 @@ MENU_HINTS=(
     ""
     ""
     "(creates the VM for you)"
+    "(cloud-init templates for New VM)"
     "(made changes to config)"
     "(wipe & reinstall maintain settings)"
     ""
@@ -7197,7 +8614,7 @@ process_menu_selections() {
         menu_rename_config && config_changed=true
     fi
 
-    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[8]} -eq 1 ]]; then
         menu_edit_config && config_changed=true
     fi
 
@@ -7233,7 +8650,7 @@ process_menu_selections() {
     fi
 
     # Reconfigure Xen Orchestra
-    if [[ ${MENU_SELECTED[5]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -7243,7 +8660,7 @@ process_menu_selections() {
     fi
 
     # Rebuild Xen Orchestra
-    if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -7265,7 +8682,7 @@ process_menu_selections() {
     fi
 
     # Restore Backup
-    if [[ ${MENU_SELECTED[8]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[9]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -7284,12 +8701,22 @@ process_menu_selections() {
     fi
 
     # Adjust Xen Orchestra Memory Allocation
-    if [[ ${MENU_SELECTED[9]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[10]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
         check_systemctl
         adjust_xo_memory
+    fi
+
+    # VM Template Library
+    # Same minimal preflight as --deploy: this targets the pool, reads nothing
+    # from the local install and changes nothing on this machine. sudo is asked
+    # for by deploy_check_local_deps only if an ISO writer has to be installed.
+    if [[ ${MENU_SELECTED[5]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        build_vm_templates
     fi
 }
 
@@ -7500,7 +8927,7 @@ main() {
                 show_version
                 exit 0
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--adjust-memory|--flush-tokens|--uninstall|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -7599,6 +9026,12 @@ main() {
             check_required_commands
             check_not_root
             deploy_xo_vm
+            ;;
+        --build-templates)
+            # Same reasoning as --deploy: targets the pool, not this machine.
+            check_required_commands
+            check_not_root
+            build_vm_templates
             ;;
         --adjust-memory)
             check_required_commands
