@@ -10,6 +10,31 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Deprecated
+
+- **Debian 11 (Bullseye) support is deprecated and will be removed on
+  2026-10-01.** Debian 11 left Debian LTS on 2026-08-31 and receives no further
+  security updates, so the platform no longer meets the bar this installer
+  claims for a supported OS — and Xen Orchestra's own build dependencies are
+  increasingly unlikely to resolve there regardless of what this script does.
+  The removal is staged rather than immediate so nobody running Bullseye today
+  finds their install broken without notice. Until 2026-10-01 a run on Debian 11
+  prints a warning naming both dates and then proceeds exactly as before; from
+  2026-10-01 the same check refuses to run and exits 1, pointing at Debian 12 or
+  13, and the run can still be forced with the new `--allow-eol-distro` flag for
+  operators who accept an untested and unsupported configuration. The check is
+  in a new `check_eol_distro()`, called from `install_dependencies()` after
+  `detect_os()`, and is the first consumer of `OS_VERSION_ID` — which until now
+  was parsed and read by nothing, as the comment above it said. The cutoff is
+  compared as a `YYYYMMDD` integer against the local clock, so a machine whose
+  date is badly wrong degrades to the warning rather than to a hard stop.
+  **Debian 12 and 13 are entirely unaffected**: the gate matches only
+  `ID=debian` with `VERSION_ID` 11, verified silent on both in containers built
+  from this repo's own CI images with the clock set past the cutoff. Debian 11
+  stays in the CI matrix, and its integration smoke test still passes, until the
+  removal date; the matrix entry and `tests/integration/Dockerfile.debian11` are
+  both commented with the date they are to be deleted.
+
 ### Fixed
 
 - **`--deploy` never actually removed the temporary deployment key, leaving a

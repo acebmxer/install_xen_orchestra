@@ -306,15 +306,23 @@ After installation, access the web interface at `https://your-server-ip`.
 
 ## Supported Operating Systems
 
-- Debian 11/12/13
+- Debian 12/13
 - Ubuntu (all supported versions)
 - RHEL / CentOS Stream / AlmaLinux / Rocky
 - Fedora
 
+> [!WARNING]
+> **Debian 11 (Bullseye) support ends on 2026-10-01.** Debian 11 reached
+> end-of-life on **2026-08-31** and no longer receives security updates. Until
+> the removal date the installer runs on Debian 11 and prints a warning; from
+> **2026-10-01** it refuses to run there unless you pass `--allow-eol-distro`,
+> which is unsupported and untested. Upgrade to Debian 12 or 13 before then.
+
 > [!NOTE]
-> Continuously smoke-tested in CI on Debian 11/12/13, Ubuntu 24.04, Rocky Linux 9,
-> AlmaLinux 9, CentOS Stream 9, and Fedora. RHEL uses the same `dnf` path as its
-> rebuilds; other Ubuntu releases use the same `apt` path.
+> Continuously smoke-tested in CI on Debian 12/13, Ubuntu 24.04, Rocky Linux 9,
+> AlmaLinux 9, CentOS Stream 9, and Fedora — plus Debian 11 until its removal on
+> 2026-10-01. RHEL uses the same `dnf` path as its rebuilds; other Ubuntu
+> releases use the same `apt` path.
 
 > [!NOTE]
 > **Firewall:** On Fedora and RHEL-family systems (which enable `firewalld` by

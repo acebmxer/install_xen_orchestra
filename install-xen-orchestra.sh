@@ -36,6 +36,7 @@ LATEST_CONFIG_VERSION=3
 NON_INTERACTIVE=false
 RESTORE_BACKUP_FILE=""
 DRY_RUN=false
+ALLOW_EOL_DISTRO=false
 
 # Logging flags (set via CLI flags in main())
 LOG_FILE=""
@@ -652,8 +653,9 @@ pkg_update_soft() {
 
 # Detect OS distribution
 detect_os() {
-    # OS_VERSION_ID is parsed for reference/diagnostics; not read by the script today.
-    # shellcheck disable=SC2034
+    # OS_VERSION_ID is read by check_eol_distro() below; keep it populated on
+    # every path, including the failure paths, so the check never sees a stale
+    # value left over from a previous call.
     if [[ -f /etc/os-release ]]; then
         if . /etc/os-release 2>/dev/null; then
             OS_ID="${ID:-unknown}"
@@ -673,11 +675,82 @@ detect_os() {
     fi
 }
 
+# End-of-life distribution policy.
+#
+# Debian 11 (Bullseye) left Debian LTS on 2026-08-31 and receives no further
+# security updates. This installer stops supporting it on 2026-10-01: until
+# that date a run on Bullseye warns and continues, and from that date it stops
+# unless the operator passes --allow-eol-distro.
+#
+# The cutoff is compared as a plain YYYYMMDD integer against the local clock,
+# so a machine with a badly wrong date degrades to the warning rather than to a
+# hard stop. Both dates are named here so there is one place to edit when this
+# whole block is deleted after the removal lands.
+XO_DEBIAN11_EOL_DATE="2026-08-31"
+XO_DEBIAN11_REMOVAL_DATE="2026-10-01"
+XO_DEBIAN11_REMOVAL_STAMP="20261001"
+
+# Warn on, or refuse to run on, a distribution whose support has been dropped.
+# Called from install_dependencies() after detect_os() has populated OS_ID and
+# OS_VERSION_ID. Returns 0 when the run may continue; exits 1 when it may not.
+check_eol_distro() {
+    [[ "$OS_ID" == "debian" && "${OS_VERSION_ID%%.*}" == "11" ]] || return 0
+
+    local today
+    today="$(date +%Y%m%d 2>/dev/null || echo 00000000)"
+
+    if (( 10#$today < 10#$XO_DEBIAN11_REMOVAL_STAMP )); then
+        log_warning "=============================================="
+        log_warning "Debian 11 (Bullseye) reached end-of-life on ${XO_DEBIAN11_EOL_DATE}"
+        log_warning "and no longer receives security updates."
+        log_warning ""
+        log_warning "Support for Debian 11 is being removed from this"
+        log_warning "installer on ${XO_DEBIAN11_REMOVAL_DATE}. After that date this"
+        log_warning "script will refuse to run on Debian 11."
+        log_warning ""
+        log_warning "Upgrade to Debian 12 or Debian 13 before then."
+        log_warning "=============================================="
+        return 0
+    fi
+
+    # Past the cutoff. With the override the run continues, so say so without
+    # printing the full refusal and telling the operator to pass a flag they
+    # have already passed.
+    if [[ "$ALLOW_EOL_DISTRO" == true ]]; then
+        log_warning "=============================================="
+        log_warning "Debian 11 (Bullseye) is no longer supported."
+        log_warning "It reached end-of-life on ${XO_DEBIAN11_EOL_DATE} and support was"
+        log_warning "removed from this installer on ${XO_DEBIAN11_REMOVAL_DATE}."
+        log_warning ""
+        log_warning "--allow-eol-distro given; continuing anyway. This"
+        log_warning "configuration is untested and unsupported."
+        log_warning "=============================================="
+        return 0
+    fi
+
+    log_error "=============================================="
+    log_error "Debian 11 (Bullseye) is no longer supported."
+    log_error ""
+    log_error "Debian 11 reached end-of-life on ${XO_DEBIAN11_EOL_DATE} and support"
+    log_error "was removed from this installer on ${XO_DEBIAN11_REMOVAL_DATE}."
+    log_error "It is no longer tested, and Xen Orchestra's own"
+    log_error "dependencies are unlikely to install on it."
+    log_error ""
+    log_error "Upgrade to Debian 12 or Debian 13."
+    log_error ""
+    log_error "To proceed anyway, at your own risk, re-run with:"
+    log_error "  --allow-eol-distro"
+    log_error "=============================================="
+
+    exit 1
+}
+
 # Install system dependencies
 install_dependencies() {
     log_info "Installing system dependencies..."
 
     detect_os
+    check_eol_distro
     pkg_update_soft
 
     if [[ "$PKG_MANAGER" == "apt" ]]; then
@@ -6709,6 +6782,7 @@ show_help() {
     echo "  --dry-run, --check     Show what would be done without making any changes"
     echo "  --log-file PATH        Append log output to PATH (plain-text by default)"
     echo "  --json-logs            Write structured JSON lines to --log-file instead of plain text"
+    echo "  --allow-eol-distro     Continue on an end-of-life distribution (Debian 11), unsupported"
     echo ""
     echo "Environment Variables:"
     echo "  XO_DEBUG=1              Enable debug mode (prints all commands with 'set -x')"
@@ -8985,6 +9059,9 @@ main() {
                 ;;
             --json-logs)
                 JSON_LOGS=true
+                ;;
+            --allow-eol-distro)
+                ALLOW_EOL_DISTRO=true
                 ;;
             --version)
                 # Informational: print revision and exit before self-update/lock.

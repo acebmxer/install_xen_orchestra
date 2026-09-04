@@ -1,3 +1,9 @@
+# DEPRECATED — scheduled for deletion on 2026-10-01.
+#
+# Debian 11 (Bullseye) reached end-of-life on 2026-08-31 and receives no
+# further security updates. This image and its CI matrix entry in
+# .github/workflows/ci.yml are kept only so the deprecation window stays
+# tested; delete both on the removal date.
 FROM debian:11
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo git curl bash bats shellcheck ca-certificates \
