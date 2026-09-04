@@ -27,14 +27,14 @@ setup() {
     [ "$MENU_CENTER_COUNT" -eq 0 ]
 }
 
-@test "an odd item count centers the last item under equal columns" {
+@test "an odd item count gives the extra item to the left column" {
     MENU_NAMES=(a b c d e f g h i)
     menu_derive_layout
 
     [ "$MENU_TOTAL" -eq 9 ]
-    [ "$MENU_LEFT_COUNT" -eq 4 ]
+    [ "$MENU_LEFT_COUNT" -eq 5 ]
     [ "$MENU_RIGHT_COUNT" -eq 4 ]
-    [ "$MENU_CENTER_COUNT" -eq 1 ]
+    [ "$MENU_CENTER_COUNT" -eq 0 ]
 }
 
 @test "the grid always accounts for exactly every item" {
@@ -49,8 +49,10 @@ setup() {
         # draw_menu iterates rows up to MENU_LEFT_COUNT and skips right-column
         # slots past MENU_RIGHT_COUNT, so a shorter left column loses rows.
         [ "$MENU_LEFT_COUNT" -ge "$MENU_RIGHT_COUNT" ]
-        # At most one item can ever be left over for the centered row.
-        [ "$MENU_CENTER_COUNT" -le 1 ]
+        # The layout is always two columns: nothing is ever centered, and the
+        # left column runs at most one row longer than the right.
+        [ "$MENU_CENTER_COUNT" -eq 0 ]
+        [ "$((MENU_LEFT_COUNT - MENU_RIGHT_COUNT))" -le 1 ]
     done
 }
 

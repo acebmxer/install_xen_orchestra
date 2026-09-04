@@ -104,6 +104,16 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Changed
 
+- **The main menu is now always two columns, with no full-width centered row.**
+  With an odd number of entries the grid split the list into two equal columns
+  and drew the leftover item full-width and centered beneath them, so the menu
+  changed shape every time an entry was added or removed. `menu_derive_layout`
+  now gives the extra item to the left column instead — the left column runs at
+  most one row longer than the right, and `MENU_CENTER_COUNT` is always 0. The
+  drawing and navigation code already handled unequal columns and an absent
+  centered row, so the grid, the cursor mapping and the up/down wrap all follow
+  from the new counts without a special case.
+
 - **Settings inherited from the scaffolding template are now set deliberately,
   in both `--build-templates` and `--deploy`.** Both start from
   `Other install media`, whose defaults target an unknown guest; anything not

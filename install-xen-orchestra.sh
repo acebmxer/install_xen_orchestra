@@ -7812,8 +7812,9 @@ M_REVERSE="${M_CSI}7m"
 
 # Menu item names, in draw order: the first half fills the left column top to
 # bottom, the second half the right column. With an odd number of items the
-# last one is drawn full-width and centered below both columns. The split is
-# computed by menu_derive_layout, so adding an item here is all that is needed.
+# left column gets the extra one and the right column ends a row early. The
+# split is computed by menu_derive_layout, so adding an item here is all that is
+# needed.
 MENU_NAMES=(
     "Install Xen Orchestra"
     "Update Xen Orchestra"
@@ -7844,14 +7845,18 @@ MENU_HINTS=(
 MENU_TITLE="Install Xen Orchestra from Sources Setup and Update"
 
 # Derive the grid from the item list rather than writing the counts down a
-# second place to drift from: an even number of items fills two equal columns,
-# an odd one leaves the last item centered beneath them. Indices run down the
-# left column and then down the right, so MENU_NAMES reads in draw order.
+# second place to drift from. The layout is always two columns: an odd number
+# of items gives the extra one to the left column, leaving the right column one
+# row short, rather than dropping it into a centered row of its own. Indices run
+# down the left column and then down the right, so MENU_NAMES reads in draw
+# order. MENU_CENTER_COUNT stays at 0 — the centered row is retained in the
+# navigation and drawing code as a no-op path so the two-column grid is the only
+# case that can be reached.
 menu_derive_layout() {
     MENU_TOTAL=${#MENU_NAMES[@]}
-    MENU_LEFT_COUNT=$(( MENU_TOTAL / 2 ))
-    MENU_RIGHT_COUNT=$(( MENU_TOTAL / 2 ))
-    MENU_CENTER_COUNT=$(( MENU_TOTAL - MENU_LEFT_COUNT - MENU_RIGHT_COUNT ))
+    MENU_LEFT_COUNT=$(( (MENU_TOTAL + 1) / 2 ))
+    MENU_RIGHT_COUNT=$(( MENU_TOTAL - MENU_LEFT_COUNT ))
+    MENU_CENTER_COUNT=0
 }
 menu_derive_layout
 
