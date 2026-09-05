@@ -10,6 +10,112 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **A template test no longer fails on Ubuntu 22.04's older bats.** "the debian
+  prep script is valid shell" wrote its scratch file to `$BATS_TEST_TMPDIR`, a
+  variable introduced in Bats 1.4. Ubuntu 22.04 ships Bats 1.2.1, where it is
+  simply unset — and because the suite runs under `set -u` that is a fatal
+  "unbound variable" rather than an empty path, so the test failed outright on
+  that image while passing on every other one, which carries Bats 1.8 or newer.
+  It had never worked there: the test and the Ubuntu 22.04 image arrived in the
+  same commit, and the failure stayed hidden only because the image was missing
+  the tools that let the suite get that far. `tests/unit/test_vm_templates.bats`
+  now creates its own scratch directory with `mktemp -d` in `setup()` and
+  removes it in `teardown()` — the pattern the other three unit test files
+  already use, and one that behaves identically on every bats version.
+  Verified across the full range in the integration images: Bats 1.2.1
+  (Ubuntu 22.04), 1.8.0 (AlmaLinux 9), 1.11.1 (Debian 13) and 1.13.0
+  (Fedora, Ubuntu 26.04) all run 230 of 230 with no failures and nothing
+  skipped.
+
+- **The integration test images now install the tools the unit suite needs, so
+  it actually runs inside them instead of skipping most of itself.** All ten
+  `tests/integration/Dockerfile.*` images installed `bats` but not `openssl`,
+  `genisoimage` or `ssh-keygen`. The visible symptom was two failing
+  password-validation tests: `deploy_hash_password` needs `openssl passwd -6`
+  (or `mkpasswd`) to hash the admin password on the machine running `--deploy`,
+  so without it the function bailed early with "hashing one needs openssl or
+  mkpasswd" rather than reaching the missing-password and minimum-length errors
+  the tests assert on.
+
+  The larger problem was invisible. The deploy tests guard themselves with
+  `command -v ssh-keygen || skip` and an equivalent check for an ISO writer, so
+  in these images **22 of them skipped and reported green without running** —
+  including the tests covering config-drive generation, password hashing and
+  SSH key handling. A skip is not a pass, and an image that skips two dozen
+  tests is not the test environment it claims to be.
+
+  All ten images now install `openssl`, an ISO writer, an SSH client and
+  PyYAML (`genisoimage`, `openssh-client` and `python3-yaml` on Debian and
+  Ubuntu; `xorriso`, which provides a `genisoimage` binary on EL9,
+  `openssh-clients` and `python3-pyyaml` on the RPM images). PyYAML backs a
+  test that parses the generated cloud-init user-data, which had been skipping
+  everywhere. The four RPM images additionally needed `diffutils`: unlike the
+  Debian base images they ship no `diff`, which two config-comparison tests
+  call directly, and those failed with status 127 once they stopped being
+  skipped. Verified by rebuilding and running the full unit suite inside the
+  images: AlmaLinux 9 goes from 2 failures and 22 skips to **230 of 230
+  passing with nothing skipped**. This did not break CI, which runs the unit
+  suite on the Ubuntu runner rather than in these images.
+
+### Changed
+
+- **`--deploy` now boots the appliance under UEFI instead of BIOS.** The
+  deployed VM had been coming up as a BIOS guest for no better reason than
+  nothing ever setting the parameter: XAPI reads an absent
+  `HVM-boot-params:firmware` as BIOS, and `deploy_create_vm` set the boot
+  *policy* — `HVM-boot-policy='BIOS order'`, which is the string every HVM
+  guest requires regardless of firmware and is not the firmware selector — and
+  then never touched the firmware itself. The template builder had been getting
+  this right since it was written, so a VM deployed by `--deploy` and a VM
+  cloned from a template built by `--build-templates` came out of the same
+  script with different firmware. The deploy path now makes the same decision
+  the same way, by calling `tpl_disk_supports_uefi` on the disk it just
+  imported: UEFI when the image carries an EFI system partition, BIOS when it
+  does not. It is probed rather than hardcoded because `XO_DEPLOY_IMAGE_URL`
+  can point the deploy at any raw image, and UEFI firmware with no bootloader
+  to load does not fall back to BIOS — it fails to boot outright. The step sits
+  between the image import and `vm-start`, which is the only window that works:
+  an empty VDI has no partition table to read, and firmware cannot change under
+  a running domain. The stock Debian cloud images the deploy defaults to carry
+  both an ESP and a BIOS boot partition, so they take the UEFI branch and an
+  operator who wants BIOS can still select it. `tpl_attach_tools_iso` grew a VM
+  uuid parameter so both paths can share it rather than keeping two copies;
+  its behaviour for the template builder is unchanged.
+
+### Added
+
+- **`--deploy` now installs the XCP-ng guest tools into the appliance.** A
+  deployed VM had no guest agent at all, so the Xen Orchestra it was itself
+  hosting could not report its IP address, memory or disk usage, and could not
+  shut it down cleanly — the VM ran perfectly while appearing half-blank in the
+  very interface it served. The pool's `guest-tools.iso` is now attached to a
+  CD drive on device 3 (free in both paths, which use 0 for the root disk and 1
+  for the config drive) and installed on the first boot by a
+  `/usr/local/sbin/xo-install-guest-tools.sh` script written through cloud-init
+  `write_files`. It comes from the ISO rather than `apt` for the reason the
+  template builder already documents: Debian 13 — the deploy default — ships no
+  `xe-guest-utilities` package, and a failed package install does not stop
+  cloud-init, so an apt-only path yields a VM that looks fine and never reports
+  an IP. The `apt` route is kept as a fallback for releases that do package the
+  agent. Unlike the template builder, a pool with no tools ISO is a warning
+  rather than a fatal error: a template without an agent is a defect stamped
+  into every clone, whereas the appliance still installs and serves XO, and
+  aborting a deploy after the 3 GB image download would cost far more than the
+  missing telemetry. The in-guest script tolerates the disc being absent
+  entirely — the config drive is built before the VM exists, so it cannot know
+  whether there was an ISO to attach — and retries the drive for thirty seconds
+  before giving up, since it may not be ready the moment cloud-init reaches it.
+  Once the install finishes, the ISO is ejected alongside the config drive so
+  clones do not inherit a mounted tools disc; the VDI itself is left alone,
+  because it is the pool's shared copy and destroying it would break guest
+  tools installs pool-wide. Verified on a Debian 13 container: the generated
+  user-data passes `cloud-init schema` as valid, and the extracted guest script
+  passes both `bash -n` and `shellcheck`. Eleven unit tests cover the two
+  changes, including the ordering constraint on the firmware probe and the
+  eject-never-destroy rule for the shared ISO.
+
 ## [0.6.0] - 2026-09-04
 
 ### Added

@@ -3659,6 +3659,10 @@ DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
 DEPLOY_VM_STARTED="false"
 DEPLOY_VM_UUID=""
 DEPLOY_ROOT_VDI=""
+# Whether the guest tools ISO was attached. A pool missing the ISO is a warning
+# rather than a failure, so the eject step needs to know whether there is
+# anything to eject.
+DEPLOY_TOOLS_ATTACHED="false"
 # Set once the deploy has actually finished. deploy_cleanup runs on every exit,
 # success included, so the failure paths it drives need a way to tell the two
 # apart -- without this, a perfectly good deploy ends by offering to destroy
@@ -5448,7 +5452,58 @@ write_files:
       APT::Periodic::Update-Package-Lists "1";
       APT::Periodic::Unattended-Upgrade "1";
 
+  # Installs the XCP-ng guest agent from the ISO attached at device 3, so XO
+  # reports this VM's IP, memory and disk usage and can shut it down cleanly.
+  #
+  # From the ISO rather than apt because Debian 13 -- the deploy default --
+  # ships no xe-guest-utilities package. The apt path fails there with "unable
+  # to locate", and does so silently, since a failed package install does not
+  # stop cloud-init.
+  #
+  # Every step is tolerant of the disc being absent: the config drive is built
+  # before the VM exists, so it cannot know whether the pool had the ISO to
+  # attach. A guest with no agent still runs XO perfectly well, so nothing here
+  # is allowed to fail the boot.
+  - path: /usr/local/sbin/xo-install-guest-tools.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      exec >> /var/log/xo-guest-tools.log 2>&1
+      set -x
+
+      mnt=/mnt/xo-guest-tools
+      mkdir -p "\$mnt"
+
+      # The drive may not be ready the instant cloud-init reaches this, so
+      # give it a few seconds before concluding there is no disc.
+      dev=""
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+          for candidate in /dev/cdrom /dev/sr0 /dev/sr1; do
+              if [ -b "\$candidate" ] && mount -o ro "\$candidate" "\$mnt" 2>/dev/null; then
+                  dev="\$candidate"
+                  break
+              fi
+          done
+          [ -n "\$dev" ] && break
+          sleep 3
+      done
+
+      if [ -n "\$dev" ] && [ -f "\$mnt/Linux/install.sh" ]; then
+          bash "\$mnt/Linux/install.sh" -n
+          rc=\$?
+          umount "\$mnt" 2>/dev/null || true
+          exit \$rc
+      fi
+
+      [ -n "\$dev" ] && umount "\$mnt" 2>/dev/null || true
+
+      # Fallback for releases that do package the agent. Harmless where the
+      # package does not exist -- the "|| true" is what keeps a missing
+      # package from being reported as a failed boot.
+      apt-get install -y xe-guest-utilities || true
+
 runcmd:
+  - [bash, /usr/local/sbin/xo-install-guest-tools.sh]
   - [git, clone, "${DEPLOY_REPO_URL}", "${DEPLOY_REPO_DIR}"]
   - [chown, -R, "${DEPLOY_ADMIN_USER}:${DEPLOY_ADMIN_USER}", "${DEPLOY_REPO_DIR}"]
 EOF
@@ -5658,6 +5713,11 @@ deploy_create_vm() {
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} platform:videoram=8" >/dev/null 2>&1 || true
 
     # Boot straight from disk — there is no installer to boot from.
+    #
+    # "BIOS order" is XAPI's boot *policy* string and is required for every HVM
+    # guest, UEFI ones included; it is not the firmware selector. The firmware
+    # is HVM-boot-params:firmware, set further down once the image has been
+    # imported and its disk can be read — see the note there.
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-policy='BIOS order'" >/dev/null
     dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-params:order=c" >/dev/null
 
@@ -5705,6 +5765,33 @@ deploy_create_vm() {
     fi
     log_success "Root disk imported"
 
+    # Boot firmware, decided from the disk that was actually imported.
+    #
+    # UEFI is the default wherever the image supports it: it is what XO's own
+    # Hub templates present, and it is the prerequisite for Secure Boot and a
+    # vTPM should the appliance ever want either. The deploy path defaulted to
+    # BIOS purely because nothing here ever set the parameter — unset reads as
+    # BIOS — while the template builder had been probing the disk since it was
+    # written. This is the same decision, made the same way, so a VM deployed
+    # here and a VM cloned from a template built here come out alike.
+    #
+    # Probed rather than assumed for the reason given at tpl_disk_supports_uefi:
+    # UEFI-bootability belongs to the image, not the distribution, and UEFI
+    # firmware with no bootloader to load does not fall back to BIOS — it fails
+    # to boot. XO_DEPLOY_IMAGE_URL can point this at any raw image, so a
+    # hardcoded uefi would strand anyone aiming it at a BIOS-only one.
+    #
+    # Ordering is load-bearing twice over: after the import, because an empty
+    # VDI has no partition table to read, and before vm-start, because firmware
+    # cannot change under a running domain.
+    if tpl_disk_supports_uefi "$DEPLOY_ROOT_VDI"; then
+        dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-params:firmware=uefi" >/dev/null 2>&1 || true
+        log_success "Boot firmware: UEFI (the image carries an EFI system partition)"
+    else
+        dom0_xe "vm-param-set uuid=${DEPLOY_VM_UUID} HVM-boot-params:firmware=bios" >/dev/null 2>&1 || true
+        log_info "Boot firmware: BIOS (the image has no EFI system partition)"
+    fi
+
     # Config drive. 16 MiB is comfortably above the ~400 KB ISO and above the
     # allocation granularity of every SR type.
     log_info "Attaching the cloud-init config drive..."
@@ -5714,6 +5801,38 @@ deploy_create_vm() {
         exit 1
     fi
     DEPLOY_CIDATA_VBD=$(dom0_xe "vbd-create vm-uuid=${DEPLOY_VM_UUID} vdi-uuid=${DEPLOY_CIDATA_VDI} device=1 type=Disk mode=RO")
+
+    # The guest tools ISO, for cloud-init to install the guest agent from.
+    #
+    # Without the agent XO shows the appliance with no IP address, no memory or
+    # disk figures, and no clean shutdown -- the VM runs perfectly but the
+    # management interface it is itself hosting cannot see into it.
+    #
+    # From the ISO rather than apt for the same reason the template builder
+    # does it: Debian 13 ships no xe-guest-utilities package, and the deploy
+    # image defaults to Debian 13.
+    #
+    # A warning rather than fatal, which is where this parts company with the
+    # template builder. A template with no agent is a defect stamped into every
+    # VM ever cloned from it, so that build stops; here the appliance still
+    # installs and serves XO, and the operator can add the agent afterwards.
+    # Aborting a deploy this late -- after the image download -- would cost far
+    # more than the missing telemetry does.
+    local deploy_tools_vdi
+    deploy_tools_vdi=$(tpl_find_tools_iso)
+    if [[ -z "$deploy_tools_vdi" ]]; then
+        log_warning "${TPL_TOOLS_ISO_NAME} was not found on this pool; skipping the guest agent."
+        log_warning "  It normally lives in the 'XCP-ng Tools' storage repository."
+        log_warning "  The VM will work, but XO will not report its IP or memory usage."
+        DEPLOY_TOOLS_ATTACHED="false"
+    elif tpl_attach_tools_iso "$DEPLOY_VM_UUID" "$deploy_tools_vdi"; then
+        DEPLOY_TOOLS_ATTACHED="true"
+        log_success "Guest tools ISO attached"
+    else
+        log_warning "Could not attach ${TPL_TOOLS_ISO_NAME}; skipping the guest agent."
+        log_warning "  The VM will work, but XO will not report its IP or memory usage."
+        DEPLOY_TOOLS_ATTACHED="false"
+    fi
 
     # Network interface.
     dom0_xe "vif-create vm-uuid=${DEPLOY_VM_UUID} network-uuid=${DEPLOY_NETWORK_UUID} device=0" >/dev/null
@@ -6067,6 +6186,35 @@ deploy_remove_config_drive() {
     fi
     DEPLOY_CIDATA_VDI=""
     DEPLOY_CIDATA_VBD=""
+}
+
+# Eject the guest tools ISO once the agent is installed.
+#
+# The agent is installed to the root disk on the first boot, so the disc is
+# only needed for that boot. Leaving it in place would leave every clone of
+# this appliance booting with a tools disc mounted, and would pin the pool's
+# shared guest-tools VDI as in-use by a VM that has finished with it.
+#
+# The VDI is ejected, never destroyed: it belongs to the pool's tools SR and is
+# shared by every VM that installs the agent. Destroying it would break guest
+# tools installs pool-wide.
+#
+# Best-effort throughout -- the install has already succeeded by this point, so
+# a drive the guest will not release is a warning, not a failed deploy.
+deploy_eject_tools_iso() {
+    [[ "${DEPLOY_TOOLS_ATTACHED:-false}" == "true" ]] || return 0
+
+    local cd_vbd
+    cd_vbd=$(dom0_xe "vbd-list vm-uuid=${DEPLOY_VM_UUID} type=CD params=uuid --minimal" 2>/dev/null | tr -d '\r' | cut -d',' -f1)
+    [[ -n "$cd_vbd" ]] || return 0
+
+    if dom0_xe "vbd-eject uuid=${cd_vbd}" >/dev/null 2>&1; then
+        log_success "Guest tools ISO ejected"
+    else
+        log_warning "Could not eject the guest tools ISO; it is still attached to the VM."
+        log_warning "Eject it later with: xe vbd-eject uuid=${cd_vbd}"
+    fi
+    DEPLOY_TOOLS_ATTACHED="false"
 }
 
 # The program deploy_revoke_deploy_key runs on the guest, kept in its own
@@ -6423,6 +6571,7 @@ deploy_xo_vm() {
     deploy_install_xo_in_vm
     deploy_verify_xo
     deploy_remove_config_drive
+    deploy_eject_tools_iso
     deploy_scrub_guest_cloudinit_cache
     # Last of the steps that need passwordless sudo in the guest.
     deploy_harden_guest_sudo
@@ -7252,19 +7401,23 @@ tpl_find_tools_iso() {
     printf '%s' "$vdi"
 }
 
-# Attach the guest tools ISO to the build VM.
+# Attach the guest tools ISO to a VM.
 #
 # The base template provisions no CD drive, so there is nothing for
 # `vm-cd-insert` to insert into -- it has to be created first. Attaching the
 # VDI by uuid rather than by name also sidesteps the duplicate-name problem
 # entirely.
+#
+# Takes the VM uuid rather than reading TPL_VM_UUID, because both the template
+# builder and the deploy path attach the same ISO the same way. Device 3 is
+# free in both: each uses 0 for the root disk and 1 for its config drive.
 tpl_attach_tools_iso() {
-    local vdi="$1"
+    local vm_uuid="$1" vdi="$2"
 
     # An empty CD VBD. `type=CD mode=RO` with no VDI is how xe models a drive
     # with no disc in it; `vbd-insert` then loads one.
     local cd_vbd
-    cd_vbd=$(dom0_xe "vbd-create vm-uuid=${TPL_VM_UUID} device=3 type=CD mode=RO" 2>/dev/null | tr -d '\r')
+    cd_vbd=$(dom0_xe "vbd-create vm-uuid=${vm_uuid} device=3 type=CD mode=RO" 2>/dev/null | tr -d '\r')
     if [[ -z "$cd_vbd" ]]; then
         return 1
     fi
@@ -7487,7 +7640,7 @@ tpl_create_build_vm() {
         return 1
     fi
 
-    if ! tpl_attach_tools_iso "$tools_vdi"; then
+    if ! tpl_attach_tools_iso "$TPL_VM_UUID" "$tools_vdi"; then
         log_error "  could not attach ${TPL_TOOLS_ISO_NAME} to the build VM."
         return 1
     fi

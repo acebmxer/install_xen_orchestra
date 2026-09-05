@@ -1,6 +1,7 @@
 FROM debian:13
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo git curl bash bats shellcheck ca-certificates \
+    openssl genisoimage openssh-client python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user with passwordless sudo (mirrors real install usage)

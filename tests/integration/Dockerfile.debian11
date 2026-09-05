@@ -32,6 +32,7 @@ RUN printf '%s\n' \
         --no-install-recommends --allow-downgrades \
         perl-base=5.32.1-4+deb11u3 \
         sudo git curl bash bats shellcheck ca-certificates \
+        openssl genisoimage openssh-client python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user with passwordless sudo (mirrors real install usage)

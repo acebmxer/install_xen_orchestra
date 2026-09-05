@@ -21,16 +21,28 @@ repository inside the guest, and its static address. From there it:
    `cloud.debian.org` straight into its disk. The download runs *on the pool
    master*, so the 3 GB never crosses your workstation's link and never lands
    on dom0's root filesystem.
-2. Attaches a cloud-init config drive that creates your admin user, installs a
+2. Sets the VM's **boot firmware to UEFI**, after checking the imported disk
+   really carries an EFI system partition — the stock Debian cloud images do.
+   An image without one gets BIOS instead, because UEFI firmware with no
+   bootloader to load does not fall back, it simply fails to boot.
+3. Attaches a cloud-init config drive that creates your admin user, installs a
    freshly generated SSH key, applies the static address, and clones this
    repository into the guest — either `/opt/install_xen_orchestra` or
-   `/home/<admin>/install_xen_orchestra`, whichever you pick.
-3. SSHes in and runs `--install --non-interactive`, streaming the output to
+   `/home/<admin>/install_xen_orchestra`, whichever you pick. It also attaches
+   the pool's `guest-tools.iso` and installs the **XCP-ng guest agent** from it
+   on the first boot, so XO reports the appliance's IP address, memory and disk
+   usage and can shut it down cleanly. (The agent comes from the ISO rather
+   than `apt` because Debian 13 ships no `xe-guest-utilities` package.) If the
+   pool has no tools ISO you get a warning and a VM without the agent, not a
+   failed deploy.
+4. SSHes in and runs `--install --non-interactive`, streaming the output to
    your terminal so you see the build as it happens.
-4. Verifies XO answers on `/signin`, then detaches and destroys the cloud-init
+5. Verifies XO answers on `/signin`, then detaches and destroys the cloud-init
    config drive — it has served its purpose, and it holds the admin password
    hash. If the guest refuses the hot-unplug, you get the `xe` commands to
-   remove it by hand rather than a failed deploy.
+   remove it by hand rather than a failed deploy. The guest tools ISO is
+   ejected at the same point; the VDI itself is left alone, since it is the
+   pool's shared copy.
 
 **Changing settings the prompts don't cover**
 

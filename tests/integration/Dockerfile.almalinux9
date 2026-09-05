@@ -1,6 +1,7 @@
 FROM almalinux:9
 RUN dnf install -y epel-release \
     && dnf install -y sudo git bash bats ShellCheck ca-certificates \
+    openssl xorriso openssh-clients diffutils python3-pyyaml \
     && dnf clean all \
     && if ! command -v shellcheck >/dev/null 2>&1; then \
          ln -s "$(command -v ShellCheck)" /usr/local/bin/shellcheck; \

@@ -10,6 +10,19 @@
 setup() {
     load '../helpers/mock_helpers'
     load_script
+
+    # A per-test scratch directory, created here rather than using
+    # BATS_TEST_TMPDIR: that variable arrived in Bats 1.4, and Ubuntu 22.04 --
+    # which this project tests against -- ships Bats 1.2.1, where it is unset.
+    # Under `set -u` an unset variable is a fatal error rather than an empty
+    # path, so the test that wrote into it failed outright on that image while
+    # passing everywhere else. mktemp is what the other test files here use and
+    # it behaves the same on every version.
+    TMPDIR_TEST=$(mktemp -d)
+}
+
+teardown() {
+    [[ -n "${TMPDIR_TEST:-}" ]] && rm -rf "$TMPDIR_TEST"
 }
 
 # --- catalogue shape -------------------------------------------------------
@@ -152,8 +165,8 @@ setup() {
 # --- prep script -----------------------------------------------------------
 
 @test "the debian prep script is valid shell" {
-    tpl_prep_debian debian > "${BATS_TEST_TMPDIR}/prep.sh"
-    bash -n "${BATS_TEST_TMPDIR}/prep.sh"
+    tpl_prep_debian debian > "${TMPDIR_TEST}/prep.sh"
+    bash -n "${TMPDIR_TEST}/prep.sh"
 }
 
 @test "the prep script substitutes the account name" {

@@ -1293,3 +1293,141 @@ _sha_b() { printf 'b%.0s' $(seq 128); }
     [[ "$XO_DEPLOY_IMAGE_URL" != *genericcloud* ]]
     [[ "$XO_DEPLOY_IMAGE_URL" == *generic-amd64* ]]
 }
+
+# --- boot firmware ---------------------------------------------------------
+#
+# The deploy path defaulted to BIOS for no better reason than never setting the
+# parameter -- unset reads as BIOS in XAPI -- while the template builder had
+# been probing the disk since it was written. UEFI is the prerequisite for
+# Secure Boot and a vTPM, so a deployed appliance should get it wherever the
+# image supports it.
+
+@test "the deployed VM's firmware is set, never left to XAPI's default" {
+    # Unset means BIOS. Both branches must set it explicitly so the choice is
+    # always a decision rather than an omission.
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"firmware=uefi"* ]]
+    [[ "$body" == *"firmware=bios"* ]]
+}
+
+@test "the deployed VM's firmware is probed from the disk, not assumed" {
+    # XO_DEPLOY_IMAGE_URL can point the deploy at any raw image, and a
+    # hardcoded uefi would strand anyone aiming it at a BIOS-only one.
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"tpl_disk_supports_uefi"* ]]
+}
+
+@test "the firmware is decided after the import and before the VM starts" {
+    # An empty VDI has no partition table to probe, and firmware cannot change
+    # under a running domain, so this step only works between the two.
+    local body import_pos firmware_pos start_pos
+    body=$(declare -f deploy_create_vm)
+
+    import_pos=$(awk '/deploy_import_vdi_from_url/ {print NR; exit}' <<< "$body")
+    firmware_pos=$(awk '/tpl_disk_supports_uefi/ {print NR; exit}' <<< "$body")
+    start_pos=$(awk '/vm-start/ {print NR; exit}' <<< "$body")
+
+    [ -n "$import_pos" ]
+    [ -n "$firmware_pos" ]
+    [ -n "$start_pos" ]
+    [ "$import_pos" -lt "$firmware_pos" ]
+    [ "$firmware_pos" -lt "$start_pos" ]
+}
+
+@test "the boot policy stays 'BIOS order' even for a UEFI guest" {
+    # HVM-boot-policy is XAPI's required policy string for every HVM guest and
+    # is not the firmware selector. Changing it to something else on the
+    # assumption that it means BIOS would break the VM outright.
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"HVM-boot-policy='BIOS order'"* ]]
+}
+
+# --- guest tools -----------------------------------------------------------
+#
+# Without the agent XO shows the appliance with no IP, no memory or disk
+# figures and no clean shutdown -- the VM runs fine but the management
+# interface it is itself hosting cannot see into it.
+
+@test "the deploy attaches the guest tools ISO" {
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"tpl_find_tools_iso"* ]]
+    [[ "$body" == *"tpl_attach_tools_iso"* ]]
+}
+
+@test "a missing tools ISO warns instead of failing the deploy" {
+    # This is where the deploy parts company with the template builder, which
+    # treats the same condition as fatal. A template with no agent is a defect
+    # baked into every clone; here the appliance still installs and serves XO,
+    # and aborting after the image download would cost far more.
+    local body
+    body=$(declare -f deploy_create_vm)
+    [[ "$body" == *"log_warning"* ]]
+    # No exit and no return between finding the ISO absent and carrying on.
+    local tools_block
+    tools_block=$(sed -n '/deploy_tools_vdi=\$(tpl_find_tools_iso)/,/vif-create/p' <<< "$body")
+    [ -n "$tools_block" ]
+    [[ "$tools_block" != *"exit 1"* ]]
+}
+
+@test "the guest installs the agent from the ISO, not from apt alone" {
+    # Debian 13 -- the deploy default -- has no xe-guest-utilities package, and
+    # a failed package install does not stop cloud-init, so an apt-only path
+    # produces a VM that looks fine and never reports an IP.
+    _deploy_drive_fixture
+    deploy_build_config_drive
+
+    local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
+    grep -q "xo-install-guest-tools.sh" "$user_data"
+    grep -q "Linux/install.sh" "$user_data"
+    # And the fallback for releases that do package it.
+    grep -q "xe-guest-utilities" "$user_data"
+}
+
+@test "the guest tools script survives the pool having no ISO" {
+    # The config drive is built before the VM exists, so it cannot know whether
+    # there was an ISO to attach. Nothing in the script may fail the boot.
+    _deploy_drive_fixture
+    deploy_build_config_drive
+
+    local script="${DEPLOY_WORKDIR}/guest-tools-extracted.sh"
+    sed -n '/^      #!\/bin\/bash/,/xe-guest-utilities/p' \
+        "${DEPLOY_WORKDIR}/cidata/user-data" | sed 's/^      //' > "$script"
+
+    # It parses as shell...
+    bash -n "$script"
+    # ...and the apt fallback cannot return non-zero.
+    grep -q "apt-get install -y xe-guest-utilities || true" "$script"
+}
+
+@test "the guest tools script keeps its own variables unexpanded" {
+    # user-data is built from an unquoted heredoc so DEPLOY_* values expand.
+    # An unescaped $mnt there would expand at build time to nothing, leaving
+    # the guest running "mount /dev/cdrom" with an empty mountpoint.
+    _deploy_drive_fixture
+    deploy_build_config_drive
+
+    local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
+    grep -q 'mkdir -p "\$mnt"' "$user_data"
+    grep -q 'dev=""' "$user_data"
+}
+
+@test "the tools ISO is ejected rather than destroyed" {
+    # The VDI is the pool's shared copy in the tools SR. Destroying it would
+    # break guest tools installs for every other VM on the pool.
+    local body
+    body=$(declare -f deploy_eject_tools_iso)
+    [[ "$body" == *"vbd-eject"* ]]
+    [[ "$body" != *"vdi-destroy"* ]]
+}
+
+@test "the tools ISO eject is skipped when nothing was attached" {
+    DEPLOY_TOOLS_ATTACHED="false"
+    dom0_xe() { echo "SHOULD NOT RUN"; }
+    run deploy_eject_tools_iso
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"SHOULD NOT RUN"* ]]
+}
