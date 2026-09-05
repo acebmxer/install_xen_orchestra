@@ -12,6 +12,92 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **A multi-template build no longer stalls on the second template.** This is
+  the cause of a build that printed "Building: Debian 13 (Trixie) Cloud-init"
+  and then sat with no further output, no CPU and no network activity on the
+  pool. `tpl_build_prep_drive` generated its throwaway SSH key at a fixed path
+  in the working directory, and that directory is shared by every template in a
+  run — so on the second build the key was already there. `ssh-keygen` will not
+  write over an existing key: it asks "Overwrite (y/n)?" and waits. Because the
+  command was run with `>/dev/null 2>&1`, the question was invisible, so the
+  build appeared to hang for no reason with the prompt swallowed. (With stdin
+  closed rather than a terminal it exits 1 instead, and the build silently
+  carried on and baked the *previous* template's key and preparation script
+  into this template's config drive — which for an Ubuntu template built after
+  a Debian one meant shipping Debian's user and `apt` script.) Neither failure
+  was noticed, because the exit status was never tested.
+
+  The key is now removed before it is regenerated, and both the key generation
+  and the ISO build have their results checked — as does the call to
+  `tpl_build_prep_drive` itself, which previously ignored its return value
+  entirely. A build that cannot produce its preparation drive now stops and
+  says so, rather than booting a VM with no instructions in it and waiting out
+  the full fifteen-minute timeout to report a cause that is not the real one.
+
+- **A multi-template build no longer looks like it has hung between
+  templates.** Four steps in each build ran with no output at all: the
+  "does this template already exist" check (`xe template-list`, a round trip to
+  the pool master that can take tens of seconds on a busy pool), building the
+  cloud-init preparation drive, confirming the guest agent installed, and
+  sealing the finished template. The first template hid this, because the
+  connection banner and the storage and network lines print immediately before
+  it — but on the second and later templates of a multi-template run the gap
+  falls directly after "Building: ...", so the screen sits unchanged with no
+  indication anything is happening. That is the same failure `--progress-bar`
+  already exists to prevent on the image download, and it is worse than
+  cosmetic: an operator who cannot tell a working build from a stuck one kills
+  it, and killing one halfway leaves a build VM and a multi-gigabyte disk to
+  clean up by hand. Each of those steps now announces itself before it runs, so
+  every template in a run prints the same progression as the first. Guarded by
+  a test that walks the build function and asserts each slow call is preceded
+  by output, and by one asserting the messages live in the per-template
+  function rather than the one-time setup around it — where they would appear
+  only before the first build.
+
+- **Nothing is installed onto dom0 or the operator's workstation to work around
+  a missing convenience.** Two places did, and both were wrong in the same way.
+
+  The template build offered to install `qemu-img` on the pool master with
+  `yum install --enablerepo=base`. That command should never have been written:
+  XCP-ng's documentation makes "never enable additional repositories" rule 1 of
+  its additional-packages guidance, because the update process assumes only
+  XCP-ng repositories are enabled, and CentOS and EPEL carry higher version
+  numbers than XCP-ng's own packages — so yum will overwrite core dom0 packages
+  and break the host. The remedy was more dangerous than the problem. It was
+  also unnecessary: dom0 runs QEMU to emulate device models for HVM guests, so
+  `qemu-img` is part of the base system, and it is not in XCP-ng's supported
+  extras list (`reports.xcp-ng.org/8.3/extra_installable.txt`) because it does
+  not need to be. A missing `qemu-img` now stops the build with an explanation
+  pointing at the host, noting that raw-image templates still build fine, and
+  explicitly warning against installing it from CentOS or EPEL.
+
+  Separately, `--deploy` installed `sshpass` — in one path after asking, in
+  another with no prompt at all — purely to avoid typing the pool master
+  password a second time. It saves one prompt and changes nothing else, so its
+  absence is now reported rather than fixed, and the connection is made with
+  plain `ssh`, which asks for the password itself. That branch deliberately
+  keeps stderr, since redirecting it would hide the prompt and read as a hang.
+
+  Guarded by tests that assert no `--enablerepo` appears anywhere in the script
+  and that `sshpass` is never installed, so neither can come back unnoticed.
+
+- **The image conversion no longer understates the expanded disk size.** The
+  progress line divided the virtual size straight to GiB in integer
+  arithmetic, so Ubuntu 24.04's 3,758,096,384-byte disk was reported as
+  "3 GiB expanded" rather than 3.5 GiB. Nothing downstream reads the figure —
+  the space check works in MiB and was unaffected — but it is the number
+  someone reads back when a build runs out of room mid-conversion, and
+  rounding it down is the wrong direction for that.
+
+  Now reported to one decimal place, rounded rather than truncated. The first
+  fix kept the truncation one digit further along, which had the same fault in
+  miniature: Ubuntu 22.04 is 2.199 GiB and printed as "2.1" while `qemu-img`
+  and every other tool says 2.2. Rounding is applied to tenths before the value
+  is split into its whole and decimal parts, so a carry works — 2.99 GiB prints
+  as "3.0" rather than the "2.10" that rounding each part separately would
+  give. Both were caught in real builds on a live pool that otherwise completed
+  end to end.
+
 - **A template test no longer fails on Ubuntu 22.04's older bats.** "the debian
   prep script is valid shell" wrote its scratch file to `$BATS_TEST_TMPDIR`, a
   variable introduced in Bats 1.4. Ubuntu 22.04 ships Bats 1.2.1, where it is
@@ -61,6 +147,18 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Changed
 
+- **The template menu's arrow keys now skip the "Coming Soon..." entries.** The
+  cursor already opened on the first buildable row, but moving from there
+  stepped through every placeholder in between — and with twelve of the
+  fifteen catalogue entries currently unbuildable, reaching Ubuntu 24.04 from
+  Debian 13 meant six presses through rows where SPACE does nothing. Navigation
+  now moves between the entries that can actually be selected, wrapping in both
+  directions, so the three buildable templates are three presses apart. The
+  skip is bounded by the row count rather than by finding a match, so a
+  catalogue of nothing but placeholders returns the cursor unmoved instead of
+  spinning forever. The placeholder rows also no longer carry a cursor-pointer
+  branch, which had become unreachable.
+
 - **`--deploy` now boots the appliance under UEFI instead of BIOS.** The
   deployed VM had been coming up as a BIOS guest for no better reason than
   nothing ever setting the parameter: XAPI reads an absent
@@ -85,6 +183,106 @@ This installer builds Xen Orchestra from source and tracks the official
   its behaviour for the template builder is unchanged.
 
 ### Added
+
+- **Ubuntu 22.04 LTS (Jammy) and 26.04 LTS (Resolute) are now buildable too.**
+  They were held back as placeholders only until the Ubuntu code path was proven
+  on a real pool, which 24.04 has now done — build, qcow2 conversion, boot under
+  both firmware modes, console, and a guest agent reporting an IP in XO. Both
+  new entries share that path and the same `apt` preparation script, so this is
+  a catalogue change rather than new code.
+
+  Each image was verified rather than assumed to match 24.04: the published
+  SHA256 checksum confirmed against the downloaded file, qcow2 confirmed from
+  the magic bytes rather than the `.img` name, a GPT carrying both an EFI system
+  partition and a BIOS boot partition (so the firmware probe publishes UEFI and
+  BIOS still works), and a `-generic` kernel rather than a `-cloud` one — the
+  latter being the trap that renders a UEFI console as scrambled colour.
+  22.04 carries `vmlinuz-5.15.0-190-generic` and 26.04 `vmlinuz-7.0.0-30-generic`.
+
+  That check earned its keep on the disk size: 22.04's image expands to only
+  2.2 GiB, so it keeps the 4 GiB default, while 26.04 expands to the same
+  3.5 GiB as 24.04 and declares 6 GiB. Copying 24.04's figure across the family
+  would have inflated every VM cloned from a 22.04 template for no reason —
+  which is exactly what the per-row disk field exists to avoid.
+
+  Ubuntu 22.04's free security maintenance ends on 2027-04-30 and its catalogue
+  entry is still scheduled for removal on 2027-06-01; it is buildable until
+  then.
+
+- **`--build-templates` can now build an Ubuntu 24.04 LTS (Noble) template, and
+  can import cloud images that are not raw.** Ubuntu had been listed in the menu
+  as **Coming Soon...** since the template library landed, blocked on three
+  things. Two of them were never Ubuntu-specific and are now solved for every
+  image:
+
+  **The image format.** Debian publishes `raw`; almost everyone else publishes
+  qcow2. The build imports straight into a VDI over XAPI's `/import_raw_vdi`,
+  which takes raw bytes and nothing else — so a qcow2 sent to it is accepted
+  without complaint and written to the disk as a qcow2 *file*, producing a
+  template whose VMs simply do not boot with nothing reporting an error.
+  `deploy_import_vdi_staged` now converts a non-raw image to raw with
+  `qemu-img` on the pool master, after the checksum has been verified and
+  before the import. This is decided by `deploy_needs_conversion`, which treats
+  anything that is not `.raw` as needing conversion — deliberately including
+  `.img`, because Ubuntu's cloud images carry that extension and are qcow2
+  (verified from their magic bytes, `QFI\xfb`, not inferred from the name). An
+  unknown extension converts rather than assuming raw: `qemu-img` detects the
+  real format itself, so converting an already-raw image costs a copy, while
+  guessing wrong costs a template that does not boot.
+
+  Two consequences follow from that and are handled explicitly. A non-raw image
+  **cannot use the streaming fallback** — there is nothing to convert in a pipe
+  — so `deploy_import_vdi_from_url` now refuses to stream one and says why,
+  rather than importing bytes that will not boot when `/var/tmp` is short. And
+  the free-space check now budgets for the *expanded* disk rather than the
+  download: a qcow2 is compressed and sparse, so Ubuntu 24.04 is 596 MiB on the
+  wire and 3.5 GiB once converted, and budgeting only for what arrives would
+  pass the check and then fill `/var/tmp` mid-conversion.
+
+  **The checksum format.** Verification had `SHA512SUMS` hardcoded, which is
+  Debian's. The file and the algorithm are now chosen from the image's own URL
+  by `deploy_checksum_source`, and the digest length follows from it — 64 hex
+  characters for SHA-256, 128 for SHA-512 — so Ubuntu's `SHA256SUMS` is read
+  and checked with `sha256sum` while Debian's behaviour is unchanged. Both are
+  in coreutils' `<hash>  <file>` shape, so one parse serves both; Ubuntu marks
+  every entry with the binary-mode `*`, which the existing parse already
+  handled. An unrecognised origin still falls back to `SHA512SUMS`, so it
+  attempts verification and warns rather than silently skipping it. A pinned
+  `XO_DEPLOY_IMAGE_SHA512` stays SHA-512 whatever the origin publishes, since
+  the variable names its own algorithm. The RHEL family and Fedora publish
+  `SHA256 (file) = hash`, a different parse that is still unhandled and is part
+  of why those entries remain placeholders.
+
+  **The third, guest preparation, turned out not to be a blocker for Ubuntu.**
+  The `apt`-based script is shared unchanged — confirmed rather than assumed:
+  Ubuntu packages `xe-guest-utilities` (which Debian 13 does not), so the guest
+  tools install from the ISO with a working `apt` fallback behind it. The RHEL
+  family and Fedora still need a `dnf` equivalent, which is now the main thing
+  standing between them and a working entry.
+
+  Two supporting changes came with this. The catalogue gained a **seventh
+  field, an optional per-row disk size**: the VDI has to clear the image's
+  *virtual* size, and Ubuntu's 3.5 GiB leaves almost no margin against the
+  4 GiB default. Raising that default for everyone was the wrong fix, because a
+  clone starts at its template's size, so it would have inflated every VM built
+  from every template; Ubuntu declares 6 GiB in its own row instead and the
+  Debian rows are untouched. And **`qemu-img` is checked for on the pool master
+  before anything is downloaded**, offering to install it from XCP-ng's base
+  repository (`yum install --enablerepo=base -y qemu-img`) — dom0 is minimal
+  and does not always carry it, and discovering that after a multi-gigabyte
+  download would report as a conversion failure rather than a missing tool.
+
+  Ubuntu 22.04 and 26.04 stay listed as **Coming Soon...** deliberately: they
+  share this code path entirely, and are held back only until 24.04 is proven
+  on a real pool. Verified against the live upstream images while building
+  this: all three publish qcow2 under `.img`, Ubuntu 24.04's published
+  `SHA256SUMS` digest matches the downloaded image, it converts to a 3.5 GiB
+  raw disk carrying a GPT with both an EFI system partition and a BIOS boot
+  partition (so the existing firmware probe publishes it as UEFI and BIOS still
+  works), and it ships `vmlinuz-6.8.0-138-generic` — a full kernel, not a
+  trimmed cloud one, so it avoids the scrambled-console trap that makes the
+  `genericcloud` images unusable under UEFI. The unit suite covers the new
+  behaviour with 23 further tests, 254 passing in total.
 
 - **`--deploy` now installs the XCP-ng guest tools into the appliance.** A
   deployed VM had no guest agent at all, so the Xen Orchestra it was itself

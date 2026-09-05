@@ -164,9 +164,10 @@ SCRATCH_VDI_MB=$((PAYLOAD_MB * 2 + 8))
 #             Connection multiplexing means it only asks once — the master
 #             connection authenticates, and every later call rides that socket.
 #
-# sshpass is deliberately not required: --deploy installs it when missing, but
-# a diagnostic you run *before* trusting the deploy path should not make you
-# install something first.
+# sshpass is deliberately not required, here or in --deploy itself: it saves a
+# second password prompt and nothing else, so its absence is reported rather
+# than fixed. Installing a package onto the operator's machine to save one
+# prompt is a change they did not ask for.
 AUTH_MODE="prompt"
 if [[ -n "$POOL_KEY" ]]; then
     AUTH_MODE="key"

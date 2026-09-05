@@ -30,10 +30,10 @@ teardown() {
 # A malformed row does not fail loudly: cut returns an empty field, and the
 # build carries on with an empty URL or an empty prep function name.
 
-@test "every catalogue row has all six fields" {
+@test "every catalogue row has all seven fields" {
     local row
     for row in "${TPL_CATALOG[@]}"; do
-        [ "$(awk -F'|' '{print NF}' <<< "$row")" -eq 6 ]
+        [ "$(awk -F'|' '{print NF}' <<< "$row")" -eq 7 ]
     done
 }
 
@@ -46,15 +46,32 @@ teardown() {
     done
 }
 
-@test "every buildable image URL is a raw image over https" {
+@test "every buildable image URL is https and a format the import handles" {
     local row url
     for row in "${TPL_CATALOG[@]}"; do
         tpl_is_placeholder "$row" && continue
         url=$(tpl_field "$row" 4)
         [[ "$url" =~ ^https:// ]]
-        # .raw specifically: XAPI imports raw natively, and disk.import rejects
-        # qcow2 from a URL, so a .qcow2 here would fail only at build time.
-        [[ "$url" =~ \.raw$ ]]
+        # Raw imports natively; anything else is converted on the pool master
+        # first. Both are handled, but only these two extensions are: an
+        # unrecognised one would reach qemu-img and fail at build time.
+        [[ "$url" =~ \.(raw|img|qcow2)$ ]]
+    done
+}
+
+@test "a buildable image that is not raw is routed through the conversion" {
+    local row url
+    for row in "${TPL_CATALOG[@]}"; do
+        tpl_is_placeholder "$row" && continue
+        url=$(tpl_field "$row" 4)
+        # The two must agree: a non-raw image that the importer thinks is raw
+        # would be written to the disk verbatim, which XAPI accepts and which
+        # produces a template whose VMs do not boot.
+        if [[ "$url" =~ \.raw$ ]]; then
+            ! deploy_needs_conversion "$url"
+        else
+            deploy_needs_conversion "$url"
+        fi
     done
 }
 
@@ -81,11 +98,11 @@ teardown() {
     done
 }
 
-@test "every placeholder still has all six fields and a display name" {
+@test "every placeholder still has all seven fields and a display name" {
     local row
     for row in "${TPL_CATALOG[@]}"; do
         tpl_is_placeholder "$row" || continue
-        [ "$(awk -F'|' '{print NF}' <<< "$row")" -eq 6 ]
+        [ "$(awk -F'|' '{print NF}' <<< "$row")" -eq 7 ]
         [ -n "$(tpl_field "$row" 2)" ]
     done
 }
@@ -910,4 +927,530 @@ teardown() {
         url=$(tpl_field "$row" 4)
         [[ "$url" != *genericcloud* ]]
     done
+}
+
+# --- checksum origin --------------------------------------------------------
+#
+# The digest is what separates a genuine image from one a bad mirror served
+# with a perfectly consistent Content-Length, so picking the wrong sums file
+# does not fail loudly -- it warns that the image could not be verified and
+# imports it anyway.
+
+@test "Ubuntu's images are verified against SHA256SUMS, Debian's against SHA512SUMS" {
+    # Both are published in coreutils' own format, so only the name and the
+    # algorithm differ. Read from the URL rather than declared per row, so
+    # adding an image cannot forget to state it.
+    [ "$(deploy_checksum_source 'https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img')" = "SHA256SUMS 256" ]
+    [ "$(deploy_checksum_source 'https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw')" = "SHA512SUMS 512" ]
+}
+
+@test "an unknown origin falls back to SHA512SUMS rather than skipping the check" {
+    # The fallback has to be a real attempt at verification. Returning nothing
+    # would turn an unrecognised mirror into an unverified import.
+    [ "$(deploy_checksum_source 'https://mirror.invalid/some/image.raw')" = "SHA512SUMS 512" ]
+}
+
+@test "every catalogue origin resolves to a checksum file and a digest length" {
+    local row url src file bits
+    for row in "${TPL_CATALOG[@]}"; do
+        url=$(tpl_field "$row" 4)
+        src=$(deploy_checksum_source "$url")
+        read -r file bits <<< "$src"
+        [ -n "$file" ]
+        # The length gates the digest regex and picks the shaNsum binary, so a
+        # value other than these two would build a command that does not exist.
+        [[ "$bits" == "256" || "$bits" == "512" ]]
+    done
+}
+
+@test "the digest length checked is the one the origin publishes" {
+    # A SHA-256 digest is 64 hex characters and a SHA-512 is 128. Validating
+    # Ubuntu's against the 128 the old code hardcoded would reject every
+    # genuine digest as malformed.
+    local body
+    body=$(declare -f deploy_verify_image_checksum)
+    [[ "$body" == *'hex_len=$(( sums_bits / 4 ))'* ]]
+    [[ "$body" == *'sha${sums_bits}sum'* ]]
+}
+
+@test "a pinned digest is always SHA-512 whatever the origin publishes" {
+    # XO_DEPLOY_IMAGE_SHA512 names its algorithm, so an Ubuntu URL must not
+    # switch the pin to a 256-bit comparison.
+    local body
+    body=$(declare -f deploy_verify_image_checksum)
+    [[ "$body" == *'[[ -n "$pinned" ]] && sums_bits=512'* ]]
+}
+
+# --- image conversion -------------------------------------------------------
+#
+# /import_raw_vdi takes raw bytes and nothing else. A qcow2 sent to it is
+# accepted without complaint and written to the disk as a file, producing a
+# template whose VMs do not boot -- with nothing reporting an error.
+
+@test "a .img is treated as needing conversion, not as raw" {
+    # Ubuntu's cloud images are qcow2 named .img. Trusting the extension is
+    # exactly the trap: verified by magic, they begin "QFI\xfb".
+    deploy_needs_conversion "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+}
+
+@test "a .raw is imported without conversion" {
+    ! deploy_needs_conversion "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw"
+}
+
+@test "a query string does not make a raw image look convertible" {
+    ! deploy_needs_conversion "https://example.invalid/image.raw?token=abc"
+}
+
+@test "an unknown extension is converted rather than assumed raw" {
+    # The safe direction: qemu-img detects the real format itself, so
+    # converting something already raw costs a copy, while assuming raw
+    # wrongly costs a template that does not boot.
+    deploy_needs_conversion "https://example.invalid/image.unknown"
+}
+
+@test "qemu-img is checked before the image is downloaded, not after" {
+    # Discovering it after several gigabytes have been fetched wastes the
+    # download and reports as a conversion failure rather than a missing tool.
+    local body
+    body=$(declare -f deploy_import_vdi_staged)
+    local probe dl
+    probe=$(grep -n 'deploy_ensure_qemu_img' <<< "$body" | head -1 | cut -d: -f1)
+    dl=$(grep -n 'downloading the image to the pool master' <<< "$body" | head -1 | cut -d: -f1)
+    [ -n "$probe" ]
+    [ -n "$dl" ]
+    [ "$probe" -lt "$dl" ]
+}
+
+@test "the image is checksummed as downloaded, before it is converted" {
+    # The origin publishes a digest of the file it publishes, so hashing the
+    # converted image could never match it.
+    local body
+    body=$(declare -f deploy_import_vdi_staged)
+    local sum conv
+    sum=$(grep -n 'deploy_verify_image_checksum' <<< "$body" | head -1 | cut -d: -f1)
+    conv=$(grep -n 'qemu-img convert' <<< "$body" | head -1 | cut -d: -f1)
+    [ -n "$sum" ]
+    [ -n "$conv" ]
+    [ "$sum" -lt "$conv" ]
+}
+
+@test "the conversion lets qemu-img detect the source format" {
+    # -f from the extension would defeat the point: the extension is what
+    # cannot be trusted here. A wrong -f is a misparsed disk, not a clean error.
+    local body
+    body=$(declare -f deploy_import_vdi_staged)
+    [[ "$body" == *"qemu-img convert -O raw"* ]]
+    [[ "$body" != *"qemu-img convert -f"* ]]
+}
+
+@test "a non-raw image is never streamed, because a stream cannot be converted" {
+    # Streaming pipes the origin's bytes straight into the VDI, so a qcow2
+    # would land verbatim. Staging is the only path that can take one.
+    local body
+    body=$(declare -f deploy_import_vdi_from_url)
+    [[ "$body" == *"deploy_needs_conversion"* ]]
+}
+
+@test "the space check budgets for the expanded disk, not just the download" {
+    # A qcow2 is compressed and sparse: Ubuntu 24.04 is 596 MiB on the wire and
+    # 3.5 GiB converted. Budgeting only for the download passes the check and
+    # then fills /var/tmp mid-conversion.
+    local body
+    body=$(declare -f deploy_import_vdi_staged)
+    [[ "$body" == *'need_mb=$(( size / 1048576 * 5 + 256 ))'* ]]
+}
+
+@test "the download and the converted image use different paths" {
+    # Converting in place would mean qemu-img reading and writing one file.
+    local body
+    body=$(declare -f deploy_import_vdi_staged)
+    [[ "$body" == *'dl="/var/tmp/xo-image-${vdi}.src"'* ]]
+    [[ "$body" == *'tmp="/var/tmp/xo-image-${vdi}.raw"'* ]]
+}
+
+# --- per-row disk size ------------------------------------------------------
+
+@test "a row's disk size overrides the default" {
+    # The VDI has to clear the image's *virtual* size. Ubuntu expands to
+    # 3.5 GiB, which the 4 GiB default barely clears.
+    [ "$(tpl_field "$(tpl_row_for_key ubuntu2404)" 7)" = "6" ]
+}
+
+@test "the Debian rows keep the default rather than being inflated" {
+    # A clone starts at the template's size, so raising the default for
+    # everyone would inflate every VM built from every template.
+    [ -z "$(tpl_field "$(tpl_row_for_key debian12)" 7)" ]
+    [ -z "$(tpl_field "$(tpl_row_for_key debian13)" 7)" ]
+}
+
+@test "every declared disk size clears the image it has to hold" {
+    # 6 GiB against Ubuntu's 3.5 GiB expanded. A row whose disk is smaller than
+    # its image fails only at import time, several minutes in.
+    local row size
+    for row in "${TPL_CATALOG[@]}"; do
+        size=$(tpl_field "$row" 7)
+        [[ -z "$size" ]] && continue
+        [[ "$size" =~ ^[0-9]+$ ]]
+        [ "$size" -ge 4 ]
+    done
+}
+
+@test "the build sizes the disk from the row, not from the global default" {
+    local body
+    body=$(declare -f tpl_create_build_vm)
+    [[ "$body" == *'virtual-size=${disk_gb}GiB'* ]]
+}
+
+@test "a missing or malformed disk size falls back to the default" {
+    # An empty field is the normal case for most rows. A malformed one would
+    # otherwise reach vdi-create as a bad value and fail with an XAPI error
+    # that says nothing about the row that caused it.
+    local body
+    body=$(declare -f tpl_create_build_vm)
+    [[ "$body" == *'disk_gb="$TPL_DEFAULT_DISK_GB"'* ]]
+    [[ "$body" == *'"$disk_gb" =~ ^[0-9]+$'* ]]
+}
+
+# --- Ubuntu -----------------------------------------------------------------
+
+@test "Ubuntu 24.04 is buildable and shares the Debian prep script" {
+    # Confirmed rather than assumed: Ubuntu packages xe-guest-utilities, so
+    # both the ISO path and the apt fallback in that script work there.
+    local row
+    row=$(tpl_row_for_key ubuntu2404)
+    ! tpl_is_placeholder "$row"
+    [ "$(tpl_field "$row" 6)" = "tpl_prep_debian" ]
+    [ "$(tpl_field "$row" 5)" = "ubuntu" ]
+}
+
+@test "every Ubuntu LTS release is buildable and shares the Debian prep script" {
+    # All three were proven the same way before being promoted: the published
+    # SHA256 checksum verified against the downloaded image, qcow2 confirmed
+    # from the magic bytes rather than the .img name, an ESP and a BIOS boot
+    # partition present so either firmware works, and a -generic kernel rather
+    # than a -cloud one.
+    local key row
+    for key in ubuntu2204 ubuntu2404 ubuntu2604; do
+        row=$(tpl_row_for_key "$key")
+        ! tpl_is_placeholder "$row"
+        [ "$(tpl_field "$row" 6)" = "tpl_prep_debian" ]
+        [ "$(tpl_field "$row" 5)" = "ubuntu" ]
+    done
+}
+
+@test "each Ubuntu row's disk is sized for its own image, not for the family" {
+    # The figure has to clear that image's virtual size. 22.04 expands to
+    # 2.2 GiB and fits the default; 24.04 and 26.04 both expand to 3.5 GiB and
+    # declare 6. Copying one release's number onto another would either inflate
+    # every clone or leave no margin.
+    [ -z "$(tpl_field "$(tpl_row_for_key ubuntu2204)" 7)" ]
+    [ "$(tpl_field "$(tpl_row_for_key ubuntu2404)" 7)" = "6" ]
+    [ "$(tpl_field "$(tpl_row_for_key ubuntu2604)" 7)" = "6" ]
+}
+
+@test "every Ubuntu row points at the LTS line" {
+    # Interim releases have nine-month lifespans, so a template built from one
+    # would be out of support before the VMs cloned from it were retired.
+    local row key
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == ubuntu* ]] || continue
+        # LTS releases are even-numbered years with an .04 release month.
+        [[ "$key" =~ ^ubuntu[0-9][0-9]04$ ]]
+        [[ $(( ${key:6:2} % 2 )) -eq 0 ]]
+    done
+}
+
+@test "the expanded size is reported to one decimal place, rounded" {
+    # Integer division reports a 3.5 GiB image as "3 GiB", understating the
+    # figure that decides whether the disk is large enough -- which is what
+    # gets read back when a build runs out of room mid-conversion. Truncating
+    # the decimal is the same fault in miniature: Ubuntu 22.04 is 2.199 GiB,
+    # shown as "2.1" while qemu-img and everything else says 2.2.
+    local body
+    body=$(declare -f deploy_import_vdi_staged)
+    [[ "$body" == *"536870912"* ]]
+
+    # Real catalogue values, against what qemu-img reports for each.
+    local v t
+    for v in 2361393152:2.2 3758096384:3.5 3221225472:3.0 1073741824:1.0; do
+        t=$(( (${v%%:*} * 10 + 536870912) / 1073741824 ))
+        [ "$(( t / 10 )).$(( t % 10 ))" = "${v##*:}" ]
+    done
+}
+
+@test "rounding the expanded size carries into the whole number" {
+    # Rounding the parts separately would print 2.99 GiB as "2.10". Rounding to
+    # tenths before the split is what makes the carry work.
+    local t=$(( (3210983178 * 10 + 536870912) / 1073741824 ))
+    [ "$(( t / 10 )).$(( t % 10 ))" = "3.0" ]
+}
+
+@test "a missing qemu-img stops the build instead of installing anything" {
+    # dom0 runs QEMU for HVM guests, so qemu-img is part of the base system.
+    # Its absence means something is wrong with the host, not that a package
+    # is waiting to be added.
+    local body
+    body=$(declare -f deploy_ensure_qemu_img)
+    [[ "$body" != *"yum install"* ]]
+    [[ "$body" != *"prompt_yes_no"* ]]
+    [[ "$body" == *"qemu-img is not available there"* ]]
+}
+
+@test "nothing offers to install onto dom0 from the CentOS or EPEL repositories" {
+    # XCP-ng's rule 1 is never to enable additional repositories: the update
+    # process assumes only XCP-ng's own are on, and CentOS/EPEL carry higher
+    # version numbers, so yum will overwrite core dom0 packages and break the
+    # host. Guarded across the whole script, not just the one function that
+    # got it wrong.
+    local src="${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh"
+    local hits
+    hits=$(grep -v '^[[:space:]]*#' "$src" | grep -c 'enablerepo' || true)
+    [ "$hits" -eq 0 ]
+}
+
+# --- cursor navigation ------------------------------------------------------
+#
+# Most of the catalogue is currently unbuildable, so a cursor that stops on
+# placeholders means scrolling through a dozen inert rows to reach the next
+# real one, at a position where SPACE does nothing.
+
+@test "the cursor opens on the first buildable row, not the first row" {
+    # AlmaLinux 8 sorts first and is a placeholder.
+    local i cursor=0
+    for ((i = 0; i < ${#TPL_CATALOG[@]}; i++)); do
+        if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then cursor=$i; break; fi
+    done
+    tpl_is_placeholder "${TPL_CATALOG[0]}"
+    ! tpl_is_placeholder "${TPL_CATALOG[$cursor]}"
+}
+
+@test "moving down skips placeholders" {
+    local count=${#TPL_CATALOG[@]} i start next
+    start=0
+    for ((i = 0; i < count; i++)); do
+        if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then start=$i; break; fi
+    done
+    next=$(tpl_next_selectable "$start" 1 "$count")
+    ! tpl_is_placeholder "${TPL_CATALOG[$next]}"
+    [ "$next" -ne "$start" ]
+}
+
+@test "moving up skips placeholders" {
+    local count=${#TPL_CATALOG[@]} i start prev
+    start=0
+    for ((i = 0; i < count; i++)); do
+        if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then start=$i; break; fi
+    done
+    # Wrapping upward from the first buildable row crosses the run of
+    # placeholders at the end of the catalogue.
+    prev=$(tpl_next_selectable "$start" -1 "$count")
+    ! tpl_is_placeholder "${TPL_CATALOG[$prev]}"
+}
+
+@test "every position the cursor can reach is selectable" {
+    # Walk the whole cycle in both directions: no step may land on a row where
+    # SPACE would do nothing.
+    local count=${#TPL_CATALOG[@]} i c step
+    for step in 1 -1; do
+        c=0
+        for ((i = 0; i < count; i++)); do
+            if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then c=$i; break; fi
+        done
+        for ((i = 0; i < count * 2; i++)); do
+            c=$(tpl_next_selectable "$c" "$step" "$count")
+            ! tpl_is_placeholder "${TPL_CATALOG[$c]}"
+        done
+    done
+}
+
+@test "navigation wraps around the ends of the catalogue" {
+    # Wrapping must reach the first buildable row from the last and back again,
+    # whether or not the catalogue happens to end on a placeholder -- which
+    # depends on which distributions are buildable and changes as rows are
+    # promoted.
+    local count=${#TPL_CATALOG[@]} last first
+
+    # Down from the last buildable row must come back to the first.
+    local i
+    first=0
+    for ((i = 0; i < count; i++)); do
+        if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then first=$i; break; fi
+    done
+    last=$first
+    for ((i = count - 1; i >= 0; i--)); do
+        if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then last=$i; break; fi
+    done
+    [ "$(tpl_next_selectable "$last" 1 "$count")" -eq "$first" ]
+    [ "$(tpl_next_selectable "$first" -1 "$count")" -eq "$last" ]
+}
+
+@test "a catalogue of nothing but placeholders does not hang the menu" {
+    # Bounded by the row count rather than by finding a match. A menu that
+    # spins forever is a far worse failure than a cursor that will not move.
+    local TPL_CATALOG=(
+        "a|A|a|https://e/a.qcow2|u|-|"
+        "b|B|b|https://e/b.qcow2|u|-|"
+    )
+    [ "$(tpl_next_selectable 0 1 2)" -eq 0 ]
+    [ "$(tpl_next_selectable 0 -1 2)" -eq 0 ]
+}
+
+@test "a single buildable row leaves the cursor where it is" {
+    local TPL_CATALOG=(
+        "a|A|a|https://e/a.qcow2|u|-|"
+        "b|B|b|https://e/b.raw|u|tpl_prep_debian|"
+    )
+    [ "$(tpl_next_selectable 1 1 2)" -eq 1 ]
+    [ "$(tpl_next_selectable 1 -1 2)" -eq 1 ]
+}
+
+@test "the menu's arrow keys go through the skipping helper" {
+    # The helper being correct is worth nothing if the key handler still does
+    # its own arithmetic. Both directions, because skipping only downward
+    # leaves the cursor stopping on placeholders on the way back up.
+    local body
+    body=$(declare -f tpl_prompt_selection)
+    [[ "$body" == *'tpl_next_selectable "$cursor" 1 "$count"'* ]]
+    [[ "$body" == *'tpl_next_selectable "$cursor" -1 "$count"'* ]]
+    # And no leftover raw arithmetic on the cursor.
+    [[ "$body" != *'cursor=$(( (cursor + 1) % count ))'* ]]
+    [[ "$body" != *'cursor=$((cursor - 1))'* ]]
+}
+
+@test "placeholders are drawn without a cursor pointer" {
+    # The cursor cannot rest on one, so a pointer could never be drawn there.
+    # A leftover branch would tell the next reader otherwise.
+    local body
+    body=$(declare -f tpl_prompt_selection)
+    local ph
+    ph=$(sed -n '/tpl_is_placeholder "\$row"/,/continue/p' <<< "$body")
+    [[ "$ph" != *"M_CYAN"* ]]
+}
+
+# --- build progress ---------------------------------------------------------
+#
+# Silence on a slow step reads as a hang. The operator kills it, and killing a
+# build halfway leaves a VM and a multi-gigabyte disk behind. This matters most
+# on the second and later templates of a multi-template run: the first is
+# preceded by the connection banner and the storage and network lines, so its
+# quiet steps are hidden, while the later ones follow "Building: ..." directly.
+
+@test "no step between announcing a build and creating its disk is silent" {
+    # `xe template-list` is a round trip to the pool master and the prep drive
+    # generates a key and an ISO. Both used to run with no output at all.
+    local body
+    body=$(declare -f tpl_build_one)
+    [[ "$body" == *"checking whether this template already exists"* ]]
+    [[ "$body" == *"building the cloud-init preparation drive"* ]]
+}
+
+@test "no step between the preparation boot and the finished template is silent" {
+    local body
+    body=$(declare -f tpl_build_one)
+    [[ "$body" == *"confirming the guest agent is installed"* ]]
+    [[ "$body" == *"sealing it as a template"* ]]
+}
+
+@test "every slow call in a build is announced before it runs" {
+    # Walk the function body: each of these calls must be preceded by output,
+    # with nothing silent in between. Ordering matters as much as presence --
+    # a message printed after the call it describes does not stop the screen
+    # looking stuck while the call runs.
+    local body
+    body=$(declare -f tpl_build_one)
+
+    local call announce
+    while read -r call announce; do
+        local call_line announce_line
+        call_line=$(grep -n -- "$call" <<< "$body" | head -1 | cut -d: -f1)
+        announce_line=$(grep -n -- "$announce" <<< "$body" | head -1 | cut -d: -f1)
+        [ -n "$call_line" ]
+        [ -n "$announce_line" ]
+        [ "$announce_line" -lt "$call_line" ]
+    done <<'PAIRS'
+tpl_template_exists checking whether this template already exists
+tpl_build_prep_drive building the cloud-init preparation drive
+tpl_seal_template sealing it as a template
+PAIRS
+}
+
+@test "each template in a run prints the same progress, not just the first" {
+    # The messages live in tpl_build_one, which runs once per template, so a
+    # message emitted from the surrounding one-time setup would appear only
+    # before the first build.
+    local body
+    body=$(declare -f build_vm_templates)
+    [[ "$body" != *"checking whether this template already exists"* ]]
+    [[ "$body" != *"building the cloud-init preparation drive"* ]]
+    [[ "$body" != *"sealing it as a template"* ]]
+}
+
+# --- multi-template runs ----------------------------------------------------
+#
+# Every template in a run reuses the same working directory, so anything
+# written at a fixed path there has to be rebuilt rather than assumed absent.
+# The first build creates these files; the second is the one that finds them
+# already there.
+
+@test "each template gets its own build key" {
+    # ssh-keygen refuses to overwrite an existing key: it asks "Overwrite
+    # (y/n)?" and, with no answer available, exits 1 having generated nothing.
+    # Every build after the first hit that, and because the failure went to
+    # /dev/null and its status was never tested, the build carried on and baked
+    # the previous template's key into this template's config drive.
+    DEPLOY_WORKDIR="$TMPDIR_TEST"
+
+    local k1 k2
+    tpl_build_prep_drive "$(tpl_row_for_key debian12)"
+    k1=$(ssh-keygen -lf "${TPL_SSH_KEY}.pub" | awk '{print $2}')
+
+    tpl_build_prep_drive "$(tpl_row_for_key debian13)"
+    k2=$(ssh-keygen -lf "${TPL_SSH_KEY}.pub" | awk '{print $2}')
+
+    [ -n "$k1" ]
+    [ -n "$k2" ]
+    [ "$k1" != "$k2" ]
+}
+
+@test "a second template's drive carries its own account, not the first's" {
+    # The clearest symptom of a stale drive: an Ubuntu template built after a
+    # Debian one would ship Debian's user and preparation script.
+    DEPLOY_WORKDIR="$TMPDIR_TEST"
+
+    tpl_build_prep_drive "$(tpl_row_for_key debian12)"
+    grep -q 'name: debian' "${DEPLOY_WORKDIR}/tpl-cidata/user-data"
+
+    tpl_build_prep_drive "$(tpl_row_for_key ubuntu2404)"
+    grep -q 'name: ubuntu' "${DEPLOY_WORKDIR}/tpl-cidata/user-data"
+    ! grep -q 'name: debian' "${DEPLOY_WORKDIR}/tpl-cidata/user-data"
+}
+
+@test "building a prep drive twice in a row succeeds both times" {
+    DEPLOY_WORKDIR="$TMPDIR_TEST"
+    tpl_build_prep_drive "$(tpl_row_for_key debian12)"
+    tpl_build_prep_drive "$(tpl_row_for_key debian12)"
+}
+
+@test "a failed key generation stops the build instead of being discarded" {
+    local body
+    body=$(declare -f tpl_build_prep_drive)
+    # The old key is cleared first, and the generation's status is tested.
+    [[ "$body" == *'rm -f "${TPL_SSH_KEY}" "${TPL_SSH_KEY}.pub"'* ]]
+    [[ "$body" == *"if ! ssh-keygen"* ]]
+}
+
+@test "a failed cloud-init drive stops the build instead of being discarded" {
+    # The drive carries the whole preparation. Booting without it wastes the
+    # full fifteen-minute timeout and reports a cause that is not the real one.
+    local body
+    body=$(declare -f tpl_build_prep_drive)
+    [[ "$body" == *'iso_rc != 0'* ]]
+    [[ "$body" == *'! -s "$iso"'* ]]
+}
+
+@test "the build checks that its preparation drive was actually built" {
+    local body
+    body=$(declare -f tpl_build_one)
+    [[ "$body" == *"if ! tpl_build_prep_drive"* ]]
 }

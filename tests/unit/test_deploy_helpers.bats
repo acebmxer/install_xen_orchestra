@@ -1431,3 +1431,31 @@ _sha_b() { printf 'b%.0s' $(seq 128); }
     [ "$status" -eq 0 ]
     [[ "$output" != *"SHOULD NOT RUN"* ]]
 }
+
+@test "sshpass is never installed to save a password prompt" {
+    # It saves one prompt and changes nothing else, so its absence is reported
+    # rather than fixed. Installing a package onto the operator's own machine
+    # is a change they did not ask for, and the connection works without it.
+    local src="${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh"
+    local hits
+    hits=$(grep -v '^[[:space:]]*#' "$src" | grep -c 'PKG_INSTALL sshpass' || true)
+    [ "$hits" -eq 0 ]
+}
+
+@test "a workstation without sshpass still connects, using plain ssh" {
+    # The fallback must actually make the connection rather than only warning
+    # about it: ssh asks for the password itself, so its prompt must not be
+    # redirected to /dev/null the way the sshpass call's is.
+    local body
+    body=$(declare -f install_xo_proxy)
+    [[ "$body" == *"ssh will ask for that password once more"* ]]
+    # The fallback runs plain ssh -- not sshpass -- and keeps stderr, where ssh
+    # writes its password prompt. `&>/dev/null` there would hide the prompt and
+    # read as a hang. Matched loosely because `declare -f` renormalises spacing.
+    local fallback
+    fallback=$(grep -A1 'sshpass would avoid the second prompt' <<< "$body" | tail -1)
+    [[ "$fallback" == *"ssh -o StrictHostKeyChecking"* ]]
+    [[ "$fallback" != *"sshpass"* ]]
+    [[ "$fallback" != *"&> /dev/null"* ]]
+    [[ "$fallback" != *"&>/dev/null"* ]]
+}

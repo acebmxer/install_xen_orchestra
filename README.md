@@ -176,13 +176,13 @@ the machine identity a clone must not inherit, and sealing the result. Once
 built they appear in Xen Orchestra under **New → VM**, alongside any Hub
 templates you already have.
 
-Debian 12 (Bookworm) and Debian 13 (Trixie) are buildable today. AlmaLinux,
-CentOS Stream, Fedora, Rocky Linux and Ubuntu are listed in the menu as
-**Coming Soon...** — each names a published cloud image, and what is missing is
-the qcow2 import path rather than the image. The full
-walkthrough — what each template contains, how the boot firmware is chosen,
-requirements, and what to do when a build fails — is in
-[docs/templates.md](docs/templates.md).
+Debian 12 (Bookworm), Debian 13 (Trixie) and the three Ubuntu LTS releases —
+22.04 (Jammy), 24.04 (Noble) and 26.04 (Resolute) — are buildable today.
+AlmaLinux, CentOS Stream, Fedora and Rocky Linux are listed in the menu as
+**Coming Soon...**: each names a published cloud image, and what is missing is a
+`dnf` preparation script rather than the image. The full walkthrough — what each
+template contains, how the boot firmware is chosen, requirements, and what to do
+when a build fails — is in [docs/templates.md](docs/templates.md).
 
 ## Configuration
 

@@ -3363,22 +3363,24 @@ install_xo_proxy() {
     # on this workstation can read the pool master's root password out of `ps`.
     # The environment of another user's process is not readable the same way.
     # This is what dom0_exec already does; these calls predate it.
+    # sshpass is a convenience, not a requirement: it feeds the password to ssh
+    # so it is not typed a second time. Its absence is reported rather than
+    # fixed -- installing a package onto the operator's machine to save one
+    # prompt is a change they did not ask for, and the connection works without
+    # it. ssh asks for the password itself, so its prompt must not be
+    # redirected away here.
     log_info "Testing SSH connection to $HOST_USERNAME@$POOL_MASTER_IP..."
-    if ! SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
-        # Try installing sshpass if not available
-        if ! command -v sshpass &> /dev/null; then
-            log_info "Installing sshpass..."
-            # shellcheck disable=SC2086
-            run_cmd $PKG_INSTALL sshpass
-            # Retry connection
-            if ! SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null; then
-                log_error "Failed to connect to Pool Master. Please check your credentials."
-                exit 1
-            fi
-        else
-            log_error "Failed to connect to Pool Master. Please check your credentials."
-            exit 1
-        fi
+    local ssh_ok=0
+    if command -v sshpass >/dev/null 2>&1; then
+        SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null || ssh_ok=$?
+    else
+        log_info "sshpass is not installed, so ssh will ask for that password once more."
+        log_info "  (installing sshpass would avoid the second prompt; nothing else changes)"
+        ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" >/dev/null || ssh_ok=$?
+    fi
+    if (( ssh_ok != 0 )); then
+        log_error "Failed to connect to Pool Master. Please check your credentials."
+        exit 1
     fi
     log_success "SSH connection successful"
 
@@ -3945,9 +3947,12 @@ STREAM_EOF
 #
 #   XO_DEPLOY_IMAGE_SHA512  an explicit pin. Like XO_DEPLOY_POOL_FINGERPRINT,
 #                           setting it means the check is mandatory: if it
-#                           cannot be made, the deploy stops.
-#   SHA512SUMS              fetched from the image's own directory, which is
-#                           where Debian publishes it. Best effort, because a
+#                           cannot be made, the deploy stops. Always SHA-512,
+#                           whatever the origin publishes, because it names the
+#                           algorithm in the variable.
+#   the origin's sums file  fetched from the image's own directory. Which file
+#                           and which algorithm is decided by
+#                           deploy_checksum_source. Best effort, because a
 #                           private mirror may not carry one -- a missing file
 #                           warns, a mismatched digest always fails.
 #
@@ -3958,10 +3963,105 @@ STREAM_EOF
 #
 # Returns 0 when verified or legitimately skipped, 1 when the image must not be
 # imported.
+# Decide which checksum file an origin publishes, and in which algorithm.
+#
+# Prints "<filename> <sha-bits>". Derived from the URL rather than declared in
+# the catalogue, so it is one fact in one place for both the deploy path and
+# every template row, and adding an image does not mean remembering to state
+# its checksum algorithm alongside it.
+#
+# Both files handled here are in coreutils' own format -- "<hash>  <file>",
+# with a leading '*' on the name for binary mode -- so only the name and the
+# digest length differ, and one parse serves both. That is not universal: the
+# RHEL family and Fedora publish "SHA256 (<file>) = <hash>", which this does
+# not attempt and which is why those catalogue rows are still placeholders.
+#
+# The default is Debian's SHA512SUMS. An unknown origin therefore gets that
+# name, does not find it, and warns that the image could not be verified --
+# which is the same outcome an unknown origin had before this function existed.
+deploy_checksum_source() {
+    local url="$1"
+    case "$url" in
+        *//cloud-images.ubuntu.com/*) printf 'SHA256SUMS 256' ;;
+        *)                            printf 'SHA512SUMS 512' ;;
+    esac
+}
+
+# True when an image has to be converted before it can be imported.
+#
+# XAPI's /import_raw_vdi takes raw bytes and nothing else, so anything the
+# origin publishes in another format has to be converted on the pool master
+# first. Judged by extension, which is what the catalogue gives us before
+# anything has been downloaded.
+#
+# `.img` counts. Ubuntu's cloud images are named "...-cloudimg-amd64.img" and
+# are qcow2 -- verified by their magic, "QFI\xfb" in the first four bytes, not
+# inferred from the name. An extension-based test that trusted ".img" to mean
+# raw would import a qcow2 header onto the disk and produce a VM that does not
+# boot, with nothing reporting an error, so .img is treated as needing
+# conversion rather than as raw.
+#
+# Only .raw is taken to be raw. An unknown extension is converted, which is the
+# safe direction: qemu-img detects the real format itself and converting an
+# image that was already raw costs a copy rather than a broken template.
+deploy_needs_conversion() {
+    local url="$1"
+    local base="${url##*/}"; base="${base%%\?*}"
+    [[ "$base" != *.raw ]]
+}
+
+# Make sure the pool master can convert an image.
+#
+# Checked *before* the download rather than after, because the alternative is
+# discovering it once several gigabytes have already been fetched -- the same
+# reason the tools ISO is checked up front.
+#
+# Missing qemu-img stops the build; it is never installed. dom0 runs QEMU to
+# emulate device models for HVM guests, so qemu-img is part of the base system
+# and its absence means something is wrong with the host rather than something
+# this script should paper over. It is not in XCP-ng's supported additional
+# packages either (reports.xcp-ng.org/8.3/extra_installable.txt), so there is no
+# blessed way to add it.
+#
+# In particular, do not reach for `yum install --enablerepo=base`. XCP-ng's own
+# documentation makes enabling extra repositories rule 1 of what not to do: the
+# update process assumes only XCP-ng repositories are enabled, and CentOS/EPEL
+# carry higher version numbers than XCP-ng's own packages, so yum will happily
+# overwrite core dom0 packages and break the host. XCP-ng's repositories are
+# already enabled, so anything legitimately installable needs no switch at all.
+# https://docs.xcp-ng.org/management/additional-packages/
+deploy_ensure_qemu_img() {
+    if dom0_exec "command -v qemu-img" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_error "This image is not raw, so it has to be converted on the pool master,"
+    log_error "but qemu-img is not available there."
+    log_error ""
+    log_error "qemu-img is normally part of dom0, so this suggests a problem with the"
+    log_error "host rather than a missing optional package. Check it directly:"
+    log_error "  ssh ${HOST_USERNAME}@${POOL_MASTER_IP} which qemu-img"
+    log_error ""
+    log_error "Do not install it from the CentOS or EPEL repositories: XCP-ng's"
+    log_error "documentation warns that enabling those lets yum overwrite core dom0"
+    log_error "packages and break the host."
+    log_error "  https://docs.xcp-ng.org/management/additional-packages/"
+    log_error ""
+    log_error "A template whose image is already raw -- the Debian ones -- needs no"
+    log_error "conversion and will build on this pool as it is."
+    return 1
+}
+
 deploy_verify_image_checksum() {
     local url="$1" tmp="$2"
     local pinned="${XO_DEPLOY_IMAGE_SHA512:-}"
     local want=""
+
+    # The pin is SHA-512 by name, so it overrides whatever the origin would
+    # otherwise have been read in.
+    local sums_file sums_bits
+    read -r sums_file sums_bits <<< "$(deploy_checksum_source "$url")"
+    [[ -n "$pinned" ]] && sums_bits=512
 
     if [[ -n "$pinned" ]]; then
         want="$pinned"
@@ -3973,31 +4073,35 @@ deploy_verify_image_checksum() {
         local dir="${url%/*}"
 
         local sums
-        sums=$(dom0_exec "curl -fsSL --max-time 120 '${dir}/SHA512SUMS' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+        sums=$(dom0_exec "curl -fsSL --max-time 120 '${dir}/${sums_file}' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
         if [[ -n "$sums" ]]; then
             # Lines are "<digest>  <name>"; coreutils marks binary mode with a
-            # leading '*' on the name.
+            # leading '*' on the name. Ubuntu's SHA256SUMS uses that '*' form
+            # for every entry, so the second half of this test is not a corner
+            # case there -- it is the only branch that matches.
             want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
         fi
 
         if [[ -z "$want" ]]; then
-            log_warning "  no published SHA512SUMS entry for $(basename "$base") at the image origin."
+            log_warning "  no published ${sums_file} entry for $(basename "$base") at the image origin."
             log_warning "  The image cannot be verified, only size-checked. Set"
             log_warning "  XO_DEPLOY_IMAGE_SHA512 to require a digest match."
             return 0
         fi
-        log_info "  verifying the image against the origin's SHA512SUMS..."
+        log_info "  verifying the image against the origin's ${sums_file}..."
     fi
 
-    if [[ ! "$want" =~ ^[a-fA-F0-9]{128}$ ]]; then
-        log_error "The expected SHA-512 digest is not 128 hex characters:"
+    # A hex digest is two characters per byte: 128 for SHA-512, 64 for SHA-256.
+    local hex_len=$(( sums_bits / 4 ))
+    if [[ ! "$want" =~ ^[a-fA-F0-9]{$hex_len}$ ]]; then
+        log_error "The expected SHA-${sums_bits} digest is not ${hex_len} hex characters:"
         log_error "  ${want}"
         return 1
     fi
 
     local got
-    got=$(dom0_exec "sha512sum '${tmp}' 2>/dev/null | awk '{print \$1}'" | tr -d '\r')
-    if [[ ! "$got" =~ ^[a-fA-F0-9]{128}$ ]]; then
+    got=$(dom0_exec "sha${sums_bits}sum '${tmp}' 2>/dev/null | awk '{print \$1}'" | tr -d '\r')
+    if [[ ! "$got" =~ ^[a-fA-F0-9]{$hex_len}$ ]]; then
         # A pin is a demand for proof, so failing to produce one is fatal.
         if [[ -n "$pinned" ]]; then
             log_error "Could not compute the image's SHA-512 on the pool master, and"
@@ -4047,6 +4151,21 @@ deploy_import_vdi_from_url() {
     # spend another few minutes arriving at the same place.
     if (( rc != 2 )); then
         return $rc
+    fi
+
+    # Nor can an image that has to be converted. Streaming pipes the origin's
+    # bytes straight into the VDI, so there is no file for qemu-img to read and
+    # a qcow2 would be written onto the disk verbatim -- which XAPI accepts
+    # without complaint and which produces a VM that does not boot. Staging is
+    # the only path that can take one, so this stops rather than importing
+    # something unusable.
+    if deploy_needs_conversion "$url"; then
+        log_error "Not enough scratch space on the pool master to stage the image."
+        log_error "This image is not raw, so it has to be staged and converted --"
+        log_error "it cannot be streamed straight into the disk."
+        log_error "Free up space in /var/tmp on the pool master and retry:"
+        log_error "  ssh ${HOST_USERNAME}@${POOL_MASTER_IP} df -h /var/tmp"
+        return 1
     fi
 
     # A pinned digest cannot be honoured by the streaming path: the bytes go
@@ -4258,6 +4377,17 @@ deploy_import_vdi_staged() {
     # per import and self-cleaning across retries of the same build.
     local tmp="/var/tmp/xo-image-${vdi}.raw"
 
+    # An image that is not raw is downloaded next to that path and converted
+    # into it, so both files exist at once and both have to fit.
+    local convert="false" dl="$tmp"
+    if deploy_needs_conversion "$url"; then
+        convert="true"
+        dl="/var/tmp/xo-image-${vdi}.src"
+        if ! deploy_ensure_qemu_img; then
+            return 1
+        fi
+    fi
+
     # Size the check on the image actually being staged, not on the stock
     # Debian one: XO_DEPLOY_IMAGE_URL and the release overrides can point at
     # something much larger (which would fill /var/tmp mid-download) or much
@@ -4268,6 +4398,16 @@ deploy_import_vdi_staged() {
     if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
         # A little headroom over the image itself for filesystem overhead.
         need_mb=$(( size / 1048576 + 256 ))
+        # Content-Length measures the compressed download, which for a qcow2 is
+        # a fraction of what it expands to -- Ubuntu 24.04 is 596 MiB on the
+        # wire and 3.5 GiB once converted. Budgeting only for the download
+        # would pass the space check and then fill /var/tmp mid-conversion, so
+        # the expanded size is added too. It is not known before the download,
+        # so it is estimated at four times the compressed size; the conversion
+        # itself checks the real figure once qemu-img can be asked.
+        if [[ "$convert" == "true" ]]; then
+            need_mb=$(( size / 1048576 * 5 + 256 ))
+        fi
     fi
 
     # Returns 2, not 1, when there is no room: this is the one failure the
@@ -4306,14 +4446,24 @@ deploy_import_vdi_staged() {
     # and nothing else will reclaim them.
     dom0_exec "rm -f /var/tmp/xo-deploy-image-*.raw" >/dev/null 2>&1 || true
 
+    # A .src from a previous run of *this* import must not be resumed onto.
+    # Unlike the .raw path, whose staleness is caught by the size check further
+    # down, a stale .src would be topped up by `curl -C -` to a plausible
+    # length and then fail the checksum -- which reads as a bad mirror rather
+    # than as the leftover it is. Cheaper to start clean: this file is only
+    # ever an intermediate, so there is nothing worth resuming in it.
+    if [[ "$convert" == "true" ]]; then
+        dom0_exec "rm -f '${dl}'" >/dev/null 2>&1 || true
+    fi
+
     log_info "  downloading the image to the pool master (resumable)..."
-    if ! dom0_exec "curl -fL --progress-bar -o '${tmp}' -C - \
+    if ! dom0_exec "curl -fL --progress-bar -o '${dl}' -C - \
             --retry 5 --retry-delay 3 --retry-all-errors \
             --speed-limit 1024 --speed-time 60 --max-time 3600 '${url}'"; then
         log_error "Failed to download the image on the pool master."
         log_error "Check outbound access from the host:"
         log_error "  ssh ${HOST_USERNAME}@${POOL_MASTER_IP} curl -I '${url}'"
-        dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+        dom0_exec "rm -f '${dl}'" >/dev/null 2>&1 || true
         return 1
     fi
 
@@ -4321,20 +4471,72 @@ deploy_import_vdi_staged() {
     # importing it would produce a VM that boots to a corrupt filesystem.
     if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
         local got
-        got=$(dom0_exec "stat -c %s '${tmp}' 2>/dev/null" | tr -d '\r')
+        got=$(dom0_exec "stat -c %s '${dl}' 2>/dev/null" | tr -d '\r')
         if [[ "$got" =~ ^[0-9]+$ ]] && (( got != size )); then
             log_error "The staged image is ${got} bytes; the server said ${size}."
             log_error "Refusing to import a truncated image."
-            dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+            dom0_exec "rm -f '${dl}'" >/dev/null 2>&1 || true
             return 1
         fi
     fi
 
     # After the size check and before anything reaches the VDI: a bad image is
     # cheap to delete now and expensive to discover once it is the appliance.
-    if ! deploy_verify_image_checksum "$url" "$tmp"; then
-        dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
+    #
+    # Checksummed as downloaded, before any conversion. The digest the origin
+    # publishes is of the file it publishes, so hashing a converted image would
+    # never match -- and verifying first is also what makes the conversion
+    # trustworthy, since qemu-img is then reading bytes already proven genuine.
+    if ! deploy_verify_image_checksum "$url" "$dl"; then
+        dom0_exec "rm -f '${dl}'" >/dev/null 2>&1 || true
         return 1
+    fi
+
+    # Convert to raw, because /import_raw_vdi takes nothing else.
+    #
+    # -O raw with no -f: qemu-img probes the source format itself, which is
+    # what should decide it. Trusting the extension here would defeat the point
+    # -- Ubuntu's qcow2 images are named .img -- and a wrong -f is not a clean
+    # failure, it is a misparsed disk.
+    #
+    # The source is removed as soon as the conversion succeeds rather than at
+    # the end: it is the larger pair of the two on a compressed image, and
+    # holding both for the duration of the import doubles what /var/tmp has to
+    # carry for no benefit.
+    if [[ "$convert" == "true" ]]; then
+        local vsize=""
+        vsize=$(dom0_exec "qemu-img info --output=json '${dl}' 2>/dev/null | tr -d ' \n' | sed -n 's/.*\"virtual-size\":\([0-9]*\).*/\\1/p'" | tr -d '\r')
+        if [[ "$vsize" =~ ^[0-9]+$ ]] && (( vsize > 0 )); then
+            # One decimal place, rounded, in integer arithmetic.
+            #
+            # Dividing straight to GiB truncates, so a 3.5 GiB image reported as
+            # "3 GiB" understates the figure that decides whether the disk is
+            # big enough -- which is exactly what someone reads back when a
+            # build runs out of room. Truncating the decimal has the same fault
+            # in miniature: Ubuntu 22.04 is 2.199 GiB, which truncation shows as
+            # "2.1" while every other tool, qemu-img included, says 2.2.
+            #
+            # So round to tenths first, by adding half a tenth before dividing,
+            # and split the result afterwards. Rounding before the split is what
+            # makes a carry work: 2.99 GiB becomes 30 tenths, which prints as
+            # "3.0" rather than the "2.10" that rounding each part separately
+            # would produce.
+            local tenths=$(( (vsize * 10 + 536870912) / 1073741824 ))
+            log_info "  converting the image to raw ($(( tenths / 10 )).$(( tenths % 10 )) GiB expanded)..."
+        else
+            log_info "  converting the image to raw..."
+        fi
+
+        if ! dom0_exec "qemu-img convert -O raw '${dl}' '${tmp}'"; then
+            log_error "Failed to convert the image to raw on the pool master."
+            log_error "This is usually /var/tmp running out of space: the expanded"
+            log_error "disk is much larger than the file that was downloaded."
+            log_error "  ssh ${HOST_USERNAME}@${POOL_MASTER_IP} df -h /var/tmp"
+            dom0_exec "rm -f '${dl}' '${tmp}'" >/dev/null 2>&1 || true
+            return 1
+        fi
+        dom0_exec "rm -f '${dl}'" >/dev/null 2>&1 || true
+        log_success "  image converted to raw"
     fi
 
     # Prove the staged file is the whole image before sending it.
@@ -4358,7 +4560,13 @@ deploy_import_vdi_staged() {
     fi
     if (( staged_ok == 0 )); then
         log_error "  the staged image on the pool master is ${staged:-0} bytes."
-        log_error "  A stale file at ${tmp} was resumed instead of downloaded."
+        if [[ "$convert" == "true" ]]; then
+            # The download was checksummed, so the bytes that arrived were
+            # right; a short file here means the conversion produced one.
+            log_error "  The conversion to raw did not produce a whole disk."
+        else
+            log_error "  A stale file at ${tmp} was resumed instead of downloaded."
+        fi
         log_error "  Remove it on the pool master and run this again:"
         log_error "    ssh ${HOST_USERNAME}@${POOL_MASTER_IP} rm -f '${tmp}'"
         dom0_exec "rm -f '${tmp}'" >/dev/null 2>&1 || true
@@ -4830,7 +5038,6 @@ deploy_connect_pool_master() {
         DEPLOY_AUTH_MODE="prompt"
         echo ""
         log_info "sshpass is not installed, so ssh will ask for that password once more."
-        log_info "Installing sshpass avoids the second prompt; nothing else changes."
     fi
 
     deploy_verify_host_key
@@ -6995,12 +7202,30 @@ show_help() {
 # ============================================================================
 
 # Catalogue of buildable templates. Each entry is:
-#   key|display name|codename|image URL|default user|prep function
+#   key|display name|codename|image URL|default user|prep function|disk GiB
 #
 # The URL points at the distribution's own mirror. Checksums are not pinned
-# here: every origin in this list publishes a SHA512SUMS beside the image, and
-# tpl_verify_checksum reads it at build time, so a new upstream release is
-# picked up without this table having to be edited.
+# here: every origin in this list publishes a checksum file beside the image,
+# and deploy_verify_image_checksum reads it at build time, so a new upstream
+# release is picked up without this table having to be edited. Which file and
+# which algorithm is derived from the URL rather than declared here -- see
+# deploy_checksum_source.
+#
+# ---------------------------------------------------------------------------
+# Field 7: disk size, in GiB, optional
+# ---------------------------------------------------------------------------
+#
+# The template's own disk. Left empty, a row gets TPL_DEFAULT_DISK_GB, which is
+# sized for the 3 GiB Debian images. It is a per-row field because the images
+# are not all the same size and a single global number cannot serve both: the
+# figure has to clear the image's *virtual* size, and raising it for everyone
+# inflates every VM cloned from every template, since a clone starts at the
+# template's size unless the operator asks for more.
+#
+# Read the virtual size, not the download. A qcow2 is compressed and sparse, so
+# the published file is far smaller than the disk it expands to -- Ubuntu 24.04
+# is a 596 MiB download that becomes a 3.5 GiB disk. `qemu-img info` reports
+# both; the "virtual size" line is the one that has to fit.
 #
 # Rows are kept in ascending order -- by distribution name, then by release --
 # because this array is the menu's running order, drawn top to bottom exactly as
@@ -7027,15 +7252,21 @@ show_help() {
 #
 #   1. Image format. Debian publishes raw; everyone else publishes qcow2. The
 #      import writes the file into a VDI over XAPI's raw endpoint, so a qcow2
-#      lands as a qcow2 *file* on the disk and the VM does not boot. Needs a
-#      conversion step on the pool master, or a different import format.
-#   2. Checksum format. tpl_verify_checksum understands Debian's SHA512SUMS
-#      ("<hash>  <file>"). Ubuntu publishes SHA256SUMS in that shape but under
-#      a different name and algorithm; the RHEL family and Fedora publish
-#      "SHA256 (<file>) = <hash>", which is a different parse entirely.
-#   3. Guest preparation. tpl_prep_debian is apt-only. The RHEL family and
-#      Fedora need a dnf equivalent. Ubuntu can most likely share the Debian
-#      one, but that is worth confirming rather than assuming.
+#      would land as a qcow2 *file* on the disk and the VM would not boot.
+#      Solved: deploy_import_vdi_staged converts a non-raw image to raw on the
+#      pool master with qemu-img before the import. Note this needs the
+#      *staged* path -- there is nothing to convert in a stream -- so a qcow2
+#      row cannot fall back to streaming when /var/tmp is short.
+#   2. Checksum format. Solved: deploy_checksum_source picks the sums file and
+#      the algorithm from the image's own URL. Debian publishes SHA512SUMS and
+#      Ubuntu SHA256SUMS, both in coreutils' "<hash>  <file>" shape, so one
+#      parse serves both. The RHEL family and Fedora publish
+#      "SHA256 (<file>) = <hash>", a different parse entirely and still
+#      unhandled -- part of why those rows are still placeholders.
+#   3. Guest preparation. tpl_prep_debian is apt-based, and Ubuntu shares it.
+#      Confirmed rather than assumed: Ubuntu packages xe-guest-utilities (which
+#      Debian 13 does not), so there both the ISO path and the apt fallback
+#      work. The RHEL family and Fedora still need a dnf equivalent.
 #
 # Version coverage below is deliberate: current supported releases only.
 # Ubuntu is the LTS line (interim releases are nine-month lifespans and would
@@ -7092,24 +7323,34 @@ show_help() {
 #     not evidence of a failed boot -- XO's own Hub templates do the same thing.
 #     Do not read a garbled console as a missing ESP.
 TPL_CATALOG=(
-    "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|-"
-    "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|-"
-    "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|-"
-    "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|-"
-    "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|-"
-    "debian12|Debian 12 (Bookworm)|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw|debian|tpl_prep_debian"
-    "debian13|Debian 13 (Trixie)|trixie|https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw|debian|tpl_prep_debian"
-    "fedora43|Fedora 43|43|https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2|fedora|-"
-    "fedora44|Fedora 44|44|https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2|fedora|-"
-    "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|-"
-    "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|-"
-    "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|-"
+    "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
+    "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
+    "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
+    "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|-|"
+    "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|-|"
+    "debian12|Debian 12 (Bookworm)|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw|debian|tpl_prep_debian|"
+    "debian13|Debian 13 (Trixie)|trixie|https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw|debian|tpl_prep_debian|"
+    "fedora43|Fedora 43|43|https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2|fedora|-|"
+    "fedora44|Fedora 44|44|https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2|fedora|-|"
+    "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
+    "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
+    "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
     # Deprecated: free support for 22.04 ends 2027-04-30, so this entry is
     # scheduled to go on 2027-06-01. Kept in the list until then so the menu
     # says so rather than the row silently vanishing.
-    "ubuntu2204|Ubuntu 22.04 LTS (Jammy)|jammy|https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img|ubuntu|-"
-    "ubuntu2404|Ubuntu 24.04 LTS (Noble)|noble|https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img|ubuntu|-"
-    "ubuntu2604|Ubuntu 26.04 LTS (Resolute)|resolute|https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img|ubuntu|-"
+    #
+    # No disk override: this image expands to 2.2 GiB, comfortably inside the
+    # 4 GiB default and smaller than either later release. The figure is per
+    # image, not per distribution -- taking 24.04's 6 GiB as "what Ubuntu needs"
+    # would inflate every VM cloned from this one for no reason.
+    "ubuntu2204|Ubuntu 22.04 LTS (Jammy)|jammy|https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img|ubuntu|tpl_prep_debian|"
+    # 6 GiB, not the 4 GiB default: the qcow2 is a 596 MiB download that expands
+    # to a 3.5 GiB disk, so the default would leave almost no margin. Read off
+    # `qemu-img info`'s "virtual size", which is the figure the VDI must clear.
+    "ubuntu2404|Ubuntu 24.04 LTS (Noble)|noble|https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img|ubuntu|tpl_prep_debian|6"
+    # 6 GiB for the same reason as 24.04: an 823 MiB download that expands to
+    # the same 3.5 GiB disk.
+    "ubuntu2604|Ubuntu 26.04 LTS (Resolute)|resolute|https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img|ubuntu|tpl_prep_debian|6"
 )
 
 # Where the guest tools ISO lives. Every XCP-ng host ships this SR; the ISO
@@ -7139,6 +7380,10 @@ TPL_DEFAULT_VCPUS=2
 # unless the operator asks for more. Sized in GiB rather than to the image so a
 # slightly larger upstream release does not silently start failing; if an image
 # ever approaches this, the number moves.
+#
+# This is the *default*, not the only value: an image that needs more says so in
+# its catalogue row's seventh field rather than pushing this number up for
+# everyone. Ubuntu's images expand to 3.5 GiB and take that route.
 TPL_DEFAULT_DISK_GB=4
 
 # State for the build in progress, cleared between templates.
@@ -7172,6 +7417,34 @@ tpl_field() {
 # built any other way from reaching a download.
 tpl_is_placeholder() {
     [[ "$(tpl_field "$1" 6)" == "-" ]]
+}
+
+# The next row the cursor should land on, skipping placeholders.
+#
+# Arguments: current index, step (-1 up / 1 down), row count. Prints the index.
+#
+# Placeholders are drawn but cannot be ticked, so stopping on one gives the
+# operator a cursor position where SPACE does nothing -- and with most of the
+# catalogue currently unbuildable, it means scrolling through a run of a dozen
+# inert rows to reach the next real one. Skipping them makes the arrow keys
+# move between the entries that can actually be selected.
+#
+# Wraps in both directions, like the plain arithmetic it replaces. The loop is
+# bounded by the row count rather than by finding a match, so a catalogue of
+# nothing but placeholders returns the starting index instead of spinning
+# forever -- that cannot happen today, but a menu that hangs is a much worse
+# failure than one whose cursor does not move.
+tpl_next_selectable() {
+    local cur="$1" step="$2" count="$3"
+    local i idx=$cur
+    for ((i = 0; i < count; i++)); do
+        idx=$(( (idx + step + count) % count ))
+        if ! tpl_is_placeholder "${TPL_CATALOG[$idx]}"; then
+            printf '%s' "$idx"
+            return 0
+        fi
+    done
+    printf '%s' "$cur"
 }
 
 # Find a catalogue row by its key. Prints the row, or nothing when unknown.
@@ -7441,9 +7714,26 @@ tpl_build_prep_drive() {
 
     # A throwaway key so the build can reach the guest if it has to be
     # diagnosed. It never leaves DEPLOY_WORKDIR and dies with it.
-    ssh-keygen -t ed25519 -N "" -C "xo template build (temporary)" \
-        -f "${DEPLOY_WORKDIR}/tpl_key" >/dev/null 2>&1
+    #
+    # Removed first, and the result checked. ssh-keygen refuses to write over an
+    # existing key -- it asks "Overwrite (y/n)?" and, with no answer available,
+    # exits 1 without generating anything. On a multi-template run the path was
+    # the same every time, so every build after the first hit that: the failure
+    # went to /dev/null, its exit status was never tested, and the build carried
+    # on and baked the *previous* template's key into this template's config
+    # drive. Nothing reported an error, because nothing looked.
+    #
+    # Both halves matter. Removing the old key stops the collision; checking the
+    # status means that if key generation ever fails for some other reason --
+    # no entropy, a full disk, a read-only workdir -- the build stops here
+    # rather than continuing towards a config drive with no key in it.
     TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    rm -f "${TPL_SSH_KEY}" "${TPL_SSH_KEY}.pub"
+    if ! ssh-keygen -t ed25519 -N "" -C "xo template build (temporary)" \
+            -f "${TPL_SSH_KEY}" >/dev/null 2>&1; then
+        log_error "  could not generate the temporary build key at ${TPL_SSH_KEY}."
+        return 1
+    fi
     local pubkey
     pubkey=$(<"${TPL_SSH_KEY}.pub")
     pubkey="${pubkey%$'\n'}"
@@ -7473,14 +7763,25 @@ tpl_build_prep_drive() {
         printf '  - [ /root/xo-template-prep.sh ]\n'
     } > "${dir}/user-data"
 
+    # Rebuilt from scratch each time: the path is reused across templates, so a
+    # stale ISO left in place would be attached to the next build and hand it
+    # the previous template's preparation script.
     local iso="${DEPLOY_WORKDIR}/tpl-cidata.iso"
     rm -f "$iso"
+    local iso_rc=0
     if command -v genisoimage >/dev/null 2>&1; then
         genisoimage -quiet -output "$iso" -volid cidata -joliet -rock \
-            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config"
+            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config" || iso_rc=$?
     else
         xorriso -as mkisofs -quiet -o "$iso" -V cidata -J -r \
-            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config" 2>/dev/null
+            "${dir}/user-data" "${dir}/meta-data" "${dir}/network-config" 2>/dev/null || iso_rc=$?
+    fi
+    # Both the status and the file, because an ISO writer that exits 0 having
+    # written nothing usable would otherwise pass. This drive carries the entire
+    # preparation; a build that boots without it wastes the full timeout.
+    if (( iso_rc != 0 )) || [[ ! -s "$iso" ]]; then
+        log_error "  could not build the cloud-init drive at ${iso}."
+        return 1
     fi
     TPL_CIDATA_ISO="$iso"
 }
@@ -7491,6 +7792,17 @@ tpl_create_build_vm() {
     local row="$1" name="$2"
     local url
     url=$(tpl_field "$row" 4)
+
+    # Field 7 overrides the default disk size for images that need a bigger
+    # one. Validated rather than trusted: an empty field is the normal case and
+    # means "use the default", but a malformed one would otherwise reach
+    # `vdi-create virtual-size=` as a bad value, where it fails with an XAPI
+    # error that says nothing about the catalogue row that caused it.
+    local disk_gb
+    disk_gb=$(tpl_field "$row" 7)
+    if [[ ! "$disk_gb" =~ ^[0-9]+$ ]] || (( disk_gb == 0 )); then
+        disk_gb="$TPL_DEFAULT_DISK_GB"
+    fi
 
     local base
     base=$(dom0_xe "template-list name-label='Other install media' params=uuid --minimal" | tr -d '\r')
@@ -7564,7 +7876,7 @@ tpl_create_build_vm() {
     dom0_xe "vm-param-set uuid=${TPL_VM_UUID} platform:videoram=8" >/dev/null 2>&1 || true
 
     log_info "  creating the root disk..."
-    TPL_ROOT_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${name} root' virtual-size=${TPL_DEFAULT_DISK_GB}GiB type=user" | tr -d '\r')
+    TPL_ROOT_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${name} root' virtual-size=${disk_gb}GiB type=user" | tr -d '\r')
     if [[ ! "$TPL_ROOT_VDI" =~ ^[0-9a-f-]{36}$ ]]; then
         # Anything but a uuid here -- an error string, an empty line -- becomes
         # a malformed import URL further down, where the endpoint accepts the
@@ -7818,6 +8130,22 @@ tpl_build_one() {
     echo ""
     log_info "Building: ${name}"
 
+    # Every step from here to the import announces itself, including the ones
+    # that are quick on a good day.
+    #
+    # This check and the prep drive below used to run silently, which left a
+    # gap between "Building: ..." and "creating the root disk..." with no
+    # output at all. `xe template-list` is a round trip to the pool master and
+    # can take tens of seconds on a busy pool, so on the second and later
+    # templates of a multi-template run that gap reads as a hang -- the first
+    # template is not affected, because the connection banner and the storage
+    # and network lines print immediately before it.
+    #
+    # Silence on a slow step is the same failure --progress-bar exists to
+    # prevent on the download. An operator who cannot tell a working build from
+    # a stuck one kills it, and killing it halfway through leaves a build VM
+    # and a multi-gigabyte disk behind.
+    log_info "  checking whether this template already exists..."
     if tpl_template_exists "$name"; then
         log_info "  a template named '${name}' already exists; skipping."
         return 0
@@ -7830,7 +8158,16 @@ tpl_build_one() {
 
     TPL_VM_UUID=""; TPL_ROOT_VDI=""; TPL_CIDATA_VDI=""; TPL_BUILD_STARTED="false"
 
-    tpl_build_prep_drive "$row"
+    log_info "  building the cloud-init preparation drive..."
+    # Checked, because this is what puts the SSH key and the preparation script
+    # into the config drive. A build that carries on past a failure here boots a
+    # VM with no instructions in it, waits the full fifteen minutes for a
+    # preparation that was never going to run, and reports a timeout that says
+    # nothing about the real cause.
+    if ! tpl_build_prep_drive "$row"; then
+        log_error "  could not build the preparation drive for ${name}."
+        return 1
+    fi
 
     if ! tpl_create_build_vm "$row" "$name"; then
         # Everything up to the preparation boot is reproducible, so the
@@ -7871,6 +8208,7 @@ tpl_build_one() {
     # boot, is accepted as corroboration when it happens to have been caught.
     # Requiring an empty-string test would pass on a VM with no agent at all,
     # so the check is for a distro name -- something only the agent supplies.
+    log_info "  confirming the guest agent is installed..."
     local osv
     osv=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=os-version" 2>/dev/null | tr -d '\r')
     if [[ ! "$osv" =~ [A-Za-z] ]] || [[ "$osv" == "<not in database>" ]]; then
@@ -7886,6 +8224,7 @@ tpl_build_one() {
         return 1
     fi
 
+    log_info "  sealing it as a template..."
     if ! tpl_seal_template "$name"; then
         tpl_cleanup_failed_build
         return 1
@@ -7960,11 +8299,14 @@ tpl_prompt_selection() {
             # chosen: no tick box to fill in, the name dimmed to the same
             # weight as the note beside it, and "Coming Soon..." where a real
             # row says what it logs in as.
+            #
+            # No pointer branch here: tpl_next_selectable skips these, so the
+            # cursor cannot come to rest on one and a pointer could never be
+            # drawn. Keeping the check would suggest otherwise to the next
+            # reader.
             if tpl_is_placeholder "$row"; then
-                local pointer="  "
-                (( i == cursor )) && pointer="${M_CYAN}▸${M_RESET} "
-                printf '  %s    %s%s  Coming Soon...%s\n' \
-                    "$pointer" "$M_DIM" "$display" "$M_RESET"
+                printf '      %s%s  Coming Soon...%s\n' \
+                    "$M_DIM" "$display" "$M_RESET"
                 continue
             fi
 
@@ -7998,10 +8340,10 @@ tpl_prompt_selection() {
         menu_read_key
         case "$MENU_KEY" in
             UP)
-                if (( cursor == 0 )); then cursor=$((count - 1)); else cursor=$((cursor - 1)); fi
+                cursor=$(tpl_next_selectable "$cursor" -1 "$count")
                 ;;
             DOWN)
-                cursor=$(( (cursor + 1) % count ))
+                cursor=$(tpl_next_selectable "$cursor" 1 "$count")
                 ;;
             SPACE)
                 # Placeholders cannot be ticked. Silently ignored rather than
