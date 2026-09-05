@@ -80,26 +80,26 @@ Running without flags launches an interactive menu. All flags also work directly
 Running the script with no arguments opens a two-column menu with keyboard navigation:
 
 ```
-  ╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-  ║                               Install Xen Orchestra from Sources Setup and Update                                ║
-  ╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+  ╔═══════════════════════════════════════════════════════════════════════════════════╗
+  ║                Install Xen Orchestra from Sources Setup and Update                ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════╝
 
-                           Current Script Commit : 693f4 (Branch: main)
-                           Master Script Commit  : 693f4 (Branch: main)
-                           Current XO Commit     : a1b2c (Branch: master)
-                         ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 commits behind
-                           Current Node          : v24.15.0
+                  Current Script Commit : 693f4 (Branch: main)
+                  Master Script Commit  : 693f4 (Branch: main)
+                  Current XO Commit     : a1b2c (Branch: master)
+                ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 behind
+                  Current Node          : v24.15.0
 
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────────────────────────────
 
-  ▸ [ ] Install Xen Orchestra                              [ ] Reconfigure Xen Orchestra (made changes to config)
-    [ ] Update Xen Orchestra                               [ ] Rebuild Xen Orchestra (wipe & reinstall, keep settings)
-    [ ] Rename Sample-xo-config.cfg                        [ ] Edit xo-config.cfg
-    [ ] Install XO Proxy                                   [ ] Restore Backup
-    [ ] Deploy Xen Orchestra to a new VM (creates the VM)  [ ] Adjust Xen Orchestra Memory Allocation
+  ▸ [ ] Install Xen Orchestra                   [ ] Reconfigure XO (config changed)
+    [ ] Update Xen Orchestra                    [ ] Rebuild XO (wipe, keep settings)
+    [ ] Rename Sample-xo-config.cfg             [ ] Edit xo-config.cfg
+    [ ] Install XO Proxy                        [ ] Restore Backup
+    [ ] Deploy XO to a new VM (creates VM)      [ ] Adjust XO Memory Allocation
     [ ] VM Template Library
 
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────────────────────────────
 
   Selected: 0
 
