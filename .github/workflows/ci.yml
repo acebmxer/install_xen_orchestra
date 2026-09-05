@@ -27,8 +27,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
 
-      - name: Install bats-core
-        run: sudo apt-get install -y bats
+      - name: Install bats-core and test tools
+        # genisoimage is what tpl_build_prep_drive uses to build the cloud-init
+        # drive. The unit job runs on the runner rather than in one of the
+        # integration images, all of which install an ISO writer, so without it
+        # here the drive-building tests fail on a missing binary rather than on
+        # anything the script got wrong.
+        run: sudo apt-get install -y bats genisoimage
 
       - name: Run unit tests
         run: bats tests/unit/

@@ -14,6 +14,17 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The unit test job no longer fails on a missing ISO writer.** Three tests
+  that build a real cloud-init drive — the two covering per-template key and
+  account isolation, and the one building a drive twice in a row — failed in CI
+  with "could not build the cloud-init drive". The cause was not in the script:
+  `tpl_build_prep_drive` uses `genisoimage`, falling back to `xorriso`, and the
+  unit job installs neither. Every integration image installs one of the two,
+  which is why only the unit job was affected, and the three neighbouring tests
+  that inspect the function's text rather than running it kept passing — so the
+  failure looked like a regression in code that had just been changed. The unit
+  job now installs `genisoimage` alongside `bats`.
+
 - **A multi-template build no longer stalls on the second template.** This is
   the cause of a build that printed "Building: Debian 13 (Trixie) Cloud-init"
   and then sat with no further output, no CPU and no network activity on the
