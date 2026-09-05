@@ -11,7 +11,7 @@
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
 [![Tests](https://img.shields.io/badge/tests-118%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
-[![Distros tested](https://img.shields.io/badge/distros%20tested-8-informational)](#supported-operating-systems)
+[![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
 Automated installation and management of [Xen
@@ -151,10 +151,13 @@ hands back the address. Run it from your own workstation:
 
 It asks for your pool master, a storage repository, a network, and a **static
 IP** (required — a stock cloud image cannot report a DHCP lease back), then
-does the rest unattended. The full walkthrough — requirements, the admin
-account and SSH key handling, image verification, what it hardens on the way
-out, and the pre-flight probe — is in
-[docs/deployment.md](docs/deployment.md).
+does the rest unattended. The VM it creates is tagged `xo-deployed` and stamped
+with `other-config` keys recording that this script deployed it, which version,
+and when — so an appliance can be identified as the script's work later, and
+filtered for by tag in XO's VM list. The full walkthrough —
+requirements, the admin account and SSH key handling, image verification, what
+it hardens on the way out, reading the deployment stamp back, and the pre-flight
+probe — is in [docs/deployment.md](docs/deployment.md).
 
 ## Building VM Templates (`--build-templates`)
 
@@ -173,7 +176,10 @@ the machine identity a clone must not inherit, and sealing the result. Once
 built they appear in Xen Orchestra under **New → VM**, alongside any Hub
 templates you already have.
 
-Debian 13 (Trixie) ships first; further distributions are additive. The full
+Debian 12 (Bookworm) and Debian 13 (Trixie) are buildable today. AlmaLinux,
+CentOS Stream, Fedora, Rocky Linux and Ubuntu are listed in the menu as
+**Coming Soon...** — each names a published cloud image, and what is missing is
+the qcow2 import path rather than the image. The full
 walkthrough — what each template contains, how the boot firmware is chosen,
 requirements, and what to do when a build fails — is in
 [docs/templates.md](docs/templates.md).
@@ -303,15 +309,35 @@ After installation, access the web interface at `https://your-server-ip`.
 
 ## Supported Operating Systems
 
-- Debian 11/12/13
-- Ubuntu (all supported versions)
+- Debian 12/13
+- Ubuntu 22.04/24.04/26.04 LTS
 - RHEL / CentOS Stream / AlmaLinux / Rocky
 - Fedora
 
+Ubuntu is the LTS line. Interim releases have nine-month lifespans and are not
+gated, but they are not tested either.
+
+> [!WARNING]
+> **Debian 11 (Bullseye) support ends on 2026-10-01.** Debian 11 reached
+> end-of-life on **2026-08-31** and no longer receives security updates. Until
+> the removal date the installer runs on Debian 11 and prints a warning; from
+> **2026-10-01** it refuses to run there unless you pass `--allow-eol-distro`,
+> which is unsupported and untested. Upgrade to Debian 12 or 13 before then.
+
+> [!WARNING]
+> **Ubuntu 22.04 LTS (Jammy) support ends on 2027-06-01.** Free security
+> maintenance for 22.04 ends on **2027-04-30**; after that, updates require a
+> paid Ubuntu Pro subscription, which this installer does not assume you have.
+> Until the removal date a run on 22.04 warns and continues; from **2027-06-01**
+> it refuses unless you pass `--allow-eol-distro`. Upgrade to Ubuntu 24.04 LTS
+> or 26.04 LTS before then.
+
 > [!NOTE]
-> Continuously smoke-tested in CI on Debian 11/12/13, Ubuntu 24.04, Rocky Linux 9,
-> AlmaLinux 9, CentOS Stream 9, and Fedora. RHEL uses the same `dnf` path as its
-> rebuilds; other Ubuntu releases use the same `apt` path.
+> Continuously smoke-tested in CI on Debian 12/13, Ubuntu 22.04/24.04/26.04 LTS,
+> Rocky Linux 9, AlmaLinux 9, CentOS Stream 9, and Fedora — plus Debian 11 until
+> its removal on 2026-10-01, and Ubuntu 22.04 until its removal on 2027-06-01.
+> RHEL uses the same `dnf` path as its rebuilds; Ubuntu interim releases use the
+> same `apt` path as the LTS ones.
 
 > [!NOTE]
 > **Firewall:** On Fedora and RHEL-family systems (which enable `firewalld` by

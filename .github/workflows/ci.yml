@@ -34,7 +34,7 @@ jobs:
         run: bats tests/unit/
 
   integration:
-    name: Integration (${{ matrix.distro }})
+    name: Integration (${{ matrix.label || matrix.distro }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -42,14 +42,27 @@ jobs:
         include:
           - distro: debian12
             dockerfile: tests/integration/Dockerfile.debian12
+          # DEPRECATED: free security maintenance for Ubuntu 22.04 ends on
+          # 2027-04-30. Support is removed from this project on 2027-06-01 —
+          # delete this matrix entry and
+          # tests/integration/Dockerfile.ubuntu2204 on that date.
+          - distro: ubuntu2204
+            dockerfile: tests/integration/Dockerfile.ubuntu2204
+            label: ubuntu2204 (deprecated, removed 2027-06-01)
           - distro: ubuntu2404
             dockerfile: tests/integration/Dockerfile.ubuntu2404
+          - distro: ubuntu2604
+            dockerfile: tests/integration/Dockerfile.ubuntu2604
           - distro: rockylinux9
             dockerfile: tests/integration/Dockerfile.rockylinux9
           - distro: fedora
             dockerfile: tests/integration/Dockerfile.fedora
+          # DEPRECATED: Debian 11 (Bullseye) left Debian LTS on 2026-08-31.
+          # Support is removed from this project on 2026-10-01 — delete this
+          # matrix entry and tests/integration/Dockerfile.debian11 on that date.
           - distro: debian11
             dockerfile: tests/integration/Dockerfile.debian11
+            label: debian11 (deprecated, removed 2026-10-01)
           - distro: debian13
             dockerfile: tests/integration/Dockerfile.debian13
           - distro: almalinux9

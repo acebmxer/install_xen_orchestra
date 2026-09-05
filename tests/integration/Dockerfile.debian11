@@ -1,6 +1,37 @@
+# DEPRECATED — scheduled for deletion on 2026-10-01.
+#
+# Debian 11 (Bullseye) reached end-of-life on 2026-08-31 and receives no
+# further security updates. This image and its CI matrix entry in
+# .github/workflows/ci.yml are kept only so the deprecation window stays
+# tested; delete both on the removal date.
 FROM debian:11
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    sudo git curl bash bats shellcheck ca-certificates \
+
+# Bullseye's security suite is being decommissioned now that it has left LTS,
+# and deb.debian.org serves it inconsistently: the index still advertises
+# sudo 1.9.5p2-3+deb11u4 and libperl5.32 5.32.1-4+deb11u5 while some Fastly
+# edges already 404 the .deb files, so a build succeeds or fails depending on
+# which cache node the runner reaches. archive.debian.org, where Bullseye now
+# lives permanently, does not carry bullseye-security at all -- only the
+# original bullseye and bullseye-updates suites. Point apt there and drop
+# security entirely; the archive suites are stable and never 404.
+#
+# Doing that means the archive's perl-base (5.32.1-4+deb11u3) is older than the
+# 5.32.1-4+deb11u5 baked into the base image from security, and apt will not
+# downgrade it implicitly to satisfy perl's exact-version dependency. Pin it to
+# the archive version so the dependency resolves. These are test-image packages
+# for a distribution that receives no further security updates in any case.
+#
+# Check-Valid-Until is disabled because the archived Release files are long
+# past their expiry date by design.
+RUN printf '%s\n' \
+        "deb http://archive.debian.org/debian bullseye main" \
+        "deb http://archive.debian.org/debian bullseye-updates main" \
+        > /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get -o Acquire::Check-Valid-Until=false install -y \
+        --no-install-recommends --allow-downgrades \
+        perl-base=5.32.1-4+deb11u3 \
+        sudo git curl bash bats shellcheck ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user with passwordless sudo (mirrors real install usage)

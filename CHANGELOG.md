@@ -10,7 +10,117 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- **Ubuntu 22.04 and 26.04 LTS join the CI integration matrix.** Ubuntu was
+  represented by 24.04 alone, so the two releases at either end of the
+  supported range — the one being deprecated and the newest one — were claimed
+  as supported without anything checking they still ran. Both now build and run
+  the integration smoke tests on every push, from
+  `tests/integration/Dockerfile.ubuntu2204` and `Dockerfile.ubuntu2604`, each
+  differing from the existing 24.04 file only in its `FROM` line. The 22.04
+  entry carries a comment and a matrix label naming its 2027-06-01 removal
+  date, the same way Debian 11's does, so the entry and its Dockerfile are
+  deleted together when that date arrives. Verified locally before landing:
+  both images build, all four smoke tests pass on each, and the end-of-life
+  gate was exercised against a real Ubuntu 22.04 container — warning and
+  continuing today, refusing with the correct upgrade advice past the cutoff —
+  with 24.04 and 26.04 silent. This takes the tested-distribution count from
+  eight to ten, and the README badge with it.
+
+- **The template menu now lists the planned distributions as "Coming Soon...",
+  instead of showing only what is buildable today.** `--build-templates`
+  offered Debian and nothing else, so the question it could not answer was
+  whether a given distribution was ever going to appear — and the only way to
+  find out was to read the catalogue in the source. Thirteen planned entries
+  are now listed alongside the two real ones: AlmaLinux 8/9/10, CentOS Stream
+  9/10, Fedora 43/44, Rocky Linux 8/9/10, and Ubuntu 22.04/24.04/26.04 LTS.
+  Every one of those URLs was checked against its origin and returns a live
+  image with a published checksum beside it, so each placeholder names
+  something real that is waiting on code rather than on an upstream release.
+  Ubuntu is the LTS line only, since an interim release's nine-month lifespan
+  would expire before VMs cloned from such a template were retired.
+  A placeholder is marked in `TPL_CATALOG` by a prep function of `-` — the one
+  field a buildable row cannot do without — and `tpl_is_placeholder()` is the
+  single place that is decided. Such a row draws with no tick box and cannot be
+  selected, and `tpl_build_one()` refuses one outright as a second line of
+  defence, so a selection arriving from anywhere other than the menu still
+  cannot start a download the rest of the build could not use. The menu's
+  cursor now opens on the first *buildable* row rather than the first row,
+  because the catalogue sorts alphabetically and AlmaLinux would otherwise take
+  the cursor on a line where the space bar does nothing.
+  What stands between these and real entries is three things shared across all
+  of them, now written down in the catalogue comment and in
+  `docs/templates.md`: every non-Debian origin publishes qcow2 rather than raw,
+  and the disk import writes the file into the VDI verbatim; the checksum
+  reader understands only Debian's `SHA512SUMS` layout, where Ubuntu uses
+  `SHA256SUMS` and the RHEL family and Fedora use `SHA256 (file) = hash`; and
+  the preparation script is `apt`-only, so the RHEL family and Fedora each need
+  a `dnf` equivalent.
+
+- **A Debian 12 (Bookworm) VM template, built by exactly the same path as the
+  Debian 13 one.** `--build-templates` previously offered a single entry, so a
+  pool that wanted a Bookworm guest — to match an existing fleet, or because an
+  application is not yet validated on Trixie — had no route to one short of
+  building the VM by hand. The template catalogue was already written as a table
+  of one row per distribution, with every consumer looping over it rather than
+  naming a row, so this is a one-line addition to `TPL_CATALOG` and no change at
+  all to the build: the same `tpl_prep_debian` prep script, the same guest-tools
+  install from `guest-tools.iso`, the same identity scrub, the same sealing, and
+  the same firmware decision read from the imported disk rather than declared in
+  the table. The image is `debian-12-generic-amd64.raw` from `cloud.debian.org`
+  — the `generic` variant, not `genericcloud`, for the same reason Debian 13
+  uses it: the cloud kernel omits the framebuffer drivers a graphical console
+  needs and produces a VM that works perfectly while rendering as scrambled
+  colour in XO. Checksums stay unpinned, as `tpl_verify_checksum` fetches the
+  `SHA512SUMS` published beside whichever image the row names. The multi-select
+  template menu sizes itself from the catalogue, so both entries appear with no
+  menu change, and either or both can be built in one run.
+
+- **VMs created by the "Deploy Xen Orchestra VM" menu option are now stamped
+  with their provenance, so a deployed appliance can be identified as this
+  script's work after the fact.** Nothing on a deployed VM previously recorded
+  where it came from. `deploy_create_vm` set only the operator's own choices
+  (vCPU count, memory, disk size) and three platform corrections to the "Other
+  install media" scaffolding — `viridian=false`, `vga=std`, `videoram=8` — and
+  left `name-description` as whatever XAPI writes for `xe vm-install`, which is
+  the generic "Installed via xe CLI". Those corrections do distinguish a
+  deployed appliance from an untouched stock-template VM, but only
+  circumstantially: they are ordinary parameters, and anyone setting the same
+  three by hand produces a byte-identical record. Asked to confirm that a
+  running appliance had come from the deploy path, the honest answer off the
+  XAPI record was "consistent with, but not provable" — and the template
+  builder, which does stamp its output via `other-config:base_template_name`,
+  made the omission on the deploy side the inconsistent half. The deploy path
+  now writes three `other-config` keys — `xo_deployed_by`, holding the script
+  name; `xo_deploy_version`, the `git describe` revision resolved the same way
+  `show_version` resolves it, falling back to `unknown` outside a checkout; and
+  `xo_deploy_date`, a UTC ISO-8601 timestamp — plus a real `name-description`
+  identifying the VM as a Xen Orchestra appliance deployed by this script. The
+  keys are deliberately distinct from the template builder's
+  `base_template_name` so the two paths are never conflated, and every write is
+  `|| true` so a XAPI that rejects one cannot fail a deployment that has already
+  imported its disks. The VM is also tagged `xo-deployed`, which is the only
+  part of the stamp Xen Orchestra puts on screen: tags render as chips on the VM
+  and are filterable in the VM list, whereas `other-config` is returned by the
+  API but has no view anywhere in XO, so on its own it would have been invisible
+  to anyone not querying XAPI directly. The tag is written with `vm-param-add`
+  rather than `vm-param-set` because `tags` is a set and `param-set` would
+  discard any tags the operator had already applied. Existing appliances are
+  unaffected; the stamp applies to VMs deployed from this version onward.
+
 ### Changed
+
+- **The deployment-key warning in the post-deploy summary is now boxed and
+  colour-highlighted.** It was one bullet in a run of similar-looking advisory
+  items, and it is the only one that is not advisory: the others are settings to
+  tighten at leisure, while this one reports a live unencrypted credential that
+  opens a root-capable session on an appliance holding the pool's root password.
+  It now carries a red border and an "ACTION REQUIRED — DEPLOYMENT KEY STILL
+  LIVE" header, and the `sed` command that fixes it is set off on its own
+  highlighted line rather than buried at the end of a paragraph.
 
 - **The README's clone badge now reports unique cloners (57) rather than the raw
   clone count.** The raw count for the same 14-day window was 433 against only
@@ -22,6 +132,118 @@ This installer builds Xen Orchestra from source and tracks the official
   static text baked into its shields.io URL — GitHub does not expose clone
   traffic to shields.io, and the window is rolling rather than cumulative, so the
   number has to be edited by hand and goes stale on its own.
+
+### Deprecated
+
+- **Ubuntu 22.04 LTS (Jammy) support is deprecated and will be removed on
+  2027-06-01.** Free security maintenance for 22.04 ends on 2027-04-30; past
+  that date updates require a paid Ubuntu Pro subscription, and this installer
+  should not imply a security posture that most operators running a stock
+  22.04 do not actually have. Canonical's own `meta-release` marks 22.04
+  supported until 2032, but that figure counts ESM, which is why the date here
+  is taken from the end of free support rather than from that flag. The staging
+  matches Debian 11's: until 2027-06-01 a run on 22.04 warns and proceeds
+  exactly as before, and from that date it refuses and exits 1, pointing at
+  24.04 or 26.04, with `--allow-eol-distro` still available for operators who
+  accept an untested configuration. **Ubuntu 24.04 and 26.04 are unaffected**,
+  verified silent past the cutoff. The template catalogue's `ubuntu2204` row
+  carries the same date, so the planned template and the install target retire
+  together.
+
+- **The end-of-life gate is now a table rather than one distribution's special
+  case.** `check_eol_distro()` was written around Debian 11 specifically —
+  hardcoded version test, hardcoded messages, three `XO_DEBIAN11_*` constants —
+  so adding a second deprecation would have meant either a duplicated function
+  body or a second function that could drift from the first. The dates, display
+  names and upgrade advice now live in an `XO_EOL_DISTROS` array, one row per
+  release, and the function loops over it; the message wording, the override
+  behaviour and the `YYYYMMDD` comparison against the local clock are all
+  unchanged. Debian 11's behaviour was re-verified at both sides of its own
+  cutoff and is identical. The gate now has test coverage it previously had
+  none of — 15 tests across the table's shape, both boundary dates for each
+  entry, the override, major-version matching against point releases such as
+  `22.04.5`, near-miss versions that must not match, and the wrong-clock
+  fallback that degrades to a warning rather than locking an operator out.
+
+- **Debian 11 (Bullseye) support is deprecated and will be removed on
+  2026-10-01.** Debian 11 left Debian LTS on 2026-08-31 and receives no further
+  security updates, so the platform no longer meets the bar this installer
+  claims for a supported OS — and Xen Orchestra's own build dependencies are
+  increasingly unlikely to resolve there regardless of what this script does.
+  The removal is staged rather than immediate so nobody running Bullseye today
+  finds their install broken without notice. Until 2026-10-01 a run on Debian 11
+  prints a warning naming both dates and then proceeds exactly as before; from
+  2026-10-01 the same check refuses to run and exits 1, pointing at Debian 12 or
+  13, and the run can still be forced with the new `--allow-eol-distro` flag for
+  operators who accept an untested and unsupported configuration. The check is
+  in a new `check_eol_distro()`, called from `install_dependencies()` after
+  `detect_os()`, and is the first consumer of `OS_VERSION_ID` — which until now
+  was parsed and read by nothing, as the comment above it said. The cutoff is
+  compared as a `YYYYMMDD` integer against the local clock, so a machine whose
+  date is badly wrong degrades to the warning rather than to a hard stop.
+  **Debian 12 and 13 are entirely unaffected**: the gate matches only
+  `ID=debian` with `VERSION_ID` 11, verified silent on both in containers built
+  from this repo's own CI images with the clock set past the cutoff. Debian 11
+  stays in the CI matrix, and its integration smoke test still passes, until the
+  removal date; the matrix entry and `tests/integration/Dockerfile.debian11` are
+  both commented with the date they are to be deleted.
+
+### Fixed
+
+- **The Debian 11 CI image stopped building, because Bullseye's security mirror
+  is being decommissioned mid-flight.** Debian 11 left LTS on 2026-08-31 and
+  `deb.debian.org` now serves `bullseye-security` inconsistently: the package
+  index still advertises `sudo 1.9.5p2-3+deb11u4` and
+  `libperl5.32 5.32.1-4+deb11u5`, but some Fastly edges have already dropped the
+  `.deb` files from the pool and return 404. Whether the build succeeded came
+  down to which cache node the runner happened to reach — it failed on CI while
+  the same image built cleanly elsewhere, and re-running was a coin flip rather
+  than a fix. The image now installs from `archive.debian.org`, where Bullseye
+  lives permanently, using the `bullseye` and `bullseye-updates` suites only;
+  the archive carries no `bullseye-security` at all, so security is dropped
+  rather than repointed. That leaves the archive's `perl-base`
+  (`5.32.1-4+deb11u3`) older than the `+deb11u5` baked into the base image from
+  security, and apt will not downgrade it implicitly to satisfy `perl`'s
+  exact-version dependency, so it is pinned explicitly with
+  `--allow-downgrades`. `Acquire::Check-Valid-Until` is disabled because
+  archived `Release` files are past their expiry by design. The image builds
+  from a cold cache and passes all four integration smoke tests. This affects
+  the test image only — nothing about how the installer runs on Debian 11, which
+  is deprecated and refuses to run from 2026-10-01 regardless.
+
+- **The deployment-key revocation tests were calling the revoke script the old
+  way, failing six tests on every run since the quoting fix landed.** When
+  `deploy_revoke_deploy_key` was repaired, the remote program's contract
+  changed: the script now arrives on the guest's stdin via `sh -s --` with the
+  key to remove as the first positional argument, where before it was embedded
+  in a quoted `sh -c` string with the key piped in. The `_revoke` helper in
+  `tests/unit/test_deploy_helpers.bats` was not updated with it, so it went on
+  piping the key into `sh -c "$(deploy_revoke_script)"` — leaving `$1` unset,
+  which the script's own empty-pattern guard correctly treats as a fatal error
+  rather than matching every line. The six revocation tests therefore failed
+  against production code that was working, which is the worst way round: the
+  suite reported a fix as broken. The helper now invokes the script exactly as
+  the caller does, and is the only place in the tests that runs it.
+
+- **`--deploy` never actually removed the temporary deployment key, leaving a
+  passphraseless root-capable credential on every appliance it built.** The
+  revocation step sent its program to the guest as `sh -c '<script>'`, embedding
+  the script inside a single-quoted argument. Three of the script's own comments
+  contain apostrophes — `grep's`, `operator's`, `caller's` — and the first of
+  them closed that quoting early, so the guest received a truncated program that
+  died on `unexpected EOF while looking for matching '`, having never reached
+  the line that writes the edited `authorized_keys` back. The failure was
+  invisible in the code because the revoke logic itself is correct: run
+  directly, it removes exactly the intended line and preserves the operator's
+  own keys. Only the transport was broken, and it broke silently on every
+  deploy, with `2>&1` discarding the parse error and the caller reporting the
+  generic "could not remove" warning. The script is now piped to `sh -s` on
+  stdin, where nothing re-parses it, and the key to match moves to a positional
+  argument single-quoted with embedded `'` escaped as `'\''`. Verified against
+  the real key format plus keys containing apostrophes, double quotes, `$`,
+  backticks, semicolons and globs. **Appliances deployed before this fix still
+  have the key**; remove it with `sed -i '/install-xen-orchestra deploy
+  (temporary)/d' ~/.ssh/authorized_keys` in the VM.
 
 ## [0.5.0] - 2026-09-04
 
@@ -824,7 +1046,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.0...v0.4.1

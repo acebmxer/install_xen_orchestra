@@ -164,6 +164,55 @@ password hash — are redacted along with any occurrence in its logs.
 > VM. Remove its line from that VM's `~/.ssh/authorized_keys` and delete the
 > file.
 
+**Identifying a deployed appliance.** A VM created by `--deploy` is stamped
+with where it came from, so you can tell later whether an appliance was built
+by this script or by hand. The stamp lives in the VM's `other-config`:
+
+| Key | Value |
+| --- | --- |
+| `xo_deployed_by` | `install-xen-orchestra.sh` |
+| `xo_deploy_version` | the script revision that deployed it, or `unknown` outside a git checkout |
+| `xo_deploy_date` | UTC ISO-8601 timestamp of the deploy |
+
+The VM is also tagged **`xo-deployed`** and its description is set to match.
+The tag is the part you can see without leaving Xen Orchestra: tags render as
+chips on the VM and can be filtered on in the VM list, so searching `xo-deployed`
+there lists every appliance this script deployed. `other-config` has no screen in
+XO and is reachable only through the API or `xe`.
+
+Read the keys back from the pool master:
+
+```bash
+xe vm-param-get uuid=<vm-uuid> param-name=other-config param-key=xo_deployed_by
+```
+
+Or list every appliance this script deployed:
+
+```bash
+xe vm-list params=uuid,name-label,other-config |
+  grep -B2 'xo_deployed_by: install-xen-orchestra.sh'
+```
+
+Without the stamp there is nothing conclusive to go on: XAPI writes its own
+generic `Installed via xe CLI` description for `xe vm-install`, and while the
+deploy does correct three settings on the `Other install media` scaffolding it
+builds from — `viridian=false`, `vga=std`, `videoram=8` — those are ordinary
+parameters that anyone could set by hand, so they suggest provenance without
+establishing it.
+
+VMs deployed before this stamp existed do not have it, and nothing backfills
+them. To mark one by hand, run the three `vm-param-set` commands against it:
+
+```bash
+xe vm-param-set uuid=<vm-uuid> other-config:xo_deployed_by='install-xen-orchestra.sh'
+xe vm-param-set uuid=<vm-uuid> other-config:xo_deploy_version='unknown'
+xe vm-param-set uuid=<vm-uuid> other-config:xo_deploy_date='<YYYY-MM-DDTHH:MM:SSZ>'
+xe vm-param-add uuid=<vm-uuid> param-name=tags param-key='xo-deployed'
+```
+
+Note the last one is `vm-param-add`, not `vm-param-set`: tags are a set, and
+`param-set` would discard any tags already on the VM.
+
 **Verifying the pool master.** The host password you type is sent to the pool
 master over SSH, so on the first connection to a host that is not yet in your
 `known_hosts`, the script shows the host key fingerprint and asks you to
