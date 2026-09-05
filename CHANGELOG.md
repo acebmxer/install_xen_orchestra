@@ -147,6 +147,34 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Changed
 
+- **The README's interactive menu no longer needs a horizontal scrollbar.**
+  The block was drawn at the terminal's own 129 characters, which is just past
+  what GitHub's README column can show. A repository cannot widen that column —
+  `style` attributes, `<style>` blocks and even `class` names are stripped from
+  rendered markdown, so the overflow could only be fixed in the block itself.
+  Primer sets `.container-lg` to `max-width:1012px`, and a `markdown-body pre`
+  takes 16px of padding each side at 85% of the 16px body font, which leaves
+  room for about 120 monospace characters. The block is now 118: the banner and
+  rules are redrawn to match, and the gap between the two menu columns is
+  closed from seventeen spaces to two. All eleven entries keep their full text
+  apart from two that could not fit at any gutter — "wipe & reinstall maintain
+  settings" reads "wipe & reinstall, keep settings", and "creates the VM for
+  you" reads "creates the VM". This is the README's depiction only — no menu
+  code changed, and the script still prints the full text.
+
+- **The README now shows the VM Template Library screen.** The
+  `--build-templates` section described the catalogue in prose — which
+  distributions are buildable, which are marked "Coming Soon..." — but nothing
+  showed what the operator actually sees when the option is chosen, so the
+  shape of the screen, the tick boxes and the per-template login had to be
+  inferred from the paragraph. It is now drawn as a fenced ASCII block matching
+  the one already used for the main menu, rather than as a screenshot: the same
+  content renders identically in either GitHub theme, stays searchable, and is
+  a one-line edit when a distribution moves out of "Coming Soon..." instead of
+  a re-shot binary. The note about a template already present on the pool is
+  called out beneath it, since that line only appears on a re-run and would
+  otherwise never be visible in the documented screen.
+
 - **The template menu's arrow keys now skip the "Coming Soon..." entries.** The
   cursor already opened on the first buildable row, but moving from there
   stepped through every placeholder in between — and with twelve of the

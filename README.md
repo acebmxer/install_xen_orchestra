@@ -80,26 +80,26 @@ Running without flags launches an interactive menu. All flags also work directly
 Running the script with no arguments opens a two-column menu with keyboard navigation:
 
 ```
-  ╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-  ║                                     Install Xen Orchestra from Sources Setup and Update                                     ║
-  ╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+  ╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║                               Install Xen Orchestra from Sources Setup and Update                                ║
+  ╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 
-                                 Current Script Commit : 693f4 (Branch: main)
-                                 Master Script Commit  : 693f4 (Branch: main)
-                                 Current XO Commit     : a1b2c (Branch: master)
-                               ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 commits behind
-                                 Current Node          : v24.15.0
+                           Current Script Commit : 693f4 (Branch: main)
+                           Master Script Commit  : 693f4 (Branch: main)
+                           Current XO Commit     : a1b2c (Branch: master)
+                         ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 commits behind
+                           Current Node          : v24.15.0
 
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  ▸ [ ] Install Xen Orchestra                                      [ ] Reconfigure Xen Orchestra (made changes to config)
-    [ ] Update Xen Orchestra                                       [ ] Rebuild Xen Orchestra (wipe & reinstall maintain settings)
-    [ ] Rename Sample-xo-config.cfg                                [ ] Edit xo-config.cfg
-    [ ] Install XO Proxy                                           [ ] Restore Backup
-    [ ] Deploy Xen Orchestra to a new VM (creates the VM for you)  [ ] Adjust Xen Orchestra Memory Allocation
+  ▸ [ ] Install Xen Orchestra                              [ ] Reconfigure Xen Orchestra (made changes to config)
+    [ ] Update Xen Orchestra                               [ ] Rebuild Xen Orchestra (wipe & reinstall, keep settings)
+    [ ] Rename Sample-xo-config.cfg                        [ ] Edit xo-config.cfg
+    [ ] Install XO Proxy                                   [ ] Restore Backup
+    [ ] Deploy Xen Orchestra to a new VM (creates the VM)  [ ] Adjust Xen Orchestra Memory Allocation
     [ ] VM Template Library
 
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
   Selected: 0
 
@@ -169,6 +169,39 @@ each distribution's own published cloud image:
 ```bash
 ./install-xen-orchestra.sh --build-templates
 ```
+
+The library lists every distribution in the catalog, with the login the built
+template uses:
+
+```
+  VM Template Library
+
+  Cloud-init templates built from each distribution's own published
+  image. Once built they appear in Xen Orchestra under New -> VM.
+
+      AlmaLinux 8  Coming Soon...
+      AlmaLinux 9  Coming Soon...
+      AlmaLinux 10  Coming Soon...
+      CentOS Stream 9  Coming Soon...
+      CentOS Stream 10  Coming Soon...
+  ▸ [ ] Debian 12 (Bookworm) (login: debian)
+    [ ] Debian 13 (Trixie) (login: debian)
+      Fedora 43  Coming Soon...
+      Fedora 44  Coming Soon...
+      Rocky Linux 8  Coming Soon...
+      Rocky Linux 9  Coming Soon...
+      Rocky Linux 10  Coming Soon...
+    [ ] Ubuntu 22.04 LTS (Jammy) (login: ubuntu)
+    [ ] Ubuntu 24.04 LTS (Noble) (login: ubuntu)
+    [ ] Ubuntu 26.04 LTS (Resolute) (login: ubuntu)
+
+  Selected: 0
+
+  ↑↓ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Back
+```
+
+A row that is already built on the pool says `already on this pool` beneath it,
+so a re-run is not a guess about what a build would do.
 
 Pick the templates you want and it does the rest — verifying the image against
 the origin's published checksum, installing the XCP-ng guest tools, scrubbing
