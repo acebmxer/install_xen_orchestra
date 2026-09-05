@@ -10,6 +10,351 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-05
+
+### Fixed
+
+- **The unit test job no longer fails on a missing ISO writer.** Three tests
+  that build a real cloud-init drive — the two covering per-template key and
+  account isolation, and the one building a drive twice in a row — failed in CI
+  with "could not build the cloud-init drive". The cause was not in the script:
+  `tpl_build_prep_drive` uses `genisoimage`, falling back to `xorriso`, and the
+  unit job installs neither. Every integration image installs one of the two,
+  which is why only the unit job was affected, and the three neighbouring tests
+  that inspect the function's text rather than running it kept passing — so the
+  failure looked like a regression in code that had just been changed. The unit
+  job now installs `genisoimage` alongside `bats`.
+
+- **A multi-template build no longer stalls on the second template.** This is
+  the cause of a build that printed "Building: Debian 13 (Trixie) Cloud-init"
+  and then sat with no further output, no CPU and no network activity on the
+  pool. `tpl_build_prep_drive` generated its throwaway SSH key at a fixed path
+  in the working directory, and that directory is shared by every template in a
+  run — so on the second build the key was already there. `ssh-keygen` will not
+  write over an existing key: it asks "Overwrite (y/n)?" and waits. Because the
+  command was run with `>/dev/null 2>&1`, the question was invisible, so the
+  build appeared to hang for no reason with the prompt swallowed. (With stdin
+  closed rather than a terminal it exits 1 instead, and the build silently
+  carried on and baked the *previous* template's key and preparation script
+  into this template's config drive — which for an Ubuntu template built after
+  a Debian one meant shipping Debian's user and `apt` script.) Neither failure
+  was noticed, because the exit status was never tested.
+
+  The key is now removed before it is regenerated, and both the key generation
+  and the ISO build have their results checked — as does the call to
+  `tpl_build_prep_drive` itself, which previously ignored its return value
+  entirely. A build that cannot produce its preparation drive now stops and
+  says so, rather than booting a VM with no instructions in it and waiting out
+  the full fifteen-minute timeout to report a cause that is not the real one.
+
+- **A multi-template build no longer looks like it has hung between
+  templates.** Four steps in each build ran with no output at all: the
+  "does this template already exist" check (`xe template-list`, a round trip to
+  the pool master that can take tens of seconds on a busy pool), building the
+  cloud-init preparation drive, confirming the guest agent installed, and
+  sealing the finished template. The first template hid this, because the
+  connection banner and the storage and network lines print immediately before
+  it — but on the second and later templates of a multi-template run the gap
+  falls directly after "Building: ...", so the screen sits unchanged with no
+  indication anything is happening. That is the same failure `--progress-bar`
+  already exists to prevent on the image download, and it is worse than
+  cosmetic: an operator who cannot tell a working build from a stuck one kills
+  it, and killing one halfway leaves a build VM and a multi-gigabyte disk to
+  clean up by hand. Each of those steps now announces itself before it runs, so
+  every template in a run prints the same progression as the first. Guarded by
+  a test that walks the build function and asserts each slow call is preceded
+  by output, and by one asserting the messages live in the per-template
+  function rather than the one-time setup around it — where they would appear
+  only before the first build.
+
+- **Nothing is installed onto dom0 or the operator's workstation to work around
+  a missing convenience.** Two places did, and both were wrong in the same way.
+
+  The template build offered to install `qemu-img` on the pool master with
+  `yum install --enablerepo=base`. That command should never have been written:
+  XCP-ng's documentation makes "never enable additional repositories" rule 1 of
+  its additional-packages guidance, because the update process assumes only
+  XCP-ng repositories are enabled, and CentOS and EPEL carry higher version
+  numbers than XCP-ng's own packages — so yum will overwrite core dom0 packages
+  and break the host. The remedy was more dangerous than the problem. It was
+  also unnecessary: dom0 runs QEMU to emulate device models for HVM guests, so
+  `qemu-img` is part of the base system, and it is not in XCP-ng's supported
+  extras list (`reports.xcp-ng.org/8.3/extra_installable.txt`) because it does
+  not need to be. A missing `qemu-img` now stops the build with an explanation
+  pointing at the host, noting that raw-image templates still build fine, and
+  explicitly warning against installing it from CentOS or EPEL.
+
+  Separately, `--deploy` installed `sshpass` — in one path after asking, in
+  another with no prompt at all — purely to avoid typing the pool master
+  password a second time. It saves one prompt and changes nothing else, so its
+  absence is now reported rather than fixed, and the connection is made with
+  plain `ssh`, which asks for the password itself. That branch deliberately
+  keeps stderr, since redirecting it would hide the prompt and read as a hang.
+
+  Guarded by tests that assert no `--enablerepo` appears anywhere in the script
+  and that `sshpass` is never installed, so neither can come back unnoticed.
+
+- **The image conversion no longer understates the expanded disk size.** The
+  progress line divided the virtual size straight to GiB in integer
+  arithmetic, so Ubuntu 24.04's 3,758,096,384-byte disk was reported as
+  "3 GiB expanded" rather than 3.5 GiB. Nothing downstream reads the figure —
+  the space check works in MiB and was unaffected — but it is the number
+  someone reads back when a build runs out of room mid-conversion, and
+  rounding it down is the wrong direction for that.
+
+  Now reported to one decimal place, rounded rather than truncated. The first
+  fix kept the truncation one digit further along, which had the same fault in
+  miniature: Ubuntu 22.04 is 2.199 GiB and printed as "2.1" while `qemu-img`
+  and every other tool says 2.2. Rounding is applied to tenths before the value
+  is split into its whole and decimal parts, so a carry works — 2.99 GiB prints
+  as "3.0" rather than the "2.10" that rounding each part separately would
+  give. Both were caught in real builds on a live pool that otherwise completed
+  end to end.
+
+- **A template test no longer fails on Ubuntu 22.04's older bats.** "the debian
+  prep script is valid shell" wrote its scratch file to `$BATS_TEST_TMPDIR`, a
+  variable introduced in Bats 1.4. Ubuntu 22.04 ships Bats 1.2.1, where it is
+  simply unset — and because the suite runs under `set -u` that is a fatal
+  "unbound variable" rather than an empty path, so the test failed outright on
+  that image while passing on every other one, which carries Bats 1.8 or newer.
+  It had never worked there: the test and the Ubuntu 22.04 image arrived in the
+  same commit, and the failure stayed hidden only because the image was missing
+  the tools that let the suite get that far. `tests/unit/test_vm_templates.bats`
+  now creates its own scratch directory with `mktemp -d` in `setup()` and
+  removes it in `teardown()` — the pattern the other three unit test files
+  already use, and one that behaves identically on every bats version.
+  Verified across the full range in the integration images: Bats 1.2.1
+  (Ubuntu 22.04), 1.8.0 (AlmaLinux 9), 1.11.1 (Debian 13) and 1.13.0
+  (Fedora, Ubuntu 26.04) all run 230 of 230 with no failures and nothing
+  skipped.
+
+- **The integration test images now install the tools the unit suite needs, so
+  it actually runs inside them instead of skipping most of itself.** All ten
+  `tests/integration/Dockerfile.*` images installed `bats` but not `openssl`,
+  `genisoimage` or `ssh-keygen`. The visible symptom was two failing
+  password-validation tests: `deploy_hash_password` needs `openssl passwd -6`
+  (or `mkpasswd`) to hash the admin password on the machine running `--deploy`,
+  so without it the function bailed early with "hashing one needs openssl or
+  mkpasswd" rather than reaching the missing-password and minimum-length errors
+  the tests assert on.
+
+  The larger problem was invisible. The deploy tests guard themselves with
+  `command -v ssh-keygen || skip` and an equivalent check for an ISO writer, so
+  in these images **22 of them skipped and reported green without running** —
+  including the tests covering config-drive generation, password hashing and
+  SSH key handling. A skip is not a pass, and an image that skips two dozen
+  tests is not the test environment it claims to be.
+
+  All ten images now install `openssl`, an ISO writer, an SSH client and
+  PyYAML (`genisoimage`, `openssh-client` and `python3-yaml` on Debian and
+  Ubuntu; `xorriso`, which provides a `genisoimage` binary on EL9,
+  `openssh-clients` and `python3-pyyaml` on the RPM images). PyYAML backs a
+  test that parses the generated cloud-init user-data, which had been skipping
+  everywhere. The four RPM images additionally needed `diffutils`: unlike the
+  Debian base images they ship no `diff`, which two config-comparison tests
+  call directly, and those failed with status 127 once they stopped being
+  skipped. Verified by rebuilding and running the full unit suite inside the
+  images: AlmaLinux 9 goes from 2 failures and 22 skips to **230 of 230
+  passing with nothing skipped**. This did not break CI, which runs the unit
+  suite on the Ubuntu runner rather than in these images.
+
+### Changed
+
+- **The README's interactive menu no longer needs a horizontal scrollbar.**
+  The block was drawn at the terminal's own 129 characters, which is just past
+  what GitHub's README column can show. A repository cannot widen that column —
+  `style` attributes, `<style>` blocks and even `class` names are stripped from
+  rendered markdown, so the overflow could only be fixed in the block itself.
+  Primer sets `.container-lg` to `max-width:1012px`, and a `markdown-body pre`
+  takes 16px of padding each side at 85% of the 16px body font, which leaves
+  room for about 120 monospace characters. The block is now 118: the banner and
+  rules are redrawn to match, and the gap between the two menu columns is
+  closed from seventeen spaces to two. All eleven entries keep their full text
+  apart from two that could not fit at any gutter — "wipe & reinstall maintain
+  settings" reads "wipe & reinstall, keep settings", and "creates the VM for
+  you" reads "creates the VM". This is the README's depiction only — no menu
+  code changed, and the script still prints the full text.
+
+- **The README now shows the VM Template Library screen.** The
+  `--build-templates` section described the catalogue in prose — which
+  distributions are buildable, which are marked "Coming Soon..." — but nothing
+  showed what the operator actually sees when the option is chosen, so the
+  shape of the screen, the tick boxes and the per-template login had to be
+  inferred from the paragraph. It is now drawn as a fenced ASCII block matching
+  the one already used for the main menu, rather than as a screenshot: the same
+  content renders identically in either GitHub theme, stays searchable, and is
+  a one-line edit when a distribution moves out of "Coming Soon..." instead of
+  a re-shot binary. The note about a template already present on the pool is
+  called out beneath it, since that line only appears on a re-run and would
+  otherwise never be visible in the documented screen.
+
+- **The template menu's arrow keys now skip the "Coming Soon..." entries.** The
+  cursor already opened on the first buildable row, but moving from there
+  stepped through every placeholder in between — and with twelve of the
+  fifteen catalogue entries currently unbuildable, reaching Ubuntu 24.04 from
+  Debian 13 meant six presses through rows where SPACE does nothing. Navigation
+  now moves between the entries that can actually be selected, wrapping in both
+  directions, so the three buildable templates are three presses apart. The
+  skip is bounded by the row count rather than by finding a match, so a
+  catalogue of nothing but placeholders returns the cursor unmoved instead of
+  spinning forever. The placeholder rows also no longer carry a cursor-pointer
+  branch, which had become unreachable.
+
+- **`--deploy` now boots the appliance under UEFI instead of BIOS.** The
+  deployed VM had been coming up as a BIOS guest for no better reason than
+  nothing ever setting the parameter: XAPI reads an absent
+  `HVM-boot-params:firmware` as BIOS, and `deploy_create_vm` set the boot
+  *policy* — `HVM-boot-policy='BIOS order'`, which is the string every HVM
+  guest requires regardless of firmware and is not the firmware selector — and
+  then never touched the firmware itself. The template builder had been getting
+  this right since it was written, so a VM deployed by `--deploy` and a VM
+  cloned from a template built by `--build-templates` came out of the same
+  script with different firmware. The deploy path now makes the same decision
+  the same way, by calling `tpl_disk_supports_uefi` on the disk it just
+  imported: UEFI when the image carries an EFI system partition, BIOS when it
+  does not. It is probed rather than hardcoded because `XO_DEPLOY_IMAGE_URL`
+  can point the deploy at any raw image, and UEFI firmware with no bootloader
+  to load does not fall back to BIOS — it fails to boot outright. The step sits
+  between the image import and `vm-start`, which is the only window that works:
+  an empty VDI has no partition table to read, and firmware cannot change under
+  a running domain. The stock Debian cloud images the deploy defaults to carry
+  both an ESP and a BIOS boot partition, so they take the UEFI branch and an
+  operator who wants BIOS can still select it. `tpl_attach_tools_iso` grew a VM
+  uuid parameter so both paths can share it rather than keeping two copies;
+  its behaviour for the template builder is unchanged.
+
+### Added
+
+- **Ubuntu 22.04 LTS (Jammy) and 26.04 LTS (Resolute) are now buildable too.**
+  They were held back as placeholders only until the Ubuntu code path was proven
+  on a real pool, which 24.04 has now done — build, qcow2 conversion, boot under
+  both firmware modes, console, and a guest agent reporting an IP in XO. Both
+  new entries share that path and the same `apt` preparation script, so this is
+  a catalogue change rather than new code.
+
+  Each image was verified rather than assumed to match 24.04: the published
+  SHA256 checksum confirmed against the downloaded file, qcow2 confirmed from
+  the magic bytes rather than the `.img` name, a GPT carrying both an EFI system
+  partition and a BIOS boot partition (so the firmware probe publishes UEFI and
+  BIOS still works), and a `-generic` kernel rather than a `-cloud` one — the
+  latter being the trap that renders a UEFI console as scrambled colour.
+  22.04 carries `vmlinuz-5.15.0-190-generic` and 26.04 `vmlinuz-7.0.0-30-generic`.
+
+  That check earned its keep on the disk size: 22.04's image expands to only
+  2.2 GiB, so it keeps the 4 GiB default, while 26.04 expands to the same
+  3.5 GiB as 24.04 and declares 6 GiB. Copying 24.04's figure across the family
+  would have inflated every VM cloned from a 22.04 template for no reason —
+  which is exactly what the per-row disk field exists to avoid.
+
+  Ubuntu 22.04's free security maintenance ends on 2027-04-30 and its catalogue
+  entry is still scheduled for removal on 2027-06-01; it is buildable until
+  then.
+
+- **`--build-templates` can now build an Ubuntu 24.04 LTS (Noble) template, and
+  can import cloud images that are not raw.** Ubuntu had been listed in the menu
+  as **Coming Soon...** since the template library landed, blocked on three
+  things. Two of them were never Ubuntu-specific and are now solved for every
+  image:
+
+  **The image format.** Debian publishes `raw`; almost everyone else publishes
+  qcow2. The build imports straight into a VDI over XAPI's `/import_raw_vdi`,
+  which takes raw bytes and nothing else — so a qcow2 sent to it is accepted
+  without complaint and written to the disk as a qcow2 *file*, producing a
+  template whose VMs simply do not boot with nothing reporting an error.
+  `deploy_import_vdi_staged` now converts a non-raw image to raw with
+  `qemu-img` on the pool master, after the checksum has been verified and
+  before the import. This is decided by `deploy_needs_conversion`, which treats
+  anything that is not `.raw` as needing conversion — deliberately including
+  `.img`, because Ubuntu's cloud images carry that extension and are qcow2
+  (verified from their magic bytes, `QFI\xfb`, not inferred from the name). An
+  unknown extension converts rather than assuming raw: `qemu-img` detects the
+  real format itself, so converting an already-raw image costs a copy, while
+  guessing wrong costs a template that does not boot.
+
+  Two consequences follow from that and are handled explicitly. A non-raw image
+  **cannot use the streaming fallback** — there is nothing to convert in a pipe
+  — so `deploy_import_vdi_from_url` now refuses to stream one and says why,
+  rather than importing bytes that will not boot when `/var/tmp` is short. And
+  the free-space check now budgets for the *expanded* disk rather than the
+  download: a qcow2 is compressed and sparse, so Ubuntu 24.04 is 596 MiB on the
+  wire and 3.5 GiB once converted, and budgeting only for what arrives would
+  pass the check and then fill `/var/tmp` mid-conversion.
+
+  **The checksum format.** Verification had `SHA512SUMS` hardcoded, which is
+  Debian's. The file and the algorithm are now chosen from the image's own URL
+  by `deploy_checksum_source`, and the digest length follows from it — 64 hex
+  characters for SHA-256, 128 for SHA-512 — so Ubuntu's `SHA256SUMS` is read
+  and checked with `sha256sum` while Debian's behaviour is unchanged. Both are
+  in coreutils' `<hash>  <file>` shape, so one parse serves both; Ubuntu marks
+  every entry with the binary-mode `*`, which the existing parse already
+  handled. An unrecognised origin still falls back to `SHA512SUMS`, so it
+  attempts verification and warns rather than silently skipping it. A pinned
+  `XO_DEPLOY_IMAGE_SHA512` stays SHA-512 whatever the origin publishes, since
+  the variable names its own algorithm. The RHEL family and Fedora publish
+  `SHA256 (file) = hash`, a different parse that is still unhandled and is part
+  of why those entries remain placeholders.
+
+  **The third, guest preparation, turned out not to be a blocker for Ubuntu.**
+  The `apt`-based script is shared unchanged — confirmed rather than assumed:
+  Ubuntu packages `xe-guest-utilities` (which Debian 13 does not), so the guest
+  tools install from the ISO with a working `apt` fallback behind it. The RHEL
+  family and Fedora still need a `dnf` equivalent, which is now the main thing
+  standing between them and a working entry.
+
+  Two supporting changes came with this. The catalogue gained a **seventh
+  field, an optional per-row disk size**: the VDI has to clear the image's
+  *virtual* size, and Ubuntu's 3.5 GiB leaves almost no margin against the
+  4 GiB default. Raising that default for everyone was the wrong fix, because a
+  clone starts at its template's size, so it would have inflated every VM built
+  from every template; Ubuntu declares 6 GiB in its own row instead and the
+  Debian rows are untouched. And **`qemu-img` is checked for on the pool master
+  before anything is downloaded**, offering to install it from XCP-ng's base
+  repository (`yum install --enablerepo=base -y qemu-img`) — dom0 is minimal
+  and does not always carry it, and discovering that after a multi-gigabyte
+  download would report as a conversion failure rather than a missing tool.
+
+  Ubuntu 22.04 and 26.04 stay listed as **Coming Soon...** deliberately: they
+  share this code path entirely, and are held back only until 24.04 is proven
+  on a real pool. Verified against the live upstream images while building
+  this: all three publish qcow2 under `.img`, Ubuntu 24.04's published
+  `SHA256SUMS` digest matches the downloaded image, it converts to a 3.5 GiB
+  raw disk carrying a GPT with both an EFI system partition and a BIOS boot
+  partition (so the existing firmware probe publishes it as UEFI and BIOS still
+  works), and it ships `vmlinuz-6.8.0-138-generic` — a full kernel, not a
+  trimmed cloud one, so it avoids the scrambled-console trap that makes the
+  `genericcloud` images unusable under UEFI. The unit suite covers the new
+  behaviour with 23 further tests, 254 passing in total.
+
+- **`--deploy` now installs the XCP-ng guest tools into the appliance.** A
+  deployed VM had no guest agent at all, so the Xen Orchestra it was itself
+  hosting could not report its IP address, memory or disk usage, and could not
+  shut it down cleanly — the VM ran perfectly while appearing half-blank in the
+  very interface it served. The pool's `guest-tools.iso` is now attached to a
+  CD drive on device 3 (free in both paths, which use 0 for the root disk and 1
+  for the config drive) and installed on the first boot by a
+  `/usr/local/sbin/xo-install-guest-tools.sh` script written through cloud-init
+  `write_files`. It comes from the ISO rather than `apt` for the reason the
+  template builder already documents: Debian 13 — the deploy default — ships no
+  `xe-guest-utilities` package, and a failed package install does not stop
+  cloud-init, so an apt-only path yields a VM that looks fine and never reports
+  an IP. The `apt` route is kept as a fallback for releases that do package the
+  agent. Unlike the template builder, a pool with no tools ISO is a warning
+  rather than a fatal error: a template without an agent is a defect stamped
+  into every clone, whereas the appliance still installs and serves XO, and
+  aborting a deploy after the 3 GB image download would cost far more than the
+  missing telemetry. The in-guest script tolerates the disc being absent
+  entirely — the config drive is built before the VM exists, so it cannot know
+  whether there was an ISO to attach — and retries the drive for thirty seconds
+  before giving up, since it may not be ready the moment cloud-init reaches it.
+  Once the install finishes, the ISO is ejected alongside the config drive so
+  clones do not inherit a mounted tools disc; the VDI itself is left alone,
+  because it is the pool's shared copy and destroying it would break guest
+  tools installs pool-wide. Verified on a Debian 13 container: the generated
+  user-data passes `cloud-init schema` as valid, and the extracted guest script
+  passes both `bash -n` and `shellcheck`. Eleven unit tests cover the two
+  changes, including the ordering constraint on the firmware probe and the
+  eject-never-destroy rule for the shared ISO.
+
 ## [0.6.0] - 2026-09-04
 
 ### Added
@@ -1046,7 +1391,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...v0.4.2

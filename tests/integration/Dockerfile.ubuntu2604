@@ -2,6 +2,7 @@ FROM ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo git curl bash bats shellcheck ca-certificates \
+    openssl genisoimage openssh-client python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user with passwordless sudo

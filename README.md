@@ -7,7 +7,7 @@
 [![Issues](https://img.shields.io/github/issues/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/issues)
 [![Stars](https://img.shields.io/github/stars/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/stargazers)
 [![Forks](https://img.shields.io/github/forks/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/forks)
-[![Unique cloners](https://img.shields.io/badge/unique%20cloners-57-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
+[![Unique cloners](https://img.shields.io/badge/unique%20cloners-65-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
 [![Tests](https://img.shields.io/badge/tests-118%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
@@ -80,26 +80,26 @@ Running without flags launches an interactive menu. All flags also work directly
 Running the script with no arguments opens a two-column menu with keyboard navigation:
 
 ```
-  ╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-  ║                                     Install Xen Orchestra from Sources Setup and Update                                     ║
-  ╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+  ╔═══════════════════════════════════════════════════════════════════════════════════╗
+  ║                Install Xen Orchestra from Sources Setup and Update                ║
+  ╚═══════════════════════════════════════════════════════════════════════════════════╝
 
-                                 Current Script Commit : 693f4 (Branch: main)
-                                 Master Script Commit  : 693f4 (Branch: main)
-                                 Current XO Commit     : a1b2c (Branch: master)
-                               ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 commits behind
-                                 Current Node          : v24.15.0
+                  Current Script Commit : 693f4 (Branch: main)
+                  Master Script Commit  : 693f4 (Branch: main)
+                  Current XO Commit     : a1b2c (Branch: master)
+                ⚠ Master XO Commit      : d4e5f (Branch: master) - 12 behind
+                  Current Node          : v24.15.0
 
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────────────────────────────
 
-  ▸ [ ] Install Xen Orchestra                                      [ ] Reconfigure Xen Orchestra (made changes to config)
-    [ ] Update Xen Orchestra                                       [ ] Rebuild Xen Orchestra (wipe & reinstall maintain settings)
-    [ ] Rename Sample-xo-config.cfg                                [ ] Edit xo-config.cfg
-    [ ] Install XO Proxy                                           [ ] Restore Backup
-    [ ] Deploy Xen Orchestra to a new VM (creates the VM for you)  [ ] Adjust Xen Orchestra Memory Allocation
+  ▸ [ ] Install Xen Orchestra                   [ ] Reconfigure XO (config changed)
+    [ ] Update Xen Orchestra                    [ ] Rebuild XO (wipe, keep settings)
+    [ ] Rename Sample-xo-config.cfg             [ ] Edit xo-config.cfg
+    [ ] Install XO Proxy                        [ ] Restore Backup
+    [ ] Deploy XO to a new VM (creates VM)      [ ] Adjust XO Memory Allocation
     [ ] VM Template Library
 
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────────────────────────────
 
   Selected: 0
 
@@ -170,19 +170,52 @@ each distribution's own published cloud image:
 ./install-xen-orchestra.sh --build-templates
 ```
 
+The library lists every distribution in the catalog, with the login the built
+template uses:
+
+```
+  VM Template Library
+
+  Cloud-init templates built from each distribution's own published
+  image. Once built they appear in Xen Orchestra under New -> VM.
+
+      AlmaLinux 8  Coming Soon...
+      AlmaLinux 9  Coming Soon...
+      AlmaLinux 10  Coming Soon...
+      CentOS Stream 9  Coming Soon...
+      CentOS Stream 10  Coming Soon...
+  ▸ [ ] Debian 12 (Bookworm) (login: debian)
+    [ ] Debian 13 (Trixie) (login: debian)
+      Fedora 43  Coming Soon...
+      Fedora 44  Coming Soon...
+      Rocky Linux 8  Coming Soon...
+      Rocky Linux 9  Coming Soon...
+      Rocky Linux 10  Coming Soon...
+    [ ] Ubuntu 22.04 LTS (Jammy) (login: ubuntu)
+    [ ] Ubuntu 24.04 LTS (Noble) (login: ubuntu)
+    [ ] Ubuntu 26.04 LTS (Resolute) (login: ubuntu)
+
+  Selected: 0
+
+  ↑↓ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Back
+```
+
+A row that is already built on the pool says `already on this pool` beneath it,
+so a re-run is not a guess about what a build would do.
+
 Pick the templates you want and it does the rest — verifying the image against
 the origin's published checksum, installing the XCP-ng guest tools, scrubbing
 the machine identity a clone must not inherit, and sealing the result. Once
 built they appear in Xen Orchestra under **New → VM**, alongside any Hub
 templates you already have.
 
-Debian 12 (Bookworm) and Debian 13 (Trixie) are buildable today. AlmaLinux,
-CentOS Stream, Fedora, Rocky Linux and Ubuntu are listed in the menu as
-**Coming Soon...** — each names a published cloud image, and what is missing is
-the qcow2 import path rather than the image. The full
-walkthrough — what each template contains, how the boot firmware is chosen,
-requirements, and what to do when a build fails — is in
-[docs/templates.md](docs/templates.md).
+Debian 12 (Bookworm), Debian 13 (Trixie) and the three Ubuntu LTS releases —
+22.04 (Jammy), 24.04 (Noble) and 26.04 (Resolute) — are buildable today.
+AlmaLinux, CentOS Stream, Fedora and Rocky Linux are listed in the menu as
+**Coming Soon...**: each names a published cloud image, and what is missing is a
+`dnf` preparation script rather than the image. The full walkthrough — what each
+template contains, how the boot firmware is chosen, requirements, and what to do
+when a build fails — is in [docs/templates.md](docs/templates.md).
 
 ## Configuration
 
