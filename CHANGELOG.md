@@ -10,7 +10,104 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **Ubuntu 22.04 and 26.04 LTS join the CI integration matrix.** Ubuntu was
+  represented by 24.04 alone, so the two releases at either end of the
+  supported range — the one being deprecated and the newest one — were claimed
+  as supported without anything checking they still ran. Both now build and run
+  the integration smoke tests on every push, from
+  `tests/integration/Dockerfile.ubuntu2204` and `Dockerfile.ubuntu2604`, each
+  differing from the existing 24.04 file only in its `FROM` line. The 22.04
+  entry carries a comment and a matrix label naming its 2027-06-01 removal
+  date, the same way Debian 11's does, so the entry and its Dockerfile are
+  deleted together when that date arrives. Verified locally before landing:
+  both images build, all four smoke tests pass on each, and the end-of-life
+  gate was exercised against a real Ubuntu 22.04 container — warning and
+  continuing today, refusing with the correct upgrade advice past the cutoff —
+  with 24.04 and 26.04 silent. This takes the tested-distribution count from
+  eight to ten, and the README badge with it.
+
+- **The template menu now lists the planned distributions as "Coming Soon...",
+  instead of showing only what is buildable today.** `--build-templates`
+  offered Debian and nothing else, so the question it could not answer was
+  whether a given distribution was ever going to appear — and the only way to
+  find out was to read the catalogue in the source. Thirteen planned entries
+  are now listed alongside the two real ones: AlmaLinux 8/9/10, CentOS Stream
+  9/10, Fedora 43/44, Rocky Linux 8/9/10, and Ubuntu 22.04/24.04/26.04 LTS.
+  Every one of those URLs was checked against its origin and returns a live
+  image with a published checksum beside it, so each placeholder names
+  something real that is waiting on code rather than on an upstream release.
+  Ubuntu is the LTS line only, since an interim release's nine-month lifespan
+  would expire before VMs cloned from such a template were retired.
+  A placeholder is marked in `TPL_CATALOG` by a prep function of `-` — the one
+  field a buildable row cannot do without — and `tpl_is_placeholder()` is the
+  single place that is decided. Such a row draws with no tick box and cannot be
+  selected, and `tpl_build_one()` refuses one outright as a second line of
+  defence, so a selection arriving from anywhere other than the menu still
+  cannot start a download the rest of the build could not use. The menu's
+  cursor now opens on the first *buildable* row rather than the first row,
+  because the catalogue sorts alphabetically and AlmaLinux would otherwise take
+  the cursor on a line where the space bar does nothing.
+  What stands between these and real entries is three things shared across all
+  of them, now written down in the catalogue comment and in
+  `docs/templates.md`: every non-Debian origin publishes qcow2 rather than raw,
+  and the disk import writes the file into the VDI verbatim; the checksum
+  reader understands only Debian's `SHA512SUMS` layout, where Ubuntu uses
+  `SHA256SUMS` and the RHEL family and Fedora use `SHA256 (file) = hash`; and
+  the preparation script is `apt`-only, so the RHEL family and Fedora each need
+  a `dnf` equivalent.
+
+- **A Debian 12 (Bookworm) VM template, built by exactly the same path as the
+  Debian 13 one.** `--build-templates` previously offered a single entry, so a
+  pool that wanted a Bookworm guest — to match an existing fleet, or because an
+  application is not yet validated on Trixie — had no route to one short of
+  building the VM by hand. The template catalogue was already written as a table
+  of one row per distribution, with every consumer looping over it rather than
+  naming a row, so this is a one-line addition to `TPL_CATALOG` and no change at
+  all to the build: the same `tpl_prep_debian` prep script, the same guest-tools
+  install from `guest-tools.iso`, the same identity scrub, the same sealing, and
+  the same firmware decision read from the imported disk rather than declared in
+  the table. The image is `debian-12-generic-amd64.raw` from `cloud.debian.org`
+  — the `generic` variant, not `genericcloud`, for the same reason Debian 13
+  uses it: the cloud kernel omits the framebuffer drivers a graphical console
+  needs and produces a VM that works perfectly while rendering as scrambled
+  colour in XO. Checksums stay unpinned, as `tpl_verify_checksum` fetches the
+  `SHA512SUMS` published beside whichever image the row names. The multi-select
+  template menu sizes itself from the catalogue, so both entries appear with no
+  menu change, and either or both can be built in one run.
+
 ### Deprecated
+
+- **Ubuntu 22.04 LTS (Jammy) support is deprecated and will be removed on
+  2027-06-01.** Free security maintenance for 22.04 ends on 2027-04-30; past
+  that date updates require a paid Ubuntu Pro subscription, and this installer
+  should not imply a security posture that most operators running a stock
+  22.04 do not actually have. Canonical's own `meta-release` marks 22.04
+  supported until 2032, but that figure counts ESM, which is why the date here
+  is taken from the end of free support rather than from that flag. The staging
+  matches Debian 11's: until 2027-06-01 a run on 22.04 warns and proceeds
+  exactly as before, and from that date it refuses and exits 1, pointing at
+  24.04 or 26.04, with `--allow-eol-distro` still available for operators who
+  accept an untested configuration. **Ubuntu 24.04 and 26.04 are unaffected**,
+  verified silent past the cutoff. The template catalogue's `ubuntu2204` row
+  carries the same date, so the planned template and the install target retire
+  together.
+
+- **The end-of-life gate is now a table rather than one distribution's special
+  case.** `check_eol_distro()` was written around Debian 11 specifically —
+  hardcoded version test, hardcoded messages, three `XO_DEBIAN11_*` constants —
+  so adding a second deprecation would have meant either a duplicated function
+  body or a second function that could drift from the first. The dates, display
+  names and upgrade advice now live in an `XO_EOL_DISTROS` array, one row per
+  release, and the function loops over it; the message wording, the override
+  behaviour and the `YYYYMMDD` comparison against the local clock are all
+  unchanged. Debian 11's behaviour was re-verified at both sides of its own
+  cutoff and is identical. The gate now has test coverage it previously had
+  none of — 15 tests across the table's shape, both boundary dates for each
+  entry, the override, major-version matching against point releases such as
+  `22.04.5`, near-miss versions that must not match, and the wrong-clock
+  fallback that degrades to a warning rather than locking an operator out.
 
 - **Debian 11 (Bullseye) support is deprecated and will be removed on
   2026-10-01.** Debian 11 left Debian LTS on 2026-08-31 and receives no further

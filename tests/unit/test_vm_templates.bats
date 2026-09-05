@@ -24,23 +24,74 @@ setup() {
     done
 }
 
-@test "every catalogue row names a prep function that exists" {
+@test "every buildable row names a prep function that exists" {
     local row fn
     for row in "${TPL_CATALOG[@]}"; do
+        tpl_is_placeholder "$row" && continue
         fn=$(tpl_field "$row" 6)
         declare -F "$fn" > /dev/null
     done
 }
 
-@test "every catalogue image URL is a raw image over https" {
+@test "every buildable image URL is a raw image over https" {
     local row url
     for row in "${TPL_CATALOG[@]}"; do
+        tpl_is_placeholder "$row" && continue
         url=$(tpl_field "$row" 4)
         [[ "$url" =~ ^https:// ]]
         # .raw specifically: XAPI imports raw natively, and disk.import rejects
         # qcow2 from a URL, so a .qcow2 here would fail only at build time.
         [[ "$url" =~ \.raw$ ]]
     done
+}
+
+# --- placeholders ----------------------------------------------------------
+#
+# A placeholder is a planned template with no build behind it. It must be
+# visible and inert: the danger is one silently becoming selectable, since the
+# rest of the build would then download an image it cannot use.
+
+@test "a placeholder is identified by its prep function, a real row is not" {
+    tpl_is_placeholder "x|X|x|https://e/x.qcow2|u|-"
+    ! tpl_is_placeholder "x|X|x|https://e/x.raw|u|tpl_prep_debian"
+}
+
+@test "every placeholder URL is https and carries a published image" {
+    local row url
+    for row in "${TPL_CATALOG[@]}"; do
+        tpl_is_placeholder "$row" || continue
+        url=$(tpl_field "$row" 4)
+        [[ "$url" =~ ^https:// ]]
+        # Not .raw -- these are the qcow2 origins the import cannot yet take,
+        # which is the reason they are placeholders rather than rows.
+        [[ "$url" =~ \.(qcow2|img)$ ]]
+    done
+}
+
+@test "every placeholder still has all six fields and a display name" {
+    local row
+    for row in "${TPL_CATALOG[@]}"; do
+        tpl_is_placeholder "$row" || continue
+        [ "$(awk -F'|' '{print NF}' <<< "$row")" -eq 6 ]
+        [ -n "$(tpl_field "$row" 2)" ]
+    done
+}
+
+@test "the build refuses a placeholder rather than downloading its image" {
+    run tpl_build_one "nope|Not Ready|x|https://e/x.qcow2|u|-"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Coming Soon"* ]]
+}
+
+@test "the catalogue is sorted, so the menu draws in order" {
+    local row keys
+    keys=""
+    for row in "${TPL_CATALOG[@]}"; do
+        keys+="$(tpl_field "$row" 1)"$'\n'
+    done
+    # -V compares embedded numbers numerically, so rockylinux9 sorts before
+    # rockylinux10 the way the menu should read.
+    [ "$keys" = "$(sort -V <<< "$keys" | grep .)"$'\n' ]
 }
 
 @test "catalogue keys are unique" {

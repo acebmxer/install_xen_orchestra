@@ -677,72 +677,94 @@ detect_os() {
 
 # End-of-life distribution policy.
 #
-# Debian 11 (Bullseye) left Debian LTS on 2026-08-31 and receives no further
-# security updates. This installer stops supporting it on 2026-10-01: until
-# that date a run on Bullseye warns and continues, and from that date it stops
-# unless the operator passes --allow-eol-distro.
+# Distributions whose support is ending, and when this installer stops
+# accepting them. Each row is:
+#
+#   ID|major version|display name|upstream EOL date|removal date|upgrade advice
+#
+# Before the removal date a run warns and continues; from that date it refuses
+# unless the operator passes --allow-eol-distro. Staging it this way means
+# nobody running the release today finds their install broken without notice.
 #
 # The cutoff is compared as a plain YYYYMMDD integer against the local clock,
 # so a machine with a badly wrong date degrades to the warning rather than to a
-# hard stop. Both dates are named here so there is one place to edit when this
-# whole block is deleted after the removal lands.
-XO_DEBIAN11_EOL_DATE="2026-08-31"
-XO_DEBIAN11_REMOVAL_DATE="2026-10-01"
-XO_DEBIAN11_REMOVAL_STAMP="20261001"
+# hard stop.
+#
+# Ubuntu is dated from the end of its *free* five-year maintenance, not from
+# ESM. Canonical's meta-release marks a release supported for as long as
+# extended maintenance runs, which for 22.04 is 2032 -- but ESM is a paid
+# Ubuntu Pro subscription, so treating it as supported would have this
+# installer promise a security posture most operators do not actually have.
+# The removal date is a month past the free-support end, matching the grace
+# Debian 11 was given between its own EOL and removal.
+#
+# A row is deleted once its removal has landed and the release is genuinely
+# gone; the dates live here so that is one edit rather than several.
+XO_EOL_DISTROS=(
+    "debian|11|Debian 11 (Bullseye)|2026-08-31|2026-10-01|Upgrade to Debian 12 or Debian 13."
+    "ubuntu|22|Ubuntu 22.04 LTS (Jammy)|2027-04-30|2027-06-01|Upgrade to Ubuntu 24.04 LTS or Ubuntu 26.04 LTS."
+)
 
 # Warn on, or refuse to run on, a distribution whose support has been dropped.
 # Called from install_dependencies() after detect_os() has populated OS_ID and
 # OS_VERSION_ID. Returns 0 when the run may continue; exits 1 when it may not.
 check_eol_distro() {
-    [[ "$OS_ID" == "debian" && "${OS_VERSION_ID%%.*}" == "11" ]] || return 0
-
-    local today
+    local row id major display eol removal advice stamp today
     today="$(date +%Y%m%d 2>/dev/null || echo 00000000)"
 
-    if (( 10#$today < 10#$XO_DEBIAN11_REMOVAL_STAMP )); then
-        log_warning "=============================================="
-        log_warning "Debian 11 (Bullseye) reached end-of-life on ${XO_DEBIAN11_EOL_DATE}"
-        log_warning "and no longer receives security updates."
-        log_warning ""
-        log_warning "Support for Debian 11 is being removed from this"
-        log_warning "installer on ${XO_DEBIAN11_REMOVAL_DATE}. After that date this"
-        log_warning "script will refuse to run on Debian 11."
-        log_warning ""
-        log_warning "Upgrade to Debian 12 or Debian 13 before then."
-        log_warning "=============================================="
-        return 0
-    fi
+    for row in "${XO_EOL_DISTROS[@]}"; do
+        IFS='|' read -r id major display eol removal advice <<< "$row"
+        [[ "$OS_ID" == "$id" && "${OS_VERSION_ID%%.*}" == "$major" ]] || continue
 
-    # Past the cutoff. With the override the run continues, so say so without
-    # printing the full refusal and telling the operator to pass a flag they
-    # have already passed.
-    if [[ "$ALLOW_EOL_DISTRO" == true ]]; then
-        log_warning "=============================================="
-        log_warning "Debian 11 (Bullseye) is no longer supported."
-        log_warning "It reached end-of-life on ${XO_DEBIAN11_EOL_DATE} and support was"
-        log_warning "removed from this installer on ${XO_DEBIAN11_REMOVAL_DATE}."
-        log_warning ""
-        log_warning "--allow-eol-distro given; continuing anyway. This"
-        log_warning "configuration is untested and unsupported."
-        log_warning "=============================================="
-        return 0
-    fi
+        stamp="${removal//-/}"
 
-    log_error "=============================================="
-    log_error "Debian 11 (Bullseye) is no longer supported."
-    log_error ""
-    log_error "Debian 11 reached end-of-life on ${XO_DEBIAN11_EOL_DATE} and support"
-    log_error "was removed from this installer on ${XO_DEBIAN11_REMOVAL_DATE}."
-    log_error "It is no longer tested, and Xen Orchestra's own"
-    log_error "dependencies are unlikely to install on it."
-    log_error ""
-    log_error "Upgrade to Debian 12 or Debian 13."
-    log_error ""
-    log_error "To proceed anyway, at your own risk, re-run with:"
-    log_error "  --allow-eol-distro"
-    log_error "=============================================="
+        if (( 10#$today < 10#$stamp )); then
+            log_warning "=============================================="
+            log_warning "${display} reaches end-of-life on ${eol}"
+            log_warning "and will no longer receive security updates."
+            log_warning ""
+            log_warning "Support for it is being removed from this"
+            log_warning "installer on ${removal}. After that date this"
+            log_warning "script will refuse to run on it."
+            log_warning ""
+            log_warning "${advice}"
+            log_warning "=============================================="
+            return 0
+        fi
 
-    exit 1
+        # Past the cutoff. With the override the run continues, so say so
+        # without printing the full refusal and telling the operator to pass a
+        # flag they have already passed.
+        if [[ "$ALLOW_EOL_DISTRO" == true ]]; then
+            log_warning "=============================================="
+            log_warning "${display} is no longer supported."
+            log_warning "It reached end-of-life on ${eol} and support was"
+            log_warning "removed from this installer on ${removal}."
+            log_warning ""
+            log_warning "--allow-eol-distro given; continuing anyway. This"
+            log_warning "configuration is untested and unsupported."
+            log_warning "=============================================="
+            return 0
+        fi
+
+        log_error "=============================================="
+        log_error "${display} is no longer supported."
+        log_error ""
+        log_error "It reached end-of-life on ${eol} and support"
+        log_error "was removed from this installer on ${removal}."
+        log_error "It is no longer tested, and Xen Orchestra's own"
+        log_error "dependencies are unlikely to install on it."
+        log_error ""
+        log_error "${advice}"
+        log_error ""
+        log_error "To proceed anyway, at your own risk, re-run with:"
+        log_error "  --allow-eol-distro"
+        log_error "=============================================="
+
+        exit 1
+    done
+
+    return 0
 }
 
 # Install system dependencies
@@ -6831,6 +6853,47 @@ show_help() {
 # tpl_verify_checksum reads it at build time, so a new upstream release is
 # picked up without this table having to be edited.
 #
+# Rows are kept in ascending order -- by distribution name, then by release --
+# because this array is the menu's running order, drawn top to bottom exactly as
+# written here. A new entry goes in its sorted position, not on the end.
+#
+# ---------------------------------------------------------------------------
+# Placeholder rows: prep function "-"
+# ---------------------------------------------------------------------------
+#
+# A row whose prep function field is a single "-" is a *planned* template, not
+# a buildable one. It is drawn in the menu as "Coming Soon..." and cannot be
+# ticked; tpl_build_one refuses it too, so nothing reaches a build even if a
+# selection were constructed some other way. tpl_is_placeholder is the one
+# place that decision is made.
+#
+# They are listed rather than left out because the question they answer -- "is
+# my distribution going to be here?" -- otherwise has no answer short of
+# reading this table. Every placeholder URL below was checked to return 200
+# with a published checksum beside it, so each is a real image awaiting the
+# code rather than an aspiration.
+#
+# Three things stand between a placeholder and a working row, and they are
+# shared across every non-Debian entry rather than being per-distribution:
+#
+#   1. Image format. Debian publishes raw; everyone else publishes qcow2. The
+#      import writes the file into a VDI over XAPI's raw endpoint, so a qcow2
+#      lands as a qcow2 *file* on the disk and the VM does not boot. Needs a
+#      conversion step on the pool master, or a different import format.
+#   2. Checksum format. tpl_verify_checksum understands Debian's SHA512SUMS
+#      ("<hash>  <file>"). Ubuntu publishes SHA256SUMS in that shape but under
+#      a different name and algorithm; the RHEL family and Fedora publish
+#      "SHA256 (<file>) = <hash>", which is a different parse entirely.
+#   3. Guest preparation. tpl_prep_debian is apt-only. The RHEL family and
+#      Fedora need a dnf equivalent. Ubuntu can most likely share the Debian
+#      one, but that is worth confirming rather than assuming.
+#
+# Version coverage below is deliberate: current supported releases only.
+# Ubuntu is the LTS line (interim releases are nine-month lifespans and would
+# be stale before a template built from one was retired). Fedora carries its
+# two supported releases. The RHEL rebuilds carry 8/9/10, matching what their
+# mirrors publish today.
+#
 # ---------------------------------------------------------------------------
 # Pick the variant with a full kernel, not the "cloud" one
 # ---------------------------------------------------------------------------
@@ -6880,7 +6943,24 @@ show_help() {
 #     not evidence of a failed boot -- XO's own Hub templates do the same thing.
 #     Do not read a garbled console as a missing ESP.
 TPL_CATALOG=(
+    "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|-"
+    "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|-"
+    "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|-"
+    "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|-"
+    "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|-"
+    "debian12|Debian 12 (Bookworm)|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw|debian|tpl_prep_debian"
     "debian13|Debian 13 (Trixie)|trixie|https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw|debian|tpl_prep_debian"
+    "fedora43|Fedora 43|43|https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2|fedora|-"
+    "fedora44|Fedora 44|44|https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2|fedora|-"
+    "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|-"
+    "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|-"
+    "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|-"
+    # Deprecated: free support for 22.04 ends 2027-04-30, so this entry is
+    # scheduled to go on 2027-06-01. Kept in the list until then so the menu
+    # says so rather than the row silently vanishing.
+    "ubuntu2204|Ubuntu 22.04 LTS (Jammy)|jammy|https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img|ubuntu|-"
+    "ubuntu2404|Ubuntu 24.04 LTS (Noble)|noble|https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img|ubuntu|-"
+    "ubuntu2604|Ubuntu 26.04 LTS (Resolute)|resolute|https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img|ubuntu|-"
 )
 
 # Where the guest tools ISO lives. Every XCP-ng host ships this SR; the ISO
@@ -6930,6 +7010,19 @@ TPL_AGENT_SEEN=""
 tpl_field() {
     local row="$1" n="$2"
     cut -d'|' -f"$n" <<< "$row"
+}
+
+# True when a row is a placeholder -- a planned template with no build behind
+# it yet. Marked by a prep function of "-", because that is the field a real
+# row cannot do without: a placeholder is precisely an entry with nothing to
+# run inside the guest.
+#
+# Kept as a function rather than an inline test so the menu, the builder and
+# the tests all decide it the same way. Both callers matter: the menu is what
+# stops an operator selecting one, and tpl_build_one is what stops a selection
+# built any other way from reaching a download.
+tpl_is_placeholder() {
+    [[ "$(tpl_field "$1" 6)" == "-" ]]
 }
 
 # Find a catalogue row by its key. Prints the row, or nothing when unknown.
@@ -7556,6 +7649,16 @@ tpl_build_one() {
     display=$(tpl_field "$row" 2)
     user=$(tpl_field "$row" 5)
 
+    # Second line of defence. The menu will not let a placeholder be ticked,
+    # but a selection can also arrive from a key on the command line, and a
+    # placeholder has no prep function to run -- so refuse here rather than
+    # download an image the rest of the build cannot use.
+    if tpl_is_placeholder "$row"; then
+        echo ""
+        log_error "${display} is not buildable yet -- it is listed as Coming Soon."
+        return 1
+    fi
+
     local name
     name=$(tpl_template_name "$display")
 
@@ -7658,7 +7761,20 @@ tpl_prompt_selection() {
     local i
     for ((i = 0; i < count; i++)); do picked[i]=0; done
 
+    # Start on the first row that can actually be built.
+    #
+    # The catalogue is sorted alphabetically, so whichever distribution sorts
+    # first may well be a placeholder -- and opening with the cursor on a row
+    # where SPACE does nothing reads as a broken menu rather than an inert
+    # entry. Falls back to 0 if every row is a placeholder, which cannot
+    # happen today but leaves the cursor somewhere valid if it ever did.
     local cursor=0
+    for ((i = 0; i < count; i++)); do
+        if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then
+            cursor=$i
+            break
+        fi
+    done
 
     # Terminal state is restored on every exit path, including the ones that
     # leave through `return`: a submenu that swallows the cursor or leaves echo
@@ -7686,6 +7802,18 @@ tpl_prompt_selection() {
             row="${TPL_CATALOG[$i]}"
             display=$(tpl_field "$row" 2)
             user=$(tpl_field "$row" 5)
+
+            # A placeholder is shown, but not as something that can be
+            # chosen: no tick box to fill in, the name dimmed to the same
+            # weight as the note beside it, and "Coming Soon..." where a real
+            # row says what it logs in as.
+            if tpl_is_placeholder "$row"; then
+                local pointer="  "
+                (( i == cursor )) && pointer="${M_CYAN}▸${M_RESET} "
+                printf '  %s    %s%s  Coming Soon...%s\n' \
+                    "$pointer" "$M_DIM" "$display" "$M_RESET"
+                continue
+            fi
 
             local mark="[ ]"
             [[ ${picked[$i]} -eq 1 ]] && mark="[${M_GREEN}✓${M_RESET}]"
@@ -7723,7 +7851,12 @@ tpl_prompt_selection() {
                 cursor=$(( (cursor + 1) % count ))
                 ;;
             SPACE)
-                picked[$cursor]=$(( 1 - picked[cursor] ))
+                # Placeholders cannot be ticked. Silently ignored rather than
+                # warned about: the row already says "Coming Soon...", so a
+                # message would only repeat what is on screen.
+                if ! tpl_is_placeholder "${TPL_CATALOG[$cursor]}"; then
+                    picked[$cursor]=$(( 1 - picked[cursor] ))
+                fi
                 ;;
             ENTER)
                 break

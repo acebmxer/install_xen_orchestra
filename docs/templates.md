@@ -37,8 +37,8 @@ Each template ships with:
   these XO never reports a VM's IP address, so a build fails rather than
   producing a template that looks fine and is quietly useless.
 - **A shipped login** — the account named in the template's description, with
-  the password set to the same word (`debian` / `debian` for Debian 13). This
-  matches how the equivalent Hub templates behave. Supply
+  the password set to the same word (`debian` / `debian` for the Debian
+  templates). This matches how the equivalent Hub templates behave. Supply
   `ssh_authorized_keys` at creation and lock the password afterwards if you
   would rather not have one.
 - **Boot firmware chosen from the image.** After the build, the imported disk's
@@ -54,11 +54,51 @@ pre-filled in XO's New VM form, not limits.
 
 | Template | Image | Default login |
 | --- | --- | --- |
+| Debian 12 (Bookworm) | `debian-12-generic-amd64.raw` from `cloud.debian.org` | `debian` |
 | Debian 13 (Trixie) | `debian-13-generic-amd64.raw` from `cloud.debian.org` | `debian` |
 
-Debian 13 is the first entry, not the intended limit — the catalogue is a table
-of one row per distribution and further ones are additive, needing no change to
-the build itself.
+The two Debian entries are built by the same code path from the same `generic`
+image family; they differ only in the release they pull.
+
+## Coming soon
+
+These appear in the menu marked **Coming Soon...** and cannot be selected. They
+are listed rather than left out so the catalogue answers "will my distribution
+be here?" without anyone reading the source. Each one names a real published
+cloud image — the URLs were checked, and each returns a live image with a
+published checksum beside it — so what is missing is the code, not the image.
+
+| Template | Image origin |
+| --- | --- |
+| AlmaLinux 8 / 9 / 10 | `repo.almalinux.org` |
+| CentOS Stream 9 / 10 | `cloud.centos.org` |
+| Fedora 43 / 44 | `dl.fedoraproject.org` |
+| Rocky Linux 8 / 9 / 10 | `dl.rockylinux.org` |
+| Ubuntu 22.04 / 24.04 / 26.04 LTS | `cloud-images.ubuntu.com` |
+
+Ubuntu is the LTS line only. Interim releases have nine-month lifespans, so a
+template built from one would be out of support before the VMs cloned from it
+were retired. The 22.04 entry is scheduled to be removed on **2027-06-01**,
+following the end of its free security maintenance on 2027-04-30.
+
+Three things stand between these and a working entry, and they are shared
+across every non-Debian image rather than being per-distribution:
+
+1. **Image format.** Debian publishes `raw`; everyone else publishes `qcow2`.
+   The build imports the image straight into a disk over XAPI's raw HTTP
+   endpoint, so a qcow2 would be written to the disk as a qcow2 *file* and the
+   VM would not boot. This needs a conversion step on the pool master, or a
+   different import path.
+2. **Checksum format.** The verification reads Debian's `SHA512SUMS`. Ubuntu
+   publishes `SHA256SUMS` in the same shape but under a different name and
+   algorithm; the RHEL family and Fedora publish `SHA256 (file) = hash`, which
+   is a different format entirely.
+3. **Guest preparation.** The current preparation script is `apt`-based. The
+   RHEL family and Fedora need a `dnf` equivalent. Ubuntu can most likely share
+   the Debian one, but that is worth confirming rather than assuming.
+
+Adding a distribution beyond these is additive — the catalogue is a table of
+one row per entry and the build loops over it.
 
 Images come from the distribution's own mirror, so nothing is redistributed and
 you can see exactly what you are installing. Checksums are not pinned in the

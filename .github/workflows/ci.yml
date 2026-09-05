@@ -42,8 +42,17 @@ jobs:
         include:
           - distro: debian12
             dockerfile: tests/integration/Dockerfile.debian12
+          # DEPRECATED: free security maintenance for Ubuntu 22.04 ends on
+          # 2027-04-30. Support is removed from this project on 2027-06-01 —
+          # delete this matrix entry and
+          # tests/integration/Dockerfile.ubuntu2204 on that date.
+          - distro: ubuntu2204
+            dockerfile: tests/integration/Dockerfile.ubuntu2204
+            label: ubuntu2204 (deprecated, removed 2027-06-01)
           - distro: ubuntu2404
             dockerfile: tests/integration/Dockerfile.ubuntu2404
+          - distro: ubuntu2604
+            dockerfile: tests/integration/Dockerfile.ubuntu2604
           - distro: rockylinux9
             dockerfile: tests/integration/Dockerfile.rockylinux9
           - distro: fedora
