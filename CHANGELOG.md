@@ -190,6 +190,27 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The Debian 11 CI image stopped building, because Bullseye's security mirror
+  is being decommissioned mid-flight.** Debian 11 left LTS on 2026-08-31 and
+  `deb.debian.org` now serves `bullseye-security` inconsistently: the package
+  index still advertises `sudo 1.9.5p2-3+deb11u4` and
+  `libperl5.32 5.32.1-4+deb11u5`, but some Fastly edges have already dropped the
+  `.deb` files from the pool and return 404. Whether the build succeeded came
+  down to which cache node the runner happened to reach — it failed on CI while
+  the same image built cleanly elsewhere, and re-running was a coin flip rather
+  than a fix. The image now installs from `archive.debian.org`, where Bullseye
+  lives permanently, using the `bullseye` and `bullseye-updates` suites only;
+  the archive carries no `bullseye-security` at all, so security is dropped
+  rather than repointed. That leaves the archive's `perl-base`
+  (`5.32.1-4+deb11u3`) older than the `+deb11u5` baked into the base image from
+  security, and apt will not downgrade it implicitly to satisfy `perl`'s
+  exact-version dependency, so it is pinned explicitly with
+  `--allow-downgrades`. `Acquire::Check-Valid-Until` is disabled because
+  archived `Release` files are past their expiry by design. The image builds
+  from a cold cache and passes all four integration smoke tests. This affects
+  the test image only — nothing about how the installer runs on Debian 11, which
+  is deprecated and refuses to run from 2026-10-01 regardless.
+
 - **The deployment-key revocation tests were calling the revoke script the old
   way, failing six tests on every run since the quoting fix landed.** When
   `deploy_revoke_deploy_key` was repaired, the remote program's contract
