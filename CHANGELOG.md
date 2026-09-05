@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-04
+
 ### Added
 
 - **Ubuntu 22.04 and 26.04 LTS join the CI integration matrix.** Ubuntu was
@@ -77,6 +79,60 @@ This installer builds Xen Orchestra from source and tracks the official
   template menu sizes itself from the catalogue, so both entries appear with no
   menu change, and either or both can be built in one run.
 
+- **VMs created by the "Deploy Xen Orchestra VM" menu option are now stamped
+  with their provenance, so a deployed appliance can be identified as this
+  script's work after the fact.** Nothing on a deployed VM previously recorded
+  where it came from. `deploy_create_vm` set only the operator's own choices
+  (vCPU count, memory, disk size) and three platform corrections to the "Other
+  install media" scaffolding — `viridian=false`, `vga=std`, `videoram=8` — and
+  left `name-description` as whatever XAPI writes for `xe vm-install`, which is
+  the generic "Installed via xe CLI". Those corrections do distinguish a
+  deployed appliance from an untouched stock-template VM, but only
+  circumstantially: they are ordinary parameters, and anyone setting the same
+  three by hand produces a byte-identical record. Asked to confirm that a
+  running appliance had come from the deploy path, the honest answer off the
+  XAPI record was "consistent with, but not provable" — and the template
+  builder, which does stamp its output via `other-config:base_template_name`,
+  made the omission on the deploy side the inconsistent half. The deploy path
+  now writes three `other-config` keys — `xo_deployed_by`, holding the script
+  name; `xo_deploy_version`, the `git describe` revision resolved the same way
+  `show_version` resolves it, falling back to `unknown` outside a checkout; and
+  `xo_deploy_date`, a UTC ISO-8601 timestamp — plus a real `name-description`
+  identifying the VM as a Xen Orchestra appliance deployed by this script. The
+  keys are deliberately distinct from the template builder's
+  `base_template_name` so the two paths are never conflated, and every write is
+  `|| true` so a XAPI that rejects one cannot fail a deployment that has already
+  imported its disks. The VM is also tagged `xo-deployed`, which is the only
+  part of the stamp Xen Orchestra puts on screen: tags render as chips on the VM
+  and are filterable in the VM list, whereas `other-config` is returned by the
+  API but has no view anywhere in XO, so on its own it would have been invisible
+  to anyone not querying XAPI directly. The tag is written with `vm-param-add`
+  rather than `vm-param-set` because `tags` is a set and `param-set` would
+  discard any tags the operator had already applied. Existing appliances are
+  unaffected; the stamp applies to VMs deployed from this version onward.
+
+### Changed
+
+- **The deployment-key warning in the post-deploy summary is now boxed and
+  colour-highlighted.** It was one bullet in a run of similar-looking advisory
+  items, and it is the only one that is not advisory: the others are settings to
+  tighten at leisure, while this one reports a live unencrypted credential that
+  opens a root-capable session on an appliance holding the pool's root password.
+  It now carries a red border and an "ACTION REQUIRED — DEPLOYMENT KEY STILL
+  LIVE" header, and the `sed` command that fixes it is set off on its own
+  highlighted line rather than buried at the end of a paragraph.
+
+- **The README's clone badge now reports unique cloners (57) rather than the raw
+  clone count.** The raw count for the same 14-day window was 433 against only
+  57 unique cloners, and the view figures show the same shape — 434 views from 20
+  unique visitors, 148 of them referred from github.com by a single visitor, with
+  individual repository pages each drawing 20-38 views from one visitor. Totals
+  on that traffic graph are dominated by automated and repeat clients, so the
+  unique figure is the one that means anything to a reader. The badge remains
+  static text baked into its shields.io URL — GitHub does not expose clone
+  traffic to shields.io, and the window is rolling rather than cumulative, so the
+  number has to be edited by hand and goes stale on its own.
+
 ### Deprecated
 
 - **Ubuntu 22.04 LTS (Jammy) support is deprecated and will be removed on
@@ -134,6 +190,20 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The deployment-key revocation tests were calling the revoke script the old
+  way, failing six tests on every run since the quoting fix landed.** When
+  `deploy_revoke_deploy_key` was repaired, the remote program's contract
+  changed: the script now arrives on the guest's stdin via `sh -s --` with the
+  key to remove as the first positional argument, where before it was embedded
+  in a quoted `sh -c` string with the key piped in. The `_revoke` helper in
+  `tests/unit/test_deploy_helpers.bats` was not updated with it, so it went on
+  piping the key into `sh -c "$(deploy_revoke_script)"` — leaving `$1` unset,
+  which the script's own empty-pattern guard correctly treats as a fatal error
+  rather than matching every line. The six revocation tests therefore failed
+  against production code that was working, which is the worst way round: the
+  suite reported a fix as broken. The helper now invokes the script exactly as
+  the caller does, and is the only place in the tests that runs it.
+
 - **`--deploy` never actually removed the temporary deployment key, leaving a
   passphraseless root-capable credential on every appliance it built.** The
   revocation step sent its program to the guest as `sh -c '<script>'`, embedding
@@ -153,64 +223,6 @@ This installer builds Xen Orchestra from source and tracks the official
   backticks, semicolons and globs. **Appliances deployed before this fix still
   have the key**; remove it with `sed -i '/install-xen-orchestra deploy
   (temporary)/d' ~/.ssh/authorized_keys` in the VM.
-
-### Changed
-
-- **The deployment-key warning in the post-deploy summary is now boxed and
-  colour-highlighted.** It was one bullet in a run of similar-looking advisory
-  items, and it is the only one that is not advisory: the others are settings to
-  tighten at leisure, while this one reports a live unencrypted credential that
-  opens a root-capable session on an appliance holding the pool's root password.
-  It now carries a red border and an "ACTION REQUIRED — DEPLOYMENT KEY STILL
-  LIVE" header, and the `sed` command that fixes it is set off on its own
-  highlighted line rather than buried at the end of a paragraph.
-
-### Added
-
-- **VMs created by the "Deploy Xen Orchestra VM" menu option are now stamped
-  with their provenance, so a deployed appliance can be identified as this
-  script's work after the fact.** Nothing on a deployed VM previously recorded
-  where it came from. `deploy_create_vm` set only the operator's own choices
-  (vCPU count, memory, disk size) and three platform corrections to the "Other
-  install media" scaffolding — `viridian=false`, `vga=std`, `videoram=8` — and
-  left `name-description` as whatever XAPI writes for `xe vm-install`, which is
-  the generic "Installed via xe CLI". Those corrections do distinguish a
-  deployed appliance from an untouched stock-template VM, but only
-  circumstantially: they are ordinary parameters, and anyone setting the same
-  three by hand produces a byte-identical record. Asked to confirm that a
-  running appliance had come from the deploy path, the honest answer off the
-  XAPI record was "consistent with, but not provable" — and the template
-  builder, which does stamp its output via `other-config:base_template_name`,
-  made the omission on the deploy side the inconsistent half. The deploy path
-  now writes three `other-config` keys — `xo_deployed_by`, holding the script
-  name; `xo_deploy_version`, the `git describe` revision resolved the same way
-  `show_version` resolves it, falling back to `unknown` outside a checkout; and
-  `xo_deploy_date`, a UTC ISO-8601 timestamp — plus a real `name-description`
-  identifying the VM as a Xen Orchestra appliance deployed by this script. The
-  keys are deliberately distinct from the template builder's
-  `base_template_name` so the two paths are never conflated, and every write is
-  `|| true` so a XAPI that rejects one cannot fail a deployment that has already
-  imported its disks. The VM is also tagged `xo-deployed`, which is the only
-  part of the stamp Xen Orchestra puts on screen: tags render as chips on the VM
-  and are filterable in the VM list, whereas `other-config` is returned by the
-  API but has no view anywhere in XO, so on its own it would have been invisible
-  to anyone not querying XAPI directly. The tag is written with `vm-param-add`
-  rather than `vm-param-set` because `tags` is a set and `param-set` would
-  discard any tags the operator had already applied. Existing appliances are
-  unaffected; the stamp applies to VMs deployed from this version onward.
-
-### Changed
-
-- **The README's clone badge now reports unique cloners (57) rather than the raw
-  clone count.** The raw count for the same 14-day window was 433 against only
-  57 unique cloners, and the view figures show the same shape — 434 views from 20
-  unique visitors, 148 of them referred from github.com by a single visitor, with
-  individual repository pages each drawing 20-38 views from one visitor. Totals
-  on that traffic graph are dominated by automated and repeat clients, so the
-  unique figure is the one that means anything to a reader. The badge remains
-  static text baked into its shields.io URL — GitHub does not expose clone
-  traffic to shields.io, and the window is rolling rather than cumulative, so the
-  number has to be edited by hand and goes stale on its own.
 
 ## [0.5.0] - 2026-09-04
 
@@ -1013,7 +1025,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.0...v0.4.1

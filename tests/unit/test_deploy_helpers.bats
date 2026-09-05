@@ -627,9 +627,10 @@ STUB
 # getting it wrong that would either strand the operator or leave the key live.
 
 _revoke() {
-    # Runs the real remote program against a fixture HOME, feeding it the key
-    # to remove on stdin exactly as deploy_revoke_deploy_key does.
-    printf '%s\n' "$1" | HOME="$TMPDIR_TEST" sh -c "$(deploy_revoke_script)"
+    # Runs the real remote program against a fixture HOME, invoked exactly as
+    # deploy_revoke_deploy_key invokes it: the script itself arrives on stdin
+    # via `sh -s`, and the key to remove is the first positional argument.
+    HOME="$TMPDIR_TEST" sh -s -- "$1" < <(deploy_revoke_script)
 }
 
 _auth_keys() { echo "${TMPDIR_TEST}/.ssh/authorized_keys"; }
