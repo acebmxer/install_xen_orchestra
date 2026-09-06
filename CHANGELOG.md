@@ -10,6 +10,29 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-06
+
+### Fixed
+
+- **Two transfers still used curl's repainting progress bar.** The 0.7.1 fix
+  converted the local download and the upload to a bar drawn here, and left the
+  other two on `curl --progress-bar` because neither has a local file to
+  measure. So a deploy — which stages the image on the pool master — still
+  showed the cursor scribbling back and forth on its longest step, the same
+  complaint the fix was for.
+
+  Both now draw the shared renderer. The pool-master download reads the size of
+  the file as it lands on the host, polled over the SSH connection `dom0_exec`
+  already keeps open, so the count costs a `stat` rather than a handshake. The
+  streaming import has no file at either end, so its bytes are counted in the
+  middle of the pipe by `dd status=progress` — the mechanism the upload already
+  used, and no third copy of the drawing code.
+
+  Failures still fail the build: the remote download recovers curl's status with
+  `wait`, and the stream checks both ends of its pipeline, since a mirror that
+  404s and an XO that refuses the body are different failures and either one
+  means no image was imported.
+
 ## [0.7.1] - 2026-09-06
 
 ### Added
@@ -1808,7 +1831,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.0...v0.6.1

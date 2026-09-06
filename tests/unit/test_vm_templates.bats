@@ -2262,18 +2262,56 @@ print("ok")
     done
 }
 
-@test "every curl progress bar in a build sets the narrowed width" {
-    # A build draws more than one bar, and fixing only the first leaves the
-    # rest wrapping -- which is exactly what happened the first time round.
-    # Counted rather than spot-checked so a new bar added later cannot quietly
-    # miss it.
-    local body bars fixed
+@test "no transfer in a build uses curl's own repainting bar" {
+    # A build draws more than one bar, and fixing only some of them leaves the
+    # rest repainting -- which is exactly what happened the first time round:
+    # the local transfers were converted to our renderer and the two that run
+    # over SSH or through a pipe were left on curl's, so the same scribbling
+    # cursor came back on the deploy.
+    #
+    # Asserted as an absence rather than a count. --progress-bar is the thing
+    # being replaced everywhere, so any reappearance of it in a transfer path
+    # is the regression, whatever width it is given.
+    local body
     body=$(declare -f deploy_import_vdi_staged tpl_api_import_image 2>/dev/null)
+    [[ "$body" != *"--progress-bar"* ]]
 
-    bars=$(grep -c -- "--progress-bar" <<< "$body")
-    fixed=$(grep -c "deploy_progress_columns" <<< "$body")
-    [ "$bars" -ge 1 ]
-    [ "$fixed" -ge "$bars" ]
+    # And each of those paths does draw a bar: silence on a multi-gigabyte
+    # step reads as a hang, so removing curl's bar without putting ours in its
+    # place would be its own bug.
+    [[ "$body" == *"_with_progress"* ]]
+}
+
+@test "every transfer helper drives the shared renderer" {
+    # Four transfer shapes -- a local download, an upload, a download that runs
+    # on the pool master, and a stream that touches no disk -- and one
+    # renderer. A new helper that draws its own line would put a second bar
+    # style on screen and would not inherit the cursor and width handling.
+    local fn body
+    for fn in deploy_curl_with_progress deploy_curl_upload_with_progress \
+              deploy_dom0_curl_with_progress deploy_curl_stream_with_progress; do
+        body=$(declare -f "$fn")
+        [[ "$body" == *"deploy_draw_progress"* ]]
+        # No helper prints its own bar: the escapes belong to the renderer.
+        [[ "$body" != *'\0337'* ]]
+    done
+}
+
+@test "the remote and streaming transfers still fail the build" {
+    # The bar must never swallow a failed transfer. The pool-master download
+    # recovers curl's status with wait; the stream has two curls in a pipeline
+    # and has to check both, because a 404 from the mirror and a refusal from
+    # XO are different failures and either one means no image was imported.
+    local body
+    body=$(declare -f deploy_dom0_curl_with_progress)
+    [[ "$body" == *"wait "* ]]
+    [[ "$body" == *"rc"* ]]
+
+    body=$(declare -f deploy_curl_stream_with_progress)
+    [[ "$body" == *"PIPESTATUS"* ]]
+    # Both ends of the pipeline, not just the upload.
+    [[ "$body" == *"PIPESTATUS[0]"* ]]
+    [[ "$body" == *"PIPESTATUS[2]"* ]]
 }
 
 @test "the drawn bar leaves the cursor where it found it" {

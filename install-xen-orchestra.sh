@@ -4320,6 +4320,51 @@ deploy_curl_with_progress() {
     return "$rc"
 }
 
+# Run a downloading curl on the pool master, drawing our bar from here.
+#
+# Same problem and same fix as deploy_curl_with_progress, one host removed.
+# curl's own --progress-bar repaints the entire line on every update, which is
+# what the local paths stopped using; running it over SSH does not change that,
+# it only puts the scribbling on the far end of a link that is slower to draw.
+#
+# Deliberately not a second renderer: the drawing is deploy_draw_progress_n,
+# exactly as the local download and the upload use. The only thing that differs
+# is where the byte count comes from -- a local download stats the file it is
+# writing, and this stats the file on dom0 instead.
+#
+# The poll is a second dom0_exec per tick. That is affordable only because
+# dom0_exec sets ControlMaster/ControlPersist, so each one rides the connection
+# already open rather than paying for a fresh SSH handshake twice a second.
+#
+# curl runs with --no-progress-meter for the same reason the local wrapper
+# passes it: its bar is being replaced, not supplemented, and leaving it on
+# would put both on the line at once.
+deploy_dom0_curl_with_progress() {
+    local remote_file="$1" total="$2"; shift 2
+    local pid rc=0 got
+
+    DEPLOY_PROGRESS_FILLED=0
+    DEPLOY_PROGRESS_PCT=-1
+    DEPLOY_PROGRESS_BYTES=-1
+
+    dom0_exec "$@" &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        got=$(dom0_exec "stat -c %s '${remote_file}' 2>/dev/null" | tr -d '\r')
+        [[ "$got" =~ ^[0-9]+$ ]] && deploy_draw_progress_n "$got" "$total"
+        sleep 0.5
+    done
+    wait "$pid" || rc=$?
+
+    if (( rc == 0 )); then
+        got=$(dom0_exec "stat -c %s '${remote_file}' 2>/dev/null" | tr -d '\r')
+        [[ "$got" =~ ^[0-9]+$ ]] && deploy_draw_progress_n "$got" "$total"
+    fi
+    printf '\n' >&2
+    return "$rc"
+}
+
 # Run an uploading curl, drawing our progress bar from the bytes it has sent.
 #
 # The download bar can poll the output file as it grows. An upload has no such
@@ -4381,6 +4426,78 @@ deploy_curl_upload_with_progress() {
     # Finish the bar at the real figure rather than wherever the last poll
     # landed, then release the line.
     (( rc == 0 )) && deploy_draw_progress_n "$size" "$size"
+    printf '\n' >&2
+
+    printf -v "$outvar" '%s' "$(cat "$d/code" 2>/dev/null)"
+    rm -rf "$d"
+    return "$rc"
+}
+
+# Stream one curl into another, drawing our bar from the bytes in flight.
+#
+# The third shape of the same transfer. The download wrapper polls a file that
+# is growing, the upload wrapper counts what it has fed to curl, and this one
+# has neither: nothing is written to disk on either side, because the whole
+# point of the streaming path is that the machine running it may not have room
+# for a multi-gigabyte staging file.
+#
+# So the count comes from the middle of the pipe. `dd status=progress` sits
+# between the two curls and reports its running total to stderr, which is the
+# same mechanism deploy_curl_upload_with_progress uses and for the same reason
+# -- it needs no signal, so there is no race that could kill the transfer.
+# Deliberately not a third renderer: the drawing is deploy_draw_progress_n, as
+# everywhere else.
+#
+# dd is passed bs=1M for throughput and, unlike the upload helper, cannot use
+# a fifo: this is one pipeline, so the shell wires the stages together.
+#
+# The uploading curl's stdout is the status code, so it is captured into the
+# caller's variable rather than printed. The download curl keeps
+# --no-progress-meter: its bar is being replaced, not supplemented.
+#
+# A total is optional. Without one deploy_draw_progress_n falls back to a
+# running byte count, which is still better than several minutes of silence.
+deploy_curl_stream_with_progress() {
+    local url="$1" total="$2" outvar="$3"; shift 3
+    local d rc=0 pipepid sent
+
+    d=$(mktemp -d) || return 1
+
+    DEPLOY_PROGRESS_FILLED=0
+    DEPLOY_PROGRESS_PCT=-1
+    DEPLOY_PROGRESS_BYTES=-1
+
+    # PIPESTATUS is captured inside the subshell because the foreground shell
+    # goes on to poll: by the time it could look, the pipeline is long gone.
+    # Both stages matter -- a mirror that 404s and an XO that refuses the body
+    # are different failures and either one must fail the build.
+    {
+        curl -fL --no-progress-meter --max-time 0 \
+            --speed-limit 1024 --speed-time 120 "$url" \
+        | dd bs=1M status=progress 2>"$d/dd.err" \
+        | curl "$@" > "$d/code" 2>/dev/null
+        printf '%s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[2]}" > "$d/rc"
+    } &
+    pipepid=$!
+
+    while kill -0 "$pipepid" 2>/dev/null; do
+        sent=$(tr '\r' '\n' < "$d/dd.err" 2>/dev/null \
+            | grep -E '^[0-9]+ bytes' | tail -1 | awk '{print $1}')
+        [[ "$sent" =~ ^[0-9]+$ ]] && deploy_draw_progress_n "$sent" "$total"
+        sleep 0.5
+    done
+    wait "$pipepid" 2>/dev/null
+
+    local dl_rc up_rc
+    read -r dl_rc up_rc < "$d/rc" 2>/dev/null || true
+    [[ "$dl_rc" =~ ^[0-9]+$ ]] || dl_rc=1
+    [[ "$up_rc" =~ ^[0-9]+$ ]] || up_rc=1
+    rc=$dl_rc
+    (( rc == 0 )) && rc=$up_rc
+
+    if (( rc == 0 )) && [[ "$total" =~ ^[0-9]+$ ]] && (( total > 0 )); then
+        deploy_draw_progress_n "$total" "$total"
+    fi
     printf '\n' >&2
 
     printf -v "$outvar" '%s' "$(cat "$d/code" 2>/dev/null)"
@@ -4879,8 +4996,10 @@ deploy_import_vdi_staged() {
     # The stall guard is here too, so a connection that goes quiet is retried
     # in a minute instead of hanging until --max-time.
     #
-    # --progress-bar because this is several minutes of silence otherwise, and
-    # silence on the longest step of the deploy reads as a hang worth killing.
+    # A progress bar at all -- see the call below -- because this is several
+    # minutes of silence otherwise, and silence on the longest step of the
+    # deploy reads as a hang worth killing.
+    #
     # Sweep leftovers from the previous naming scheme, which used the calling
     # shell's PID and so could never be matched again. They are gigabyte-sized
     # and nothing else will reclaim them.
@@ -4897,10 +5016,19 @@ deploy_import_vdi_staged() {
     fi
 
     log_info "  downloading the image to the pool master (resumable)..."
-    # COLUMNS is exported into the remote shell for the same reason as the API
-    # path -- see deploy_progress_columns. The bar is rendered on *this*
-    # terminal, so the width that matters is the local one, not dom0's.
-    if ! dom0_exec "COLUMNS=$(deploy_progress_columns) curl -fL --progress-bar -o '${dl}' -C - \
+    # Our bar rather than curl's --progress-bar, for the same reason the
+    # template paths use ours: curl repaints the entire line on every update,
+    # and over SSH that is a cursor visibly scribbling back and forth. The
+    # transfer runs on dom0 and the bar is drawn on *this* terminal, from the
+    # size of the file as it lands on the host -- see
+    # deploy_dom0_curl_with_progress. No COLUMNS is exported any more: the
+    # width is the local terminal's and is applied where the drawing happens.
+    #
+    # -C - resumes, so the file can already be part-sized when this starts;
+    # the bar picks up from whatever is on disk rather than restarting at zero,
+    # which is the honest figure for a resumed transfer.
+    if ! deploy_dom0_curl_with_progress "$dl" "$size" \
+            "curl -fL --no-progress-meter -o '${dl}' -C - \
             --retry 5 --retry-delay 3 --retry-all-errors \
             --speed-limit 1024 --speed-time 60 --max-time 3600 '${url}'"; then
         log_error "Failed to download the image on the pool master."
@@ -9563,16 +9691,28 @@ tpl_api_import_image() {
             --output "$resp_file" --write-out '%{http_code}' \
             "$target" || rc=$?
     else
-        http_code=$(COLUMNS="$(deploy_progress_columns)" \
-                curl -fL --progress-bar --max-time 0 \
-                --speed-limit 1024 --speed-time 120 "$url" \
-            | curl -s -k -L --post301 --post302 --post303 -X POST \
-                --speed-limit 1024 --speed-time 120 \
-                -b "authenticationToken=${XO_API_TOKEN}" \
-                -H 'Content-Type: application/octet-stream' \
-                --data-binary @- \
-                --output "$resp_file" --write-out '%{http_code}' \
-                "$target" 2>/dev/null) || rc=$?
+        # Ours, not curl's --progress-bar, for the same reason as every other
+        # transfer here: curl repaints the whole line on each update. Nothing
+        # is on disk on this path, so the count comes from the middle of the
+        # pipe -- see deploy_curl_stream_with_progress.
+        #
+        # The size is asked of the origin so there is a percentage to draw. It
+        # is only ever used for the bar: the body is streamed, so no
+        # Content-Length is set from it and a mirror that declines to say
+        # costs nothing but the percentage.
+        local stream_size
+        stream_size=$(curl -fsSLI "$url" 2>/dev/null | tr -d '\r' \
+            | grep -i '^content-length:' | tail -1 | awk '{print $2}')
+        [[ "$stream_size" =~ ^[0-9]+$ ]] || stream_size=""
+
+        deploy_curl_stream_with_progress "$url" "$stream_size" http_code \
+            -s -k -L --post301 --post302 --post303 -X POST \
+            --speed-limit 1024 --speed-time 120 \
+            -b "authenticationToken=${XO_API_TOKEN}" \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary @- \
+            --output "$resp_file" --write-out '%{http_code}' \
+            "$target" || rc=$?
     fi
 
     resp=$(<"$resp_file")
