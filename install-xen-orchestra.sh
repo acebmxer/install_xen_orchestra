@@ -30,7 +30,7 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 ORIGINAL_ARGS=("$@")
 CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
-LATEST_CONFIG_VERSION=3
+LATEST_CONFIG_VERSION=4
 
 # Runtime mode flags (set via CLI flags in main())
 NON_INTERACTIVE=false
@@ -422,6 +422,19 @@ load_config() {
     DISABLE_LICENSE_CHECK=${DISABLE_LICENSE_CHECK:-false}
     PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
 
+    # How --build-templates reaches the pool. See the comment block above
+    # tpl_select_build_method for what each value does.
+    TEMPLATE_BUILD_METHOD=${TEMPLATE_BUILD_METHOD:-auto}
+    # Base URL of the XO instance the API path talks to. Empty is the common
+    # case rather than an error: run from inside the VM this project deployed,
+    # localhost is correct, and that is what tpl_api_base_url falls back to.
+    XO_URL=${XO_URL:-}
+    # The token for XO's API, used by both the running-task check and the
+    # template builder. XO_TASK_CHECK_TOKEN is the name this had while the task
+    # check was its only consumer; it is still honoured, so a config written
+    # before the template builder existed keeps working untouched.
+    XO_API_TOKEN=${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}
+
     # Migrate config schema if needed, then validate
     migrate_config "$CONFIG_FILE"
     validate_config
@@ -485,6 +498,20 @@ validate_config() {
     # Validate TURBO_CACHE_ENABLED is a boolean
     if [[ "$TURBO_CACHE_ENABLED" != "true" ]] && [[ "$TURBO_CACHE_ENABLED" != "false" ]]; then
         errors+=("TURBO_CACHE_ENABLED must be true or false, got: $TURBO_CACHE_ENABLED")
+    fi
+
+    # Validate TEMPLATE_BUILD_METHOD
+    case "${TEMPLATE_BUILD_METHOD:-auto}" in
+        auto|api|ssh) ;;
+        *) errors+=("TEMPLATE_BUILD_METHOD must be auto, api or ssh, got: ${TEMPLATE_BUILD_METHOD:-}") ;;
+    esac
+
+    # Validate XO_URL is a URL rather than a bare host. curl is given this
+    # verbatim, and a bare hostname makes it read the value as a path against
+    # no host at all -- which fails as a malformed URL rather than as the
+    # "you left off https://" that it actually is.
+    if [[ -n "${XO_URL:-}" ]] && [[ ! "$XO_URL" =~ ^https?:// ]]; then
+        errors+=("XO_URL must start with http:// or https://, got: $XO_URL")
     fi
 
     # Report errors if any
@@ -597,6 +624,50 @@ migrate_config() {
             } >> "$cfg_file"
         fi
         CONFIG_VERSION=3
+    fi
+
+    # v3 -> v4: add the --build-templates keys.
+    #
+    # No rename happens here. XO_TASK_CHECK_TOKEN keeps working -- load_config
+    # reads it when XO_API_TOKEN is unset -- so a config that already holds a
+    # token for the pre-update task check needs no edit to use the API path.
+    # The keys are appended commented-out so the file documents them without
+    # changing any behaviour the operator did not ask for.
+    if [[ "$current_ver" -lt 4 ]]; then
+        if ! grep -q '^[[:space:]]*TEMPLATE_BUILD_METHOD=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# How --build-templates reaches the pool:"
+                echo "#   auto  Use Xen Orchestra's API when it is reachable and"
+                echo "#         authenticated; otherwise fall back to SSH on the pool"
+                echo "#         master and say why. (default)"
+                echo "#   api   Use the API only; fail if it is unavailable."
+                echo "#   ssh   Use SSH only; never contact the API. This is how"
+                echo "#         template building worked before this option existed."
+                echo "#TEMPLATE_BUILD_METHOD=auto"
+            } >> "$cfg_file"
+        fi
+        if ! grep -q '^[[:space:]]*XO_URL=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# Base URL of the Xen Orchestra instance the API path talks to."
+                echo "# Leave unset when running on the XO VM itself -- localhost and"
+                echo "# HTTPS_PORT are used, which is right for a --deploy install."
+                echo "# Example: XO_URL=https://xo.example.com"
+                echo "#XO_URL="
+            } >> "$cfg_file"
+        fi
+        if ! grep -q '^[[:space:]]*XO_API_TOKEN=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# API token for Xen Orchestra, used by both the pre-update running-"
+                echo "# task check and --build-templates. This is the current name for"
+                echo "# XO_TASK_CHECK_TOKEN, which is still read when this is unset -- so"
+                echo "# if you already have a token above, nothing here needs filling in."
+                echo "#XO_API_TOKEN="
+            } >> "$cfg_file"
+        fi
+        CONFIG_VERSION=4
     fi
 
     # Stamp the new schema version.
@@ -3851,6 +3922,18 @@ DEPLOY_SESSION=""
 # it never appears in dom0's process list and never lands on dom0's disk, where
 # a fixed /tmp path would have been readable by any other local account for the
 # duration of the request (and would have collided with a concurrent deploy).
+# DELIBERATELY NOT deploy_xapi_call, and this is the only pair that is not.
+#
+# Two reasons, both specific to the session calls. This one carries the host
+# password, so it pipes the body through stdin under `set +x` and must not go
+# near a shared helper whose tracing behaviour could change under it. And it
+# has no session to pass -- it is the call that creates one -- so the helper's
+# whole shape, "method plus session plus arguments", does not fit.
+# deploy_xapi_logout stays beside it for symmetry: the two are read together.
+#
+# Every other XAPI call goes through deploy_xapi_call. Do not add a third
+# hand-rolled envelope; there was one, and it silently missed the --max-time
+# the shared helper applies.
 deploy_xapi_login() {
     local -
     set +x
@@ -4206,10 +4289,8 @@ deploy_import_vdi_from_url() {
     fi
     local task
     task=$(deploy_task_create "import ${vdi}")
-    local task_q=""
-    [[ "$task" =~ ^OpaqueRef: ]] && task_q="&task_id=${task}"
-
-    local target="https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw${task_q}"
+    local target
+    target=$(deploy_import_url "$vdi_ref" "$task")
     # A here-string, not a pipe: if the remote shell ever exits before reading
     # the program, a pipe hands back SIGPIPE (141) instead of whatever actually
     # went wrong. This is also how the config-drive upload feeds dom0_exec.
@@ -4237,11 +4318,12 @@ deploy_vdi_ref() {
     # when it does not, rather than falling back to the uuid and failing in the
     # confusing way described above.
     if [[ ! "$ref" =~ ^OpaqueRef: ]]; then
-        local xml
-        xml=$(printf '<?xml version="1.0"?><methodCall><methodName>VDI.get_by_uuid</methodName><params><param><value><string>%s</string></value></param><param><value><string>%s</string></value></param></params></methodCall>' \
-            "$(xml_escape "$DEPLOY_SESSION")" "$(xml_escape "$uuid")")
+        # Through deploy_xapi_call, which builds and sends exactly this --
+        # escaping, envelope and transport. Hand-rolling the XML here meant two
+        # ways to make the same call, and only one of them would have got the
+        # next fix to either.
         local reply
-        reply=$(dom0_exec "curl -sk -H 'Content-Type: text/xml' --data-binary @- https://localhost/ 2>/dev/null" <<< "$xml" || true)
+        reply=$(deploy_xapi_call "VDI.get_by_uuid" "$DEPLOY_SESSION" "$uuid")
         ref=$(grep -o 'OpaqueRef:[A-Za-z0-9._-]*' <<< "$reply" | head -1 || true)
     fi
 
@@ -4277,6 +4359,32 @@ deploy_xapi_call() {
         "$method" "$params")
     dom0_exec "curl -sk --max-time 30 -H 'Content-Type: text/xml' \
         --data-binary @- https://localhost/ 2>/dev/null" <<< "$xml" || true
+}
+
+# The XAPI endpoint URL for reading a VDI's raw bytes back.
+#
+# ONE builder, for the same reason as deploy_import_url below: both callers --
+# the partition-table check and the ESP check -- need exactly this URL, and a
+# second copy is a second place for it to drift.
+deploy_export_url() {
+    printf 'https://localhost/export_raw_vdi?session_id=%s&vdi=%s&format=raw' \
+        "$DEPLOY_SESSION" "$1"
+}
+
+# The XAPI endpoint URL for importing raw bytes into a VDI.
+#
+# ONE builder, for all three import paths (streamed, staged and from a file).
+# Every one of them needs the same session, the same vdi ref, the same
+# format=raw and the same optional task id, and there is nothing path-specific
+# about any of it -- so a second copy is a second place for the query string to
+# go wrong. Add a caller, not another printf.
+#
+# Arguments: the VDI's OpaqueRef, and the task OpaqueRef or "" for none.
+deploy_import_url() {
+    local vdi_ref="$1" task="$2" task_q=""
+    [[ "$task" =~ ^OpaqueRef: ]] && task_q="&task_id=${task}"
+    printf 'https://localhost/import_raw_vdi?session_id=%s&vdi=%s&format=raw%s' \
+        "$DEPLOY_SESSION" "$vdi_ref" "$task_q"
 }
 
 # Create a task for an import to report itself through. Prints its OpaqueRef,
@@ -4588,8 +4696,6 @@ deploy_import_vdi_staged() {
     # deploy_task_check: curl exiting 0 says only that XAPI accepted the body.
     local task
     task=$(deploy_task_create "import ${vdi}")
-    local task_q=""
-    [[ "$task" =~ ^OpaqueRef: ]] && task_q="&task_id=${task}"
 
     # -L is load-bearing on a pool with more than one host. XAPI's import
     # handler checks whether the host being asked can actually see the SR, and
@@ -4600,10 +4706,12 @@ deploy_import_vdi_staged() {
     # of header in it. --post301/302/303 keeps the PUT a PUT across the hop.
     # -w records the redirect count so a silently-swallowed hop cannot happen
     # again unnoticed.
+    local target
+    target=$(deploy_import_url "$vdi_ref" "$task")
     out=$(dom0_exec "curl -sk -f -L --post301 --post302 --post303 --show-error \
         -w '\nxo-redirects=%{num_redirects} xo-code=%{http_code}\n' \
         --speed-limit 1024 --speed-time 60 --max-time 3600 -T '${tmp}' \
-        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw${task_q}' 2>&1") || rc=$?
+        '${target}' 2>&1") || rc=$?
     local hops
     hops=$(sed -n 's/.*xo-redirects=\([0-9]*\).*/\1/p' <<< "$out" | tail -1)
     if [[ "$hops" =~ ^[0-9]+$ ]] && (( hops > 0 )); then
@@ -4646,15 +4754,15 @@ deploy_import_vdi_from_file() {
 
     local task
     task=$(deploy_task_create "import ${vdi}")
-    local task_q=""
-    [[ "$task" =~ ^OpaqueRef: ]] && task_q="&task_id=${task}"
+    local target
+    target=$(deploy_import_url "$vdi_ref" "$task")
 
     local rc=0
     # -L for the same reason as the image import above: on a multi-host pool the
     # SR may not be visible from the master, and an unfollowed 302 sends the
     # config drive nowhere while reporting success.
     dom0_exec "curl -sk -f -L --post301 --post302 --post303 --max-time 300 -T '${remote}' \
-        'https://localhost/import_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw${task_q}'" || rc=$?
+        '${target}'" || rc=$?
     if (( rc == 0 )) && ! deploy_task_check "$task"; then
         rc=1
     fi
@@ -7202,7 +7310,7 @@ show_help() {
 # ============================================================================
 
 # Catalogue of buildable templates. Each entry is:
-#   key|display name|codename|image URL|default user|prep function|disk GiB
+#   key|display name|codename|image URL|default user|prep function|disk GiB|firmware
 #
 # The URL points at the distribution's own mirror. Checksums are not pinned
 # here: every origin in this list publishes a checksum file beside the image,
@@ -7230,6 +7338,23 @@ show_help() {
 # Rows are kept in ascending order -- by distribution name, then by release --
 # because this array is the menu's running order, drawn top to bottom exactly as
 # written here. A new entry goes in its sorted position, not on the end.
+#
+# ---------------------------------------------------------------------------
+# Field 8: boot firmware, optional
+# ---------------------------------------------------------------------------
+#
+# Only the API build path reads this, and only because it has no way to work it
+# out for itself. The SSH path decides firmware by reading the imported disk's
+# partition table for an EFI system partition -- the right way round, since
+# whether an image is UEFI-bootable is a property of that image -- but that
+# needs block access to the VDI, and no XO endpoint exposes one.
+#
+# So a row may declare `uefi` or `bios` here for the API path to use. Left
+# empty it defaults to uefi, which is correct for every current entry: they all
+# ship an ESP alongside a BIOS boot partition, so a VM created from them boots
+# either way. A future BIOS-only image needs `bios` written here, and the way
+# to find out which it is remains reading the disk -- either by building it
+# once over SSH, or with `qemu-img`/`fdisk` on the downloaded image.
 #
 # ---------------------------------------------------------------------------
 # Placeholder rows: prep function "-"
@@ -7363,6 +7488,20 @@ TPL_TOOLS_ISO_NAME="guest-tools.iso"
 # are starting points rather than limits.
 TPL_DEFAULT_RAM_GB=2
 TPL_DEFAULT_VCPUS=2
+
+# The floor for static-min, separate from the RAM figure above.
+#
+# static-min is the smallest XAPI would shrink a guest to if ballooning were
+# ever enabled; it is not the memory a VM gets, which is dynamic-min/max. Set
+# to 1 GiB to match the VMs already on the pool -- they run 1 GiB against a
+# much larger dynamic allocation -- rather than to the template's own RAM,
+# which pinned all four figures together and left no headroom below.
+#
+# Only the SSH path can set this: XO's API accepts memoryMin and discards it,
+# so an API-built template keeps the base template's 128 MiB. Either way the
+# operator can change it at or after VM creation.
+TPL_STATIC_MIN_GB=1
+
 
 # The template's own disk. cloud-init's growpart expands the filesystem to fill
 # whatever the operator asks for at deploy time, so this only has to hold the
@@ -7597,7 +7736,7 @@ tpl_disk_has_partition_table() {
     #
     # od rather than xxd: xxd is not on a stock XCP-ng dom0.
     sig=$(dom0_exec "curl -sk -f --max-time 120 \
-        'https://localhost/export_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw' \
+        '$(deploy_export_url "${vdi_ref}")' \
         2>/dev/null | head -c 1024 | od -An -tx1 -v | tr -d ' \n'")
 
     if (( ${#sig} < 1040 )); then
@@ -7651,7 +7790,7 @@ tpl_disk_supports_uefi() {
     vdi_ref=$(deploy_vdi_ref "$vdi")
 
     sig=$(dom0_exec "curl -sk -f --max-time 180 \
-        'https://localhost/export_raw_vdi?session_id=${DEPLOY_SESSION}&vdi=${vdi_ref}&format=raw' \
+        '$(deploy_export_url "${vdi_ref}")' \
         2>/dev/null | head -c 40960 | od -An -tx1 -v | tr -d ' \n'")
 
     # No GPT at all means no ESP. "EFI PART" at offset 512.
@@ -7698,6 +7837,77 @@ tpl_attach_tools_iso() {
     dom0_xe "vbd-insert uuid=${cd_vbd} vdi-uuid=${vdi}" >/dev/null 2>&1
 }
 
+# Generate the throwaway SSH key the preparation boot authorises.
+#
+# ONE implementation, called by both build paths. Do not inline a second
+# ssh-keygen: the removal-then-check below is not boilerplate, it is the fix
+# for a real bug, and a copy that omits either half reintroduces it silently.
+#
+# Removed first, and the result checked. ssh-keygen refuses to write over an
+# existing key -- it asks "Overwrite (y/n)?" and, with no answer available,
+# exits 1 without generating anything. On a multi-template run the path is the
+# same every time, so every build after the first hit that: the failure went to
+# /dev/null, its exit status was never tested, and the build carried on and
+# baked the *previous* template's key into this template's config drive.
+# Nothing reported an error, because nothing looked.
+#
+# Both halves matter. Removing the old key stops the collision; checking the
+# status means that if key generation ever fails for some other reason -- no
+# entropy, a full disk, a read-only workdir -- the build stops here rather than
+# continuing towards a config drive with no key in it.
+#
+# Prints the public key. TPL_SSH_KEY names the private half, and is assigned
+# here as a plain expression rather than inside the function body: callers
+# capture this with $( ), which runs it in a subshell, so an assignment made
+# in the body would not survive the return -- and the caller would be left
+# with an empty key path pointing at nothing.
+tpl_build_ssh_key() {
+    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    rm -f "${TPL_SSH_KEY}" "${TPL_SSH_KEY}.pub"
+    if ! ssh-keygen -t ed25519 -N "" -C "xo template build (temporary)" \
+            -f "${TPL_SSH_KEY}" >/dev/null 2>&1; then
+        log_error "  could not generate the temporary build key at ${TPL_SSH_KEY}."
+        return 1
+    fi
+    local pubkey
+    pubkey=$(<"${TPL_SSH_KEY}.pub")
+    printf '%s' "${pubkey%$'\n'}"
+}
+
+# The cloud-init document that prepares a build VM.
+#
+# ONE implementation, called by both build paths -- the SSH path writes it to
+# an ISO it builds locally, the API path hands the same text to XO, which
+# builds the drive itself. Do not write a second copy for a new path: the two
+# must produce byte-identical guests, and a duplicate drifts the moment either
+# is edited. That is not hypothetical -- this function exists because there
+# were two copies, and only one of them would have received the next fix.
+#
+# The prep script is embedded rather than fetched. A build that reaches out to
+# a git host mid-run fails on an air-gapped pool and silently changes behaviour
+# when the remote does, neither of which belongs in something that produces a
+# golden image.
+#
+# Arguments: default user, prep function name, public key.
+tpl_cloud_config() {
+    local user="$1" prep_fn="$2" pubkey="$3"
+    printf '#cloud-config\n'
+    printf 'users:\n'
+    printf '  - name: %s\n' "$user"
+    printf '    sudo: ALL=(ALL) NOPASSWD:ALL\n'
+    printf '    shell: /bin/bash\n'
+    printf '    lock_passwd: false\n'
+    printf '    ssh_authorized_keys:\n'
+    printf '      - %s\n' "$pubkey"
+    printf 'write_files:\n'
+    printf '  - path: /root/xo-template-prep.sh\n'
+    printf "    permissions: '0755'\n"
+    printf '    content: |\n'
+    "$prep_fn" "$user" | sed 's/^/      /'
+    printf 'runcmd:\n'
+    printf '  - [ /root/xo-template-prep.sh ]\n'
+}
+
 # Build the cloud-init drive that drives the single preparation boot.
 #
 # This is not the config drive the operator's VMs get -- theirs comes from XO
@@ -7727,16 +7937,11 @@ tpl_build_prep_drive() {
     # status means that if key generation ever fails for some other reason --
     # no entropy, a full disk, a read-only workdir -- the build stops here
     # rather than continuing towards a config drive with no key in it.
-    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
-    rm -f "${TPL_SSH_KEY}" "${TPL_SSH_KEY}.pub"
-    if ! ssh-keygen -t ed25519 -N "" -C "xo template build (temporary)" \
-            -f "${TPL_SSH_KEY}" >/dev/null 2>&1; then
-        log_error "  could not generate the temporary build key at ${TPL_SSH_KEY}."
-        return 1
-    fi
+    # Assigned here, not inside tpl_build_ssh_key: that is captured with $( ),
+    # so anything it sets is confined to the subshell.
     local pubkey
-    pubkey=$(<"${TPL_SSH_KEY}.pub")
-    pubkey="${pubkey%$'\n'}"
+    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    pubkey=$(tpl_build_ssh_key) || return 1
 
     printf 'instance-id: xo-template-build\nlocal-hostname: xo-template-build\n' > "${dir}/meta-data"
     : > "${dir}/network-config"
@@ -7745,23 +7950,7 @@ tpl_build_prep_drive() {
     # to a git host mid-run fails on an air-gapped pool and silently changes
     # behaviour when the remote does, neither of which belongs in something
     # that produces a golden image.
-    {
-        printf '#cloud-config\n'
-        printf 'users:\n'
-        printf '  - name: %s\n' "$user"
-        printf '    sudo: ALL=(ALL) NOPASSWD:ALL\n'
-        printf '    shell: /bin/bash\n'
-        printf '    lock_passwd: false\n'
-        printf '    ssh_authorized_keys:\n'
-        printf '      - %s\n' "$pubkey"
-        printf 'write_files:\n'
-        printf '  - path: /root/xo-template-prep.sh\n'
-        printf "    permissions: '0755'\n"
-        printf '    content: |\n'
-        "$prep_fn" "$user" | sed 's/^/      /'
-        printf 'runcmd:\n'
-        printf '  - [ /root/xo-template-prep.sh ]\n'
-    } > "${dir}/user-data"
+    tpl_cloud_config "$user" "$prep_fn" "$pubkey" > "${dir}/user-data"
 
     # Rebuilt from scratch each time: the path is reused across templates, so a
     # stale ISO left in place would be attached to the next build and hand it
@@ -7831,6 +8020,11 @@ tpl_create_build_vm() {
     done
 
     local mem="${TPL_DEFAULT_RAM_GB}GiB"
+    local static_min="${TPL_STATIC_MIN_GB}GiB"
+
+    # A floor above the allocation would be rejected by XAPI's ordering rule,
+    # so it is clamped rather than sent as configured.
+    (( TPL_STATIC_MIN_GB > TPL_DEFAULT_RAM_GB )) && static_min="$mem"
     dom0_xe "vm-param-set uuid=${TPL_VM_UUID} VCPUs-max=${TPL_DEFAULT_VCPUS}" >/dev/null
     dom0_xe "vm-param-set uuid=${TPL_VM_UUID} VCPUs-at-startup=${TPL_DEFAULT_VCPUS}" >/dev/null
 
@@ -7848,7 +8042,11 @@ tpl_create_build_vm() {
     # Linux as a Hyper-V machine. Surveyed against a live pool: the only VMs
     # with viridian enabled are the Windows ones and the ones this script built.
     dom0_xe "vm-param-set uuid=${TPL_VM_UUID} platform:viridian=false" >/dev/null 2>&1 || true
-    dom0_xe "vm-memory-limits-set uuid=${TPL_VM_UUID} static-min=${mem} dynamic-min=${mem} dynamic-max=${mem} static-max=${mem}" >/dev/null
+    # static-min lower than the rest on purpose -- see TPL_STATIC_MIN_GB.
+    # XAPI requires static-max >= dynamic-max >= dynamic-min >= static-min, so
+    # a floor below the other three is valid; equal to them is what this used
+    # to send.
+    dom0_xe "vm-memory-limits-set uuid=${TPL_VM_UUID} static-min=${static_min} dynamic-min=${mem} dynamic-max=${mem} static-max=${mem}" >/dev/null
 
     # Firmware for the *build*: BIOS, always, whatever the finished template
     # ends up advertising.
@@ -7968,6 +8166,42 @@ tpl_create_build_vm() {
 # Wait for the preparation boot to finish. The prep script ends in a shutdown,
 # so the VM halting is the completion signal -- there is no need to reach into
 # the guest, and nothing to reach it over once the host keys are deleted.
+# Read the build VM's power state through whichever path this run is using.
+#
+# The two build paths ask XAPI the same question by different routes -- `xe` on
+# dom0, or XO's REST API. Split out so the wait loop below can be ONE loop
+# rather than one per path.
+tpl_power_state() {
+    if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        local resp
+        resp=$(tpl_api_get "vms/${TPL_VM_UUID}?fields=power_state" 2>/dev/null) || return 1
+        tpl_json_field "$resp" "power_state" | tr '[:upper:]' '[:lower:]'
+    else
+        dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=power-state" 2>/dev/null | tr -d '\r'
+    fi
+}
+
+# The guest agent's version, if it can be seen. Empty when it cannot.
+#
+# Only the SSH path can read this: PV-drivers-version is cleared when the
+# domain goes away, so it has to be caught mid-boot, and XO's REST API does not
+# expose it. That is why it is a *secondary* signal -- see the caller.
+tpl_agent_version() {
+    if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        return 0
+    fi
+    dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=PV-drivers-version" 2>/dev/null | tr -d '\r'
+}
+
+# Wait for the preparation boot to finish. The prep script ends in a shutdown,
+# so the VM halting is the completion signal -- there is no need to reach into
+# the guest, and nothing to reach it over once the host keys are deleted.
+#
+# ONE loop for both build paths. It was two, which meant the API copy silently
+# lacked the agent observation below and backed off on a different schedule --
+# the same wait behaving differently depending on how it connected. Anything
+# path-specific belongs in tpl_power_state or tpl_agent_version, not in a
+# second copy of this loop.
 tpl_wait_for_prep() {
     local timeout="${1:-900}"
     local waited=0 interval=15 state=""
@@ -7975,13 +8209,13 @@ tpl_wait_for_prep() {
     # Wait for the VM to actually start before watching for it to stop.
     #
     # Without this the loop below reads "halted" on its first pass -- XAPI has
-    # not necessarily moved the VM out of that state by the time vm-start
+    # not necessarily moved the VM out of that state by the time the start
     # returns -- and treats a VM that never booted as a finished preparation.
     # The template then seals with no guest agent installed and no machine
     # state scrubbed, which looks exactly like success.
     local starting=0
     while (( starting < 120 )); do
-        state=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=power-state" 2>/dev/null | tr -d '\r')
+        state=$(tpl_power_state)
         [[ "$state" == "running" ]] && break
         sleep 5
         starting=$((starting + 5))
@@ -8001,13 +8235,13 @@ tpl_wait_for_prep() {
     # every halted VM reports it empty, working ones included, and on guest
     # tools that ship the management agent without versioned PV drivers it may
     # never appear even while running. tpl_build_one's check does not depend
-    # on it.
+    # on it, which is also what lets the API path leave it empty.
     TPL_AGENT_SEEN=""
     local pv=""
     while (( waited < timeout )); do
-        state=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=power-state" 2>/dev/null | tr -d '\r')
+        state=$(tpl_power_state)
         if [[ -z "$TPL_AGENT_SEEN" && "$state" == "running" ]]; then
-            pv=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=PV-drivers-version" 2>/dev/null | tr -d '\r')
+            pv=$(tpl_agent_version)
             [[ "$pv" =~ [0-9]+\.[0-9]+ ]] && TPL_AGENT_SEEN="$pv"
         fi
         if [[ "$state" == "halted" ]]; then
@@ -8106,6 +8340,992 @@ tpl_cleanup_failed_build() {
     TPL_VM_UUID=""; TPL_ROOT_VDI=""; TPL_CIDATA_VDI=""; TPL_BUILD_STARTED="false"
 }
 
+
+# ============================================================================
+# The API path's implementations of the build steps
+#
+# The SSH path drives `xe` on dom0; these do the same work over XO's API. They
+# are called from the same places, so a build reads the same either way and the
+# progress messages, error handling and cleanup are shared.
+#
+# xo-cli covers what REST does not (see the block above tpl_select_build_method).
+# It is invoked with --url and --token on every call rather than relying on a
+# stored registration: a build must not depend on, or disturb, whatever the
+# operator has already registered xo-cli against.
+# ============================================================================
+
+# Run an xo-cli command against the configured XO, printing its output.
+tpl_xo_cli() {
+    local base
+    base=$(tpl_api_base_url)
+
+    # The token goes INSIDE the url, as xo-cli's own --help states: "The URL
+    # must include credentials: https://token@xo.company.net/". There is no
+    # standalone --token for a command invocation -- passing one is read as a
+    # positional argument and fails with "invalid arg: <the token>", which
+    # looks like the token is malformed rather than misplaced.
+    local auth_url="${base/:\/\//://${XO_API_TOKEN}@}"
+
+    # --au (--allowUnauthorized) for the same reason curl gets -k: the common
+    # target is an XO with a self-signed certificate.
+    xo-cli --au --url "$auth_url" "$@" 2>&1
+}
+
+# POST a REST path with a JSON body and print the response.
+tpl_api_post() {
+    tpl_api_request POST "$1" "${2:-}"
+}
+
+# Wait for an asynchronous REST action and print the id it produced.
+#
+# Actions that create objects answer 202 with {"taskId": "..."} rather than the
+# object itself -- verified against a live instance: POST create_vm returns a
+# task, and the VM's id appears in that task's `result.id` once its `status`
+# reaches "success". Reading the POST body for an id therefore finds none, and
+# the build fails claiming XO returned nothing while the VM it asked for is
+# being built perfectly well.
+#
+# Sets TPL_API_TASK_RESULT to the created object's id, and on failure sets
+# TPL_API_TASK_ERROR to why.
+#
+# It returns its id in a global rather than on stdout so that the caller can
+# run it in the *current* shell. Called as `id=$(tpl_api_await_task ...)` the
+# whole function body runs in a subshell, so every TPL_API_TASK_ERROR it sets
+# is discarded when that subshell exits -- and the caller, reading the variable
+# it still holds from before the call, reports "unknown error" for a failure
+# whose reason XO had stated plainly.
+tpl_api_await_task() {
+    local task_id="$1" timeout="${2:-300}"
+    local waited=0 resp status
+
+    TPL_API_TASK_RESULT=""
+    TPL_API_TASK_ERROR=""
+
+    while (( waited < timeout )); do
+        resp=$(tpl_api_get "tasks/${task_id}" 2>/dev/null) || true
+        status=$(tpl_json_field "$resp" "status")
+        case "$status" in
+            success)
+                # `result` is an object holding the id; tpl_json_field takes
+                # the first "id" in the body, and the task's own id comes
+                # first, so the result section is isolated before reading it.
+                TPL_API_TASK_RESULT=$(printf '%s' "${resp#*\"result\"}" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+                return 0
+                ;;
+            failure|cancelled)
+                # XO reports a failed task's reason in several shapes depending
+                # on what threw: a plain `message`, an XAPI error carried in
+                # `result` (whose `code` is the useful part -- and its `message`
+                # may be absent entirely), or nothing but the status. Each is
+                # tried in turn so the operator sees the most specific one XO
+                # actually sent, rather than the bare word "failure".
+                TPL_API_TASK_ERROR=$(tpl_json_field "$resp" "message")
+                if [[ -z "$TPL_API_TASK_ERROR" ]]; then
+                    local result_part="${resp#*\"result\"}"
+                    TPL_API_TASK_ERROR=$(tpl_json_field "$result_part" "code")
+                    [[ -n "$TPL_API_TASK_ERROR" ]] &&
+                        TPL_API_TASK_ERROR="${TPL_API_TASK_ERROR} $(printf '%s' "$result_part" |
+                            sed -n 's/.*"params"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/(\1)/p' | head -1)"
+                fi
+                [[ -z "${TPL_API_TASK_ERROR// /}" ]] && TPL_API_TASK_ERROR="$status"
+                return 1
+                ;;
+        esac
+        sleep 3
+        waited=$((waited + 3))
+    done
+
+    TPL_API_TASK_ERROR="the task did not finish within ${timeout}s"
+    return 1
+}
+
+# Pull one JSON string field out of a response.
+#
+# XO's REST responses are flat enough for this, and a build must not require
+# jq on the operator's machine -- the SSH path needs no JSON tooling at all,
+# and adding a hard dependency for the API path would be a step backwards.
+tpl_json_field() {
+    local json="$1" field="$2"
+    printf '%s' "$json" | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# The id of the object in a REST collection whose <field> is exactly <value>.
+#
+# Separate from tpl_json_id_matching, which greps object text for a substring.
+# That is right for "the template called Other install media" and wrong the
+# moment a pool holds names that contain one another -- an upgraded host keeps
+# "Old version of guest-tools.iso" beside "guest-tools.iso", and a substring
+# match takes whichever is listed first, quietly installing guest tools from a
+# superseded ISO. XO's own ?filter= is a substring match too, so it cannot
+# settle this either; the exactness has to happen here.
+#
+# Objects are pretty-printed across several lines, so the match is made on the
+# whole response with awk tracking the current object rather than by splitting
+# on braces.
+tpl_json_id_where() {
+    tpl_json_field_where "$1" "$2" "$3" id
+}
+
+# As above, but returns <want> from the matching object rather than its id.
+# Needed because a template's `id` and `uuid` differ and the two are not
+# interchangeable -- see tpl_api_create_build_vm.
+tpl_json_field_where() {
+    local json="$1" field="$2" value="$3" want="${4:-id}"
+    printf '%s' "$json" | awk -v f="\"${field}\"" -v v="\"${value}\"" -v w="\"${want}\"" -v bare="${value}" '
+        # Braces escaped: busybox awk reads an unescaped { as the start of a
+        # repetition quantifier and rejects the pattern outright ("bad regex
+        # ... Unmatched \{"), so every lookup through here returns nothing on
+        # a musl system. gawk accepts either form.
+        /^[[:space:]]*\{/ { id = ""; hit = 0 }
+        {
+            line = $0
+            if (index(line, w) == 1 || index(line, "    " w) == 1 || index(line, w ":") > 0) {
+                rest2 = substr(line, index(line, w) + length(w))
+                if (match(rest2, /"[^"]*"/)) {
+                    seg = substr(rest2, RSTART + 1, RLENGTH - 2)
+                    id = seg
+                }
+            }
+            if (index(line, f) && index(line, bare)) {
+                # Confirm the value is the whole field, not a suffix of it.
+                rest = substr(line, index(line, f) + length(f))
+                if (match(rest, /"[^"]*"/)) {
+                    got = substr(rest, RSTART, RLENGTH)
+                    if (got == v) hit = 1
+                }
+                # Unquoted scalars -- booleans and numbers -- which JSON writes
+                # bare. `management` on a PIF is the case this exists for: the
+                # quoted branch above can never match `"management": true`, and
+                # a lookup for it silently returned nothing rather than failing.
+                if (!hit && match(rest, /:[[:space:]]*[^",}[:space:]]+/)) {
+                    got = substr(rest, RSTART, RLENGTH)
+                    sub(/^:[[:space:]]*/, "", got)
+                    if (got == bare) hit = 1
+                }
+            }
+        }
+        /^[[:space:]]*\}/ { if (hit && id != "") { print id; exit } }
+    '
+}
+
+# Whether a string is an id XO could have returned.
+#
+# NOT a uuid test. Real objects -- VMs, VDIs, SRs, networks, pools -- carry a
+# plain 36-character uuid, but a *template* is identified by its pool uuid and
+# its own uuid joined with a dash, giving 73 characters:
+#
+#   751d40fa-60b5-82cf-e735-6ed42d0e03f8-552bce37-51b2-445d-84f2-5f33fa112d7e
+#
+# Read off this pool, not assumed. A `^[0-9a-f-]{36}$` check rejects that
+# outright, which is how "Could not find the 'Other install media' template"
+# came to be reported for a template the API had just returned.
+tpl_is_xo_id() {
+    [[ "$1" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}(-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})?$ ]]
+}
+
+# The id of the first object in a REST collection whose text matches a pattern.
+#
+# ONE implementation. There were three copies of this; add a caller, not a
+# fourth copy.
+#
+# Objects are accumulated with awk rather than split on '}' with tr. Splitting
+# assumed a collection arrives as one line, so the chunk grep matched held both
+# the name and the id; XO in fact pretty-prints across lines, leaving the
+# matched line holding the name alone and the following sed finding no id at
+# all. That returned empty, which the callers read as "no such object": the
+# cloud-init drive was never detached from a finished template, so a clone
+# found a used seed and skipped the operator's own cloud-config.
+#
+# Arguments: the response body, the grep flags to use ("-F" for a literal,
+# "-Ei" for a case-insensitive regex), and the pattern.
+tpl_json_id_matching() {
+    local json="$1" grep_flag="$2" pattern="$3"
+    local obj id
+    # One object per line, id and all, so a match has the id beside it.
+    while IFS= read -r obj; do
+        if printf '%s' "$obj" | grep -q "$grep_flag" -- "$pattern"; then
+            id=$(printf '%s' "$obj" |
+                sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            if [[ -n "$id" ]]; then
+                printf '%s' "$id"
+                return 0
+            fi
+        fi
+    done < <(printf '%s' "$json" | awk '
+        # Braces escaped for busybox awk, as in tpl_json_field_where.
+        /^[[:space:]]*\{/ { buf = ""; depth = 1; next }
+        /^[[:space:]]*\}/ { if (depth) { print buf; depth = 0 }; next }
+        depth { gsub(/^[[:space:]]+/, "", $0); buf = buf " " $0 }
+    ')
+    return 0
+}
+
+# Resolve the SR and network through the API, in place of tpl_resolve_storage
+# and tpl_resolve_network's `xe` calls.
+#
+# The same choice is made as the SSH path makes: the pool's default SR, and the
+# management network. Both are what a VM created in XO's own New VM form would
+# get, so a template built either way lands in the same place.
+tpl_api_resolve_targets() {
+    local pools default_sr pool_id
+    if ! pools=$(tpl_api_get "pools?fields=id,default_SR,name_label"); then
+        log_error "Could not list pools from XO."
+        return 1
+    fi
+
+    pool_id=$(tpl_json_field "$pools" "id")
+    default_sr=$(tpl_json_field "$pools" "default_SR")
+
+    if [[ -z "$pool_id" ]]; then
+        log_error "XO returned no pools. Is a host connected to this XO?"
+        return 1
+    fi
+    TPL_API_POOL_ID="$pool_id"
+
+    if [[ -z "$default_sr" ]]; then
+        log_error "This pool has no default SR set. Set one in XO, or use"
+        log_error "TEMPLATE_BUILD_METHOD=ssh to pick storage on the pool master."
+        return 1
+    fi
+    DEPLOY_SR_UUID="$default_sr"
+
+    local srs label
+    if srs=$(tpl_api_get "srs/${default_sr}?fields=name_label"); then
+        label=$(tpl_json_field "$srs" "name_label")
+    fi
+    log_info "Storage: ${label:-$default_sr} (the pool's default SR)"
+
+    # The management network, matching the SSH path's `pif-list management=true`.
+    #
+    # Asked for by the same property, not by position. Listing networks and
+    # taking the first is what this did before, and XO's ordering is not the
+    # pool's: on a live pool it returned "Host internal management network" on
+    # one run and "Pool-wide network 3" on the next, both of which carry no PIF
+    # at all. A VM on either boots fine and can reach nothing -- so the
+    # preparation boot, which installs the guest tools and updates packages
+    # from the distribution's mirrors, hangs until it times out with no
+    # indication that the network was the problem.
+    #
+    # PIFs carry `management`, networks do not, so the question is asked of the
+    # PIF and the answer read off its $network. A pool has one management PIF
+    # per host, all on the same network, so any of them gives the same answer.
+    local pifs net_id
+    if ! pifs=$(tpl_api_get "pifs?fields=management,\$network&limit=200"); then
+        log_error "Could not list PIFs from XO."
+        return 1
+    fi
+    net_id=$(tpl_json_field_where "$pifs" management true '$network')
+
+    if [[ -z "$net_id" ]]; then
+        # No management PIF is a pool XO cannot be managing, but fall back to a
+        # network that at least has a physical interface rather than failing:
+        # the SSH path falls back too, and an unrouted network is worse than a
+        # guess at a routed one.
+        local nets
+        if ! nets=$(tpl_api_get "networks?fields=id,name_label,PIFs&limit=200"); then
+            log_error "Could not list networks from XO."
+            return 1
+        fi
+        net_id=$(printf '%s' "$nets" | awk '
+            /^[[:space:]]*\{/ { id = ""; haspif = 0 }
+            /"id"[[:space:]]*:/ && id == "" {
+                if (match($0, /"id"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                    seg = substr($0, RSTART, RLENGTH)
+                    if (match(seg, /:[[:space:]]*"[^"]*"/)) {
+                        id = substr(seg, RSTART + 1, RLENGTH - 1)
+                        gsub(/[[:space:]"]/, "", id)
+                    }
+                }
+            }
+            /"PIFs"[[:space:]]*:[[:space:]]*\[[[:space:]]*"/ { haspif = 1 }
+            /^[[:space:]]*\}/ { if (haspif && id != "") { print id; exit } }
+        ' | head -1)
+        [[ -n "$net_id" ]] && log_warning "No management PIF found; using the first network with an uplink."
+    fi
+
+    if [[ -z "$net_id" ]]; then
+        log_error "No network with a physical interface found on this pool."
+        log_error "  A template build needs a network that reaches the internet:"
+        log_error "  the preparation boot installs the guest tools and updates"
+        log_error "  packages from the distribution's mirrors."
+        return 1
+    fi
+    DEPLOY_NETWORK_UUID="$net_id"
+
+    local netinfo
+    if netinfo=$(tpl_api_get "networks/${net_id}?fields=name_label" 2>/dev/null); then
+        log_info "Network: $(tpl_json_field "$netinfo" "name_label") (the management network)"
+    else
+        log_info "Network: ${net_id} (the management network)"
+    fi
+    return 0
+}
+
+# Import a cloud image into a new VDI on the default SR.
+#
+# The image is streamed from its mirror straight into XO's import endpoint, so
+# it is never written to a file on the way. That matters on the in-VM case,
+# where the machine running this is the XO VM and has no room to spare for a
+# multi-gigabyte staging file.
+#
+# A qcow2 image is converted to raw here before the upload, because XO's import
+# endpoint accepts raw and VHD only -- see tpl_api_import_image. That needs
+# qemu-img on this machine, where the SSH path needs it on the pool master.
+tpl_api_import_image() {
+    local name="$1" url="$2"
+    local base resp rc=0
+    # The base the preflight actually reached XO on, not a freshly guessed one:
+    # tpl_api_request settles https-vs-http on the first call, and re-deriving
+    # it here would send the image to a scheme this XO may not answer.
+    base="${TPL_API_BASE_USED:-$(tpl_api_base_url)}"
+
+    # XO's import endpoint takes raw or VHD -- and nothing else.
+    #
+    # Read off the controller, not assumed: SR_importVdi is called with
+    # `raw ? SUPPORTED_VDI_FORMAT.raw : SUPPORTED_VDI_FORMAT.vhd`, and the VDI
+    # import route types its format parameter as
+    # `Exclude<SUPPORTED_VDI_FORMAT, 'qcow2'>` -- qcow2 is excluded by name.
+    # So there is no "hand it a qcow2 and let XO sort it out": a qcow2 sent
+    # with raw=false is read as a VHD and fails on its footer checksum, which
+    # is what "invalid footer checksum 0" means.
+    #
+    # Everything in the catalogue except Debian ships qcow2, so those are
+    # converted here before the upload -- the same conversion the SSH path
+    # does on the pool master, done locally because that is where the bytes
+    # are on this path.
+    local local_file="" upload_file="" converted=""
+    case "$url" in
+        *.raw)
+            # Raw streams straight through: nothing to convert, and staging a
+            # 3 GiB file to disk for no reason is worth avoiding.
+            upload_file=""
+            ;;
+        *)
+            if ! command -v qemu-img >/dev/null 2>&1; then
+                log_error "  ${url##*/} is a qcow2 image and XO's import endpoint"
+                log_error "  does not accept qcow2, so it has to be converted first."
+                log_error "  Install qemu-utils (Debian/Ubuntu) or qemu-img (RHEL"
+                log_error "  family), or use TEMPLATE_BUILD_METHOD=ssh, which"
+                log_error "  converts on the pool master instead."
+                return 1
+            fi
+            local_file="${DEPLOY_WORKDIR}/image.qcow2"
+            converted="${DEPLOY_WORKDIR}/image.raw"
+            # Cleared rather than resumed: `curl -C -` would top a stale file
+            # from a previous template up to a plausible length and hand it to
+            # qemu-img, which fails in a way that reads as a bad mirror. The
+            # workdir is per-run, so there is never anything here worth keeping.
+            rm -f "$local_file" "$converted"
+
+            # --progress-bar for the same reason the SSH path has one: this is
+            # several minutes of silence otherwise, and silence on the longest
+            # step reads as a hang worth killing. --retry and -C - likewise --
+            # a multi-gigabyte download over one connection eventually hits a
+            # transient error, and restarting it from zero is the worst way to
+            # find that out.
+            log_info "    downloading the image..."
+            if ! curl -fL --progress-bar -o "$local_file" -C - \
+                    --retry 5 --retry-delay 3 --retry-all-errors \
+                    --speed-limit 1024 --speed-time 120 --max-time 3600 "$url"; then
+                log_error "  could not download ${url}"
+                rm -f "$local_file"
+                return 1
+            fi
+
+            # qemu-img is silent and takes a minute or two on a 3.5 GiB
+            # image, so the size is printed rather than leaving another
+            # unexplained pause between two progress bars.
+            local vsize
+            vsize=$(qemu-img info --output=json "$local_file" 2>/dev/null \
+                | sed -n 's/.*"virtual-size":[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+            if [[ "$vsize" =~ ^[0-9]+$ ]]; then
+                # One decimal place: bash does integer division, so a 3.5 GiB
+                # image printed as "0 GiB" and read as a failed size lookup
+                # rather than as the rounding it was.
+                local tenths=$(( vsize / 107374182 ))
+                log_info "    converting it to raw ($(( tenths / 10 )).$(( tenths % 10 )) GiB expanded)..."
+            else
+                log_info "    converting it to raw..."
+            fi
+            if ! qemu-img convert -f qcow2 -O raw "$local_file" "$converted" 2>/dev/null; then
+                log_error "  could not convert the image to raw."
+                rm -f "$local_file" "$converted"
+                return 1
+            fi
+            rm -f "$local_file"
+            upload_file="$converted"
+            ;;
+    esac
+
+    # This is the one call that cannot go through tpl_api_request: it streams a
+    # multi-gigabyte body, so it needs no overall timeout (the shared 60s would
+    # abort every build) and must not buffer the response first. Everything
+    # else about it -- the cookie, the -k, -L, the base URL -- matches,
+    # deliberately.
+    local resp_file http_code
+    resp_file=$(mktemp --tmpdir xo-import-XXXXXX)
+
+    local target
+    target="${base}/rest/v0/srs/${DEPLOY_SR_UUID}/vdis?raw=true&name_label=$(tpl_urlencode "${name} root")"
+
+    log_info "    uploading it to Xen Orchestra..."
+    if [[ -n "$upload_file" ]]; then
+        # A file, so curl can set Content-Length -- which XAPI needs, and which
+        # a streamed body cannot provide.
+        # --progress-bar, not -s: this is a multi-gigabyte PUT over the
+        # network and is the second-longest step of a build. The bar goes to
+        # stderr and the status code to stdout, so the capture is unaffected.
+        http_code=$(curl -k -L --post301 --post302 --post303 -X POST \
+            --progress-bar \
+            --speed-limit 1024 --speed-time 120 \
+            -b "authenticationToken=${XO_API_TOKEN}" \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary "@${upload_file}" \
+            --output "$resp_file" --write-out '%{http_code}' \
+            "$target") || rc=$?
+    else
+        http_code=$(curl -fL --progress-bar --max-time 0 \
+                --speed-limit 1024 --speed-time 120 "$url" \
+            | curl -s -k -L --post301 --post302 --post303 -X POST \
+                --speed-limit 1024 --speed-time 120 \
+                -b "authenticationToken=${XO_API_TOKEN}" \
+                -H 'Content-Type: application/octet-stream' \
+                --data-binary @- \
+                --output "$resp_file" --write-out '%{http_code}' \
+                "$target" 2>/dev/null) || rc=$?
+    fi
+
+    resp=$(<"$resp_file")
+    rm -f "$resp_file" "$converted"
+
+    if (( rc != 0 )) || [[ ! "$http_code" =~ ^2 ]]; then
+        log_error "  the image import failed (HTTP ${http_code:-none})."
+        [[ -n "$resp" ]] && log_error "  ${resp}"
+        return 1
+    fi
+
+    TPL_ROOT_VDI=$(tpl_json_field "$resp" "id")
+    if ! tpl_is_xo_id "$TPL_ROOT_VDI"; then
+        log_error "  XO did not return a disk id for the imported image."
+        [[ -n "$resp" ]] && log_error "  it said: ${resp}"
+        return 1
+    fi
+    return 0
+}
+
+# Percent-encode a string for use in a query parameter.
+tpl_urlencode() {
+    local s="$1" out="" c i
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) out+=$(printf '%%%02X' "'$c") ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# Create the build VM and attach the imported disk.
+#
+# cloud_config is passed to XO, which builds the NoCloud drive itself -- so the
+# API path needs no ISO writer on this machine, where the SSH path needs
+# genisoimage or xorriso.
+tpl_api_create_build_vm() {
+    local row="$1" name="$2"
+    local url user prep_fn
+    url=$(tpl_field "$row" 4)
+    user=$(tpl_field "$row" 5)
+    prep_fn=$(tpl_field "$row" 6)
+
+    log_info "  importing the cloud image (this is the longest step)..."
+    log_info "    ${url}"
+    if ! tpl_api_import_image "$name" "$url"; then
+        return 1
+    fi
+
+    # The same key and the same payload the SSH path uses -- literally the same
+    # two functions, not a copy of them. See the notes above tpl_build_ssh_key
+    # and tpl_cloud_config for why this must not be inlined again.
+    local pubkey cloud_config
+    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    pubkey=$(tpl_build_ssh_key) || return 1
+    cloud_config=$(tpl_cloud_config "$user" "$prep_fn" "$pubkey")
+
+    # The base template, matching the SSH path's "Other install media".
+    #
+    # Asked for by name through XO's own filter first, because a pool can carry
+    # several hundred templates and the default page size is not guaranteed to
+    # reach the one we want. The unfiltered listing is the fallback for an XO
+    # whose filter syntax differs, and only then do we give up -- reporting how
+    # many templates came back, since "none at all" and "many but not that one"
+    # are different problems with different fixes.
+    # `uuid`, not `id`.
+    #
+    # A template carries both, and they are not the same string. `id` is REST's
+    # routing key and joins the pool uuid to the object uuid:
+    #
+    #   id   751d40fa-...-6ed42d0e03f8-552bce37-51b2-445d-84f2-5f33fa112d7e
+    #   uuid 552bce37-51b2-445d-84f2-5f33fa112d7e
+    #
+    # create_vm resolves its `template` against XAPI objects, so it wants the
+    # uuid; handed the compound id it answers "no such object" while quoting
+    # the exact string the listing had just returned. Every other object type
+    # here -- SRs, networks, pools -- reports id and uuid identically, which is
+    # why this is the only lookup that has to ask for both.
+    local tpls base_tpl count
+    tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label&filter=$(tpl_urlencode 'name_label:"Other install media"')&limit=50" 2>/dev/null) || tpls=""
+    base_tpl=$(tpl_json_field_where "$tpls" name_label 'Other install media' uuid)
+
+    if [[ -z "$base_tpl" ]]; then
+        if ! tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label&limit=1000"); then
+            log_error "Could not list VM templates from XO."
+            return 1
+        fi
+        base_tpl=$(tpl_json_field_where "$tpls" name_label 'Other install media' uuid)
+    fi
+    if [[ -z "$base_tpl" ]]; then
+        count=$(printf '%s' "$tpls" | grep -o '"id"' | wc -l | tr -d ' ')
+        log_error "Could not find the 'Other install media' template on this pool."
+        log_error "  XO returned ${count} template(s) for this account."
+        if [[ "$count" == "0" ]]; then
+            log_error "  None at all usually means the token's account cannot see"
+            log_error "  the pool's objects -- the REST API needs an admin account."
+        else
+            log_error "  It is the stock XCP-ng template every host ships; if it"
+            log_error "  has been renamed or removed, use TEMPLATE_BUILD_METHOD=ssh."
+        fi
+        return 1
+    fi
+
+    log_info "  creating the build VM..."
+    local body resp
+    body=$(tpl_api_vm_create_body "$name" "$base_tpl" "$cloud_config")
+    if ! resp=$(tpl_api_post "pools/${TPL_API_POOL_ID}/actions/create_vm" "$body"); then
+        log_error "Failed to create the build VM."
+        [[ -n "$resp" ]] && log_error "  ${resp}"
+        return 1
+    fi
+
+    # 202 with a taskId is the normal answer here; the VM id arrives in the
+    # task. A body that already carries an id is accepted too, so this works
+    # on an XO that answers synchronously.
+    local task_id
+    task_id=$(tpl_json_field "$resp" "taskId")
+    if [[ -n "$task_id" ]]; then
+        # Not `$(tpl_api_await_task ...)`: the reason a failed task gives is
+        # returned in a global, which a command substitution's subshell would
+        # throw away. See the notes on that function.
+        if tpl_api_await_task "$task_id" 600; then
+            TPL_VM_UUID="$TPL_API_TASK_RESULT"
+        else
+            log_error "Failed to create the build VM: ${TPL_API_TASK_ERROR:-unknown error}"
+            return 1
+        fi
+    else
+        TPL_VM_UUID=$(tpl_json_field "$resp" "id")
+    fi
+
+    if ! tpl_is_xo_id "$TPL_VM_UUID"; then
+        log_error "XO did not return a VM id: ${resp:-<empty>}"
+        return 1
+    fi
+    TPL_BUILD_STARTED="true"
+
+    # The placeholder goes *before* the root disk is attached, not after, and
+    # the order is the whole point.
+    #
+    # XAPI hands each new VBD the lowest free slot. Destroying the placeholder
+    # afterwards frees slot 0 but does not move anything into it, so the root
+    # disk keeps whatever slot it was given while the placeholder still held 0
+    # -- observed on this pool as userdevice 2, behind the cloud-config drive
+    # at 1, with the BIOS finding no bootable disk where it looks and the build
+    # boot hanging until its timeout.
+    tpl_api_drop_placeholder_disk
+
+    # Attach the imported disk at device 0, bootable.
+    log_info "  attaching the root disk..."
+    # "VM" and "VDI", capitalised, and "userdevice" as a string.
+    #
+    # Read off the endpoint's own schema, which requires exactly those keys and
+    # gives them in that case. Lowercase VM/VDI are rejected with a 422 whose
+    # message ("'VDI' is required") names fields the request appears to
+    # contain, so the mistake is not obvious from the error.
+    #
+    # userdevice is stated rather than left to XAPI: `bootable` marks which
+    # disk may be booted, but the BIOS boots the *first* one, so the flag alone
+    # does not put this disk where the firmware looks.
+    local vbd_resp
+    if ! vbd_resp=$(tpl_api_post "vbds" "$(printf '{"VM":"%s","VDI":"%s","userdevice":"0","bootable":true,"mode":"RW"}' \
+            "$TPL_VM_UUID" "$TPL_ROOT_VDI")"); then
+        log_error "Could not attach the imported disk to the build VM."
+        [[ -n "$vbd_resp" ]] && log_error "  ${vbd_resp}"
+        return 1
+    fi
+
+    return 0
+}
+
+# Body for POST /pools/{id}/actions/create_vm.
+#
+# Kept separate so the JSON is readable and so the escaping of the cloud-init
+# document -- which is multi-line YAML going into a JSON string -- happens in
+# exactly one place.
+tpl_api_vm_create_body() {
+    local name="$1" template="$2" cloud_config="$3"
+    local mem_bytes=$(( TPL_DEFAULT_RAM_GB * 1024 * 1024 * 1024 ))
+    local cc_escaped
+
+    # JSON-escape: backslashes, quotes, then newlines and tabs.
+    cc_escaped=$(printf '%s' "$cloud_config" \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+        | awk '{printf "%s\\n", $0}')
+
+    # The `vdis` entry is a throwaway 8 MiB disk, and it is what makes
+    # cloud_config work at all.
+    #
+    # XO builds the NoCloud drive during create_vm, and createCloudInitConfig
+    # refuses outright when the new VM has no disk yet:
+    #
+    #   Can't create cloud init config drive for VM without disks
+    #
+    # -- read off this pool's own failed task, not inferred. The imported root
+    # disk cannot be supplied here to satisfy it: `vdis` takes size/name_label
+    # and *creates* blank disks, with no field naming an existing VDI, and
+    # create_vm is the only endpoint that accepts cloud_config at all, so the
+    # config drive cannot be added after the real disk is attached either.
+    #
+    # So the VM is created holding one small placeholder purely to get past
+    # that check, and tpl_api_drop_placeholder_disk destroys it once the
+    # imported disk is on. 8 MiB because the size is never used -- the disk is
+    # written to by nothing and exists for the length of one API call.
+    printf '{"name_label":"[building template] %s","template":"%s","cpus":%s,"memory":%s,"cloud_config":"%s","vdis":[{"name_label":"%s","size":8388608,"sr":"%s"}],"vifs":[{"network":"%s"}],"boot":false}' \
+        "$name" "$template" "$TPL_DEFAULT_VCPUS" "$mem_bytes" "$cc_escaped" \
+        "$TPL_API_PLACEHOLDER_DISK" "$DEPLOY_SR_UUID" "$DEPLOY_NETWORK_UUID"
+}
+
+# Destroy the placeholder disk created alongside the cloud-init drive.
+#
+# Matched by name_label, which is why that name is a constant rather than
+# spelled out at both ends: the imported root disk and the cloud-init drive sit
+# on the same VM and neither must be touched. A VM whose listing cannot be read
+# is left alone rather than guessed at -- an 8 MiB disk left behind is a far
+# smaller problem than destroying the wrong one.
+tpl_api_drop_placeholder_disk() {
+    local vdis id
+    vdis=$(tpl_api_get "vms/${TPL_VM_UUID}/vdis?fields=id,name_label" 2>/dev/null) || return 0
+    id=$(tpl_json_id_where "$vdis" name_label "$TPL_API_PLACEHOLDER_DISK")
+    [[ -z "$id" ]] && return 0
+    # The empty third argument is required, not decorative: tpl_api_request
+    # reads its body as "$3" with no default, and the script runs under
+    # `set -u`, so a two-argument call dies with "unbound variable".
+    tpl_api_request DELETE "vdis/${id}" "" >/dev/null 2>&1 || true
+    return 0
+}
+
+# Attach the guest-tools ISO, which installs the agent XO needs to report a
+# VM's IP address. JSON-RPC only -- there is no REST route for inserting a CD.
+tpl_api_attach_tools_iso() {
+    local out
+    if out=$(tpl_xo_cli vm.insertCd id="$TPL_VM_UUID" cd_id="$TPL_TOOLS_ISO_NAME" force=true); then
+        DEPLOY_TOOLS_ATTACHED="true"
+        return 0
+    fi
+
+    # Try by VDI id: insertCd wants the ISO's own id, and pools differ in
+    # whether the name resolves.
+    #
+    # Matched on the exact name, not a substring. A pool that has been upgraded
+    # carries "Old version of guest-tools.iso" entries beside the current one,
+    # and a substring match hits whichever came back first -- installing guest
+    # tools from a superseded ISO, which is the sort of thing that works often
+    # enough to go unnoticed.
+    local isos iso_id
+    if isos=$(tpl_api_get "vdis?fields=id,name_label&limit=2000"); then
+        iso_id=$(tpl_json_id_where "$isos" name_label "$TPL_TOOLS_ISO_NAME")
+    fi
+    if [[ -n "$iso_id" ]] && tpl_xo_cli vm.insertCd id="$TPL_VM_UUID" cd_id="$iso_id" force=true >/dev/null; then
+        DEPLOY_TOOLS_ATTACHED="true"
+        return 0
+    fi
+
+    log_warning "  could not attach ${TPL_TOOLS_ISO_NAME}; the template will be"
+    log_warning "  built without the guest agent and XO will not report an IP"
+    log_warning "  address for VMs cloned from it."
+    return 0
+}
+
+# Start the build VM.
+tpl_api_start_vm() {
+    tpl_api_post "vms/${TPL_VM_UUID}/actions/start" '{}' >/dev/null
+}
+
+# Apply over REST the same VM settings tpl_create_build_vm applies over SSH.
+#
+# The values are not restated here. They are read out of tpl_create_build_vm
+# itself with `declare -f`, so that function stays the only place they are
+# written down and a template comes out the same whichever way the pool was
+# reached. Choosing a different connection must not change what gets built.
+#
+# Only the spelling differs between the transports: `xe` takes platform keys,
+# XO's PATCH /vms/{id} takes camelCase. That mapping is the one thing this
+# function knows, and a platform key with no REST equivalent is skipped rather
+# than guessed at.
+tpl_api_configure_build_vm() {
+    local ssh_src key value rest_prop body=""
+    ssh_src=$(declare -f tpl_create_build_vm)
+
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        value="${key#*=}"
+        key="${key%%=*}"
+
+        # The build VM's vCPU count is spelled as a variable in the source.
+        value="${value//\$\{TPL_DEFAULT_VCPUS\}/$TPL_DEFAULT_VCPUS}"
+
+        # viridian goes through JSON-RPC, not this PATCH. REST accepts it in
+        # the body, answers 200, and leaves the property untouched -- checked
+        # on a live pool, where a template built by this path came out
+        # viridian=true while the same request's vga, videoram and
+        # coresPerSocket all applied. vm.set does set it, so it is sent there
+        # instead of being quietly lost.
+        if [[ "$key" == "viridian" ]]; then
+            tpl_xo_cli vm.set id="$TPL_VM_UUID" viridian="$value" >/dev/null 2>&1 || true
+            continue
+        fi
+
+        case "$key" in
+            cores-per-socket) rest_prop="coresPerSocket" ;;
+            vga)              rest_prop="vga" ;;
+            videoram)         rest_prop="videoram" ;;
+            *)                continue ;;
+        esac
+
+        # Unquoted for numbers and booleans, quoted for strings: the schema
+        # types these individually (videoram is an enum of numbers, viridian a
+        # boolean, vga an enum of strings) and a quoted number is rejected.
+        if [[ "$value" =~ ^([0-9]+|true|false)$ ]]; then
+            body="${body:+${body},}\"${rest_prop}\":${value}"
+        else
+            body="${body:+${body},}\"${rest_prop}\":\"${value}\""
+        fi
+    done < <(printf '%s' "$ssh_src" |
+        sed -n 's/.*vm-param-set uuid=[^ ]* platform:\([a-z-]*\)=\([^"]*\)".*/\1=\2/p')
+
+    # Memory, as close as XO's API gets to vm-memory-limits-set.
+    #
+    # static-min cannot be raised through XO at all: memoryMin over REST and
+    # through vm.set both answer success and leave it at the base template's
+    # 128 MiB -- tried singly and with all four keys together against a live
+    # pool. Only `xe vm-memory-limits-set` moves it, which is what the SSH
+    # path uses and what this path exists to avoid needing.
+    #
+    # So an API-built template records static: [134217728, 2147483648] where an
+    # SSH-built one records the figure twice, and this does carry into VMs made
+    # from it -- XO's Advanced tab shows "Static: 128 MiB/2 GiB" on one and
+    # "2 GiB/2 GiB" on the other. Inert in practice: static-min is only the
+    # floor XAPI may shrink a guest to under ballooning, and dynamic min and
+    # max are both the full figure here so ballooning never engages. Checked
+    # against a live pool whose own VMs run static-min far below their dynamic
+    # allocation with no effect. Left as XO reports it rather than papered
+    # over, and recorded here so it is known.
+    local mem_bytes=$(( TPL_DEFAULT_RAM_GB * 1024 * 1024 * 1024 ))
+    body="${body:+${body},}\"memory\":${mem_bytes},\"memoryMax\":${mem_bytes}"
+    body="${body},\"memoryStaticMax\":${mem_bytes}"
+
+    # Failure here is not fatal: these settings improve the template rather
+    # than making it work at all, and a build that has already imported an
+    # image should not be thrown away because one cosmetic field was refused.
+    # It is reported, though, because the point is that the two paths agree --
+    # so a silent skip would hide exactly the drift this guards against.
+    if ! tpl_api_request PATCH "vms/${TPL_VM_UUID}" "{${body}}" >/dev/null 2>&1; then
+        log_warning "  could not apply the build VM's display and CPU topology"
+        log_warning "  settings; the template will work but may differ from one"
+        log_warning "  built over SSH (HTTP ${TPL_API_LAST_CODE:-?})."
+    fi
+
+    # Boot order, through JSON-RPC because REST has no route for it: PATCH
+    # /vms/{id} takes 36 properties and no boot policy among them. Read from
+    # the SSH function for the same reason as everything above.
+    local order
+    order=$(printf '%s' "$ssh_src" |
+        sed -n 's/.*HVM-boot-params:order=\([a-z]*\)".*/\1/p' | head -1)
+    [[ -n "$order" ]] &&
+        tpl_xo_cli vm.setBootOrder vm="$TPL_VM_UUID" order="$order" >/dev/null 2>&1 || true
+
+    return 0
+}
+
+# Seal the build VM into a template.
+#
+# The firmware decision is the one thing the API cannot make the way the SSH
+# path does: reading the imported disk's partition table needs block access to
+# the VDI, and no XO endpoint exposes that. So it comes from the catalogue's
+# eighth field instead -- see the note above TPL_CATALOG.
+tpl_api_seal_template() {
+    local name="$1" firmware="$2"
+
+    # Detach the cloud-init drive XO created, so a clone does not find a used
+    # seed and skip the operator's own config. destroy_cloud_config_vdi on
+    # create_vm only fires on first boot, which this VM has had.
+    local vbds
+    if vbds=$(tpl_api_get "vms/${TPL_VM_UUID}/vdis?fields=id,name_label" 2>/dev/null); then
+        local cc_vdi
+        cc_vdi=$(tpl_json_id_matching "$vbds" -Ei 'cloud.?config|cloudinit|cidata')
+        if [[ -n "$cc_vdi" ]]; then
+            tpl_xo_cli vdi.delete id="$cc_vdi" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    tpl_xo_cli vm.ejectCd id="$TPL_VM_UUID" >/dev/null 2>&1 || true
+
+    # Firmware, name and description, all settable over REST -- through the
+    # one request function, like every other call here, rather than a second
+    # hand-rolled curl with its own idea of the URL and the auth header.
+    tpl_api_request PATCH "vms/${TPL_VM_UUID}" \
+        "$(printf '{"nameLabel":"%s","nameDescription":"%s","hvmBootFirmware":"%s"}' \
+            "$name" "$TPL_DESCRIPTION" "$firmware")" >/dev/null 2>&1 || true
+
+    log_info "  publishing as ${firmware^^} (from the catalogue)."
+
+    # other-config:base_template_name is the one property the SSH path sets
+    # that this path cannot.
+    #
+    # XO's General tab reads it to show what a VM was built from, so a clone of
+    # an API-built template reports "Other install media" where a clone of an
+    # SSH-built one reports the template's real name. Nothing in XO's API
+    # writes other_config: PATCH /vms/{id} has no such property among its 36,
+    # and JSON-RPC exposes no other_config setter either (vm.set takes 35
+    # named fields, none of them it) -- checked against a live instance, not
+    # assumed. Reaching it needs `xe` on the pool master, which is exactly what
+    # this path exists to avoid.
+    #
+    # Cosmetic: the field only steers behaviour on the PV install path, which
+    # an HVM guest never takes. Left unset rather than faked, and recorded here
+    # so the difference is known rather than discovered.
+
+    # Seal. JSON-RPC only: there is no REST route that flips is_a_template.
+    local out
+    if ! out=$(tpl_xo_cli vm.convertToTemplate id="$TPL_VM_UUID"); then
+        log_error "Could not convert the VM into a template."
+        [[ -n "$out" ]] && log_error "  ${out}"
+        return 1
+    fi
+
+    return 0
+}
+
+# Remove a half-built VM, as tpl_cleanup_failed_build does over SSH.
+tpl_api_cleanup_failed_build() {
+    # The imported disk is destroyed even when no VM was ever created.
+    #
+    # On this path the disk is imported *before* the VM, so a failure in
+    # between -- no base template, a rejected create -- leaves a multi-gigabyte
+    # VDI on the SR that nothing references and nothing will ever collect. It
+    # has to be cleared on its own account, not as a side effect of deleting a
+    # VM that may not exist. (Destroying the VM does take its disks with it,
+    # so this runs first and blanks the reference to avoid a second attempt.)
+    if [[ -n "$TPL_ROOT_VDI" && -z "$TPL_VM_UUID" ]]; then
+        log_info "  removing the imported disk left by the failed build..."
+        tpl_xo_cli vdi.delete id="$TPL_ROOT_VDI" >/dev/null 2>&1 || true
+        TPL_ROOT_VDI=""
+    fi
+
+    [[ "$TPL_BUILD_STARTED" == "true" ]] || return 0
+    [[ -n "$TPL_VM_UUID" ]] || return 0
+
+    local state
+    state=$(tpl_power_state 2>/dev/null || echo "")
+    if [[ "$state" == "running" || "$state" == "paused" ]]; then
+        tpl_api_post "vms/${TPL_VM_UUID}/actions/hard_shutdown" '{}' >/dev/null 2>&1 || true
+    fi
+    tpl_xo_cli vm.delete id="$TPL_VM_UUID" >/dev/null 2>&1 || true
+
+    TPL_VM_UUID=""; TPL_ROOT_VDI=""; TPL_CIDATA_VDI=""; TPL_BUILD_STARTED="false"
+}
+
+
+# --- Dispatch ---------------------------------------------------------------
+#
+# One entry per build step, sending it to whichever path this run selected.
+# tpl_build_one calls only these, so the sequence of a build -- and its
+# progress messages, its checks and its cleanup -- is written once and shared.
+
+tpl_template_exists_dispatch() {
+    if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        local resp
+        resp=$(tpl_api_get "vm-templates?fields=name_label&limit=500" 2>/dev/null) || return 1
+        printf '%s' "$resp" | grep -qF "\"$1\""
+    else
+        tpl_template_exists "$1"
+    fi
+}
+
+tpl_create_build_vm_dispatch() {
+    if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        tpl_api_create_build_vm "$1" "$2" || return 1
+        # Before the boot, like the SSH path: cores-per-socket and the VGA
+        # device are read by the guest as it comes up.
+        tpl_api_configure_build_vm
+        tpl_api_attach_tools_iso
+        log_info "  starting the preparation boot..."
+        tpl_api_start_vm || return 1
+    else
+        tpl_create_build_vm "$1" "$2"
+    fi
+}
+
+
+# The guest agent's own report of the guest OS, read off the halted VM.
+#
+# Proves the preparation boot actually ran: only the agent writes this, so a
+# VM that booted and halted without preparing has nothing here. Both paths read
+# the same XAPI field, one through `xe` and one through XO.
+tpl_os_version_dispatch() {
+    if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        local resp
+        resp=$(tpl_api_get "vms/${TPL_VM_UUID}?fields=os_version" 2>/dev/null) || return 0
+        # os_version is an object; its "name" is the distro string the SSH
+        # path's os-version parameter reports.
+        tpl_json_field "$resp" "name"
+    else
+        dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=os-version" 2>/dev/null | tr -d '\r'
+    fi
+}
+
+# Firmware for a template, for the API path only.
+#
+# The SSH path reads the imported disk and decides from what is on it, which is
+# the right way round and stays. The API path cannot -- no XO endpoint gives
+# block access to a VDI -- so it takes the catalogue's eighth field, defaulting
+# to uefi, which is correct for every image in the catalogue today. See the
+# note on field 8 above TPL_CATALOG.
+tpl_row_firmware() {
+    local fw
+    fw=$(tpl_field "$1" 8)
+    case "$fw" in
+        uefi|bios) printf '%s' "$fw" ;;
+        *)         printf 'uefi' ;;
+    esac
+}
+
+tpl_seal_template_dispatch() {
+    local row="$1" name="$2"
+    if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        tpl_api_seal_template "$name" "$(tpl_row_firmware "$row")"
+    else
+        tpl_seal_template "$name"
+    fi
+}
+
+tpl_cleanup_failed_build_dispatch() {
+    if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        tpl_api_cleanup_failed_build
+    else
+        tpl_cleanup_failed_build
+    fi
+}
+
 # Build one template: one image, one firmware mode, start to finish.
 tpl_build_one() {
     local row="$1"
@@ -8146,7 +9366,7 @@ tpl_build_one() {
     # a stuck one kills it, and killing it halfway through leaves a build VM
     # and a multi-gigabyte disk behind.
     log_info "  checking whether this template already exists..."
-    if tpl_template_exists "$name"; then
+    if tpl_template_exists_dispatch "$name"; then
         log_info "  a template named '${name}' already exists; skipping."
         return 0
     fi
@@ -8158,22 +9378,27 @@ tpl_build_one() {
 
     TPL_VM_UUID=""; TPL_ROOT_VDI=""; TPL_CIDATA_VDI=""; TPL_BUILD_STARTED="false"
 
-    log_info "  building the cloud-init preparation drive..."
-    # Checked, because this is what puts the SSH key and the preparation script
-    # into the config drive. A build that carries on past a failure here boots a
-    # VM with no instructions in it, waits the full fifteen minutes for a
-    # preparation that was never going to run, and reports a timeout that says
-    # nothing about the real cause.
-    if ! tpl_build_prep_drive "$row"; then
-        log_error "  could not build the preparation drive for ${name}."
-        return 1
+    # The API path hands the cloud-init document to XO, which builds the drive
+    # itself, so there is no ISO to write here -- and no ISO writer needed on
+    # this machine. The SSH path builds one locally and attaches it.
+    if [[ "$TPL_BUILD_METHOD" == "ssh" ]]; then
+        log_info "  building the cloud-init preparation drive..."
+        # Checked, because this is what puts the SSH key and the preparation
+        # script into the config drive. A build that carries on past a failure
+        # here boots a VM with no instructions in it, waits the full fifteen
+        # minutes for a preparation that was never going to run, and reports a
+        # timeout that says nothing about the real cause.
+        if ! tpl_build_prep_drive "$row"; then
+            log_error "  could not build the preparation drive for ${name}."
+            return 1
+        fi
     fi
 
-    if ! tpl_create_build_vm "$row" "$name"; then
+    if ! tpl_create_build_vm_dispatch "$row" "$name"; then
         # Everything up to the preparation boot is reproducible, so the
         # wreckage -- a VM with a multi-gigabyte disk -- is cleared rather than
         # left for the operator to identify and unpick.
-        tpl_cleanup_failed_build
+        tpl_cleanup_failed_build_dispatch
         return 1
     fi
 
@@ -8210,7 +9435,7 @@ tpl_build_one() {
     # so the check is for a distro name -- something only the agent supplies.
     log_info "  confirming the guest agent is installed..."
     local osv
-    osv=$(dom0_xe "vm-param-get uuid=${TPL_VM_UUID} param-name=os-version" 2>/dev/null | tr -d '\r')
+    osv=$(tpl_os_version_dispatch)
     if [[ ! "$osv" =~ [A-Za-z] ]] || [[ "$osv" == "<not in database>" ]]; then
         osv=""
     fi
@@ -8225,8 +9450,8 @@ tpl_build_one() {
     fi
 
     log_info "  sealing it as a template..."
-    if ! tpl_seal_template "$name"; then
-        tpl_cleanup_failed_build
+    if ! tpl_seal_template_dispatch "$row" "$name"; then
+        tpl_cleanup_failed_build_dispatch
         return 1
     fi
 
@@ -8384,7 +9609,7 @@ tpl_prompt_selection() {
 # Mirrors deploy_cleanup: closes the shared SSH connection, then removes the
 # working directory the prep key and config drive live in.
 tpl_cleanup() {
-    tpl_cleanup_failed_build
+    tpl_cleanup_failed_build_dispatch
     if [[ -n "${DEPLOY_SSH_CTL:-}" && -S "${DEPLOY_SSH_CTL}" ]]; then
         ssh -o ControlPath="$DEPLOY_SSH_CTL" -O exit \
             "${HOST_USERNAME}@${POOL_MASTER_IP}" 2>/dev/null || true
@@ -8457,6 +9682,370 @@ tpl_resolve_network() {
     return 0
 }
 
+
+# ============================================================================
+# Reaching the pool through Xen Orchestra's API
+#
+# --build-templates has always driven `xe` over SSH on the pool master. That
+# still works and is still the fallback, but it needs dom0's root password,
+# and everything it does by hand -- creating the VM, importing the disk,
+# building the cloud-init drive -- Xen Orchestra now exposes over its own API.
+#
+# Where this runs from decides which is convenient. Deployed by --deploy, this
+# repo lives at /opt/install_xen_orchestra *inside* the XO VM and is where
+# --update is run from, so XO is on localhost and the operator already keeps an
+# API token in xo-config.cfg for the pre-update running-task check. Run from a
+# workstation against a pool that has no XO yet, none of that is true and SSH
+# is the only way in.
+#
+# TEMPLATE_BUILD_METHOD picks between them:
+#
+#   auto  (default)  API when the preflight passes, SSH otherwise.
+#   api              API only; a failed preflight is a hard error.
+#   ssh              SSH only; the API is never contacted.
+#
+# ---------------------------------------------------------------------------
+# Why the API path still needs xo-cli
+# ---------------------------------------------------------------------------
+#
+# Not everything has a REST route yet. Verified against a live instance running
+# REST API 0.39.0 by reading its own OpenAPI document at
+# /rest/v0/docs/swagger.json -- 224 paths, and neither of these among them:
+#
+#   - Sealing the build VM into a template. /vm-templates is read, delete and
+#     tags only, and PATCH /vms/{id} takes 34 properties without an is_template
+#     among them. The operation exists in XO's JSON-RPC API as
+#     vm.convertToTemplate.
+#   - Inserting the guest-tools ISO. Likewise JSON-RPC only, as vm.insertCd.
+#
+# xo-cli speaks that JSON-RPC API, so the API path is REST for the bulk of the
+# work and xo-cli for those two steps. Vates is actively growing the REST API
+# -- POST /pools/{id}/actions/create_vm, which this path depends on, is itself
+# recent -- so both are expected to arrive there eventually, at which point the
+# xo-cli dependency can go.
+#
+# ---------------------------------------------------------------------------
+# The preflight decides once, before any build work
+# ---------------------------------------------------------------------------
+#
+# Everything that can send us down the SSH path is checked up front: XO
+# reachable, token accepted, xo-cli present. That ordering is deliberate. A
+# fallback partway through a build would ask for dom0's root password ten
+# minutes into an image download, with a half-built VM already on the pool --
+# so once a build starts the method is fixed, and a failure after that point is
+# reported as a failure and cleaned up by tpl_cleanup_failed_build.
+#
+# "Half-built VM" means the throwaway one the builder boots to install the
+# guest agent, which XO shows as "[building template] ...". A sealed template
+# is never touched by any of this.
+# ============================================================================
+
+# Which method the current run is using: "api" or "ssh". Set by
+# tpl_select_build_method and read by the build steps.
+TPL_BUILD_METHOD=""
+# HTTP status and curl exit of the most recent API call, so a failure can name
+# which of several unrelated causes it actually was.
+TPL_API_LAST_CODE=""
+TPL_API_LAST_CURL_RC=""
+# The base URL the last call actually used, so an error names the right one.
+TPL_API_BASE_USED=""
+# Every base URL the last call tried, for a failure that names them all.
+TPL_API_TRIED=""
+# Why the last asynchronous action failed, for the caller to report.
+TPL_API_TASK_ERROR=""
+# The id the last asynchronous action produced, set in the caller's own shell.
+TPL_API_TASK_RESULT=""
+# Name of the throwaway disk create_vm needs before it will build a cloud-init
+# drive. Written by tpl_api_vm_create_body and matched by
+# tpl_api_drop_placeholder_disk, so the two must agree exactly.
+#
+# Deliberately says neither "cloud-init" nor "cidata": tpl_api_seal_template
+# finds the drive to detach by matching those words against the VM's disk
+# names, and a placeholder named after what it is for would match that pattern
+# too.
+TPL_API_PLACEHOLDER_DISK="xo-template-build scratch (safe to delete)"
+
+# Base URL for XO's API.
+#
+# XO_URL wins when set. Falling back to localhost is what makes the in-VM case
+# need no configuration at all: deployed by --deploy, this script runs on the
+# XO VM itself. HTTPS_PORT is XO's own configured port, so a non-default port
+# is picked up without being restated here.
+tpl_api_base_url() {
+    if [[ -n "${XO_URL:-}" ]]; then
+        printf '%s' "${XO_URL%/}"
+    elif [[ -n "${PUBLIC_URL:-}" ]]; then
+        # See tpl_api_request: PUBLIC_URL already records where this XO is
+        # reachable, so it answers this without a second key being set.
+        printf '%s' "${PUBLIC_URL%/}"
+    else
+        printf 'https://localhost:%s' "${HTTPS_PORT:-443}"
+    fi
+}
+
+# GET a REST path and print the response body. Returns non-zero on any
+# non-2xx, with the body still printed so the caller can log XO's own error.
+tpl_api_get() {
+    local path="$1"
+    # Modelled on check_active_xo_tasks, which has been talking to this same
+    # REST API from this same script for far longer: try HTTPS on XO's
+    # configured port, fall back to HTTP. Only one of the two answers on a
+    # given install, and which one depends on how XO was set up -- so a client
+    # that tries only HTTPS fails on a plain-HTTP instance and reports it as an
+    # unreachable server.
+    #
+    # The status is returned through TPL_API_LAST_CODE, which the caller reads
+    # only when it did not capture this function in $( ) -- see
+    # tpl_api_request, which exists so the two cannot be confused.
+    tpl_api_request GET "$path" ""
+}
+
+# One REST call. Prints the response body; sets TPL_API_LAST_CODE.
+#
+# Deliberately not a $( ) wrapper around curl: a command substitution runs in a
+# subshell, so a status assigned inside it never reaches the caller. Everything
+# the caller needs therefore comes back either on stdout (the body, which the
+# caller may capture) or in a global set here (the status, which it may not).
+tpl_api_request() {
+    local method="$1" path="$2" body="$3"
+    local proto port base http_code rc resp_file
+
+    resp_file=$(mktemp --tmpdir xo-api-XXXXXX)
+    TPL_API_LAST_CODE=""
+    TPL_API_LAST_CURL_RC=""
+    # Every base tried, so a failure can say what it actually attempted. Only
+    # reporting the last one names http://localhost:80 for an XO that serves
+    # HTTPS -- which reads as "you configured the wrong port" when the real
+    # story is that both were refused.
+    TPL_API_TRIED=""
+
+    for proto in https http; do
+        # An explicit URL names its own scheme and port, so it is used as given
+        # rather than being probed both ways.
+        #
+        # PUBLIC_URL is honoured when XO_URL is unset. It already means "where
+        # this XO is reachable" -- it is what gets written into config.toml as
+        # publicUrl -- so an operator who has set it has already answered this
+        # question, and asking them to repeat it under a second key is how you
+        # end up with two settings that disagree.
+        if [[ -n "${XO_URL:-}" ]]; then
+            base="${XO_URL%/}"
+        elif [[ -n "${PUBLIC_URL:-}" ]]; then
+            base="${PUBLIC_URL%/}"
+        elif [[ "$proto" == "https" ]]; then
+            base="https://localhost:${HTTPS_PORT:-443}"
+        else
+            base="http://localhost:${HTTP_PORT:-80}"
+        fi
+
+        # -L, and --post301/302/303 to keep a POST a POST across the hop.
+        #
+        # An XO behind a reverse proxy answers 3xx for perfectly ordinary
+        # reasons -- a trailing slash, a hostname canonicalisation, an ingress
+        # rule -- and without -L that arrives here as "returned HTTP 307",
+        # which reads as a broken API rather than a redirect nobody followed.
+        # Every other curl in this script already does this; these calls were
+        # the exception.
+        local args=(-s --max-time 60 -k -L --post301 --post302 --post303
+            --output "$resp_file" --write-out '%{http_code}'
+            -b "authenticationToken=${XO_API_TOKEN}")
+        [[ "$method" != "GET" ]] && args+=(-X "$method")
+        if [[ -n "$body" ]]; then
+            args+=(-H 'Content-Type: application/json' --data-binary "$body")
+        fi
+
+        rc=0
+        http_code=$(curl "${args[@]}" "${base}/rest/v0/${path#/}" 2>/dev/null) || rc=$?
+
+        TPL_API_LAST_CODE="$http_code"
+        TPL_API_LAST_CURL_RC="$rc"
+        TPL_API_BASE_USED="$base"
+        TPL_API_TRIED="${TPL_API_TRIED:+${TPL_API_TRIED}, }${base}"
+
+        # A reply of any kind settles which protocol this XO speaks; only a
+        # failure to get one at all is worth trying the other way.
+        if [[ "$http_code" != "000" && -n "$http_code" ]]; then
+            break
+        fi
+        # An explicit URL, from either key, is not second-guessed.
+        [[ -n "${XO_URL:-}${PUBLIC_URL:-}" ]] && break
+    done
+
+    cat "$resp_file"
+    rm -f "$resp_file"
+
+    [[ "$TPL_API_LAST_CODE" =~ ^2 ]] || return 1
+    return 0
+}
+
+# Check that XO is reachable and the token is accepted.
+#
+# /rest/v0/users/me is the cheapest authenticated endpoint and, unlike a
+# collection, says something useful about *which* account the token belongs to
+# -- worth logging, because the REST API requires an admin account and a token
+# from a non-admin user fails later in ways that do not mention permissions.
+tpl_api_check_auth() {
+    if [[ -z "${XO_API_TOKEN:-}" ]]; then
+        TPL_API_UNAVAILABLE_REASON="no XO_API_TOKEN (or XO_TASK_CHECK_TOKEN) in ${CONFIG_FILE##*/}"
+        return 1
+    fi
+
+    # Not captured with $( ): that runs in a subshell and the status set inside
+    # it would be lost, which is exactly how every failure here came to report
+    # as "could not reach XO" -- including a token the server read and
+    # rejected, sending the operator to check a URL that was never at fault.
+    # The body goes to a file; the status comes back in a global.
+    local resp_file
+    resp_file=$(mktemp --tmpdir xo-api-me-XXXXXX)
+    tpl_api_request GET "users/me" "" > "$resp_file" 2>/dev/null || true
+    local resp
+    resp=$(<"$resp_file")
+    rm -f "$resp_file"
+
+    local base="${TPL_API_BASE_USED:-$(tpl_api_base_url)}"
+
+    if [[ ! "${TPL_API_LAST_CODE:-}" =~ ^2 ]]; then
+        case "${TPL_API_LAST_CODE:-000}" in
+            401|403)
+                TPL_API_UNAVAILABLE_REASON="XO at ${base} rejected the token (HTTP ${TPL_API_LAST_CODE}) -- it must belong to an admin account, and tokens expire, so create a fresh one in XO and put it in ${CONFIG_FILE##*/}"
+                ;;
+            404)
+                TPL_API_UNAVAILABLE_REASON="XO at ${base} has no users/me route (HTTP 404), so its REST API predates what this needs"
+                ;;
+            000|"")
+                TPL_API_UNAVAILABLE_REASON="could not reach XO -- tried ${TPL_API_TRIED:-$base} (curl exit ${TPL_API_LAST_CURL_RC:-?}). If XO is not on this machine, set XO_URL in ${CONFIG_FILE##*/}; if it is, check that xo-server is running and listening on those ports"
+                ;;
+            3??)
+                # Redirects are followed, so one arriving here means the chain
+                # did not end anywhere useful -- a proxy loop, or a hop to a
+                # host that is not this XO.
+                TPL_API_UNAVAILABLE_REASON="XO at ${base} redirected users/me (HTTP ${TPL_API_LAST_CODE}) and following it did not reach the API -- if XO is behind a reverse proxy, set XO_URL to the address the proxy serves it on"
+                ;;
+            *)
+                TPL_API_UNAVAILABLE_REASON="XO at ${base} returned HTTP ${TPL_API_LAST_CODE} for users/me"
+                ;;
+        esac
+        return 1
+    fi
+
+    TPL_API_ACCOUNT=$(tpl_json_field "$resp" "email")
+    TPL_API_ACCOUNT="${TPL_API_ACCOUNT:-unknown}"
+    return 0
+}
+
+# Offer to install xo-cli, which the API path needs for the two operations
+# with no REST route (see the block above).
+#
+# Prompted rather than silent: this installs a package globally with sudo, and
+# the SSH path is a perfectly good answer for someone who would rather not.
+# Under --non-interactive there is nobody to ask, so a missing xo-cli simply
+# routes the run to SSH.
+tpl_api_ensure_xo_cli() {
+    if command -v xo-cli >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        TPL_API_UNAVAILABLE_REASON="xo-cli is not installed"
+        return 1
+    fi
+
+    echo ""
+    log_info "The API path needs xo-cli for two steps XO's REST API does not"
+    log_info "cover yet: sealing the build VM into a template, and attaching"
+    log_info "the guest-tools ISO."
+    echo ""
+
+    if ! command -v npm >/dev/null 2>&1; then
+        TPL_API_UNAVAILABLE_REASON="xo-cli is not installed and npm was not found to install it"
+        return 1
+    fi
+
+    if ! confirm_or_skip "Install xo-cli now (npm i -g xo-cli)?"; then
+        TPL_API_UNAVAILABLE_REASON="xo-cli is not installed"
+        return 1
+    fi
+
+    check_sudo
+    log_info "Installing xo-cli..."
+    if ! run_cmd sudo npm i -g xo-cli; then
+        TPL_API_UNAVAILABLE_REASON="xo-cli could not be installed"
+        return 1
+    fi
+
+    log_success "xo-cli installed"
+    return 0
+}
+
+# Decide how this run will reach the pool, and say so.
+#
+# Runs before any build work. Sets TPL_BUILD_METHOD to "api" or "ssh"; returns
+# non-zero only when TEMPLATE_BUILD_METHOD=api was asked for explicitly and
+# cannot be honoured, because silently doing the other thing is exactly what an
+# explicit setting is asking us not to do.
+tpl_select_build_method() {
+    TPL_API_UNAVAILABLE_REASON=""
+    TPL_API_ACCOUNT=""
+
+    local want="${TEMPLATE_BUILD_METHOD:-auto}"
+
+    if [[ "$want" == "ssh" ]]; then
+        TPL_BUILD_METHOD="ssh"
+        log_info "Build method: SSH to the pool master (TEMPLATE_BUILD_METHOD=ssh)."
+        return 0
+    fi
+
+    log_info "Checking whether Xen Orchestra's API can be used..."
+
+    if tpl_api_check_auth && tpl_api_ensure_xo_cli; then
+        TPL_BUILD_METHOD="api"
+        log_success "Build method: Xen Orchestra API at $(tpl_api_base_url) as ${TPL_API_ACCOUNT}."
+        return 0
+    fi
+
+    if [[ "$want" == "api" ]]; then
+        log_error "TEMPLATE_BUILD_METHOD=api, but the API path is unavailable:"
+        log_error "  ${TPL_API_UNAVAILABLE_REASON}"
+        log_error "Fix that, or set TEMPLATE_BUILD_METHOD=auto to fall back to SSH."
+        return 1
+    fi
+
+    TPL_BUILD_METHOD="ssh"
+    log_info "Using SSH to the pool master: ${TPL_API_UNAVAILABLE_REASON}."
+    return 0
+}
+
+
+# Dependencies both build paths need, checked before the method is chosen.
+#
+# THIS IS A DELIBERATE THIRD DEPENDENCY CHECK, and the reason is the whole
+# point of it: check_required_commands covers what the installer needs on the
+# XO host, deploy_check_local_deps covers what an SSH-driven pool operation
+# needs, and neither describes a run that may take either path and does not yet
+# know which. Do not merge them, and do not add a fourth -- if a new path needs
+# a different set, extend one of these three with an argument.
+#
+# Deliberately smaller than deploy_check_local_deps. That function insists on
+# an ISO writer and the openssh client suite, which are the SSH path's
+# requirements: the API path builds no ISO -- XO builds the config drive from
+# the cloud-init document it is handed -- and opens no SSH connection. Making
+# the API path install xorriso to do neither would be the sort of unnecessary
+# dependency that sends someone to the SSH path for no reason.
+#
+# What is left is what genuinely serves both: curl for every transfer, and
+# ssh-keygen for the throwaway key baked into the preparation config.
+tpl_check_local_deps() {
+    local missing=()
+    for cmd in curl ssh-keygen; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required commands: ${missing[*]}"
+        log_error "Install curl and your distribution's openssh-client package."
+        exit 1
+    fi
+}
+
 # --- Entry point ------------------------------------------------------------
 
 build_vm_templates() {
@@ -8484,7 +10073,11 @@ build_vm_templates() {
     echo "  touched; the work happens on the pool."
     echo ""
 
-    deploy_check_local_deps
+    # Deliberately not deploy_check_local_deps: that insists on an ISO writer
+    # and the openssh client suite, which the API path needs neither of -- it
+    # hands the cloud-init document to XO and never opens an SSH connection.
+    # The SSH path's dependencies are checked once that path is chosen.
+    tpl_check_local_deps
 
     tpl_prompt_selection
     if [[ ${#TPL_SELECTED[@]} -eq 0 ]]; then
@@ -8501,11 +10094,22 @@ build_vm_templates() {
     chmod 700 "$DEPLOY_WORKDIR"
     trap tpl_cleanup EXIT
 
-    # Reuses the deploy path's connection: same pool, same host key pinning,
-    # same credentials prompt. Nothing here needs a second way in.
-    deploy_connect_pool_master
-    tpl_resolve_storage || return 1
-    tpl_resolve_network || return 1
+    # Decided here, before anything is created on the pool, so a fallback to
+    # SSH happens while the only cost is a credentials prompt. See the comment
+    # block above tpl_select_build_method.
+    tpl_select_build_method || return 1
+
+    # The SSH path reuses the deploy path's connection: same pool, same host
+    # key pinning, same credentials prompt. Nothing there needs a second way
+    # in. The API path talks to XO instead and never asks for dom0's password.
+    if [[ "$TPL_BUILD_METHOD" == "ssh" ]]; then
+        deploy_check_local_deps
+        deploy_connect_pool_master
+        tpl_resolve_storage || return 1
+        tpl_resolve_network || return 1
+    else
+        tpl_api_resolve_targets || return 1
+    fi
 
     echo ""
     echo "=============================================="
@@ -9476,12 +11080,16 @@ process_menu_selections() {
     fi
 
     # VM Template Library
-    # Same minimal preflight as --deploy: this targets the pool, reads nothing
-    # from the local install and changes nothing on this machine. sudo is asked
-    # for by deploy_check_local_deps only if an ISO writer has to be installed.
+    # Same minimal preflight as --deploy: this targets the pool and changes
+    # nothing on this machine. sudo is asked for only if the SSH path has to
+    # install an ISO writer. It does read xo-config.cfg, for the build method
+    # and the API token -- see the load_config note on the flag path below.
     if [[ ${MENU_SELECTED[5]} -eq 1 ]]; then
         check_required_commands
         check_not_root
+        # See the --build-templates flag above: the build method and the API
+        # token come from xo-config.cfg, so it has to be read here too.
+        load_config
         build_vm_templates
     fi
 }
@@ -9798,8 +11406,16 @@ main() {
             ;;
         --build-templates)
             # Same reasoning as --deploy: targets the pool, not this machine.
+            #
+            # load_config, though, because this path does now read local
+            # config: TEMPLATE_BUILD_METHOD, XO_URL and the API token decide
+            # whether the build talks to XO or to the pool master over SSH.
+            # Without it those keys are never read, the token appears unset
+            # however carefully it was filled in, and every run silently takes
+            # the SSH path.
             check_required_commands
             check_not_root
+            load_config
             build_vm_templates
             ;;
         --adjust-memory)

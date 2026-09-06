@@ -33,7 +33,12 @@ jobs:
         # integration images, all of which install an ISO writer, so without it
         # here the drive-building tests fail on a missing binary rather than on
         # anything the script got wrong.
-        run: sudo apt-get install -y bats genisoimage
+        #
+        # python3 parses the JSON the API build path sends to XO. Those tests
+        # skip when it is absent rather than failing, which is worse than a
+        # failure: the escaping of a 60-line cloud-init document inside a JSON
+        # string would go unchecked and the run would still be green.
+        run: sudo apt-get install -y bats genisoimage python3
 
       - name: Run unit tests
         run: bats tests/unit/
