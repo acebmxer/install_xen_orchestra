@@ -504,7 +504,10 @@ teardown() {
     local body
     body=$(declare -f tpl_disk_has_partition_table)
     [[ "$body" != *"vdi-attach"* ]]
-    [[ "$body" == *"export_raw_vdi"* ]]
+    # The URL comes from the one builder now, so the check follows it there
+    # rather than pinning a string that moved.
+    [[ "$body" == *"deploy_export_url"* ]]
+    [[ "$(declare -f deploy_export_url)" == *"export_raw_vdi"* ]]
 }
 
 @test "a check that cannot run does not fail a good import" {
@@ -526,8 +529,12 @@ teardown() {
 @test "the guest agent is observed while the VM is still running" {
     local body
     body=$(declare -f tpl_wait_for_prep)
-    [[ "$body" == *"PV-drivers-version"* ]]
+    # The loop is shared by both build paths now, so the path-specific read
+    # lives in tpl_agent_version. The observation still happens in the poll
+    # that is already running, which is the thing this test is about.
+    [[ "$body" == *"tpl_agent_version"* ]]
     [[ "$body" == *"TPL_AGENT_SEEN"* ]]
+    [[ "$(declare -f tpl_agent_version)" == *"PV-drivers-version"* ]]
 }
 
 @test "the agent check uses a signal that survives the shutdown" {
@@ -535,10 +542,27 @@ teardown() {
     # the reported addresses persist. Checked on a live pool: every halted VM
     # reports PV-drivers-version empty, working ones included. Depending on it
     # fails every build.
+    # The read now sits in the dispatcher, so that both build paths ask the
+    # same question of XAPI -- through `xe` on one and through XO on the other.
     local body
-    body=$(declare -f tpl_build_one)
+    body=$(declare -f tpl_os_version_dispatch)
     [[ "$body" == *"param-name=os-version"* ]]
-    [[ "$body" != *'vm-param-get uuid=${TPL_VM_UUID} param-name=PV-drivers-version'* ]]
+    [[ "$body" != *"PV-drivers-version"* ]]
+
+    # And tpl_build_one still gets its answer from there rather than from the
+    # signal that does not survive the shutdown.
+    local caller
+    caller=$(declare -f tpl_build_one)
+    [[ "$caller" == *"tpl_os_version_dispatch"* ]]
+    [[ "$caller" != *'vm-param-get uuid=${TPL_VM_UUID} param-name=PV-drivers-version'* ]]
+}
+
+@test "both build paths read the agent's os-version, not PV-drivers-version" {
+    # The API path reads XO's os_version field, which is the same value XAPI
+    # exposes to `xe` as os-version.
+    local body
+    body=$(declare -f tpl_os_version_dispatch)
+    [[ "$body" == *"os_version"* ]]
 }
 
 @test "os-version reported by the agent passes the build" {
@@ -625,7 +649,7 @@ teardown() {
     body=$(declare -f deploy_import_vdi_staged)
     local chk imp
     chk=$(grep -n 'the staged image on the pool master' <<< "$body" | head -1 | cut -d: -f1)
-    imp=$(grep -n 'import_raw_vdi' <<< "$body" | head -1 | cut -d: -f1)
+    imp=$(grep -n 'deploy_import_url' <<< "$body" | head -1 | cut -d: -f1)
     [ -n "$chk" ]
     [ -n "$imp" ]
     [ "$chk" -lt "$imp" ]
@@ -693,7 +717,10 @@ teardown() {
         found=$((found + 1))
         body=$(declare -f "$fn")
         [[ "$body" == *"deploy_task_create"* ]]
-        [[ "$body" == *'task_q'* ]]
+        # The task id is appended by the one URL builder now, so every import path
+    # gets it by construction rather than each remembering to.
+    [[ "$body" == *'deploy_import_url'* ]]
+    [[ "$(declare -f deploy_import_url)" == *'task_id'* ]]
         [[ "$body" == *"deploy_task_check"* ]]
     done
     [ "$found" -eq 3 ]
@@ -864,17 +891,78 @@ teardown() {
     [[ "$body" != *"firmware=uefi"* ]]
 }
 
+@test "the SSH path gives static-min a floor below the allocation" {
+    # static-min is the smallest XAPI would shrink a guest to under ballooning,
+    # not the memory a VM gets. Pinning all four figures together left no
+    # headroom below; 1 GiB matches the VMs already on the pool, which run a
+    # 1 GiB floor against a much larger dynamic allocation.
+    local body
+    body=$(declare -f tpl_create_build_vm)
+    [[ "$body" == *"static-min=\${static_min}"* ]]
+    [[ "$body" == *"dynamic-min=\${mem}"* ]]
+    [[ "$body" == *"static-max=\${mem}"* ]]
+    [ "$TPL_STATIC_MIN_GB" -lt "$TPL_DEFAULT_RAM_GB" ]
+}
+
+@test "a static-min floor above the allocation is clamped, not sent" {
+    # XAPI requires static-max >= dynamic-max >= dynamic-min >= static-min, so
+    # a floor above the RAM figure would be rejected outright.
+    local body
+    body=$(declare -f tpl_create_build_vm)
+    [[ "$body" == *"TPL_STATIC_MIN_GB > TPL_DEFAULT_RAM_GB"* ]]
+}
+
 @test "the console gets both a std adapter and the 8 MiB that goes with it" {
     # vga=std alone is not enough: videoram stays at whatever the base template
     # carried, which is 4, and a template built that way produced UEFI VMs with
     # an unreadable console. 16 is no better -- it renders as coloured noise
     # under UEFI. Every working UEFI VM on a live pool runs std with 8. XAPI
     # accepts any of these silently, so a wrong value only shows on the console.
+    #
     local body
     body=$(declare -f tpl_create_build_vm)
     [[ "$body" == *"platform:vga=std"* ]]
     [[ "$body" == *"platform:videoram=8"* ]]
     [[ "$body" != *"platform:videoram=16"* ]]
+}
+
+@test "the API path reads its VM settings from the SSH function, not its own copy" {
+    # A template must come out the same whichever way the pool was reached, so
+    # the API path must not carry its own copy of these values. It reads them
+    # out of tpl_create_build_vm with declare -f; a literal value written here
+    # is a second source of truth that will drift.
+    local body
+    body=$(declare -f tpl_api_configure_build_vm)
+    [[ "$body" == *"declare -f tpl_create_build_vm"* ]]
+    [[ "$body" != *'"vga":"std"'* ]]
+    [[ "$body" != *'"videoram":8'* ]]
+    [[ "$body" != *'"viridian":false'* ]]
+}
+
+@test "the API path sets the memory figures XO will actually accept" {
+    # static-min cannot be raised through XO: memoryMin over REST and through
+    # vm.set both answer success and leave it at the base template's 128 MiB,
+    # tried singly and with all four keys together on a live pool. Only
+    # `xe vm-memory-limits-set` moves it, which is what this path avoids
+    # needing. So the three that do apply are sent and memoryMin is not
+    # claimed -- a template records static: [134217728, ...] where an
+    # SSH-built one records the figure twice, which is a difference in the
+    # record and not in the VMs it produces.
+    local body
+    body=$(declare -f tpl_api_configure_build_vm)
+    [[ "$body" == *"memoryMax"* ]]
+    [[ "$body" == *"memoryStaticMax"* ]]
+    [[ "$body" != *"memoryMin"* ]]
+}
+
+@test "viridian goes through JSON-RPC, which is the call that applies it" {
+    # REST accepts viridian in the PATCH body, answers 200, and leaves the
+    # property alone -- a template built that way came out viridian=true while
+    # the same request's vga, videoram and coresPerSocket all applied.
+    local body
+    body=$(declare -f tpl_api_configure_build_vm)
+    [[ "$body" == *"vm.set id="*"viridian="* ]]
+    [[ "$body" != *'"viridian":'* ]]
 }
 
 # --- settings inherited from the scaffolding template ----------------------
@@ -1394,6 +1482,7 @@ PAIRS
 # already there.
 
 @test "each template gets its own build key" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available to build the key"
     # ssh-keygen refuses to overwrite an existing key: it asks "Overwrite
     # (y/n)?" and, with no answer available, exits 1 having generated nothing.
     # Every build after the first hit that, and because the failure went to
@@ -1414,6 +1503,7 @@ PAIRS
 }
 
 @test "a second template's drive carries its own account, not the first's" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available to build the key"
     # The clearest symptom of a stale drive: an Ubuntu template built after a
     # Debian one would ship Debian's user and preparation script.
     DEPLOY_WORKDIR="$TMPDIR_TEST"
@@ -1427,6 +1517,7 @@ PAIRS
 }
 
 @test "building a prep drive twice in a row succeeds both times" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available to build the key"
     DEPLOY_WORKDIR="$TMPDIR_TEST"
     tpl_build_prep_drive "$(tpl_row_for_key debian12)"
     tpl_build_prep_drive "$(tpl_row_for_key debian12)"
@@ -1436,8 +1527,26 @@ PAIRS
     local body
     body=$(declare -f tpl_build_prep_drive)
     # The old key is cleared first, and the generation's status is tested.
-    [[ "$body" == *'rm -f "${TPL_SSH_KEY}" "${TPL_SSH_KEY}.pub"'* ]]
-    [[ "$body" == *"if ! ssh-keygen"* ]]
+    # Both halves live in tpl_build_ssh_key now -- one implementation shared by
+    # both build paths, which is what stops a copy reintroducing this.
+    [[ "$(declare -f tpl_build_ssh_key)" == *'rm -f "${TPL_SSH_KEY}" "${TPL_SSH_KEY}.pub"'* ]]
+    [[ "$(declare -f tpl_build_ssh_key)" == *"if ! ssh-keygen"* ]]
+    # And the caller still stops on a failure rather than carrying on with no key.
+    [[ "$body" == *"tpl_build_ssh_key"* ]]
+    [[ "$body" == *"|| return 1"* ]]
+}
+
+@test "the build key path is spelled once, not at every call site" {
+    # tpl_build_ssh_key is captured with $( ), so it cannot export the path --
+    # every caller needs it too, to read the key back. That is what made three
+    # copies of "${DEPLOY_WORKDIR}/tpl_key" appear across the file. They must
+    # all go through tpl_ssh_key_path, or a change to the path breaks whichever
+    # copy was missed.
+    local fn
+    for fn in tpl_build_ssh_key tpl_build_prep_drive tpl_api_create_build_vm; do
+        [[ "$(declare -f "$fn")" != *'DEPLOY_WORKDIR}/tpl_key'* ]]
+    done
+    [ "$(DEPLOY_WORKDIR=/w tpl_ssh_key_path)" = "/w/tpl_key" ]
 }
 
 @test "a failed cloud-init drive stops the build instead of being discarded" {
@@ -1453,4 +1562,433 @@ PAIRS
     local body
     body=$(declare -f tpl_build_one)
     [[ "$body" == *"if ! tpl_build_prep_drive"* ]]
+}
+
+# --- The API build path -----------------------------------------------------
+
+@test "tpl_json_field reads a string field out of a REST response" {
+    local j='{"id":"abc-123","name_label":"Debian 13"}'
+    [ "$(tpl_json_field "$j" id)" = "abc-123" ]
+    [ "$(tpl_json_field "$j" name_label)" = "Debian 13" ]
+}
+
+@test "tpl_json_field is empty for a field that is not there" {
+    [ -z "$(tpl_json_field '{"id":"x"}' missing)" ]
+}
+
+@test "tpl_urlencode escapes what a query parameter cannot carry" {
+    [ "$(tpl_urlencode "Debian 13 (Trixie) root")" = "Debian%2013%20%28Trixie%29%20root" ]
+}
+
+@test "the create_vm body is valid JSON carrying the cloud-init document" {
+    command -v python3 >/dev/null || skip "python3 not available to parse JSON"
+    TPL_DEFAULT_VCPUS=2
+    TPL_DEFAULT_RAM_GB=2
+    DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
+
+    local cc
+    cc=$(printf '#cloud-config\nusers:\n  - name: debian\nruncmd:\n  - sh -c "echo hi"\n')
+    local body
+    body=$(tpl_api_vm_create_body "Debian 13" "tpl-1" "$cc")
+
+    printf '%s' "$body" > "${TMPDIR_TEST}/body.json"
+    printf '%s' "$cc" > "${TMPDIR_TEST}/cc.txt"
+
+    run python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+orig=open(sys.argv[2]).read().rstrip("\n")
+assert d["cloud_config"].rstrip("\n")==orig, "cloud_config did not round-trip"
+assert d["memory"]==2147483648
+assert d["cpus"]==2
+assert d["name_label"].startswith("[building template]")
+print("ok")
+' "${TMPDIR_TEST}/body.json" "${TMPDIR_TEST}/cc.txt"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ok"* ]]
+}
+
+@test "the create_vm body carries the resolved SR and network" {
+    command -v python3 >/dev/null || skip "python3 not available to parse JSON"
+    TPL_DEFAULT_VCPUS=2
+    TPL_DEFAULT_RAM_GB=2
+    DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
+
+    # Both are globals resolved earlier in the run, so an unset one used to
+    # kill the body under `set -u` -- and, once defaulted to empty, would send
+    # a request naming no storage and no network at all. Asserting the values
+    # reach the body is what keeps the default from hiding a missing resolve.
+    tpl_api_vm_create_body "D" "t" "#cloud-config" > "${TMPDIR_TEST}/body.json"
+
+    run python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d["vdis"][0]["sr"]=="sr-1", d["vdis"]
+assert d["vifs"][0]["network"]=="net-1", d["vifs"]
+print("ok")
+' "${TMPDIR_TEST}/body.json"
+    [ "$status" -eq 0 ]
+}
+
+@test "a cloud-init document with quotes and backslashes survives the body" {
+    command -v python3 >/dev/null || skip "python3 not available to parse JSON"
+    TPL_DEFAULT_VCPUS=2
+    TPL_DEFAULT_RAM_GB=2
+    DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
+
+    local cc
+    cc=$(printf '#cloud-config\nruncmd:\n  - sh -c "echo \\"x\\""\n  - path: C:\\\\tmp\n')
+    printf '%s' "$cc" > "${TMPDIR_TEST}/cc.txt"
+    tpl_api_vm_create_body "D" "t" "$cc" > "${TMPDIR_TEST}/body.json"
+
+    run python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+orig=open(sys.argv[2]).read().rstrip("\n")
+assert d["cloud_config"].rstrip("\n")==orig, "escaping lost content"
+print("ok")
+' "${TMPDIR_TEST}/body.json" "${TMPDIR_TEST}/cc.txt"
+    [ "$status" -eq 0 ]
+}
+
+@test "the real prep payload round-trips through the create_vm body" {
+    command -v python3 >/dev/null || skip "python3 not available to parse JSON"
+    TPL_DEFAULT_VCPUS=2
+    TPL_DEFAULT_RAM_GB=2
+    DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
+
+    # The payload an actual build sends, not a stand-in: this is the thing
+    # whose escaping matters, and it is 60-odd lines of shell inside YAML
+    # inside JSON.
+    local row user prep cc
+    row=$(tpl_row_for_key debian13)
+    user=$(tpl_field "$row" 5)
+    prep=$(tpl_field "$row" 6)
+    cc=$( printf '#cloud-config\nusers:\n  - name: %s\n' "$user"
+          printf 'write_files:\n  - path: /root/xo-template-prep.sh\n    content: |\n'
+          "$prep" "$user" | sed 's/^/      /' )
+
+    printf '%s' "$cc" > "${TMPDIR_TEST}/cc.txt"
+    tpl_api_vm_create_body "Debian 13 Cloud-init" "tpl-1" "$cc" > "${TMPDIR_TEST}/body.json"
+
+    run python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+orig=open(sys.argv[2]).read().rstrip("\n")
+assert d["cloud_config"].rstrip("\n")==orig, "prep payload did not survive"
+assert "xo-template-prep.sh" in d["cloud_config"]
+print("ok")
+' "${TMPDIR_TEST}/body.json" "${TMPDIR_TEST}/cc.txt"
+    [ "$status" -eq 0 ]
+}
+
+@test "every buildable catalogue row resolves to a valid firmware" {
+    local row fw
+    for row in "${TPL_CATALOG[@]}"; do
+        tpl_is_placeholder "$row" && continue
+        fw=$(tpl_row_firmware "$row")
+        [[ "$fw" == "uefi" || "$fw" == "bios" ]]
+    done
+}
+
+@test "an unset firmware field defaults to uefi" {
+    [ "$(tpl_row_firmware "k|D|c|http://x/i.raw|u|tpl_prep_debian|")" = "uefi" ]
+}
+
+@test "an explicit bios firmware field is honoured" {
+    [ "$(tpl_row_firmware "k|D|c|http://x/i.raw|u|tpl_prep_debian|8|bios")" = "bios" ]
+}
+
+@test "a nonsense firmware field falls back to uefi rather than being sent on" {
+    [ "$(tpl_row_firmware "k|D|c|http://x/i.raw|u|tpl_prep_debian|8|sideways")" = "uefi" ]
+}
+
+@test "the dispatchers send each step to the selected path" {
+    # Both implementations replaced, so the test observes only the routing.
+    tpl_cleanup_failed_build() { echo "SSH-cleanup"; }
+    tpl_api_cleanup_failed_build() { echo "API-cleanup"; }
+
+    TPL_BUILD_METHOD=ssh
+    run tpl_cleanup_failed_build_dispatch
+    [[ "$output" == "SSH-cleanup" ]]
+
+    TPL_BUILD_METHOD=api
+    run tpl_cleanup_failed_build_dispatch
+    [[ "$output" == "API-cleanup" ]]
+}
+
+@test "sealing on the API path passes the row's firmware through" {
+    tpl_api_seal_template() { echo "sealed:$1:$2"; }
+    TPL_BUILD_METHOD=api
+
+    run tpl_seal_template_dispatch "k|D|c|http://x/i.raw|u|tpl_prep_debian|8|bios" "My Template"
+    [[ "$output" == "sealed:My Template:bios" ]]
+}
+
+@test "the shared dependency check does not demand an ISO writer" {
+    # The API path builds no ISO, so requiring one would push it to SSH for a
+    # tool it never uses. Asserted against what the function requires rather
+    # than against this machine, so the test says the same thing on a host that
+    # happens to have xorriso installed as on one that does not.
+    local body
+    body=$(declare -f tpl_check_local_deps)
+    [[ "$body" != *genisoimage* ]]
+    [[ "$body" != *xorriso* ]]
+    [[ "$body" == *curl* ]]
+    [[ "$body" == *ssh-keygen* ]]
+}
+
+@test "the shared dependency check passes when its commands are present" {
+    command -v curl >/dev/null && command -v ssh-keygen >/dev/null \
+        || skip "curl or ssh-keygen not installed here"
+    run tpl_check_local_deps
+    [ "$status" -eq 0 ]
+}
+
+@test "the API path is never asked for an ISO writer or an SSH connection" {
+    # tpl_api_create_build_vm hands cloud-init to XO and opens no SSH.
+    local body
+    body=$(declare -f tpl_api_create_build_vm)
+    [[ "$body" != *genisoimage* ]]
+    [[ "$body" != *xorriso* ]]
+    [[ "$body" != *dom0_exec* ]]
+    [[ "$body" != *dom0_xe* ]]
+}
+
+@test "no API build step reaches for the pool master over SSH" {
+    local fn body
+    for fn in tpl_api_import_image tpl_api_seal_template \
+              tpl_api_cleanup_failed_build tpl_api_resolve_targets; do
+        body=$(declare -f "$fn")
+        [[ "$body" != *dom0_exec* ]]
+        [[ "$body" != *dom0_xe* ]]
+    done
+}
+
+@test "the image import streams a .raw URL and converts anything else" {
+    local body
+    body=$(declare -f tpl_api_import_image)
+    # Debian ships .raw and streams straight through; everyone else ships
+    # qcow2, which is converted here first -- XO will not take a qcow2.
+    [[ "$body" == *'*.raw)'* ]]
+    [[ "$body" == *"qemu-img convert"* ]]
+}
+
+@test "the import does not inherit the 60s timeout meant for small calls" {
+    # A multi-gigabyte transfer under --max-time 60 would abort every build.
+    local body
+    body=$(declare -f tpl_api_import_image)
+    [[ "$body" == *"--max-time"* ]]
+    [[ "$body" == *"speed-limit"* ]]
+}
+
+@test "both --build-templates entry points read the config file" {
+    # The build method and the API token live in xo-config.cfg, so a path that
+    # reaches build_vm_templates without load_config sees them unset -- the
+    # token appears missing however carefully it was filled in, and every run
+    # silently takes the SSH path.
+    local body
+
+    body=$(declare -f main)
+    [[ "$body" == *"load_config"* ]]
+
+    # The flag path and the interactive menu path are separate call sites and
+    # both have to do it; checking one would not have caught this.
+    local script="${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh"
+    local flag_ctx menu_ctx
+    flag_ctx=$(grep -A8 -- '--build-templates)' "$script" | head -12)
+    [[ "$flag_ctx" == *"load_config"* ]]
+
+    menu_ctx=$(grep -A8 'MENU_SELECTED\[5\]' "$script" | head -12)
+    [[ "$menu_ctx" == *"load_config"* ]]
+}
+
+@test "the API import never sends a qcow2 to XO" {
+    # XO's import endpoint takes raw and VHD only -- SR_importVdi is called
+    # with `raw ? raw : vhd`, and the VDI route types its format as
+    # Exclude<SUPPORTED_VDI_FORMAT, 'qcow2'>. A qcow2 posted with raw=false is
+    # read as a VHD and dies on its footer checksum ("invalid footer checksum
+    # 0"), which is not a message that points anywhere near the real cause.
+    local body
+    body=$(declare -f tpl_api_import_image)
+
+    # Always raw=true: the conversion happens before the upload, never by
+    # asking XO to interpret a format it does not accept.
+    [[ "$body" == *"raw=true"* ]]
+    [[ "$body" != *"raw=false"* ]]
+    [[ "$body" != *'raw=${raw_q}'* ]]
+
+    # And a non-raw URL is converted rather than streamed as-is.
+    [[ "$body" == *"qemu-img convert"* ]]
+}
+
+@test "a missing qemu-img is reported before the image is downloaded" {
+    # Downloading 800 MB and then discovering the converter is absent wastes
+    # the slowest step of the build.
+    local body chk dl
+    body=$(declare -f tpl_api_import_image)
+    chk=$(grep -n 'command -v qemu-img' <<< "$body" | head -1 | cut -d: -f1)
+    dl=$(grep -n 'downloading the image' <<< "$body" | head -1 | cut -d: -f1)
+    [ -n "$chk" ]
+    [ -n "$dl" ]
+    [ "$chk" -lt "$dl" ]
+}
+
+@test "a failed API build removes the imported disk even with no VM" {
+    # The disk is imported before the VM is created, so a failure in between
+    # leaves a multi-gigabyte VDI that nothing references. Deleting only the
+    # VM misses it entirely, because there is no VM.
+    local body
+    body=$(declare -f tpl_api_cleanup_failed_build)
+    [[ "$body" == *"vdi.delete"* ]]
+
+    # And the VDI cleanup must not sit behind the VM guard, or it never runs
+    # in exactly the case it exists for.
+    local vdi_line guard_line
+    vdi_line=$(grep -n 'vdi.delete' <<< "$body" | head -1 | cut -d: -f1)
+    guard_line=$(grep -n 'TPL_BUILD_STARTED.*|| return 0' <<< "$body" | head -1 | cut -d: -f1)
+    [ -n "$vdi_line" ]
+    [ -n "$guard_line" ]
+    [ "$vdi_line" -lt "$guard_line" ]
+}
+
+@test "tpl_json_id_where matches a field exactly, not as a substring" {
+    # An upgraded pool keeps "Old version of guest-tools.iso" beside
+    # "guest-tools.iso". A substring match takes whichever is listed first and
+    # installs guest tools from a superseded ISO -- which works often enough
+    # not to be noticed. XO's own ?filter= is a substring match too, so the
+    # exactness has to happen locally.
+    local json='[
+  {
+    "id": "old-1",
+    "name_label": "Old version of guest-tools.iso"
+  },
+  {
+    "id": "current-1",
+    "name_label": "guest-tools.iso"
+  }
+]'
+    [ "$(tpl_json_id_where "$json" name_label "guest-tools.iso")" = "current-1" ]
+    [ "$(tpl_json_id_where "$json" name_label "Old version of guest-tools.iso")" = "old-1" ]
+    [ -z "$(tpl_json_id_where "$json" name_label "nothing-like-this")" ]
+}
+
+@test "an XO template id is accepted despite not being a plain uuid" {
+    # Templates are identified by pool uuid + object uuid joined with a dash,
+    # 73 characters. A ^[0-9a-f-]{36}$ test rejects that, which is how "could
+    # not find the template" got reported for one the API had just returned.
+    tpl_is_xo_id "751d40fa-60b5-82cf-e735-6ed42d0e03f8-552bce37-51b2-445d-84f2-5f33fa112d7e"
+    tpl_is_xo_id "067cf6c5-62f6-472c-b29d-4fd44bcefc4d"
+    ! tpl_is_xo_id "not-an-id"
+    ! tpl_is_xo_id ""
+}
+
+@test "xo-cli is given the token in the URL, not as a flag" {
+    # xo-cli has no standalone --token for a command invocation: its --help
+    # says "The URL must include credentials". Passing one is read as a
+    # positional argument and fails with "invalid arg: <the token>", which
+    # reads as a malformed token rather than a misplaced one.
+    local body
+    body=$(declare -f tpl_xo_cli)
+    [[ "$body" == *'${XO_API_TOKEN}@'* ]]
+    [[ "$body" != *"--token"* ]]
+}
+
+@test "the API path picks the management network, not whichever XO lists first" {
+    # Taking networks?limit=1 returned "Host internal management network" on one
+    # live run and "Pool-wide network 3" on the next -- both carrying no PIF, so
+    # a VM on either reaches nothing and the preparation boot, which installs
+    # guest tools and updates packages from the mirrors, hangs until it times
+    # out. The management PIF's own network is what the SSH path asks for.
+    local body
+    body=$(declare -f tpl_api_resolve_targets)
+    [[ "$body" == *"pifs?fields=management"* ]]
+    [[ "$body" != *'"networks?fields=id,name_label&limit=1"'* ]]
+}
+
+@test "a boolean JSON field can be matched, not just a quoted string" {
+    # PIFs report management as a bare `true`. The quoted-value branch cannot
+    # match that, so before this the management lookup returned nothing at all
+    # and fell through to the guess it was meant to replace.
+    #
+    # Single-quoted so the $network key reaches awk as written rather than
+    # being expanded by the shell -- which is also why the field name is
+    # passed single-quoted below.
+    local json
+    json='[
+  {
+    "management": false,
+    "$network": "wrong-net"
+  },
+  {
+    "management": true,
+    "$network": "right-net"
+  }
+]'
+    [ "$(tpl_json_field_where "$json" management true '$network')" = "right-net" ]
+}
+
+@test "the cloud-init drive is found in XO's pretty-printed listing" {
+    # XO prints each object across several lines. Splitting the body on '}'
+    # left the matched line holding the name alone, with the id on an earlier
+    # line, so the lookup returned empty and the drive was never detached --
+    # a clone then found a used seed and skipped the operator's cloud-config.
+    local json
+    json='[
+  {
+    "id": "root-disk",
+    "name_label": "Ubuntu 26.04 LTS (Resolute) Cloud-init root"
+  },
+  {
+    "id": "config-drive",
+    "name_label": "XO CloudConfigDrive"
+  }
+]'
+    [ "$(tpl_json_id_matching "$json" -Ei 'cloud.?config|cloudinit|cidata')" = "config-drive" ]
+}
+
+@test "the base template is looked up by uuid, not by REST id" {
+    # A template carries both and they differ: `id` joins the pool uuid to the
+    # object uuid, `uuid` is the XAPI object alone. create_vm resolves its
+    # template against XAPI, so the compound id comes back as "no such object"
+    # quoting the exact string the listing had just returned.
+    local body
+    body=$(declare -f tpl_api_create_build_vm)
+    [[ "$body" == *"tpl_json_field_where"* ]]
+    [[ "$body" == *"uuid"* ]]
+}
+
+@test "tpl_json_field_where can return a field other than id" {
+    local json='[
+  {
+    "id": "pool-obj-compound",
+    "uuid": "plain-uuid",
+    "name_label": "Other install media"
+  }
+]'
+    [ "$(tpl_json_field_where "$json" name_label 'Other install media' uuid)" = "plain-uuid" ]
+    [ "$(tpl_json_field_where "$json" name_label 'Other install media' id)" = "pool-obj-compound" ]
+}
+
+@test "an asynchronous create is followed to its task result" {
+    # create_vm answers 202 with {"taskId":...}; the VM's id appears in that
+    # task's result.id once it succeeds. Reading the POST body for an id finds
+    # none and fails a build whose VM is being created perfectly well.
+    local body
+    body=$(declare -f tpl_api_create_build_vm)
+    [[ "$body" == *"taskId"* ]]
+    [[ "$body" == *"tpl_api_await_task"* ]]
+}
+
+@test "the VBD body uses the capitalised keys the endpoint requires" {
+    # The schema requires "VM" and "VDI" in that case. Lowercase is rejected
+    # with a 422 that names fields the request appears to contain.
+    local body
+    body=$(declare -f tpl_api_create_build_vm)
+    [[ "$body" == *'"VM":"%s","VDI":"%s"'* ]]
+    [[ "$body" != *'"vm":"%s","vdi":"%s"'* ]]
 }

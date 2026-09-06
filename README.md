@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-65-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-118%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-335%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -20,10 +20,35 @@ Orchestra](https://xen-orchestra.com/) from source.
 > [!IMPORTANT]
 > **⚠️ Upgrading from an earlier version of this script? Read this first.**
 >
-> This version bumps the config schema to **v2** (adds `PUBLIC_URL` and
-> `ENCRYPT_REDIS_CREDENTIALS`) and corrects two `config.toml` generation bugs.
-> Your `xo-config.cfg` is migrated automatically and non-destructively, but the
-> corrected `/etc/xo-server/config.toml` is **only written by `--reconfigure`**.
+> **This script edits your `xo-config.cfg` by itself.** On the first run after
+> an upgrade, it appends any config keys added since your file was written and
+> rewrites the `CONFIG_VERSION=` line. It does this without asking, it takes no
+> backup, and there is no flag to skip it. It runs on any command that reads
+> the config — `--install`, `--update`, `--reconfigure` and `--build-templates`
+> included.
+>
+> It is additive: new keys are appended commented-out with their explanations,
+> keys you already have are left alone, and nothing you configured changes
+> behaviour. Once your file is at the current schema version the migration
+> returns immediately and never writes again — so this is a one-off per
+> upgrade, not something that happens every run.
+>
+> The current schema is **v4**. Depending on how old your file is, it may gain:
+>
+> | Schema | Keys appended |
+> | --- | --- |
+> | v2 | `PUBLIC_URL`, `ENCRYPT_REDIS_CREDENTIALS` |
+> | v3 | `SSL_CERT_DAYS` |
+> | v4 | `TEMPLATE_BUILD_METHOD`, `XO_URL`, `XO_API_TOKEN` |
+>
+> No key is ever renamed or removed. `XO_TASK_CHECK_TOKEN` in particular keeps
+> working — it is read whenever `XO_API_TOKEN` is unset — so a config written
+> before the template builder existed needs no edit.
+>
+> **If you are coming from a schema older than v2**, this version also corrects
+> two `config.toml` generation bugs. Your `xo-config.cfg` is migrated
+> automatically, but the corrected `/etc/xo-server/config.toml` is **only
+> written by `--reconfigure`**.
 >
 > **Run `--reconfigure` once** before resuming normal updates:
 >
