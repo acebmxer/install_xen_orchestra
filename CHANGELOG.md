@@ -12,6 +12,13 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Added
 
+- **CentOS Stream 9 and 10 templates.** Both rows already named a published
+  image but had no preparation script, so the menu drew them as **Coming
+  Soon...** and refused to build them. They now run `tpl_prep_rhel`, the same
+  script the AlmaLinux rows use rather than a second copy, since it is the same
+  family. Both build with a 10 GiB disk rather than the 4 GiB default, which is
+  the virtual size of the images, and log in as `cloud-user`.
+
 - **AlmaLinux 8, 9 and 10 templates.** All three rows already named a published
   image but had no preparation script, so the menu drew them and refused to
   build them. They now run `tpl_prep_rhel`, the `dnf` counterpart to
@@ -20,6 +27,18 @@ This installer builds Xen Orchestra from source and tracks the official
   default, which is the virtual size of every image in this family.
 
 ### Fixed
+
+- **CentOS Stream images would have imported unverified, for two reasons.**
+  `deploy_checksum_source` fell through to Debian's `SHA512SUMS` for this
+  origin, so the fetch would have 404'd; and even with the right filename the
+  digest would not have been found, because `cloud.centos.org` publishes the BSD
+  tag shape `SHA256 (<file>) = <hash>` and the only parser read the digest from
+  the first field. Either one alone gives a warning and an unverified import
+  rather than an error. `deploy_checksum_source` now resolves
+  `cloud.centos.org` to `CHECKSUM` with SHA-256, and
+  `deploy_verify_image_checksum` tries the BSD parse when the coreutils one
+  finds nothing — in that order, so existing rows keep taking the proven
+  branch.
 
 - **AlmaLinux images would have imported unverified.** `deploy_checksum_source`
   fell through to Debian's `SHA512SUMS` for unrecognised origins, so the fetch

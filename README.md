@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-101-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-335%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-353%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -207,8 +207,8 @@ template uses:
   ▸ [ ] AlmaLinux 8 (login: almalinux)
     [ ] AlmaLinux 9 (login: almalinux)
     [ ] AlmaLinux 10 (login: almalinux)
-      CentOS Stream 9  Coming Soon...
-      CentOS Stream 10  Coming Soon...
+    [ ] CentOS Stream 9 (login: cloud-user)
+    [ ] CentOS Stream 10 (login: cloud-user)
     [ ] Debian 12 (Bookworm) (login: debian)
     [ ] Debian 13 (Trixie) (login: debian)
       Fedora 43  Coming Soon...
@@ -234,11 +234,11 @@ the machine identity a clone must not inherit, and sealing the result. Once
 built they appear in Xen Orchestra under **New → VM**, alongside any Hub
 templates you already have.
 
-AlmaLinux 8, 9 and 10, Debian 12 (Bookworm), Debian 13 (Trixie) and the three
-Ubuntu LTS releases — 22.04 (Jammy), 24.04 (Noble) and 26.04 (Resolute) — are
-buildable today. CentOS Stream, Fedora and Rocky Linux are listed in the menu as
-**Coming Soon...**: each names a published cloud image, and what is missing is
-the preparation script rather than the image. The full walkthrough — what each
+AlmaLinux 8, 9 and 10, CentOS Stream 9 and 10, Debian 12 (Bookworm), Debian 13
+(Trixie) and the three Ubuntu LTS releases — 22.04 (Jammy), 24.04 (Noble) and
+26.04 (Resolute) — are buildable today. Fedora and Rocky Linux are listed in the
+menu as **Coming Soon...**: each names a published cloud image, and what is
+missing is the preparation script rather than the image. The full walkthrough — what each
 template contains, how the boot firmware is chosen, requirements, and what to do
 when a build fails — is in [docs/templates.md](docs/templates.md).
 

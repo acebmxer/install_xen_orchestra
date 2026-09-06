@@ -49,7 +49,7 @@ Each template ships with:
   firmware" dropdown — the template just gives you the right default.
 
 Defaults are 2 vCPUs, 2 GiB of RAM and a 4 GiB disk — 6 GiB for Ubuntu 24.04
-and 26.04, and 10 GiB for the AlmaLinux entries, whose images expand to more
+and 26.04, and 10 GiB for the RHEL-family entries, whose images expand to more
 than the default would hold. They are starting points, pre-filled in XO's New VM
 form, not limits.
 
@@ -60,6 +60,8 @@ form, not limits.
 | AlmaLinux 8 | `AlmaLinux-8-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
 | AlmaLinux 9 | `AlmaLinux-9-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
 | AlmaLinux 10 | `AlmaLinux-10-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
+| CentOS Stream 9 | `CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2` from `cloud.centos.org` | `cloud-user` |
+| CentOS Stream 10 | `CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2` from `cloud.centos.org` | `cloud-user` |
 | Debian 12 (Bookworm) | `debian-12-generic-amd64.raw` from `cloud.debian.org` | `debian` |
 | Debian 13 (Trixie) | `debian-13-generic-amd64.raw` from `cloud.debian.org` | `debian` |
 | Ubuntu 22.04 LTS (Jammy) | `jammy-server-cloudimg-amd64.img` from `cloud-images.ubuntu.com` | `ubuntu` |
@@ -87,34 +89,39 @@ from Debian and are handled automatically:
 Ubuntu 22.04's free security maintenance ends on 2027-04-30, and this entry is
 scheduled to be removed on **2027-06-01**. It is buildable until then.
 
-The three AlmaLinux entries share a preparation script of their own —
-`tpl_prep_rhel`, the `dnf` counterpart to the `apt` one Debian and Ubuntu use.
-It is named for the family rather than for AlmaLinux because Rocky Linux and
-CentOS Stream will be the same script when they are built. Four things differ
-from the Debian path:
+The three AlmaLinux entries and both CentOS Stream entries share a preparation
+script of their own — `tpl_prep_rhel`, the `dnf` counterpart to the `apt` one
+Debian and Ubuntu use. It is named for the family rather than for any one
+distribution because Rocky Linux will be the same script when it is built. Four
+things differ from the Debian path:
 
 - **Guest tools come from the ISO with no package fallback.** No release in this
   family packages `xe-guest-utilities` — checked against the base repositories
-  and EPEL on all three releases — so unlike Debian there is nothing to fall
-  back to.
+  and EPEL on AlmaLinux 8, 9 and 10 and on CentOS Stream 9 and 10 — so unlike
+  Debian there is nothing to fall back to.
 - **SELinux is enforcing.** The script touches `/.autorelabel` so the files it
   writes are relabelled on first boot; without it an unlabelled sshd drop-in can
   leave a clone refusing logins with nothing obvious in the log.
 - **Password login is enabled differently per release.** AlmaLinux 8 ships
   neither `/etc/ssh/sshd_config.d` nor the `Include` line that reads it, so a
-  drop-in alone would be silently ignored there; 9 and 10 ship both. The script
-  tests for a working include and edits `sshd_config` directly when there is
-  none.
+  drop-in alone would be silently ignored there; AlmaLinux 9 and 10 and both
+  CentOS Stream releases ship both. The script tests for a working include and
+  edits `sshd_config` directly when there is none.
 - **NetworkManager connections are removed.** This family bakes the build VM's
   MAC and DHCP client-id into a saved connection, which every clone would
   otherwise inherit and reuse.
 
-All three are built with a 10 GiB disk rather than the 4 GiB default. Every image
+All five are built with a 10 GiB disk rather than the 4 GiB default. Every image
 in this family is a 10 GiB virtual disk however small the download is — AlmaLinux
-8 downloads as 1.55 GiB and AlmaLinux 10 as 0.48 GiB, and both expand to the
-same 10 GiB. AlmaLinux 8 is supported until 2029-05-31; its image being frozen
-at the final 8.10 point release is not the same thing as the distribution
-approaching end of life.
+8 downloads as 1.55 GiB and AlmaLinux 10 as 0.48 GiB, CentOS Stream 9 as
+1.19 GiB and 10 as 1.00 GiB, and all of them expand to the same 10 GiB.
+AlmaLinux 8 is supported until 2029-05-31; its image being frozen at the final
+8.10 point release is not the same thing as the distribution approaching end of
+life.
+
+The CentOS Stream default account is `cloud-user`, not `centos` — read out of
+each image's own `/etc/cloud/cloud.cfg`, where `system_info.default_user.name`
+says so on both releases.
 
 ## Coming soon
 
@@ -126,7 +133,6 @@ published checksum beside it — so what is missing is the code, not the image.
 
 | Template | Image origin |
 | --- | --- |
-| CentOS Stream 9 / 10 | `cloud.centos.org` |
 | Fedora 43 / 44 | `dl.fedoraproject.org` |
 | Rocky Linux 8 / 9 / 10 | `dl.rockylinux.org` |
 
@@ -141,23 +147,29 @@ AlmaLinux entries buildable and leaves the remaining rows here:
    back to streaming when `/var/tmp` is short on space.
 2. **Checksum format.** ~~The verification reads Debian's `SHA512SUMS`.~~
    **Solved.** The checksum file and algorithm are chosen from the image's own
-   URL, and every origin handled so far publishes coreutils' `<hash>  <file>`
-   shape, so one parse serves all of them: Debian's `SHA512SUMS`, Ubuntu's
-   `SHA256SUMS` and AlmaLinux's `CHECKSUM`.
+   URL, and the two shapes those files come in are both parsed: coreutils'
+   `<hash>  <file>` (Debian's `SHA512SUMS`, Ubuntu's `SHA256SUMS`, AlmaLinux's
+   `CHECKSUM`) and the BSD tag `SHA256 (<file>) = <hash>` (CentOS Stream's
+   `CHECKSUM`, on both releases).
 
-   This section previously said the RHEL family publishes `SHA256 (file) = hash`
-   and that this was why those rows were placeholders. That was wrong, and it
-   was never checked against a mirror. `repo.almalinux.org` publishes an
-   ordinary coreutils-format `CHECKSUM`, and it carries an entry for the
-   `-latest` filename this catalogue requests rather than only the dated name it
-   points at — so AlmaLinux needed a filename and a digest length and no new
-   parser at all. Rocky and Fedora have not been read the same way and are still
-   assumed rather than known.
+   The shape is not a property of the distribution family, which is why it is
+   tried both ways rather than selected by origin: `repo.almalinux.org` and
+   `cloud.centos.org` publish a file with the same name, `CHECKSUM`, and
+   disagree on what goes inside it. Both carry an entry for the `-latest`
+   filename this catalogue requests rather than only the dated name it points
+   at.
+
+   This section previously said the whole RHEL family publishes
+   `SHA256 (file) = hash` and that this was why those rows were placeholders.
+   That was half wrong and had never been checked against a mirror — AlmaLinux
+   uses the coreutils shape, CentOS Stream does use the BSD one. Rocky and
+   Fedora have not been read the same way and are still assumed rather than
+   known.
 3. **Guest preparation.** ~~The preparation script is `apt`-based.~~ **Solved
    for the RHEL rebuilds.** `tpl_prep_rhel` is the `dnf` equivalent and is what
-   made the AlmaLinux entries buildable; it is named for the family because
-   Rocky Linux and CentOS Stream are the same script when they are built. Fedora
-   still needs checking against it rather than being assumed to fit.
+   made the AlmaLinux and CentOS Stream entries buildable; it is named for the
+   family because Rocky Linux is the same script when it is built. Fedora still
+   needs checking against it rather than being assumed to fit.
 
 Adding a distribution beyond these is additive — the catalogue is a table of
 one row per entry and the build loops over it.
@@ -165,10 +177,11 @@ one row per entry and the build loops over it.
 Images come from the distribution's own mirror, so nothing is redistributed and
 you can see exactly what you are installing. Checksums are not pinned in the
 script: every origin publishes a checksum file beside its image — `SHA512SUMS`
-for Debian, `SHA256SUMS` for Ubuntu — which is fetched and verified at build
-time, so a new upstream release is picked up without anyone editing the
-catalogue. Which file and which algorithm is worked out from the image's URL,
-so adding an image does not mean declaring its checksum format alongside it.
+for Debian, `SHA256SUMS` for Ubuntu, `CHECKSUM` for AlmaLinux and CentOS Stream
+— which is fetched and verified at build time, so a new upstream release is
+picked up without anyone editing the catalogue. Which file and which algorithm
+is worked out from the image's URL, so adding an image does not mean declaring
+its checksum format alongside it.
 
 ## What a build does
 

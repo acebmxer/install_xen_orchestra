@@ -338,6 +338,49 @@ teardown() {
     done
 }
 
+@test "every CentOS Stream row is buildable and shares the rhel prep script" {
+    # Same family as AlmaLinux and the same script -- a second copy for these
+    # rows is how one of them silently stops getting fixes.
+    local row key prep found=0
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == centos* ]] || continue
+        found=$((found + 1))
+        prep=$(tpl_field "$row" 6)
+        [ "$prep" = "tpl_prep_rhel" ]
+        ! tpl_is_placeholder "$row"
+    done
+    # 9 and 10.
+    [ "$found" -eq 2 ]
+}
+
+@test "every CentOS Stream row asks for a disk that fits its 10 GiB image" {
+    # Both are ~1 GiB downloads that expand to a 10 GiB disk, so the 4 GiB
+    # default would not hold either. Read off `qemu-img info`'s "virtual size".
+    local row key disk
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == centos* ]] || continue
+        disk=$(tpl_field "$row" 7)
+        [ -n "$disk" ]
+        [ "$disk" -ge 10 ]
+    done
+}
+
+@test "every CentOS Stream row logs in as the account its image actually creates" {
+    # cloud-user, not centos -- read out of each image's own
+    # /etc/cloud/cloud.cfg, where system_info.default_user.name says so on both
+    # releases. Getting this wrong produces a template nobody can log into, and
+    # nothing reports an error.
+    local row key user
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == centos* ]] || continue
+        user=$(tpl_field "$row" 5)
+        [ "$user" = "cloud-user" ]
+    done
+}
+
 # --- menu wiring -----------------------------------------------------------
 #
 # The dispatch in process_menu_selections indexes MENU_SELECTED by number, so
@@ -1158,6 +1201,50 @@ teardown() {
         [[ "$url" == *repo.almalinux.org* ]] || continue
         [ "$(deploy_checksum_source "$url")" = "CHECKSUM 256" ]
     done
+}
+
+@test "CentOS Stream images are verified against the CHECKSUM file it publishes" {
+    # Same filename as AlmaLinux and a different format inside it, which is the
+    # whole reason the parse is tried both ways rather than picked per origin.
+    local row url
+    for row in "${TPL_CATALOG[@]}"; do
+        url=$(tpl_field "$row" 4)
+        [[ "$url" == *cloud.centos.org* ]] || continue
+        [ "$(deploy_checksum_source "$url")" = "CHECKSUM 256" ]
+    done
+}
+
+@test "a BSD-tag checksum file yields the digest for the requested image" {
+    # cloud.centos.org publishes "SHA256 (<file>) = <hash>", where the digest
+    # is the fourth field rather than the first. The coreutils parse finds
+    # nothing in it, so without this branch the build warns and imports the
+    # image unverified -- a warning, not a failure.
+    local sums base want
+    base="CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+    sums="SHA256 (CentOS-Stream-Azure-9-latest.x86_64.vhd.xz) = 1111111111111111111111111111111111111111111111111111111111111111
+SHA256 (${base}) = 659024f5219a57e0be136c2902f624ee4405e307bc6d8fc72c7fabdf8267e6ff"
+
+    # The coreutils parse must not match a BSD line: its second field is
+    # "(<name>)", never the bare name.
+    want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
+    [ -z "$want" ]
+
+    want=$(awk -v f="($base)" '$2 == f && $3 == "=" { print $4; exit }' <<< "$sums")
+    [ "$want" = "659024f5219a57e0be136c2902f624ee4405e307bc6d8fc72c7fabdf8267e6ff" ]
+}
+
+@test "the BSD-tag parse is tried only after the coreutils one finds nothing" {
+    # Order matters: every existing row is verified by the coreutils parse, and
+    # it has to stay the branch they take. A BSD attempt running first would
+    # put a new parse in front of proven ones for no gain.
+    local body first second
+    body=$(declare -f deploy_verify_image_checksum)
+    first=$(grep -n '\$2 == f || \$2 == "\*" f' <<< "$body" | head -1 | cut -d: -f1)
+    second=$(grep -n '\$3 == "="' <<< "$body" | head -1 | cut -d: -f1)
+    [ -n "$first" ]
+    [ -n "$second" ]
+    [ "$first" -lt "$second" ]
+    [[ "$body" == *'if [[ -z "$want" ]]; then'* ]]
 }
 
 @test "an unknown origin falls back to SHA512SUMS rather than skipping the check" {

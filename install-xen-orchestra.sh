@@ -4062,19 +4062,25 @@ STREAM_EOF
 # every template row, and adding an image does not mean remembering to state
 # its checksum algorithm alongside it.
 #
-# Every file handled here is in coreutils' own format -- "<hash>  <file>",
-# with a leading '*' on the name for binary mode -- so only the name and the
-# digest length differ, and one parse serves all of them.
+# Two on-disk shapes are handled, and which one a file uses is a property of
+# the mirror rather than of the distribution -- so it is read from the file,
+# not declared here. See deploy_verify_image_checksum for the parse.
 #
-# AlmaLinux was expected to need a second parser and does not. The comment here
-# used to say the RHEL family publishes "SHA256 (<file>) = <hash>" and that this
-# was why those rows were placeholders. Checked against the mirror rather than
+#   coreutils   "<hash>  <file>", optionally "*<file>" for binary mode.
+#               Debian, Ubuntu and AlmaLinux.
+#   BSD tag     "SHA256 (<file>) = <hash>". CentOS Stream.
+#
+# AlmaLinux was expected to need the second shape and does not. The comment
+# here used to say the whole RHEL family publishes the BSD form and that this
+# was why those rows were placeholders. Checked against the mirrors rather than
 # taken on trust: repo.almalinux.org publishes a file named CHECKSUM in the
-# ordinary coreutils shape with SHA-256 digests, and it carries an entry for the
-# "-latest" name this catalogue actually requests, not only for the dated
-# filename it points at. So AlmaLinux needs a name and a digest length here and
-# nothing more. Rocky and Fedora are unverified on this point and keep the
-# default until someone reads their mirrors the same way.
+# ordinary coreutils shape with SHA-256 digests, while cloud.centos.org
+# publishes a file of the same name in the BSD tag shape. Same filename, same
+# family, different format -- which is why the parser tries both rather than
+# keying the shape off the origin. Both carry an entry for the "-latest" name
+# this catalogue actually requests, not only for the dated filename it points
+# at. Rocky and Fedora are unverified on this point and keep the default until
+# someone reads their mirrors the same way.
 #
 # The default is Debian's SHA512SUMS. An unknown origin therefore gets that
 # name, does not find it, and warns that the image could not be verified --
@@ -4084,6 +4090,7 @@ deploy_checksum_source() {
     case "$url" in
         *//cloud-images.ubuntu.com/*) printf 'SHA256SUMS 256' ;;
         *//repo.almalinux.org/*)      printf 'CHECKSUM 256' ;;
+        *//cloud.centos.org/*)        printf 'CHECKSUM 256' ;;
         *)                            printf 'SHA512SUMS 512' ;;
     esac
 }
@@ -4181,6 +4188,20 @@ deploy_verify_image_checksum() {
             # for every entry, so the second half of this test is not a corner
             # case there -- it is the only branch that matches.
             want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
+
+            # BSD tag format: "SHA256 (<name>) = <digest>". cloud.centos.org
+            # publishes this, under a file named CHECKSUM -- the same filename
+            # AlmaLinux uses for the coreutils shape, so the format cannot be
+            # decided from the origin and has to be tried here.
+            #
+            # Tried second, and only when the first found nothing, so the
+            # coreutils parse stays the path every existing row takes. The two
+            # cannot both match: a coreutils line has the digest in $1, a BSD
+            # line has the literal algorithm name there, and the regex below
+            # rejects that either way.
+            if [[ -z "$want" ]]; then
+                want=$(awk -v f="($base)" '$2 == f && $3 == "=" { print $4; exit }' <<< "$sums")
+            fi
         fi
 
         if [[ -z "$want" ]]; then
@@ -7401,15 +7422,20 @@ show_help() {
 #      *staged* path -- there is nothing to convert in a stream -- so a qcow2
 #      row cannot fall back to streaming when /var/tmp is short.
 #   2. Checksum format. Solved: deploy_checksum_source picks the sums file and
-#      the algorithm from the image's own URL. Debian publishes SHA512SUMS and
-#      Ubuntu SHA256SUMS, both in coreutils' "<hash>  <file>" shape, so one
-#      parse serves both. The RHEL family and Fedora publish
-#      "SHA256 (<file>) = <hash>", a different parse entirely and still
-#      unhandled -- part of why those rows are still placeholders.
+#      the algorithm from the image's own URL, and deploy_verify_image_checksum
+#      parses either of the two shapes those files come in -- coreutils'
+#      "<hash>  <file>" (Debian, Ubuntu, AlmaLinux) or the BSD tag
+#      "SHA256 (<file>) = <hash>" (CentOS Stream). The shape is not a property
+#      of the family: AlmaLinux and CentOS Stream both publish a file called
+#      CHECKSUM and disagree on what goes in it, which is why the parse is
+#      tried both ways rather than selected by origin. Fedora and Rocky are
+#      unread on this point.
 #   3. Guest preparation. tpl_prep_debian is apt-based, and Ubuntu shares it.
 #      Confirmed rather than assumed: Ubuntu packages xe-guest-utilities (which
 #      Debian 13 does not), so there both the ISO path and the apt fallback
-#      work. The RHEL family and Fedora still need a dnf equivalent.
+#      work. tpl_prep_rhel is the dnf counterpart and serves the RHEL rebuilds;
+#      Fedora is close enough to reach for it but has not been checked against
+#      it, so those rows stay placeholders until it is.
 #
 # Version coverage below is deliberate: current supported releases only.
 # Ubuntu is the LTS line (interim releases are nine-month lifespans and would
@@ -7486,8 +7512,24 @@ TPL_CATALOG=(
     "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
     "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
     "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
-    "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|-|"
-    "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|-|"
+    # Both CentOS Stream rows: 10 GiB for the same reason as the AlmaLinux rows
+    # above, read off `qemu-img info`'s "virtual size" -- 9 downloads as
+    # 1.19 GiB and 10 as 1.00 GiB, and both expand to the same 10 GiB.
+    #
+    # cloud-user, not centos: read out of each image's own /etc/cloud/cloud.cfg,
+    # where system_info.default_user.name says so on both releases.
+    #
+    # No firmware field on either. Both GPTs carry an EFI system partition
+    # alongside a BIOS boot partition -- read off the images' partition tables
+    # -- so tpl_disk_supports_uefi finds the ESP and publishes them as UEFI,
+    # which is the default this field would have set anyway. Confirmed on a
+    # real pool for 9: templates built from it boot under both BIOS and UEFI.
+    #
+    # 10 has three partitions to 9's four -- it carries no separate /boot --
+    # which changes nothing here: the ESP is what is looked for, and the build
+    # never assumes a partition count.
+    "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|tpl_prep_rhel|10"
+    "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|tpl_prep_rhel|10"
     "debian12|Debian 12 (Bookworm)|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw|debian|tpl_prep_debian|"
     "debian13|Debian 13 (Trixie)|trixie|https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw|debian|tpl_prep_debian|"
     "fedora43|Fedora 43|43|https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2|fedora|-|"
@@ -7738,15 +7780,17 @@ PREP_EOF
 #
 # Deliberately not tpl_prep_debian, and not a copy of it: the two differ in
 # package manager, in where the guest tools come from, and in what has to be
-# scrubbed. Do not add a third for Rocky or CentOS Stream -- they are the same
-# family and the same script, and a per-distro copy is how one of them silently
-# stops getting fixes. The catalogue rows point every RHEL-family entry here.
+# scrubbed. Do not add a third for Rocky -- it is the same family and the same
+# script, and a per-distro copy is how one of them silently stops getting
+# fixes. The catalogue rows point every RHEL-family entry here, AlmaLinux and
+# CentOS Stream alike.
 #
 # The guest tools come from the ISO, for a stronger reason than on Debian:
 # xe-guest-utilities is packaged by nobody in this family. Confirmed against
-# AlmaLinux 8, 9 and 10 -- absent from base repos and absent from EPEL on all
-# three -- so unlike the Debian path there is no package fallback worth
-# attempting, and the ISO is the only route that exists.
+# AlmaLinux 8, 9 and 10 and CentOS Stream 9 -- absent from base repos and
+# absent from EPEL on all of them -- so unlike the Debian path there is no
+# package fallback worth attempting, and the ISO is the only route that
+# exists.
 tpl_prep_rhel() {
     local user="$1"
     # Quoted heredoc for the same reason as the Debian path: the guest script
