@@ -10,6 +10,27 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **AlmaLinux 8, 9 and 10 templates.** All three rows already named a published
+  image but had no preparation script, so the menu drew them and refused to
+  build them. They now run `tpl_prep_rhel`, the `dnf` counterpart to
+  `tpl_prep_debian`, named for the family because Rocky Linux and CentOS Stream
+  will share it. Each row builds with a 10 GiB disk rather than the 4 GiB
+  default, which is the virtual size of every image in this family.
+
+### Fixed
+
+- **AlmaLinux images would have imported unverified.** `deploy_checksum_source`
+  fell through to Debian's `SHA512SUMS` for unrecognised origins, so the fetch
+  would have 404'd and the build would have warned and imported anyway. It now
+  resolves `repo.almalinux.org` to `CHECKSUM` with SHA-256.
+
+- **A template menu test asserted that the first catalogue row was a
+  placeholder**, which stopped being true once AlmaLinux 8 became buildable. It
+  now checks that the cursor lands on the first buildable row without depending
+  on which distro sorts first.
+
 ## [0.7.0] - 2026-09-05
 
 ### Added

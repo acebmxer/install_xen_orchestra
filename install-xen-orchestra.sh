@@ -4062,11 +4062,19 @@ STREAM_EOF
 # every template row, and adding an image does not mean remembering to state
 # its checksum algorithm alongside it.
 #
-# Both files handled here are in coreutils' own format -- "<hash>  <file>",
+# Every file handled here is in coreutils' own format -- "<hash>  <file>",
 # with a leading '*' on the name for binary mode -- so only the name and the
-# digest length differ, and one parse serves both. That is not universal: the
-# RHEL family and Fedora publish "SHA256 (<file>) = <hash>", which this does
-# not attempt and which is why those catalogue rows are still placeholders.
+# digest length differ, and one parse serves all of them.
+#
+# AlmaLinux was expected to need a second parser and does not. The comment here
+# used to say the RHEL family publishes "SHA256 (<file>) = <hash>" and that this
+# was why those rows were placeholders. Checked against the mirror rather than
+# taken on trust: repo.almalinux.org publishes a file named CHECKSUM in the
+# ordinary coreutils shape with SHA-256 digests, and it carries an entry for the
+# "-latest" name this catalogue actually requests, not only for the dated
+# filename it points at. So AlmaLinux needs a name and a digest length here and
+# nothing more. Rocky and Fedora are unverified on this point and keep the
+# default until someone reads their mirrors the same way.
 #
 # The default is Debian's SHA512SUMS. An unknown origin therefore gets that
 # name, does not find it, and warns that the image could not be verified --
@@ -4075,6 +4083,7 @@ deploy_checksum_source() {
     local url="$1"
     case "$url" in
         *//cloud-images.ubuntu.com/*) printf 'SHA256SUMS 256' ;;
+        *//repo.almalinux.org/*)      printf 'CHECKSUM 256' ;;
         *)                            printf 'SHA512SUMS 512' ;;
     esac
 }
@@ -7457,9 +7466,26 @@ show_help() {
 #     not evidence of a failed boot -- XO's own Hub templates do the same thing.
 #     Do not read a garbled console as a missing ESP.
 TPL_CATALOG=(
-    "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
-    "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
-    "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
+    # 10 GiB, not the 4 GiB default. Every image in this family is a 10 GiB
+    # virtual disk -- read off `qemu-img info`'s "virtual size" for all three
+    # AlmaLinux releases, and the same for Rocky 8/9/10 and CentOS Stream
+    # 9/10 when those are built. That is the figure the VDI has to clear, and
+    # it is a property of the image, not of the download: AlmaLinux 8 is a
+    # 1.55 GiB download and AlmaLinux 10 a 0.48 GiB one, and both expand to
+    # the same 10 GiB.
+    #
+    # XO's own Hub lists its AlmaLinux 9 template at exactly 10 GiB, which
+    # agrees. Its AlmaLinux 8 entry says 4 GiB, but that is an image pinned at
+    # 8.5 from 2021; the current 8.10 image is not that image, so the smaller
+    # figure does not transfer. Do not size these from the Hub card.
+    #
+    # No EOL gate on AlmaLinux 8: it is supported until 2029-05-31, which is
+    # years outside the one-year horizon that would warrant one. Its image
+    # being frozen at the final 8.10 point release is not the same thing as
+    # the distribution being near end of life.
+    "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
+    "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
+    "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
     "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|-|"
     "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|-|"
     "debian12|Debian 12 (Bookworm)|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw|debian|tpl_prep_debian|"
@@ -7701,6 +7727,109 @@ truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
 apt-get clean
+rm -f /root/.bash_history /home/*/.bash_history
+
+# The build watches for the VM to halt. This must be the last thing that runs.
+shutdown -h now
+PREP_EOF
+}
+
+# Emit the in-guest preparation script for the RHEL rebuilds.
+#
+# Deliberately not tpl_prep_debian, and not a copy of it: the two differ in
+# package manager, in where the guest tools come from, and in what has to be
+# scrubbed. Do not add a third for Rocky or CentOS Stream -- they are the same
+# family and the same script, and a per-distro copy is how one of them silently
+# stops getting fixes. The catalogue rows point every RHEL-family entry here.
+#
+# The guest tools come from the ISO, for a stronger reason than on Debian:
+# xe-guest-utilities is packaged by nobody in this family. Confirmed against
+# AlmaLinux 8, 9 and 10 -- absent from base repos and absent from EPEL on all
+# three -- so unlike the Debian path there is no package fallback worth
+# attempting, and the ISO is the only route that exists.
+tpl_prep_rhel() {
+    local user="$1"
+    # Quoted heredoc for the same reason as the Debian path: the guest script
+    # is emitted verbatim and only the account name is substituted.
+    cat <<'PREP_EOF' | sed "s/__TPL_USER__/${user}/g"
+#!/bin/bash
+# Prepares a cloud image for use as an XCP-ng template. Runs once, inside the
+# guest, then powers the VM off.
+exec > /var/log/xo-template-prep.log 2>&1
+set -x
+
+# --- guest tools ---
+# ISO only. No release in this family packages xe-guest-utilities, so there is
+# no fallback to fall back to; if the ISO is not attached the template will not
+# report an IP, and that has to be visible in the log rather than silently
+# skipped.
+install_guest_tools() {
+    local mnt=/mnt
+    if ! mountpoint -q "$mnt" && mount /dev/cdrom "$mnt" 2>/dev/null; then
+        if [[ -f "$mnt/Linux/install.sh" ]]; then
+            bash "$mnt/Linux/install.sh" -n
+            umount "$mnt" 2>/dev/null || true
+            return 0
+        fi
+        umount "$mnt" 2>/dev/null || true
+    fi
+    echo "WARNING: guest-tools ISO not found; template will not report an IP"
+    return 1
+}
+install_guest_tools || true
+
+# --- cloud-init and disk growth ---
+# cloud-utils-growpart is this family's equivalent of Debian's
+# cloud-initramfs-growroot: it is what lets an operator ask for a bigger disk
+# at deploy time and have the filesystem actually fill it. Present in
+# appstream on 8, 9 and 10 -- checked, not assumed.
+dnf install -y cloud-init cloud-utils-growpart || true
+
+# --- shipped login ---
+# Same rationale as the Debian path: a known password so a freshly deployed VM
+# is reachable before the operator supplies a cloud-config.
+echo "__TPL_USER__:__TPL_USER__" | chpasswd
+
+# A drop-in only works where sshd reads one. AlmaLinux 8 ships neither the
+# sshd_config.d directory nor the Include line that pulls it in -- its OpenSSH
+# predates both -- so a drop-in written there is silently ignored and the
+# template ends up refusing password logins with nothing in the log to say
+# why. 9 and 10 do ship both. Checked on all three rather than assumed, so
+# this edits the main file when there is no working include, and drops a file
+# in when there is.
+if grep -q '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config 2>/dev/null; then
+    mkdir -p /etc/ssh/sshd_config.d
+    printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-xo-template.conf
+else
+    sed -i 's/^[[:space:]]*#*[[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    grep -q '^PasswordAuthentication yes' /etc/ssh/sshd_config \
+        || printf '\nPasswordAuthentication yes\n' >> /etc/ssh/sshd_config
+fi
+
+# --- SELinux ---
+# Enforcing by default in this family, unlike Debian. Relabel on next boot:
+# the files written above were created without the contexts SELinux expects,
+# and an unlabelled sshd_config.d drop-in is exactly the kind of thing that
+# leaves a clone refusing logins with nothing obvious in the log.
+touch /.autorelabel
+
+# --- scrub machine identity ---
+# Everything below this line exists so that clones do not share an identity.
+cloud-init clean --logs --seed
+rm -rf /var/lib/cloud/instances /var/lib/cloud/instance
+rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
+truncate -s 0 /etc/machine-id
+truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
+find /etc/ssh -type f -name 'ssh_host_*' -delete
+
+# Drop the network config anaconda/cloud-init left behind. On this family a
+# baked-in NetworkManager connection carries the build VM's MAC and DHCP
+# client-id, which a clone then reuses -- two VMs, one lease.
+rm -f /etc/sysconfig/network-scripts/ifcfg-e* 2>/dev/null || true
+find /etc/NetworkManager/system-connections -type f -delete 2>/dev/null || true
+
+dnf clean all
+rm -rf /var/cache/dnf
 rm -f /root/.bash_history /home/*/.bash_history
 
 # The build watches for the VM to halt. This must be the last thing that runs.

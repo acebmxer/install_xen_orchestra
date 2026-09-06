@@ -49,13 +49,17 @@ Each template ships with:
   firmware" dropdown — the template just gives you the right default.
 
 Defaults are 2 vCPUs, 2 GiB of RAM and a 4 GiB disk — 6 GiB for Ubuntu 24.04
-and 26.04, whose images expand to more than the default would hold. They are
-starting points, pre-filled in XO's New VM form, not limits.
+and 26.04, and 10 GiB for the AlmaLinux entries, whose images expand to more
+than the default would hold. They are starting points, pre-filled in XO's New VM
+form, not limits.
 
 ## Available templates
 
 | Template | Image | Default login |
 | --- | --- | --- |
+| AlmaLinux 8 | `AlmaLinux-8-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
+| AlmaLinux 9 | `AlmaLinux-9-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
+| AlmaLinux 10 | `AlmaLinux-10-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
 | Debian 12 (Bookworm) | `debian-12-generic-amd64.raw` from `cloud.debian.org` | `debian` |
 | Debian 13 (Trixie) | `debian-13-generic-amd64.raw` from `cloud.debian.org` | `debian` |
 | Ubuntu 22.04 LTS (Jammy) | `jammy-server-cloudimg-amd64.img` from `cloud-images.ubuntu.com` | `ubuntu` |
@@ -83,6 +87,35 @@ from Debian and are handled automatically:
 Ubuntu 22.04's free security maintenance ends on 2027-04-30, and this entry is
 scheduled to be removed on **2027-06-01**. It is buildable until then.
 
+The three AlmaLinux entries share a preparation script of their own —
+`tpl_prep_rhel`, the `dnf` counterpart to the `apt` one Debian and Ubuntu use.
+It is named for the family rather than for AlmaLinux because Rocky Linux and
+CentOS Stream will be the same script when they are built. Four things differ
+from the Debian path:
+
+- **Guest tools come from the ISO with no package fallback.** No release in this
+  family packages `xe-guest-utilities` — checked against the base repositories
+  and EPEL on all three releases — so unlike Debian there is nothing to fall
+  back to.
+- **SELinux is enforcing.** The script touches `/.autorelabel` so the files it
+  writes are relabelled on first boot; without it an unlabelled sshd drop-in can
+  leave a clone refusing logins with nothing obvious in the log.
+- **Password login is enabled differently per release.** AlmaLinux 8 ships
+  neither `/etc/ssh/sshd_config.d` nor the `Include` line that reads it, so a
+  drop-in alone would be silently ignored there; 9 and 10 ship both. The script
+  tests for a working include and edits `sshd_config` directly when there is
+  none.
+- **NetworkManager connections are removed.** This family bakes the build VM's
+  MAC and DHCP client-id into a saved connection, which every clone would
+  otherwise inherit and reuse.
+
+All three are built with a 10 GiB disk rather than the 4 GiB default. Every image
+in this family is a 10 GiB virtual disk however small the download is — AlmaLinux
+8 downloads as 1.55 GiB and AlmaLinux 10 as 0.48 GiB, and both expand to the
+same 10 GiB. AlmaLinux 8 is supported until 2029-05-31; its image being frozen
+at the final 8.10 point release is not the same thing as the distribution
+approaching end of life.
+
 ## Coming soon
 
 These appear in the menu marked **Coming Soon...** and cannot be selected. They
@@ -93,14 +126,13 @@ published checksum beside it — so what is missing is the code, not the image.
 
 | Template | Image origin |
 | --- | --- |
-| AlmaLinux 8 / 9 / 10 | `repo.almalinux.org` |
 | CentOS Stream 9 / 10 | `cloud.centos.org` |
 | Fedora 43 / 44 | `dl.fedoraproject.org` |
 | Rocky Linux 8 / 9 / 10 | `dl.rockylinux.org` |
 
-Three things stood between these and a working entry. The first two are now
-solved for every image rather than per-distribution, which is what made the
-Ubuntu entries buildable and leaves only the RHEL family here:
+Three things stood between these and a working entry. All three are now solved
+for every image rather than per-distribution, which is what made the Ubuntu and
+AlmaLinux entries buildable and leaves the remaining rows here:
 
 1. **Image format.** ~~Debian publishes `raw`; everyone else publishes
    `qcow2`.~~ **Solved.** A non-raw image is now converted to raw with
@@ -108,14 +140,24 @@ Ubuntu entries buildable and leaves only the RHEL family here:
    since there is nothing to convert in a stream, so a qcow2 image cannot fall
    back to streaming when `/var/tmp` is short on space.
 2. **Checksum format.** ~~The verification reads Debian's `SHA512SUMS`.~~
-   **Solved for Ubuntu.** The checksum file and algorithm are now chosen from
-   the image's own URL: Debian's `SHA512SUMS` and Ubuntu's `SHA256SUMS` are
-   both in coreutils' `<hash>  <file>` shape, so one parse serves both. The
-   RHEL family and Fedora publish `SHA256 (file) = hash`, a different format
-   that is still unhandled — part of why those entries remain here.
-3. **Guest preparation.** The preparation script is `apt`-based, and Ubuntu
-   shares it. The RHEL family and Fedora still need a `dnf` equivalent, and
-   that is now the main thing between them and a working entry.
+   **Solved.** The checksum file and algorithm are chosen from the image's own
+   URL, and every origin handled so far publishes coreutils' `<hash>  <file>`
+   shape, so one parse serves all of them: Debian's `SHA512SUMS`, Ubuntu's
+   `SHA256SUMS` and AlmaLinux's `CHECKSUM`.
+
+   This section previously said the RHEL family publishes `SHA256 (file) = hash`
+   and that this was why those rows were placeholders. That was wrong, and it
+   was never checked against a mirror. `repo.almalinux.org` publishes an
+   ordinary coreutils-format `CHECKSUM`, and it carries an entry for the
+   `-latest` filename this catalogue requests rather than only the dated name it
+   points at — so AlmaLinux needed a filename and a digest length and no new
+   parser at all. Rocky and Fedora have not been read the same way and are still
+   assumed rather than known.
+3. **Guest preparation.** ~~The preparation script is `apt`-based.~~ **Solved
+   for the RHEL rebuilds.** `tpl_prep_rhel` is the `dnf` equivalent and is what
+   made the AlmaLinux entries buildable; it is named for the family because
+   Rocky Linux and CentOS Stream are the same script when they are built. Fedora
+   still needs checking against it rather than being assumed to fit.
 
 Adding a distribution beyond these is additive — the catalogue is a table of
 one row per entry and the build loops over it.

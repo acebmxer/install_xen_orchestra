@@ -228,6 +228,116 @@ teardown() {
     [[ "$output" == *"cloud-initramfs-growroot"* ]]
 }
 
+# --- RHEL-family prep script ------------------------------------------------
+#
+# A separate script from the Debian one because the family differs in package
+# manager, guest-tools availability and SELinux. These mirror the Debian
+# assertions above rather than inventing new ones: the two scripts have to
+# meet the same contract, and anything only one of them is checked for is the
+# half that quietly regresses.
+
+@test "the rhel prep script is valid shell" {
+    tpl_prep_rhel almalinux > "${TMPDIR_TEST}/prep-rhel.sh"
+    bash -n "${TMPDIR_TEST}/prep-rhel.sh"
+}
+
+@test "the rhel prep script substitutes the account name" {
+    run tpl_prep_rhel someuser
+    [[ "$output" == *"someuser:someuser"* ]]
+    [[ "$output" != *"__TPL_USER__"* ]]
+}
+
+@test "the rhel prep script ends by powering the VM off" {
+    run tpl_prep_rhel almalinux
+    [[ "$(grep -v '^\s*#' <<< "$output" | grep . | tail -1)" == "shutdown -h now" ]]
+}
+
+@test "the rhel prep script scrubs every piece of machine identity" {
+    run tpl_prep_rhel almalinux
+    [[ "$output" == *"cloud-init clean"* ]]
+    [[ "$output" == *"/etc/machine-id"* ]]
+    [[ "$output" == *"ssh_host_"* ]]
+    [[ "$output" == *"/var/lib/cloud/instances"* ]]
+    # This family bakes the build VM's MAC into a NetworkManager connection,
+    # which a clone would reuse -- two VMs sharing one DHCP lease.
+    [[ "$output" == *"NetworkManager/system-connections"* ]]
+}
+
+@test "the rhel prep script uses dnf, never apt" {
+    # Catches a copy-paste from the Debian script, which would fail silently:
+    # cloud-init does not abort on a failed runcmd.
+    run tpl_prep_rhel almalinux
+    [[ "$output" != *"apt-get"* ]]
+    [[ "$output" == *"dnf install -y cloud-init"* ]]
+}
+
+@test "the rhel prep script installs growpart so deploy-time disk sizes take effect" {
+    # cloud-utils-growpart is this family's equivalent of growroot. Without it
+    # an operator can ask for a bigger disk and the filesystem will not fill it.
+    run tpl_prep_rhel almalinux
+    [[ "$output" == *"cloud-utils-growpart"* ]]
+}
+
+@test "the rhel prep script takes guest tools from the ISO with no package fallback" {
+    # No release in this family packages xe-guest-utilities -- verified absent
+    # from base repos and EPEL on AlmaLinux 8, 9 and 10 -- so unlike the Debian
+    # script there is nothing to fall back to, and a fallback that looked like
+    # one would just fail quietly.
+    run tpl_prep_rhel almalinux
+    [[ "$output" == *"install.sh"* ]]
+    # No *install* of it -- the name appearing in a comment explaining why
+    # there is no fallback is the point, not a violation.
+    local code
+    code=$(grep -v '^\s*#' <<< "$output")
+    [[ "$code" != *"install"*"xe-guest-utilities"* ]]
+}
+
+@test "the rhel prep script enables password login where sshd reads no drop-in" {
+    # AlmaLinux 8 ships neither sshd_config.d nor the Include line that reads
+    # it, so a drop-in alone is silently ignored there and the template refuses
+    # password logins. 9 and 10 do ship both. The script has to handle each.
+    run tpl_prep_rhel almalinux
+    [[ "$output" == *"Include /etc/ssh/sshd_config.d"* ]]
+    [[ "$output" == *"sshd_config.d/99-xo-template.conf"* ]]
+    [[ "$output" == *"sed -i"*"PasswordAuthentication"* ]]
+}
+
+@test "the rhel prep script relabels for SELinux" {
+    # Enforcing by default in this family, unlike Debian. The files the script
+    # writes get no context, and an unlabelled sshd drop-in locks logins out
+    # with nothing obvious in the log.
+    run tpl_prep_rhel almalinux
+    [[ "$output" == *"/.autorelabel"* ]]
+}
+
+@test "every AlmaLinux row is buildable and shares the rhel prep script" {
+    local row key prep found=0
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == almalinux* ]] || continue
+        found=$((found + 1))
+        prep=$(tpl_field "$row" 6)
+        [ "$prep" = "tpl_prep_rhel" ]
+        ! tpl_is_placeholder "$row"
+    done
+    # 8, 9 and 10.
+    [ "$found" -eq 3 ]
+}
+
+@test "every AlmaLinux row asks for a disk that fits its 10 GiB image" {
+    # Every image in this family is a 10 GiB virtual disk regardless of how
+    # small the download is, so each row overrides the default rather than
+    # inheriting a 4 GiB disk the image cannot fit in.
+    local row key disk
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == almalinux* ]] || continue
+        disk=$(tpl_field "$row" 7)
+        [ -n "$disk" ]
+        [ "$disk" -ge 10 ]
+    done
+}
+
 # --- menu wiring -----------------------------------------------------------
 #
 # The dispatch in process_menu_selections indexes MENU_SELECTED by number, so
@@ -1032,6 +1142,24 @@ teardown() {
     [ "$(deploy_checksum_source 'https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw')" = "SHA512SUMS 512" ]
 }
 
+@test "AlmaLinux images are verified against the CHECKSUM file it publishes" {
+    # The mirror publishes a file named CHECKSUM, not SHA512SUMS, so without a
+    # case here the fetch 404s and the build imports the image unverified --
+    # a warning, not a failure, which is exactly the kind of thing that goes
+    # unnoticed.
+    #
+    # It is SHA-256 in coreutils' ordinary "<hash>  <file>" shape, so the
+    # existing parser handles it. The comments once claimed this family used
+    # "SHA256 (file) = hash" and needed a second parser; reading the mirror
+    # showed otherwise.
+    local row url
+    for row in "${TPL_CATALOG[@]}"; do
+        url=$(tpl_field "$row" 4)
+        [[ "$url" == *repo.almalinux.org* ]] || continue
+        [ "$(deploy_checksum_source "$url")" = "CHECKSUM 256" ]
+    done
+}
+
 @test "an unknown origin falls back to SHA512SUMS rather than skipping the check" {
     # The fallback has to be a real attempt at verification. Returning nothing
     # would turn an unrecognised mirror into an unverified import.
@@ -1304,13 +1432,23 @@ teardown() {
 # real one, at a position where SPACE does nothing.
 
 @test "the cursor opens on the first buildable row, not the first row" {
-    # AlmaLinux 8 sorts first and is a placeholder.
+    # The behaviour under test is that the opening cursor lands somewhere
+    # SPACE actually works. It is deliberately not asserted against a
+    # particular row: this test used to require TPL_CATALOG[0] to be a
+    # placeholder, which was true only while AlmaLinux 8 was unbuilt, and it
+    # failed the moment that row got a prep function. Which distro sorts first
+    # is not what this test is for.
     local i cursor=0
     for ((i = 0; i < ${#TPL_CATALOG[@]}; i++)); do
         if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then cursor=$i; break; fi
     done
-    tpl_is_placeholder "${TPL_CATALOG[0]}"
     ! tpl_is_placeholder "${TPL_CATALOG[$cursor]}"
+
+    # And it is the *first* such row -- everything before it, if anything, is
+    # a placeholder that was correctly skipped.
+    for ((i = 0; i < cursor; i++)); do
+        tpl_is_placeholder "${TPL_CATALOG[$i]}"
+    done
 }
 
 @test "moving down skips placeholders" {
