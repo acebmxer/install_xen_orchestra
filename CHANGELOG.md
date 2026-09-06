@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-05
+
 ### Added
 
 - **`--build-templates` can now reach the pool through Xen Orchestra's own API
@@ -246,6 +248,29 @@ This installer builds Xen Orchestra from source and tracks the official
   path. Both entry points are separate call sites and both were affected.
 
 ### Changed
+
+- **The upgrade notice in the README said schema v2 when the schema is v4, and
+  never said the script writes to `xo-config.cfg`.** The notice had not been
+  touched since the v2 migration, so it described two `config.toml` bugs as
+  though they were this release's news and listed keys two schema versions out
+  of date. Worse, it called the migration "automatic and non-destructive" and
+  left it there — which reads as reassurance, not as notice that the file gets
+  edited. An operator running `--build-templates` to test a build had no way to
+  know from the docs that their config would be appended to, and found the new
+  lines afterwards.
+
+  The notice now leads with the fact that the script edits the file by itself:
+  what triggers it (any command that reads the config, `--build-templates`
+  included, which is new in this release), that it asks nothing, takes no
+  backup and has no skip flag, and that it is one write per upgrade rather than
+  every run. A table maps each schema version to the keys it appends. The
+  `config.toml` guidance is kept but scoped to files older than v2, where it
+  actually applies.
+
+  `docs/configuration.md` — where the README sends people for every config
+  option — gains the same migration note, the three v4 keys in its settings
+  table, and a section on `TEMPLATE_BUILD_METHOD`. All three were missing, so
+  the page did not document the keys this release adds.
 
 - **A template's `static-min` is now 1 GiB rather than the template's whole RAM
   figure.** `vm-memory-limits-set` was given the same value for all four
@@ -1651,7 +1676,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.4.2...v0.5.0

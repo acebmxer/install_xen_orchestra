@@ -23,6 +23,39 @@ Key settings:
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
 | `PUBLIC_URL` | *(unset)* | Public URL advertised to external entities (e.g. XO Lite) |
 | `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see below) |
+| `TEMPLATE_BUILD_METHOD` | auto | How `--build-templates` reaches the pool: `auto`, `api` or `ssh` (see below) |
+| `XO_URL` | *(unset)* | Base URL of the XO instance the API build path talks to; unset means localhost |
+| `XO_API_TOKEN` | *(unset)* | XO API token, used by the pre-update task check and `--build-templates` |
+
+## The config file is migrated automatically
+
+The script appends config keys added since your file was written, and rewrites
+its `CONFIG_VERSION=` line, on the first run after an upgrade. It does this
+without asking, takes no backup, and has no flag to skip it. Any command that
+reads the config triggers it, `--build-templates` included.
+
+It only ever adds: new keys arrive commented-out with their explanations, keys
+already in your file are untouched, and no key is renamed or removed. Once the
+file is at the current schema version (**v4**) the migration returns
+immediately, so it is one write per upgrade rather than something that happens
+on every run.
+
+## `TEMPLATE_BUILD_METHOD`
+
+`--build-templates` can reach the pool two ways, and this picks between them:
+
+- `auto` *(default)* — use Xen Orchestra's API when it is reachable and
+  authenticated, otherwise fall back to SSH on the pool master and say why.
+- `api` — use the API only; fail rather than fall back.
+- `ssh` — use SSH only, never contacting the API. This is how template
+  building worked before this option existed.
+
+The API path needs no pool-master root password, which is the point of it: run
+from the XO VM this project deploys, XO is on localhost and `XO_API_TOKEN`
+already exists for the pre-update task check. It does need `qemu-img` and
+`xo-cli` on the machine running the build. The choice is made by a preflight
+before anything is created on the pool, so a fallback costs nothing.
+
 
 ## `SSL_CERT_DAYS`
 
