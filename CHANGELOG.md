@@ -12,6 +12,40 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Added
 
+- **Fedora 44 template.** Read the same way as 43 rather than assumed to match
+  it: same default user, same `lock_passwd: True`, same sshd `Include` line,
+  same 5 GiB virtual size, and `xe-guest-utilities-latest`, `cloud-init` and
+  `cloud-utils-growpart` all present in its repositories. It shares
+  `tpl_prep_fedora` with 43 rather than getting a copy. Its partition table
+  carries three entries to 43's four, with no separate `/boot`, which changes
+  nothing — the build looks for the EFI system partition and never assumes a
+  partition count. The checksum filename needed no work: it is derived from the
+  image name, so `Fedora-Cloud-44-1.7-x86_64-CHECKSUM` resolved already.
+
+- **Fedora 43 template.** The row already named a published image but had no
+  preparation script, so the menu drew it as **Coming Soon...** and refused to
+  build it. It now runs `tpl_prep_fedora`, a script of its own rather than the
+  RHEL rebuilds' one: the ISO's `install.sh` recognises Debian, CentOS, RHEL,
+  SLES and Ubuntu by name and refuses Fedora, and Fedora packages
+  `xe-guest-utilities-latest` in its own `updates` repository where the rebuilds
+  package nothing. Keeping it separate leaves the five rows already building on
+  `tpl_prep_rhel` untouched. Guest tools are installed in the tiers
+  `linux_util`'s installer already uses — the ISO with the documented
+  `-d fedora -m 43` override, then the ISO's `xe-guest-utilities_*_all.tgz`
+  unpacked by hand, then Fedora's package — each confirmed by finding
+  `xe-daemon` on disk rather than by an exit status, with the service enabled
+  and started afterwards because the package does not enable it. It builds with
+  a 5 GiB disk rather than the 4 GiB default, which is the image's virtual size,
+  and logs in as `fedora`.
+
+  The shipped password login needs more than setting a password: the image
+  declares `lock_passwd: True` for its default user, and cloud-init re-locks
+  that account on every boot, so a clone would come up with the password
+  already locked. The build now writes an `/etc/cloud/cloud.cfg.d` drop-in
+  setting `lock_passwd: False` and `ssh_pwauth: True`, which deep-merges over
+  the image's own block and leaves the username untouched. Delete that file
+  once you have installed your own SSH keys.
+
 - **CentOS Stream 9 and 10 templates.** Both rows already named a published
   image but had no preparation script, so the menu drew them as **Coming
   Soon...** and refused to build them. They now run `tpl_prep_rhel`, the same
@@ -27,6 +61,62 @@ This installer builds Xen Orchestra from source and tracks the official
   default, which is the virtual size of every image in this family.
 
 ### Fixed
+
+- **The download progress bar redrew itself on every update, dragging the
+  cursor across the line.** `curl --progress-bar` rewrites the whole line each
+  time — carriage return, every block, the padding and the percentage — and
+  leaves the cursor sitting in it, which over SSH is a cursor visibly
+  scribbling back and forth rather than a bar filling up. It also draws a line
+  exactly as wide as the terminal, so the cursor ends in the final column where
+  terminals disagree about wrapping, and a wrapped cursor sends the next redraw
+  to the wrong line.
+
+  The image download now draws its own bar: the line is emitted between the
+  terminal's save- and restore-cursor controls, so the cursor returns to where
+  it started and never sits inside the bar, and it is drawn one column short of
+  the terminal so it cannot wrap. Cleared with `\033[K` rather than padded
+  over, the same way the menu repaints. The transfer runs in the background and
+  its exit status is recovered with `wait`, so a failed download still fails the
+  build.
+
+  The upload draws the same bar. It cannot measure progress by watching a file
+  grow, because the bytes are leaving rather than arriving, and curl offers no
+  live machine-readable progress — `--write-out` fires only at the end, and its
+  own meter is block-buffered when stderr is not a terminal. So the body is fed
+  through `dd status=progress`, which counts what it has written, with curl
+  reading from a fifo and an explicit `Content-Length` because a fifo has no
+  length to discover. `status=progress` rather than `kill -USR1`: the signal is
+  a race, and one arriving before `dd` installs its handler kills it and aborts
+  the upload.
+
+  Both transfers share one renderer rather than carrying a copy each. The
+  download on the pool master and the streaming fallback keep curl's bar, since
+  neither has a local file to measure, and take the width fix alone. The API
+  download also no longer passes `curl -C -`, which had nothing to resume — the
+  file is deleted immediately before it.
+
+- **The AlmaLinux and CentOS Stream templates shipped a password that was
+  locked on first boot.** Every image in this family declares
+  `lock_passwd: True` for its default user, and cloud-init's user module
+  re-locks that account on every boot, so the password the build set was
+  already locked by the time a clone came up and password login failed however
+  sshd was configured. The prep script now writes an `/etc/cloud/cloud.cfg.d`
+  drop-in setting `lock_passwd: False` and `ssh_pwauth: True`, which
+  deep-merges over the image's own block and leaves the default user's name
+  untouched — confirmed on cloud-init 23.4 (AlmaLinux 8) and 25.2. Key
+  authentication was never affected. Delete that file once you have installed
+  your own SSH keys.
+
+- **Fedora images would have imported unverified.** `deploy_checksum_source`
+  fell through to Debian's `SHA512SUMS` for this origin, so the fetch would have
+  404'd and the build would have warned and imported anyway. Fedora is the one
+  origin here that does not publish a fixed filename — the sums file carries the
+  release and compose, as in `Fedora-Cloud-43-1.6-x86_64-CHECKSUM` — so a
+  constant cannot name it and pinning today's compose would break at the next
+  respin. The filename is now derived from the image's own name. The digest
+  parse needed no change: Fedora publishes the BSD tag shape the CentOS Stream
+  work already added, and its PGP clearsigned envelope does not obstruct it,
+  though that signature is not itself verified.
 
 - **CentOS Stream images would have imported unverified, for two reasons.**
   `deploy_checksum_source` fell through to Debian's `SHA512SUMS` for this

@@ -211,8 +211,8 @@ template uses:
     [ ] CentOS Stream 10 (login: cloud-user)
     [ ] Debian 12 (Bookworm) (login: debian)
     [ ] Debian 13 (Trixie) (login: debian)
-      Fedora 43  Coming Soon...
-      Fedora 44  Coming Soon...
+    [ ] Fedora 43 (login: fedora)
+    [ ] Fedora 44 (login: fedora)
       Rocky Linux 8  Coming Soon...
       Rocky Linux 9  Coming Soon...
       Rocky Linux 10  Coming Soon...
@@ -235,10 +235,10 @@ built they appear in Xen Orchestra under **New → VM**, alongside any Hub
 templates you already have.
 
 AlmaLinux 8, 9 and 10, CentOS Stream 9 and 10, Debian 12 (Bookworm), Debian 13
-(Trixie) and the three Ubuntu LTS releases — 22.04 (Jammy), 24.04 (Noble) and
-26.04 (Resolute) — are buildable today. Fedora and Rocky Linux are listed in the
-menu as **Coming Soon...**: each names a published cloud image, and what is
-missing is the preparation script rather than the image. The full walkthrough — what each
+(Trixie), Fedora 43 and 44, and the three Ubuntu LTS releases — 22.04 (Jammy),
+24.04 (Noble) and 26.04 (Resolute) — are buildable today. Rocky Linux is listed
+in the menu as **Coming Soon...**: each row names a published cloud image, and
+what is missing is the preparation script rather than the image. The full walkthrough — what each
 template contains, how the boot firmware is chosen, requirements, and what to do
 when a build fails — is in [docs/templates.md](docs/templates.md).
 

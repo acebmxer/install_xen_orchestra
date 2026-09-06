@@ -589,6 +589,13 @@ STUB
 # --- deploy_prompt_admin_password (now mandatory) -------------------------
 
 @test "a non-interactive deploy without a password is refused" {
+    # Needs a hashing tool for the same reason the hashing test below does:
+    # deploy_prompt_admin_password checks for openssl or mkpasswd first and
+    # exits there when neither exists, so without one this asserts against the
+    # missing-tool message instead of the missing-password one and fails for a
+    # reason that has nothing to do with what it is testing.
+    command -v openssl >/dev/null || command -v mkpasswd >/dev/null \
+        || skip "no password hashing tool available"
     NON_INTERACTIVE=true
     DEPLOY_ADMIN_USER=xo
     unset XO_DEPLOY_ADMIN_PASSWORD
@@ -599,6 +606,9 @@ STUB
 }
 
 @test "a non-interactive password below the minimum length is refused" {
+    # Same hashing-tool dependency as above.
+    command -v openssl >/dev/null || command -v mkpasswd >/dev/null \
+        || skip "no password hashing tool available"
     NON_INTERACTIVE=true
     DEPLOY_ADMIN_USER=xo
     XO_DEPLOY_ADMIN_PASSWORD="short"
@@ -606,6 +616,25 @@ STUB
     run deploy_prompt_admin_password
     [ "$status" -ne 0 ]
     [[ "$output" == *"${XO_DEPLOY_MIN_PASSWORD_LEN}"* ]]
+}
+
+@test "a missing hashing tool is refused before the password is even read" {
+    # The ordering the two tests above depend on, pinned so it cannot change
+    # silently: with no openssl and no mkpasswd the run stops at the tool
+    # check, whatever the password situation is. Verified by hiding both from
+    # PATH rather than by reading the source.
+    local fakebin
+    fakebin=$(mktemp -d)
+    NON_INTERACTIVE=true
+    DEPLOY_ADMIN_USER=xo
+    XO_DEPLOY_ADMIN_PASSWORD="a-perfectly-long-enough-password"
+
+    PATH="$fakebin" run deploy_prompt_admin_password
+    rm -rf "$fakebin"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"openssl"* ]]
+    [[ "$output" == *"mkpasswd"* ]]
 }
 
 @test "a non-interactive password is hashed, not stored in the clear" {

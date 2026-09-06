@@ -381,6 +381,135 @@ teardown() {
     done
 }
 
+@test "the RHEL rebuilds do not use the Fedora prep script" {
+    # The five AlmaLinux and CentOS Stream rows are proven on tpl_prep_rhel.
+    # Nothing about adding Fedora may move them onto another script.
+    local row key prep found=0
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == almalinux* || "$key" == centos* ]] || continue
+        found=$((found + 1))
+        prep=$(tpl_field "$row" 6)
+        [ "$prep" = "tpl_prep_rhel" ]
+    done
+    [ "$found" -eq 5 ]
+}
+
+@test "the Fedora prep script installs guest tools in three tiers" {
+    # ISO with the documented -d/-m override, then the ISO tarball, then
+    # Fedora's own package -- the order linux_util's installer uses. Each tier
+    # is checked by looking for xe-daemon rather than trusting an exit status,
+    # which is what let the first failure reach the build's own agent check.
+    local body
+    body=$(tpl_prep_fedora fedora)
+
+    [[ "$body" == *'install.sh" -n -d "$did" -m "$major"'* ]]
+    [[ "$body" == *"xe-guest-utilities_*_all.tgz"* ]]
+    [[ "$body" == *"dnf install -y xe-guest-utilities-latest"* ]]
+    [[ "$body" == *"guest_tools_present"* ]]
+    [[ "$body" == *"systemctl enable xe-linux-distribution.service"* ]]
+}
+
+@test "the Fedora prep script unlocks the default user for password login" {
+    # Setting a password is not enough: the image declares lock_passwd: True
+    # for its default user and cloud-init re-locks the account on every boot,
+    # so a clone would come up with the shipped password already locked.
+    # Written as a cloud.cfg.d drop-in, which is a deep merge over the image's
+    # own block -- the username in it is preserved, only these keys change.
+    local body
+    body=$(tpl_prep_fedora fedora)
+
+    [[ "$body" == *"/etc/cloud/cloud.cfg.d/99-xo-template-login.cfg"* ]]
+    [[ "$body" == *"lock_passwd: False"* ]]
+    [[ "$body" == *"ssh_pwauth: True"* ]]
+}
+
+@test "the RHEL prep script keeps its ISO-only guest tools step" {
+    # Its guest-tools step is proven on five rows. Fedora needing three tiers
+    # did not change it -- no package fallback, no -d/-m override.
+    local body
+    body=$(tpl_prep_rhel almalinux)
+    [[ "$body" != *"xe-guest-utilities-latest"* ]]
+    [[ "$body" != *'-d "$did"'* ]]
+    [[ "$body" == *'install.sh" -n'* ]]
+}
+
+@test "the RHEL prep script unlocks the default user for password login" {
+    # Every image in this family declares lock_passwd: True, so cloud-init
+    # re-locks the account on every boot and the shipped password is useless
+    # without this. Verified on a real Fedora VM first, then applied here.
+    local body
+    body=$(tpl_prep_rhel almalinux)
+
+    [[ "$body" == *"/etc/cloud/cloud.cfg.d/99-xo-template-login.cfg"* ]]
+    [[ "$body" == *"lock_passwd: False"* ]]
+    [[ "$body" == *"ssh_pwauth: True"* ]]
+}
+
+@test "the login drop-in is written before the SELinux relabel is requested" {
+    # The drop-in is created without the contexts SELinux expects, so it has to
+    # exist before /.autorelabel is touched or it is not relabelled on first
+    # boot. Both prep scripts that set SELinux up have to get this right.
+    local body pos_file pos_relabel fn
+    for fn in tpl_prep_rhel tpl_prep_fedora; do
+        body=$("$fn" testuser)
+        pos_file=$(grep -n "cloud.cfg.d/99-xo-template-login.cfg" <<< "$body" | head -1 | cut -d: -f1)
+        pos_relabel=$(grep -n "^touch /.autorelabel" <<< "$body" | head -1 | cut -d: -f1)
+        [ -n "$pos_file" ]
+        [ -n "$pos_relabel" ]
+        [ "$pos_file" -lt "$pos_relabel" ]
+    done
+}
+
+@test "every Fedora row logs in as the account its image actually creates" {
+    # fedora on both releases, read out of each image's own
+    # /etc/cloud/cloud.cfg, where system_info.default_user.name says so.
+    # Getting this wrong produces a template nobody can log into, and nothing
+    # reports an error.
+    local row key
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == fedora* ]] || continue
+        [ "$(tpl_field "$row" 5)" = "fedora" ]
+    done
+}
+
+@test "both Fedora rows are buildable and share one prep script" {
+    # Not tpl_prep_rhel: Fedora's guest tools do not come from the ISO the way
+    # the rebuilds' do -- install.sh refuses on Fedora, and Fedora packages
+    # xe-guest-utilities-latest where they package nothing -- so Fedora has a
+    # separate script rather than a branch inside the proven one.
+    #
+    # 44 was read the same way as 43 rather than assumed to match it: same
+    # default user, same lock_passwd, same sshd include, same 5 GiB image, and
+    # xe-guest-utilities-latest present in its repositories too. A second copy
+    # of the script for it would be how one of them stops getting fixes.
+    local row key prep found=0
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == fedora* ]] || continue
+        found=$((found + 1))
+        prep=$(tpl_field "$row" 6)
+        [ "$prep" = "tpl_prep_fedora" ]
+        ! tpl_is_placeholder "$row"
+    done
+    # 43 and 44.
+    [ "$found" -eq 2 ]
+}
+
+@test "every Fedora row asks for a disk that fits its 5 GiB image" {
+    # Both images expand to 5 GiB, read off `qemu-img info`'s virtual size, so
+    # the 4 GiB default clears neither.
+    local row key disk
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == fedora* ]] || continue
+        disk=$(tpl_field "$row" 7)
+        [ -n "$disk" ]
+        [ "$disk" -ge 5 ]
+    done
+}
+
 # --- menu wiring -----------------------------------------------------------
 #
 # The dispatch in process_menu_selections indexes MENU_SELECTED by number, so
@@ -1212,6 +1341,54 @@ teardown() {
         [[ "$url" == *cloud.centos.org* ]] || continue
         [ "$(deploy_checksum_source "$url")" = "CHECKSUM 256" ]
     done
+}
+
+@test "Fedora's checksum filename is derived from the image, not a constant" {
+    # Fedora is the one origin here that stamps the release and compose into
+    # the sums filename, so no fixed string can name it and hardcoding today's
+    # compose would break at the next respin. Both of these are the names the
+    # mirror actually publishes beside those images.
+    local url
+
+    url='https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2'
+    [ "$(deploy_checksum_source "$url")" = "Fedora-Cloud-43-1.6-x86_64-CHECKSUM 256" ]
+
+    url='https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2'
+    [ "$(deploy_checksum_source "$url")" = "Fedora-Cloud-44-1.7-x86_64-CHECKSUM 256" ]
+}
+
+@test "a future Fedora compose resolves without the table being edited" {
+    # The point of deriving rather than declaring: a respin changes the image
+    # filename and the sums filename together, and this has to follow both.
+    local url='https://dl.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-45-2.3.x86_64.qcow2'
+    [ "$(deploy_checksum_source "$url")" = "Fedora-Cloud-45-2.3-x86_64-CHECKSUM 256" ]
+}
+
+@test "Fedora's PGP-signed checksum file still yields the image's digest" {
+    # Fedora wraps its CHECKSUM in a clearsigned envelope. The digest lines
+    # inside are ordinary BSD tag lines, so the existing parse reaches them --
+    # but a parser that choked on the armour would warn and import unverified.
+    # This is the real file's shape, trimmed.
+    local sums base want
+    base="Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2"
+    sums="-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+# ${base}: 583335936 bytes
+SHA256 (${base}) = 846574c8a97cd2d8dc1f231062d73107cc85cbbbda56335e264a46e3a6c8ab2f
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCAAdFiEExufwgc+A4TFGZ26IgptgZjFkVTEFAmj9DpIACgkQgptgZjFk
+-----END PGP SIGNATURE-----"
+
+    # The commented size line above each digest starts with '#' and carries the
+    # filename in field 2 -- with a trailing colon, so the coreutils parse must
+    # not mistake it for an entry and return "#" as the digest.
+    want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
+    [ -z "$want" ]
+
+    want=$(awk -v f="($base)" '$2 == f && $3 == "=" { print $4; exit }' <<< "$sums")
+    [ "$want" = "846574c8a97cd2d8dc1f231062d73107cc85cbbbda56335e264a46e3a6c8ab2f" ]
 }
 
 @test "a BSD-tag checksum file yields the digest for the requested image" {
@@ -2049,6 +2226,150 @@ print("ok")
 
     # And a non-raw URL is converted rather than streamed as-is.
     [[ "$body" == *"qemu-img convert"* ]]
+}
+
+@test "the progress bar is drawn one column narrower than the terminal" {
+    # curl draws --progress-bar to exactly COLUMNS characters and redraws with
+    # a bare carriage return. A line that exactly fills the row leaves the
+    # cursor in the final column, where terminals disagree about whether to
+    # wrap -- and a wrapped cursor sends the next redraw to the wrong line, so
+    # the bar walks down the screen over its own percentage. Reporting one
+    # column less leaves a trailing space and removes the ambiguity.
+    tput() { case "$1" in cols) echo "$FAKE_COLS";; lines) echo 24;; esac; }
+
+    FAKE_COLS=80  ; [ "$(deploy_progress_columns)" = "79" ]
+    FAKE_COLS=120 ; [ "$(deploy_progress_columns)" = "119" ]
+    # Clamped at the top so an absurd width cannot produce an absurd line...
+    FAKE_COLS=500 ; [ "$(deploy_progress_columns)" = "199" ]
+    # ...and at the bottom, where a 10-column bar would be useless.
+    FAKE_COLS=30  ; [ "$(deploy_progress_columns)" = "39" ]
+    # No terminal, or a nonsense answer, falls back the way the menu does.
+    FAKE_COLS=""    ; [ "$(deploy_progress_columns)" = "79" ]
+    FAKE_COLS="abc" ; [ "$(deploy_progress_columns)" = "79" ]
+}
+
+@test "the width reported to curl is always less than the real terminal width" {
+    # The -1 is the entire fix, so a refactor that clamps or defaults without
+    # subtracting would silently restore the bug. Checked as a property across
+    # the range rather than at the handful of points above.
+    tput() { case "$1" in cols) echo "$FAKE_COLS";; lines) echo 24;; esac; }
+
+    local w got
+    for w in 40 55 80 100 120 160 200; do
+        FAKE_COLS=$w
+        got=$(deploy_progress_columns)
+        [ "$got" -lt "$w" ]
+    done
+}
+
+@test "every curl progress bar in a build sets the narrowed width" {
+    # A build draws more than one bar, and fixing only the first leaves the
+    # rest wrapping -- which is exactly what happened the first time round.
+    # Counted rather than spot-checked so a new bar added later cannot quietly
+    # miss it.
+    local body bars fixed
+    body=$(declare -f deploy_import_vdi_staged tpl_api_import_image 2>/dev/null)
+
+    bars=$(grep -c -- "--progress-bar" <<< "$body")
+    fixed=$(grep -c "deploy_progress_columns" <<< "$body")
+    [ "$bars" -ge 1 ]
+    [ "$fixed" -ge "$bars" ]
+}
+
+@test "the drawn bar leaves the cursor where it found it" {
+    # The complaint this exists to fix: curl repaints the whole line every
+    # update and leaves the cursor sitting in it, so the cursor is visibly
+    # dragged back and forth. Save/restore (ESC 7 / ESC 8) puts it back where
+    # it was, so it never sits inside the bar between updates.
+    local body
+    # The rendering moved into deploy_draw_progress_n when the upload started
+    # sharing it; the escapes live there now.
+    body=$(declare -f deploy_draw_progress_n)
+    [[ "$body" == *'\0337'* ]]
+    [[ "$body" == *'\0338'* ]]
+    # Cleared to end of line rather than padded over, the way draw_menu does
+    # it. Matched against the expanded escape: declare -f prints the value bash
+    # already resolved, not the backslash-033 that was typed.
+    [[ "$body" == *$'\033[K'* ]]
+}
+
+@test "the drawn bar fits the terminal with a column to spare" {
+    # Rendered for a range of widths: the bar plus its percentage must never
+    # reach the last column, because a line that exactly fills the row leaves
+    # the cursor where terminals disagree about wrapping.
+    tput() { case "$1" in cols) echo "$FAKE_COLS";; lines) echo 24;; esac; }
+
+    local w tmp out visible
+    tmp=$(mktemp); printf '%*s' 500 "" > "$tmp"
+
+    for w in 60 80 120; do
+        FAKE_COLS=$w
+        DEPLOY_PROGRESS_FILLED=0; DEPLOY_PROGRESS_PCT=-1; DEPLOY_PROGRESS_BYTES=-1
+        out=$(deploy_draw_progress "$tmp" 500 2>&1)
+        # Strip the escape sequences to count what actually lands on screen.
+        visible=$(printf '%s' "$out" | sed -e 's/\x1b7//g' -e 's/\x1b8//g' \
+            -e 's/\x1b\[K//g' -e 's/\r//g')
+        [ "${#visible}" -lt "$w" ]
+    done
+    rm -f "$tmp"
+}
+
+@test "the upload draws our bar, not curl's" {
+    # The second bar an operator sees. It was left on curl's own meter at
+    # first, which meant one clean bar followed by one that still scribbled.
+    local body
+    body=$(declare -f tpl_api_import_image)
+    [[ "$body" == *"deploy_curl_upload_with_progress"* ]]
+    # And it must feed curl from the counter, not hand it the file directly --
+    # curl reading the file itself is what leaves nothing to measure.
+    [[ "$body" == *"--data-binary @-"* ]]
+    [[ "$body" != *'--data-binary "@${upload_file}"'* ]]
+}
+
+@test "the upload counter never signals dd" {
+    # dd reports progress either continuously with status=progress or on
+    # SIGUSR1. The signal is a race: sent before dd installs its handler it
+    # kills dd instead, aborting the upload that carries the image.
+    local body
+    body=$(declare -f deploy_curl_upload_with_progress)
+    [[ "$body" == *"status=progress"* ]]
+    [[ "$body" != *"USR1"* ]]
+}
+
+@test "the upload passes an explicit Content-Length" {
+    # The body comes from a fifo, which has no length curl can discover, and
+    # XAPI refuses a chunked body -- so the size has to be stated.
+    local body
+    body=$(declare -f deploy_curl_upload_with_progress)
+    [[ "$body" == *"Content-Length:"* ]]
+}
+
+@test "both transfer helpers share one renderer" {
+    # Download and upload measure progress differently but draw identically.
+    # Two copies of the drawing code is how one of them stops getting fixes.
+    local dl ul
+    dl=$(declare -f deploy_curl_with_progress)
+    ul=$(declare -f deploy_curl_upload_with_progress)
+    [[ "$dl" == *"deploy_draw_progress"* ]]
+    [[ "$ul" == *"deploy_draw_progress_n"* ]]
+}
+
+@test "a failed transfer still fails the build" {
+    # The bar runs the transfer in the background and recovers its status with
+    # wait. Losing that status would turn a failed download into a silent
+    # success and a corrupt template.
+    local body
+    body=$(declare -f deploy_curl_with_progress)
+    [[ "$body" == *'wait "$pid"'* ]]
+    [[ "$body" == *'return "$rc"'* ]]
+}
+
+@test "the API path does not ask curl to resume a file it just deleted" {
+    # The image file is removed immediately before the download, so -C - had
+    # nothing to resume -- the comment above it says clearing is deliberate.
+    local api
+    api=$(declare -f tpl_api_import_image 2>/dev/null)
+    [[ "$api" != *'-o "$local_file" -C -'* ]]
 }
 
 @test "a missing qemu-img is reported before the image is downloaded" {
