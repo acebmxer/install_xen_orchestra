@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-06
+
 ### Added
 
 - **Fedora 44 template.** Read the same way as 43 rather than assumed to match
@@ -1806,7 +1808,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.5.0...v0.6.0
