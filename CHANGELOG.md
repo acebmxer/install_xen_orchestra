@@ -205,6 +205,31 @@ This installer builds Xen Orchestra from source and tracks the official
   stdin under suppressed tracing, and has no session to pass because it is the
   call that creates one.
 
+- **`DEPLOY_SR_UUID` and `DEPLOY_NETWORK_UUID` were never declared.** Every
+  other piece of deploy state is declared empty at the top of the script;
+  these two were only ever assigned by the functions that resolve them, so
+  `tpl_api_vm_create_body` -- which reads both while assembling the create_vm
+  request -- died under `set -u` with "unbound variable" whenever it ran
+  before a resolve. Caught by the unit tests, which exercise the body
+  directly. Both are now declared with the rest, and a test asserts the
+  resolved values actually reach the body, so the empty default cannot quietly
+  stand in for a resolve that never happened.
+
+- **The build key path was spelled at three call sites.** `tpl_build_ssh_key`
+  is captured with `$( )`, so it cannot export the path -- but every caller
+  needs it too, in order to read the key back. The response had been to repeat
+  `"${DEPLOY_WORKDIR}/tpl_key"` at each site, including one inside the
+  function body that a comment described as being outside it and that the
+  subshell made dead. Now `tpl_ssh_key_path`, with a test that fails if any
+  caller respells it.
+
+- **CI could not generate an SSH key.** The unit job installed `bats`,
+  `genisoimage` and `python3`, but the three tests covering the per-template
+  build key need `ssh-keygen`, which is not in the base image. It is present
+  on GitHub's runner, so this surfaced only when the suite was run in a clean
+  container. `openssh-client` is now installed alongside the rest, and those
+  tests skip rather than fail where it is absent.
+
 - **A build key path lost to a subshell.** `tpl_build_ssh_key` is captured with
   `$( )`, so the `TPL_SSH_KEY` it assigned never left the subshell and callers
   were left pointing at nothing. Caught by an existing test during the

@@ -1482,6 +1482,7 @@ PAIRS
 # already there.
 
 @test "each template gets its own build key" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available to build the key"
     # ssh-keygen refuses to overwrite an existing key: it asks "Overwrite
     # (y/n)?" and, with no answer available, exits 1 having generated nothing.
     # Every build after the first hit that, and because the failure went to
@@ -1502,6 +1503,7 @@ PAIRS
 }
 
 @test "a second template's drive carries its own account, not the first's" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available to build the key"
     # The clearest symptom of a stale drive: an Ubuntu template built after a
     # Debian one would ship Debian's user and preparation script.
     DEPLOY_WORKDIR="$TMPDIR_TEST"
@@ -1515,6 +1517,7 @@ PAIRS
 }
 
 @test "building a prep drive twice in a row succeeds both times" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available to build the key"
     DEPLOY_WORKDIR="$TMPDIR_TEST"
     tpl_build_prep_drive "$(tpl_row_for_key debian12)"
     tpl_build_prep_drive "$(tpl_row_for_key debian12)"
@@ -1531,6 +1534,19 @@ PAIRS
     # And the caller still stops on a failure rather than carrying on with no key.
     [[ "$body" == *"tpl_build_ssh_key"* ]]
     [[ "$body" == *"|| return 1"* ]]
+}
+
+@test "the build key path is spelled once, not at every call site" {
+    # tpl_build_ssh_key is captured with $( ), so it cannot export the path --
+    # every caller needs it too, to read the key back. That is what made three
+    # copies of "${DEPLOY_WORKDIR}/tpl_key" appear across the file. They must
+    # all go through tpl_ssh_key_path, or a change to the path breaks whichever
+    # copy was missed.
+    local fn
+    for fn in tpl_build_ssh_key tpl_build_prep_drive tpl_api_create_build_vm; do
+        [[ "$(declare -f "$fn")" != *'DEPLOY_WORKDIR}/tpl_key'* ]]
+    done
+    [ "$(DEPLOY_WORKDIR=/w tpl_ssh_key_path)" = "/w/tpl_key" ]
 }
 
 @test "a failed cloud-init drive stops the build instead of being discarded" {
@@ -1569,6 +1585,7 @@ PAIRS
     TPL_DEFAULT_VCPUS=2
     TPL_DEFAULT_RAM_GB=2
     DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
 
     local cc
     cc=$(printf '#cloud-config\nusers:\n  - name: debian\nruncmd:\n  - sh -c "echo hi"\n')
@@ -1592,11 +1609,35 @@ print("ok")
     [[ "$output" == *"ok"* ]]
 }
 
+@test "the create_vm body carries the resolved SR and network" {
+    command -v python3 >/dev/null || skip "python3 not available to parse JSON"
+    TPL_DEFAULT_VCPUS=2
+    TPL_DEFAULT_RAM_GB=2
+    DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
+
+    # Both are globals resolved earlier in the run, so an unset one used to
+    # kill the body under `set -u` -- and, once defaulted to empty, would send
+    # a request naming no storage and no network at all. Asserting the values
+    # reach the body is what keeps the default from hiding a missing resolve.
+    tpl_api_vm_create_body "D" "t" "#cloud-config" > "${TMPDIR_TEST}/body.json"
+
+    run python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d["vdis"][0]["sr"]=="sr-1", d["vdis"]
+assert d["vifs"][0]["network"]=="net-1", d["vifs"]
+print("ok")
+' "${TMPDIR_TEST}/body.json"
+    [ "$status" -eq 0 ]
+}
+
 @test "a cloud-init document with quotes and backslashes survives the body" {
     command -v python3 >/dev/null || skip "python3 not available to parse JSON"
     TPL_DEFAULT_VCPUS=2
     TPL_DEFAULT_RAM_GB=2
     DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
 
     local cc
     cc=$(printf '#cloud-config\nruncmd:\n  - sh -c "echo \\"x\\""\n  - path: C:\\\\tmp\n')
@@ -1618,6 +1659,7 @@ print("ok")
     TPL_DEFAULT_VCPUS=2
     TPL_DEFAULT_RAM_GB=2
     DEPLOY_NETWORK_UUID=net-1
+    DEPLOY_SR_UUID=sr-1
 
     # The payload an actual build sends, not a stand-in: this is the thing
     # whose escaping matters, and it is 60-odd lines of shell inside YAML

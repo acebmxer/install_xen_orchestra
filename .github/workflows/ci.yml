@@ -34,11 +34,13 @@ jobs:
         # here the drive-building tests fail on a missing binary rather than on
         # anything the script got wrong.
         #
-        # python3 parses the JSON the API build path sends to XO. Those tests
-        # skip when it is absent rather than failing, which is worse than a
-        # failure: the escaping of a 60-line cloud-init document inside a JSON
-        # string would go unchecked and the run would still be green.
-        run: sudo apt-get install -y bats genisoimage python3
+        # python3 parses the JSON the API build path sends to XO, and
+        # openssh-client provides the ssh-keygen that builds each template's
+        # throwaway key. Both sets of tests skip when their tool is absent
+        # rather than failing, which is worse than a failure: the escaping of a
+        # 60-line cloud-init document inside a JSON string, and the per-template
+        # key regression, would go unchecked and the run would still be green.
+        run: sudo apt-get install -y bats genisoimage python3 openssh-client
 
       - name: Run unit tests
         run: bats tests/unit/

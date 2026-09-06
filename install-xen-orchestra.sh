@@ -3732,6 +3732,15 @@ DEPLOY_CONFIG_BASE_LABEL="sample-xo-config.cfg (defaults)"
 DEPLOY_VM_STARTED="false"
 DEPLOY_VM_UUID=""
 DEPLOY_ROOT_VDI=""
+# The pool storage and network everything built on the pool lands on -- the
+# deploy VM, and both template build paths. Set by deploy_pick_sr /
+# deploy_pick_network when the operator is asked, by tpl_resolve_storage and
+# tpl_resolve_network on the SSH build path, and by tpl_api_resolve_targets on
+# the API one. Declared empty here because tpl_api_vm_create_body reads
+# both while assembling a request body, and under `set -u` an unset one kills
+# the run rather than sending a wrong value.
+DEPLOY_SR_UUID=""
+DEPLOY_NETWORK_UUID=""
 # Whether the guest tools ISO was attached. A pool missing the ISO is a warning
 # rather than a failure, so the eject step needs to know whether there is
 # anything to eject.
@@ -7856,13 +7865,18 @@ tpl_attach_tools_iso() {
 # entropy, a full disk, a read-only workdir -- the build stops here rather than
 # continuing towards a config drive with no key in it.
 #
-# Prints the public key. TPL_SSH_KEY names the private half, and is assigned
-# here as a plain expression rather than inside the function body: callers
-# capture this with $( ), which runs it in a subshell, so an assignment made
-# in the body would not survive the return -- and the caller would be left
-# with an empty key path pointing at nothing.
+# Prints the public key. The private half's path is NOT set here: callers
+# capture this with $( ), which runs it in a subshell, so an assignment made in
+# the body dies with that subshell and leaves the caller pointing at nothing.
+# tpl_ssh_key_path builds the path instead, so the one spelling of it is shared
+# by this function and by every caller that needs to read the key afterwards.
+tpl_ssh_key_path() {
+    printf '%s' "${DEPLOY_WORKDIR}/tpl_key"
+}
+
 tpl_build_ssh_key() {
-    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    local TPL_SSH_KEY
+    TPL_SSH_KEY=$(tpl_ssh_key_path)
     rm -f "${TPL_SSH_KEY}" "${TPL_SSH_KEY}.pub"
     if ! ssh-keygen -t ed25519 -N "" -C "xo template build (temporary)" \
             -f "${TPL_SSH_KEY}" >/dev/null 2>&1; then
@@ -7940,7 +7954,7 @@ tpl_build_prep_drive() {
     # Assigned here, not inside tpl_build_ssh_key: that is captured with $( ),
     # so anything it sets is confined to the subshell.
     local pubkey
-    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    TPL_SSH_KEY=$(tpl_ssh_key_path)
     pubkey=$(tpl_build_ssh_key) || return 1
 
     printf 'instance-id: xo-template-build\nlocal-hostname: xo-template-build\n' > "${dir}/meta-data"
@@ -8848,7 +8862,7 @@ tpl_api_create_build_vm() {
     # two functions, not a copy of them. See the notes above tpl_build_ssh_key
     # and tpl_cloud_config for why this must not be inlined again.
     local pubkey cloud_config
-    TPL_SSH_KEY="${DEPLOY_WORKDIR}/tpl_key"
+    TPL_SSH_KEY=$(tpl_ssh_key_path)
     pubkey=$(tpl_build_ssh_key) || return 1
     cloud_config=$(tpl_cloud_config "$user" "$prep_fn" "$pubkey")
 
