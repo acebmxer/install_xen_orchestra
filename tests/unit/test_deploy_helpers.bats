@@ -364,7 +364,13 @@ _import_stub() {
             # XAPI's import endpoint takes an opaque ref, so every import
             # resolves the VDI's uuid to one first.
             *"param-name=_ref"*) echo "OpaqueRef:00000000-1111-2222-3333-444444444444" ;;
-            *"--progress-bar"*) [[ -z "${DOWNLOAD_FAILS:-}" ]] || return 1 ;;
+            # The staged download, identified by the curl that writes the
+            # image to /var/tmp. It used to be matched on --progress-bar;
+            # that flag is gone now that the bar is drawn from here rather
+            # than by curl on the host, so the -o is what names it. Note
+            # `stat -c %s` above answers the progress poller too, which is
+            # why the bar reads full instantly under this stub.
+            *"curl -fL"*"-o "*) [[ -z "${DOWNLOAD_FAILS:-}" ]] || return 1 ;;
         esac
         return 0
     }
@@ -378,7 +384,10 @@ _import_stub() {
     # Staging is the only path that can resume, retry and size-check, so it is
     # what a normal deploy should use. Streaming must not be attempted at all
     # when there is room to stage.
-    grep -q -- "--progress-bar" "$CMDLOG"
+    #
+    # Recognised by the resuming download itself (-C -), not by a progress
+    # flag: the bar is drawn locally now, so curl on the host has none.
+    grep -q -- "-C -" "$CMDLOG"
     ! grep -q -- "bash -s --" "$CMDLOG"
 }
 
@@ -470,11 +479,16 @@ STUB
 
     deploy_import_vdi_staged "vdi-1" "https://example.invalid/img.raw"
 
+    # Matched on -o, the flag that names the download writing the image to
+    # the host. --progress-bar used to identify it; the bar is drawn from
+    # this end now, so curl on the host no longer carries one.
     local line
-    line=$(grep -- "--progress-bar" "$CMDLOG")
+    line=$(grep -- "curl -fL" "$CMDLOG" | grep -- "-o ")
     [[ "$line" == *"-C -"* ]]
     [[ "$line" == *"--retry 5"* ]]
     [[ "$line" == *"--retry-all-errors"* ]]
+    # And curl's own meter stays silenced, so the two bars cannot both draw.
+    [[ "$line" == *"--no-progress-meter"* ]]
 }
 
 @test "a truncated staged download is refused, not imported" {
