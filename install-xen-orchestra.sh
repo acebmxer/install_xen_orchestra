@@ -4062,11 +4062,32 @@ STREAM_EOF
 # every template row, and adding an image does not mean remembering to state
 # its checksum algorithm alongside it.
 #
-# Both files handled here are in coreutils' own format -- "<hash>  <file>",
-# with a leading '*' on the name for binary mode -- so only the name and the
-# digest length differ, and one parse serves both. That is not universal: the
-# RHEL family and Fedora publish "SHA256 (<file>) = <hash>", which this does
-# not attempt and which is why those catalogue rows are still placeholders.
+# Two on-disk shapes are handled, and which one a file uses is a property of
+# the mirror rather than of the distribution -- so it is read from the file,
+# not declared here. See deploy_verify_image_checksum for the parse.
+#
+#   coreutils   "<hash>  <file>", optionally "*<file>" for binary mode.
+#               Debian, Ubuntu and AlmaLinux.
+#   BSD tag     "SHA256 (<file>) = <hash>". CentOS Stream and Fedora.
+#
+# Fedora wraps its file in a PGP clearsigned envelope. That costs the parse
+# nothing -- the digest lines inside are ordinary BSD tag lines and the awk
+# match ignores the armour -- but note the signature is not checked here, so it
+# buys no more trust than any other sums file fetched over the same connection.
+#
+# AlmaLinux was expected to need the second shape and does not. The comment
+# here used to say the whole RHEL family publishes the BSD form and that this
+# was why those rows were placeholders. Checked against the mirrors rather than
+# taken on trust: repo.almalinux.org publishes a file named CHECKSUM in the
+# ordinary coreutils shape with SHA-256 digests, while cloud.centos.org
+# publishes a file of the same name in the BSD tag shape. Same filename, same
+# family, different format -- which is why the parser tries both rather than
+# keying the shape off the origin. Both carry an entry for the "-latest" name
+# this catalogue actually requests, not only for the dated filename it points
+# at. Fedora has since been read the same way: BSD tag shape, SHA-256, but
+# under a version-stamped filename rather than a constant one, which is the
+# case the branch below derives instead of naming. Rocky is unverified on this
+# point and keeps the default until someone reads its mirror the same way.
 #
 # The default is Debian's SHA512SUMS. An unknown origin therefore gets that
 # name, does not find it, and warns that the image could not be verified --
@@ -4075,8 +4096,296 @@ deploy_checksum_source() {
     local url="$1"
     case "$url" in
         *//cloud-images.ubuntu.com/*) printf 'SHA256SUMS 256' ;;
+        *//repo.almalinux.org/*)      printf 'CHECKSUM 256' ;;
+        *//cloud.centos.org/*)        printf 'CHECKSUM 256' ;;
+        *//dl.fedoraproject.org/*)
+            # Fedora is the one origin here that does not publish a fixed
+            # filename: the sums file carries the release and compose in its
+            # name, so 43 is Fedora-Cloud-43-1.6-x86_64-CHECKSUM and 44 is
+            # Fedora-Cloud-44-1.7-x86_64-CHECKSUM. A constant like the rows
+            # above cannot name it, and hardcoding today's compose would break
+            # the next respin -- which is exactly what this table avoids by
+            # deriving from the URL.
+            #
+            # Both halves come out of the image's own filename,
+            # Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2: drop the
+            # "Base-Generic-" that only the image carries, and swap the "."
+            # before the architecture for a "-". Read off the mirror, not
+            # guessed.
+            local base="${url##*/}"; base="${base%%\?*}"
+            local stem="${base%.qcow2}"
+            stem="${stem/Cloud-Base-Generic-/Cloud-}"
+            stem="${stem/.x86_64/-x86_64}"
+            printf '%s-CHECKSUM 256' "$stem"
+            ;;
         *)                            printf 'SHA512SUMS 512' ;;
     esac
+}
+
+# The width to tell curl the terminal is, when drawing a progress bar.
+#
+# One column narrower than it really is, and that subtraction is the whole
+# point of this function.
+#
+# curl draws --progress-bar to exactly COLUMNS characters and redraws with a
+# bare carriage return -- no clear-to-end-of-line. A line that exactly fills the
+# row leaves the cursor in the final column, and terminals disagree about what
+# happens next: some hold the cursor there, others wrap it to the next line, at
+# which point curl's next carriage return returns to the wrong line and the bar
+# walks down the screen writing over its own percentage. Measured, not assumed:
+# `COLUMNS=80 curl --progress-bar` emits a line exactly 80 characters wide.
+#
+# Reporting one column less leaves a trailing space, so the cursor never
+# reaches the edge and no terminal has to make that choice. Reported on
+# Termius, where the bar redrew over itself on every update.
+#
+# curl honours COLUMNS over its own ioctl, which is what makes this fixable
+# from here at all. The value is also clamped: 200 is wide enough for any
+# sensible bar and stops an absurd width producing an absurd line, and 40 keeps
+# it readable at the bottom end. 80 is the fallback when there is no terminal
+# to ask, matching menu_compute_layout.
+deploy_progress_columns() {
+    local cols
+    cols=$(tput cols 2>/dev/null) || cols=80
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+    (( cols > 200 )) && cols=200
+    (( cols < 40 )) && cols=40
+    # The -1 is the fix; the clamp above only bounds it.
+    printf '%s' "$(( cols - 1 ))"
+}
+
+# Draw a transfer progress bar that grows instead of repainting.
+#
+# Reads curl's machine-readable progress on stdin and renders it. Used instead
+# of curl's own --progress-bar, which redraws the *entire* line on every update
+# -- carriage return, every '#', all the padding, the percentage -- so the
+# cursor is visibly dragged across the line several times a second. On a local
+# terminal that is fast enough to look solid; over SSH, and on clients like
+# Termius, it is a cursor visibly scribbling back and forth. Measured, not
+# assumed: curl emits "\r" followed by the whole bar per update.
+#
+# This writes only what changed. The bar is redrawn from the start of the line
+# each time, but the line is emitted as one printf and terminated with
+# \033[K (clear to end of line) rather than padded with spaces, which is the
+# same technique draw_menu uses to repaint without flicker. The cursor is also
+# parked at column 0 rather than after the percentage, so it is not left
+# hovering in the middle of the output.
+#
+# --no-progress-meter silences curl's own bar; -w '%{...}' is not usable here
+# because it only fires at the end, so the progress comes from curl's
+# --progress-bar replacement: reading the transferred byte count from
+# curl's stderr is not machine-readable, so this instead polls the output file.
+# The caller passes the expected total; without one there is nothing to compute
+# a percentage from and a simple byte count is printed.
+#
+# Deliberately not a second implementation of the menu's drawing code: that
+# renders a full screen from an array of items, this renders one line from two
+# numbers, and the only thing they share is the escape sequence.
+deploy_draw_progress() {
+    local file="$1" total="$2" label="${3:-}"
+    local got
+
+    got=$(stat -c %s "$file" 2>/dev/null || echo 0)
+    [[ "$got" =~ ^[0-9]+$ ]] || got=0
+    deploy_draw_progress_n "$got" "$total" "$label"
+}
+
+# Draw the bar from a byte count that is already known.
+#
+# Split out from deploy_draw_progress so the upload can share it: a download
+# measures progress by the size of the file arriving, an upload by what has
+# been fed to curl, but from there the rendering is identical and must not be
+# written twice.
+deploy_draw_progress_n() {
+    local got="$1" total="$2" label="${3:-}"
+    local width cols pct filled i bar eol=$'\033[K'
+
+    [[ "$got" =~ ^[0-9]+$ ]] || got=0
+
+    # Re-read on every draw rather than once per transfer, so resizing the
+    # window mid-download re-fits the bar instead of leaving it wrapped. The
+    # \033[K below is what clears the tail of a longer previous line when the
+    # window is made narrower.
+    cols=$(deploy_progress_columns)
+    # Leave room for " 100.0%" (7) plus a space, so the bar itself never
+    # collides with the percentage the way curl's own can.
+    width=$(( cols - 9 ))
+    (( width < 10 )) && width=10
+
+    if [[ "$total" =~ ^[0-9]+$ ]] && (( total > 0 )); then
+        (( got > total )) && got=$total
+        # Tenths of a percent, integer-only: bash has no floating point, and
+        # printing "0%" for the first half-gigabyte of a large image reads as a
+        # stalled transfer.
+        pct=$(( got * 1000 / total ))
+        filled=$(( got * width / total ))
+
+        # Nothing to show yet, and nothing has moved since the last draw:
+        # return rather than repaint an identical line. Without this the bar
+        # is rewritten twice a second even on a stalled transfer.
+        if (( filled == DEPLOY_PROGRESS_FILLED && pct == DEPLOY_PROGRESS_PCT )); then
+            return 0
+        fi
+
+        # Save the cursor, draw the whole line, restore the cursor.
+        #
+        # \033[7 and \033[8 are the terminal's own save- and restore-cursor
+        # controls, and using them is what stops the cursor being visibly
+        # dragged across the bar: it is put back exactly where it started, so
+        # between updates it never sits inside the bar and never lands in the
+        # last column where terminals disagree about wrapping.
+        #
+        # An earlier version wrote only the newly-filled blocks and then walked
+        # the cursor back by hand. That is fewer bytes but the offset has to
+        # account for the width of everything printed -- padding that shrinks
+        # as the bar grows, a percentage that is four to six characters -- and
+        # any drift puts the next blocks in the wrong column, which showed up
+        # as gaps in the bar. Save/restore cannot drift, so it is used instead
+        # even though it redraws the line.
+        #
+        # \033[K clears to end of line rather than padding with spaces, the
+        # same technique draw_menu uses to repaint without flicker.
+        bar=""
+        for (( i = 0; i < filled; i++ )); do bar+="#"; done
+        printf '\0337\r%s%s%*s %5s.%s%%\0338' "$eol" "$bar" \
+            "$(( width - filled ))" "" \
+            "$(( pct / 10 ))" "$(( pct % 10 ))" >&2
+
+        DEPLOY_PROGRESS_FILLED=$filled
+        DEPLOY_PROGRESS_PCT=$pct
+    else
+        (( got == DEPLOY_PROGRESS_BYTES )) && return 0
+        DEPLOY_PROGRESS_BYTES=$got
+        printf '\r%s %s%s' "${label:-transferred}" \
+            "$(deploy_human_bytes "$got")" "$eol" >&2
+    fi
+}
+
+# Bytes as a human-readable size, for progress output.
+#
+# Integer arithmetic with one decimal place, for the same reason the conversion
+# step prints one: a 3.5 GiB image shown as "3 GiB" reads as a wrong number
+# rather than a rounded one.
+deploy_human_bytes() {
+    local b="${1:-0}" tenths
+    [[ "$b" =~ ^[0-9]+$ ]] || b=0
+    if (( b >= 1073741824 )); then
+        tenths=$(( b / 107374182 ))
+        printf '%s.%s GiB' "$(( tenths / 10 ))" "$(( tenths % 10 ))"
+    elif (( b >= 1048576 )); then
+        tenths=$(( b / 104857 ))
+        printf '%s.%s MiB' "$(( tenths / 10 ))" "$(( tenths % 10 ))"
+    elif (( b >= 1024 )); then
+        printf '%s KiB' "$(( b / 1024 ))"
+    else
+        # Sub-kilobyte is printed as bytes rather than rounded to "0 KiB",
+        # which reads as nothing having transferred at all.
+        printf '%s B' "$b"
+    fi
+}
+
+# Run curl with its own meter silenced, drawing ours instead.
+#
+# The transfer runs in the background so the foreground can poll the growing
+# file and redraw. Its exit status is recovered with `wait`, so a failed
+# download still fails the build -- the bar must never swallow that.
+deploy_curl_with_progress() {
+    local file="$1" total="$2"; shift 2
+    local pid rc=0
+
+    # Per-transfer state for deploy_draw_progress, which needs to know how much
+    # of the bar it has already put on screen in order to append to it. Reset
+    # here rather than in the drawing function, which is called once per tick
+    # and must not forget what it drew a moment ago. -1 rather than 0 so the
+    # first draw always happens, including for a zero-length transfer.
+    DEPLOY_PROGRESS_FILLED=0
+    DEPLOY_PROGRESS_PCT=-1
+    DEPLOY_PROGRESS_BYTES=-1
+
+    curl "$@" &
+    pid=$!
+
+    # Two updates a second: fast enough to look live, slow enough that the
+    # redraw is not itself the thing chewing the terminal.
+    while kill -0 "$pid" 2>/dev/null; do
+        deploy_draw_progress "$file" "$total"
+        sleep 0.5
+    done
+    wait "$pid" || rc=$?
+
+    # One final draw so the line ends at the real figure rather than wherever
+    # the last poll happened to land, then a newline to release it.
+    (( rc == 0 )) && deploy_draw_progress "$file" "$total"
+    printf '\n' >&2
+    return "$rc"
+}
+
+# Run an uploading curl, drawing our progress bar from the bytes it has sent.
+#
+# The download bar can poll the output file as it grows. An upload has no such
+# file -- the bytes are leaving, not arriving -- and curl offers no live
+# machine-readable progress: --write-out only fires at the end, and its own
+# meter is block-buffered when stderr is not a terminal, so a redirected copy
+# of it stays empty until the transfer finishes. Checked, not assumed.
+#
+# So the body is fed through `dd`, which counts what it has written, and curl
+# reads from a fifo. dd is run with status=progress, which writes its running
+# total to stderr continuously; that is redirected to a file the drawing loop
+# reads. Deliberately not `kill -USR1`, dd's other way of reporting: a signal
+# sent before dd has installed its handler kills it instead, which is a race
+# that would abort the upload carrying the image. status=progress needs no
+# signal at all.
+#
+# The fifo and the mktemp -d around it follow the streaming upload helper
+# already in this file: a directory created atomically at mode 700, so the
+# path cannot be pre-empted in a world-writable /tmp.
+#
+# Content-Length is passed explicitly because a fifo has no length curl can
+# discover, and XAPI refuses a chunked body. The caller has the size already.
+deploy_curl_upload_with_progress() {
+    local file="$1" size="$2" outvar="$3"; shift 3
+    local d fifo ddpid clpid rc=0 sent
+
+    d=$(mktemp -d) || return 1
+    fifo="$d/pipe"
+    if ! mkfifo "$fifo" 2>/dev/null; then rm -rf "$d"; return 1; fi
+
+    # Writer. Blocks until curl opens the read end, which is why it is
+    # backgrounded before curl rather than after.
+    dd if="$file" of="$fifo" bs=1M status=progress 2>"$d/dd.err" &
+    ddpid=$!
+
+    # The transfer itself. Its stdout is the status code the caller wants, so
+    # it is captured rather than printed.
+    { curl "$@" -H "Content-Length: ${size}" < "$fifo" > "$d/code" 2>/dev/null; echo $? > "$d/rc"; } &
+    clpid=$!
+
+    DEPLOY_PROGRESS_FILLED=0
+    DEPLOY_PROGRESS_PCT=-1
+    DEPLOY_PROGRESS_BYTES=-1
+
+    while kill -0 "$clpid" 2>/dev/null; do
+        # dd rewrites its progress line with carriage returns, so the last
+        # "<n> bytes ..." line is the current total.
+        sent=$(tr '\r' '\n' < "$d/dd.err" 2>/dev/null \
+            | grep -E '^[0-9]+ bytes' | tail -1 | awk '{print $1}')
+        [[ "$sent" =~ ^[0-9]+$ ]] && deploy_draw_progress_n "$sent" "$size"
+        sleep 0.5
+    done
+
+    wait "$clpid" 2>/dev/null
+    wait "$ddpid" 2>/dev/null
+    rc=$(cat "$d/rc" 2>/dev/null || echo 1)
+    [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+
+    # Finish the bar at the real figure rather than wherever the last poll
+    # landed, then release the line.
+    (( rc == 0 )) && deploy_draw_progress_n "$size" "$size"
+    printf '\n' >&2
+
+    printf -v "$outvar" '%s' "$(cat "$d/code" 2>/dev/null)"
+    rm -rf "$d"
+    return "$rc"
 }
 
 # True when an image has to be converted before it can be imported.
@@ -4172,6 +4481,20 @@ deploy_verify_image_checksum() {
             # for every entry, so the second half of this test is not a corner
             # case there -- it is the only branch that matches.
             want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
+
+            # BSD tag format: "SHA256 (<name>) = <digest>". cloud.centos.org
+            # publishes this, under a file named CHECKSUM -- the same filename
+            # AlmaLinux uses for the coreutils shape, so the format cannot be
+            # decided from the origin and has to be tried here.
+            #
+            # Tried second, and only when the first found nothing, so the
+            # coreutils parse stays the path every existing row takes. The two
+            # cannot both match: a coreutils line has the digest in $1, a BSD
+            # line has the literal algorithm name there, and the regex below
+            # rejects that either way.
+            if [[ -z "$want" ]]; then
+                want=$(awk -v f="($base)" '$2 == f && $3 == "=" { print $4; exit }' <<< "$sums")
+            fi
         fi
 
         if [[ -z "$want" ]]; then
@@ -4574,7 +4897,10 @@ deploy_import_vdi_staged() {
     fi
 
     log_info "  downloading the image to the pool master (resumable)..."
-    if ! dom0_exec "curl -fL --progress-bar -o '${dl}' -C - \
+    # COLUMNS is exported into the remote shell for the same reason as the API
+    # path -- see deploy_progress_columns. The bar is rendered on *this*
+    # terminal, so the width that matters is the local one, not dom0's.
+    if ! dom0_exec "COLUMNS=$(deploy_progress_columns) curl -fL --progress-bar -o '${dl}' -C - \
             --retry 5 --retry-delay 3 --retry-all-errors \
             --speed-limit 1024 --speed-time 60 --max-time 3600 '${url}'"; then
         log_error "Failed to download the image on the pool master."
@@ -7392,15 +7718,25 @@ show_help() {
 #      *staged* path -- there is nothing to convert in a stream -- so a qcow2
 #      row cannot fall back to streaming when /var/tmp is short.
 #   2. Checksum format. Solved: deploy_checksum_source picks the sums file and
-#      the algorithm from the image's own URL. Debian publishes SHA512SUMS and
-#      Ubuntu SHA256SUMS, both in coreutils' "<hash>  <file>" shape, so one
-#      parse serves both. The RHEL family and Fedora publish
-#      "SHA256 (<file>) = <hash>", a different parse entirely and still
-#      unhandled -- part of why those rows are still placeholders.
+#      the algorithm from the image's own URL, and deploy_verify_image_checksum
+#      parses either of the two shapes those files come in -- coreutils'
+#      "<hash>  <file>" (Debian, Ubuntu, AlmaLinux) or the BSD tag
+#      "SHA256 (<file>) = <hash>" (CentOS Stream). The shape is not a property
+#      of the family: AlmaLinux and CentOS Stream both publish a file called
+#      CHECKSUM and disagree on what goes in it, which is why the parse is
+#      tried both ways rather than selected by origin. Fedora publishes the BSD
+#      tag shape too, but under a name carrying the release and compose rather
+#      than a fixed one, so it is the origin that made the filename derived
+#      instead of constant -- see deploy_checksum_source. Rocky is unread on
+#      this point.
 #   3. Guest preparation. tpl_prep_debian is apt-based, and Ubuntu shares it.
 #      Confirmed rather than assumed: Ubuntu packages xe-guest-utilities (which
 #      Debian 13 does not), so there both the ISO path and the apt fallback
-#      work. The RHEL family and Fedora still need a dnf equivalent.
+#      work. tpl_prep_rhel is the dnf counterpart and serves the RHEL rebuilds.
+#      Fedora 43 has its own, tpl_prep_fedora: install.sh does not recognise
+#      Fedora and refuses, so its guest tools come from the documented -d/-m
+#      override, the ISO tarball, or Fedora's own package -- the tiers
+#      linux_util's installer already uses. Fedora 44 stays a placeholder.
 #
 # Version coverage below is deliberate: current supported releases only.
 # Ubuntu is the LTS line (interim releases are nine-month lifespans and would
@@ -7457,15 +7793,83 @@ show_help() {
 #     not evidence of a failed boot -- XO's own Hub templates do the same thing.
 #     Do not read a garbled console as a missing ESP.
 TPL_CATALOG=(
-    "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
-    "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
-    "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|-|"
-    "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|-|"
-    "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|-|"
+    # 10 GiB, not the 4 GiB default. Every image in this family is a 10 GiB
+    # virtual disk -- read off `qemu-img info`'s "virtual size" for all three
+    # AlmaLinux releases, and the same for Rocky 8/9/10 and CentOS Stream
+    # 9/10 when those are built. That is the figure the VDI has to clear, and
+    # it is a property of the image, not of the download: AlmaLinux 8 is a
+    # 1.55 GiB download and AlmaLinux 10 a 0.48 GiB one, and both expand to
+    # the same 10 GiB.
+    #
+    # XO's own Hub lists its AlmaLinux 9 template at exactly 10 GiB, which
+    # agrees. Its AlmaLinux 8 entry says 4 GiB, but that is an image pinned at
+    # 8.5 from 2021; the current 8.10 image is not that image, so the smaller
+    # figure does not transfer. Do not size these from the Hub card.
+    #
+    # No EOL gate on AlmaLinux 8: it is supported until 2029-05-31, which is
+    # years outside the one-year horizon that would warrant one. Its image
+    # being frozen at the final 8.10 point release is not the same thing as
+    # the distribution being near end of life.
+    "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
+    "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
+    "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
+    # Both CentOS Stream rows: 10 GiB for the same reason as the AlmaLinux rows
+    # above, read off `qemu-img info`'s "virtual size" -- 9 downloads as
+    # 1.19 GiB and 10 as 1.00 GiB, and both expand to the same 10 GiB.
+    #
+    # cloud-user, not centos: read out of each image's own /etc/cloud/cloud.cfg,
+    # where system_info.default_user.name says so on both releases.
+    #
+    # No firmware field on either. Both GPTs carry an EFI system partition
+    # alongside a BIOS boot partition -- read off the images' partition tables
+    # -- so tpl_disk_supports_uefi finds the ESP and publishes them as UEFI,
+    # which is the default this field would have set anyway. Confirmed on a
+    # real pool for 9: templates built from it boot under both BIOS and UEFI.
+    #
+    # 10 has three partitions to 9's four -- it carries no separate /boot --
+    # which changes nothing here: the ESP is what is looked for, and the build
+    # never assumes a partition count.
+    "centos9|CentOS Stream 9|9-stream|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|cloud-user|tpl_prep_rhel|10"
+    "centos10|CentOS Stream 10|10-stream|https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2|cloud-user|tpl_prep_rhel|10"
     "debian12|Debian 12 (Bookworm)|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw|debian|tpl_prep_debian|"
     "debian13|Debian 13 (Trixie)|trixie|https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.raw|debian|tpl_prep_debian|"
-    "fedora43|Fedora 43|43|https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2|fedora|-|"
-    "fedora44|Fedora 44|44|https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2|fedora|-|"
+    # 5 GiB, not the 4 GiB default: read off `qemu-img info`'s "virtual size"
+    # for this image -- a 556 MiB download that expands to a 5 GiB disk, so the
+    # default would not clear it at all.
+    #
+    # fedora, not cloud-user: read out of the image's own
+    # /etc/cloud/cloud.cfg, where system_info.default_user.name says so.
+    #
+    # tpl_prep_fedora, not the RHEL rebuilds' script. Fedora's guest tools do
+    # not come from the ISO the way theirs do: install.sh does not recognise
+    # Fedora and refuses, and Fedora packages xe-guest-utilities-latest in its
+    # own updates repository, which the rebuilds do not. Its prep script is
+    # therefore separate rather than a shared one with a branch in it, so the
+    # AlmaLinux and CentOS Stream path is not touched. cloud-utils-growpart is
+    # present, its sshd carries the Include line, and SELINUX is enforcing --
+    # all read off the image.
+    #
+    # No firmware field: the GPT carries an EFI system partition alongside a
+    # BIOS boot partition -- read off the image's partition table -- so
+    # tpl_disk_supports_uefi finds the ESP and publishes it as UEFI.
+    #
+    # The root filesystem is btrfs with subvolumes, unlike every other row
+    # here. Nothing in the build reads the filesystem -- the import is
+    # block-level and growpart works on the partition -- so this changes
+    # nothing, but it is why mounting the image by offset alone shows
+    # subvolumes rather than /etc.
+    "fedora43|Fedora 43|43|https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2|fedora|tpl_prep_fedora|5"
+    # Fedora 44: read the same way as 43 and identical on every point that
+    # matters -- default user fedora, lock_passwd: True, sshd carrying the
+    # Include line, SELINUX enforcing, and the same 5 GiB virtual size off
+    # `qemu-img info`. xe-guest-utilities-latest, cloud-init and
+    # cloud-utils-growpart are all present in its repositories.
+    #
+    # Its partition table has three entries to 43's four -- no separate /boot,
+    # so root is partition 3 -- which changes nothing here: the ESP is what
+    # tpl_disk_supports_uefi looks for and the build never assumes a partition
+    # count.
+    "fedora44|Fedora 44|44|https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2|fedora|tpl_prep_fedora|5"
     "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
     "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
     "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
@@ -7707,6 +8111,340 @@ rm -f /root/.bash_history /home/*/.bash_history
 shutdown -h now
 PREP_EOF
 }
+
+# Emit the in-guest preparation script for the RHEL rebuilds.
+#
+# Deliberately not tpl_prep_debian, and not a copy of it: the two differ in
+# package manager, in where the guest tools come from, and in what has to be
+# scrubbed. Do not add a third for Rocky -- it is the same family and the same
+# script, and a per-distro copy is how one of them silently stops getting
+# fixes. The catalogue rows point every RHEL-family entry here, AlmaLinux and
+# CentOS Stream alike.
+#
+# The guest tools come from the ISO, for a stronger reason than on Debian:
+# Emit the in-guest preparation script for the RHEL rebuilds.
+#
+# Deliberately not tpl_prep_debian, and not a copy of it: the two differ in
+# package manager, in where the guest tools come from, and in what has to be
+# scrubbed. Do not add a third for Rocky -- it is the same family and the same
+# script, and a per-distro copy is how one of them silently stops getting
+# fixes. The catalogue rows point every RHEL-family entry here, AlmaLinux and
+# CentOS Stream alike.
+#
+# The guest tools come from the ISO, for a stronger reason than on Debian:
+# xe-guest-utilities is packaged by nobody in this family. Confirmed against
+# AlmaLinux 8, 9 and 10 and CentOS Stream 9 -- absent from base repos and
+# absent from EPEL on all of them -- so unlike the Debian path there is no
+# package fallback worth attempting, and the ISO is the only route that
+# exists.
+tpl_prep_rhel() {
+    local user="$1"
+    # Quoted heredoc for the same reason as the Debian path: the guest script
+    # is emitted verbatim and only the account name is substituted.
+    cat <<'PREP_EOF' | sed "s/__TPL_USER__/${user}/g"
+#!/bin/bash
+# Prepares a cloud image for use as an XCP-ng template. Runs once, inside the
+# guest, then powers the VM off.
+exec > /var/log/xo-template-prep.log 2>&1
+set -x
+
+# --- guest tools ---
+# ISO only. No release in this family packages xe-guest-utilities, so there is
+# no fallback to fall back to; if the ISO is not attached the template will not
+# report an IP, and that has to be visible in the log rather than silently
+# skipped.
+install_guest_tools() {
+    local mnt=/mnt
+    if ! mountpoint -q "$mnt" && mount /dev/cdrom "$mnt" 2>/dev/null; then
+        if [[ -f "$mnt/Linux/install.sh" ]]; then
+            bash "$mnt/Linux/install.sh" -n
+            umount "$mnt" 2>/dev/null || true
+            return 0
+        fi
+        umount "$mnt" 2>/dev/null || true
+    fi
+    echo "WARNING: guest-tools ISO not found; template will not report an IP"
+    return 1
+}
+install_guest_tools || true
+
+# --- cloud-init and disk growth ---
+# cloud-utils-growpart is this family's equivalent of Debian's
+# cloud-initramfs-growroot: it is what lets an operator ask for a bigger disk
+# at deploy time and have the filesystem actually fill it. Present in
+# appstream on 8, 9 and 10 -- checked, not assumed.
+dnf install -y cloud-init cloud-utils-growpart || true
+
+# --- shipped login ---
+# Same rationale as the Debian path: a known password so a freshly deployed VM
+# is reachable before the operator supplies a cloud-config.
+echo "__TPL_USER__:__TPL_USER__" | chpasswd
+
+# A drop-in only works where sshd reads one. AlmaLinux 8 ships neither the
+# sshd_config.d directory nor the Include line that pulls it in -- its OpenSSH
+# predates both -- so a drop-in written there is silently ignored and the
+# template ends up refusing password logins with nothing in the log to say
+# why. 9 and 10 do ship both. Checked on all three rather than assumed, so
+# this edits the main file when there is no working include, and drops a file
+# in when there is.
+if grep -q '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config 2>/dev/null; then
+    mkdir -p /etc/ssh/sshd_config.d
+    printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-xo-template.conf
+else
+    sed -i 's/^[[:space:]]*#*[[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    grep -q '^PasswordAuthentication yes' /etc/ssh/sshd_config \
+        || printf '\nPasswordAuthentication yes\n' >> /etc/ssh/sshd_config
+fi
+
+# Setting the password above is not enough on its own. Every image in this
+# family declares lock_passwd: True for its default user -- read out of the
+# AlmaLinux and CentOS Stream images' own cloud.cfg -- and cloud-init's user
+# module re-locks that account on *every* boot ("Default locking down the
+# account", cloudinit/distros/__init__.py). A clone therefore came up with the
+# password set here already locked, and password login failed however sshd was
+# configured.
+#
+# Written as a drop-in under cloud.cfg.d rather than by editing cloud.cfg,
+# because a drop-in survives a cloud-init package update and does not depend on
+# the shipped file's exact indentation. The merge is a deep one -- verified on
+# cloud-init 23.4 (AlmaLinux 8) and 25.2 (Fedora), where the image's own
+# default_user name survives and only these keys change -- so this must not be
+# rewritten as a whole-block replacement.
+#
+# ssh_pwauth is set here too, for completeness rather than necessity: the sshd
+# configuration above already decides this on these images. Setting both means
+# neither mechanism has to be the one that holds.
+#
+# This is a shipped-login convenience and is meant to be replaced: install your
+# own SSH keys and lock the password again, or supply ssh_authorized_keys at VM
+# creation and never use it.
+mkdir -p /etc/cloud/cloud.cfg.d
+cat > /etc/cloud/cloud.cfg.d/99-xo-template-login.cfg <<'CLOUDCFG_EOF'
+# Written by the XO template build. Ships a usable password login on first
+# boot; remove this file once you have installed your own SSH keys.
+system_info:
+  default_user:
+    lock_passwd: False
+ssh_pwauth: True
+CLOUDCFG_EOF
+
+# --- SELinux ---
+# Enforcing by default in this family, unlike Debian. Relabel on next boot:
+# the files written above were created without the contexts SELinux expects,
+# and an unlabelled sshd_config.d drop-in is exactly the kind of thing that
+# leaves a clone refusing logins with nothing obvious in the log.
+touch /.autorelabel
+
+# --- scrub machine identity ---
+# Everything below this line exists so that clones do not share an identity.
+cloud-init clean --logs --seed
+rm -rf /var/lib/cloud/instances /var/lib/cloud/instance
+rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
+truncate -s 0 /etc/machine-id
+truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
+find /etc/ssh -type f -name 'ssh_host_*' -delete
+
+# Drop the network config anaconda/cloud-init left behind. On this family a
+# baked-in NetworkManager connection carries the build VM's MAC and DHCP
+# client-id, which a clone then reuses -- two VMs, one lease.
+rm -f /etc/sysconfig/network-scripts/ifcfg-e* 2>/dev/null || true
+find /etc/NetworkManager/system-connections -type f -delete 2>/dev/null || true
+
+dnf clean all
+rm -rf /var/cache/dnf
+rm -f /root/.bash_history /home/*/.bash_history
+
+# The build watches for the VM to halt. This must be the last thing that runs.
+shutdown -h now
+PREP_EOF
+}
+# Emit the in-guest preparation script for Fedora.
+#
+# Separate from tpl_prep_rhel on purpose, and not a refactor of it: the RHEL
+# rebuilds' script is proven and stays exactly as it is. The two differ only in
+# the guest-tools step, but that step is the whole reason Fedora failed, and
+# sharing it would mean editing the path AlmaLinux and CentOS Stream already
+# build on. Do not merge them.
+#
+# Everything else here is the same work the RHEL script does, for the same
+# reasons documented there: dnf, SELinux relabel, sshd drop-in, NetworkManager
+# scrub, machine-identity scrub.
+#
+# The guest-tools step follows linux_util's installer
+# (lib/installers/xen_guest_utilities.sh), which already solved this:
+#
+#   1. ISO with "-d fedora -m <major>". install.sh recognises Debian, CentOS,
+#      RHEL, SLES and Ubuntu by name and refuses anything else, which is what
+#      Fedora hits. XCP-ng documents -d/-m for exactly that case, and
+#      linux_util passes the distribution's own id -- "-d fedora", reserving
+#      "-d rhel" for the RHEL derivatives.
+#      https://docs.xcp-ng.org/vms/#linux-guest-tools
+#   2. The tgz on the ISO, unpacked into /etc and /usr by hand. The documented
+#      manual route for a distribution install.sh will not serve.
+#   3. Fedora's own package. Fedora ships xe-guest-utilities-latest in its
+#      updates repository, built from the same upstream -- note the "-latest"
+#      suffix, since the bare name finds nothing. XCP-ng's docs send Fedora to
+#      a package rather than the ISO, though they name EPEL, which has no
+#      Fedora branch.
+#
+# Each tier is checked by looking for xe-daemon on disk rather than trusting an
+# exit status, and the service is enabled and started after a package install
+# because the package does not enable it.
+tpl_prep_fedora() {
+    local user="$1"
+    # Quoted heredoc for the same reason as the other paths: the guest script
+    # is emitted verbatim and only the account name is substituted.
+    cat <<'PREP_EOF' | sed "s/__TPL_USER__/${user}/g"
+#!/bin/bash
+# Prepares a cloud image for use as an XCP-ng template. Runs once, inside the
+# guest, then powers the VM off.
+exec > /var/log/xo-template-prep.log 2>&1
+set -x
+
+# --- guest tools ---
+guest_tools_present() {
+    command -v xe-daemon >/dev/null 2>&1 \
+        || [ -x /usr/sbin/xe-daemon ] \
+        || [ -x /usr/bin/xe-daemon ]
+}
+
+enable_guest_service() {
+    systemctl enable xe-linux-distribution.service 2>/dev/null || true
+    systemctl start xe-linux-distribution.service 2>/dev/null || true
+}
+
+install_guest_tools() {
+    local mnt=/mnt
+    local did major tgz tmp
+
+    did=$(. /etc/os-release 2>/dev/null && echo "$ID")
+    major=$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID%%.*}")
+
+    if ! mountpoint -q "$mnt" && mount /dev/cdrom "$mnt" 2>/dev/null; then
+        # Tier 1: the ISO installer, told what it is looking at.
+        if [ -f "$mnt/Linux/install.sh" ] && [ -n "$did" ] && [ -n "$major" ]; then
+            bash "$mnt/Linux/install.sh" -n -d "$did" -m "$major" || true
+            if guest_tools_present; then
+                umount "$mnt" 2>/dev/null || true
+                return 0
+            fi
+        fi
+
+        # Tier 2: the tgz on the ISO, unpacked by hand.
+        tgz=$(find "$mnt/Linux/" -name 'xe-guest-utilities_*_all.tgz' 2>/dev/null | head -1)
+        if [ -n "$tgz" ]; then
+            tmp=$(mktemp -d /tmp/xe-guest-tools-XXXXXX)
+            if tar -xzf "$tgz" -C "$tmp" 2>/dev/null; then
+                [ -d "$tmp/etc" ] && cp -a "$tmp/etc/." /etc/ 2>/dev/null || true
+                [ -d "$tmp/usr" ] && cp -a "$tmp/usr/." /usr/ 2>/dev/null || true
+                systemctl daemon-reload 2>/dev/null || true
+            fi
+            rm -rf "$tmp"
+            if guest_tools_present; then
+                enable_guest_service
+                umount "$mnt" 2>/dev/null || true
+                return 0
+            fi
+        fi
+
+        umount "$mnt" 2>/dev/null || true
+    fi
+
+    # Tier 3: Fedora's own package.
+    dnf install -y xe-guest-utilities-latest 2>/dev/null \
+        || dnf install -y xe-guest-utilities 2>/dev/null \
+        || true
+    if guest_tools_present; then
+        enable_guest_service
+        return 0
+    fi
+
+    echo "WARNING: guest tools not installed; template will not report an IP"
+    return 1
+}
+install_guest_tools || true
+
+# --- cloud-init and disk growth ---
+# cloud-utils-growpart is what lets an operator ask for a bigger disk at deploy
+# time and have the filesystem actually fill it. Present on Fedora 43.
+dnf install -y cloud-init cloud-utils-growpart || true
+
+# --- shipped login ---
+# A known password so a freshly deployed VM is reachable before the operator
+# supplies a cloud-config.
+echo "__TPL_USER__:__TPL_USER__" | chpasswd
+
+# Fedora 43 ships sshd_config.d and the Include line that reads it -- checked
+# on the image itself -- so the drop-in is the branch taken. The else arm is
+# kept for a release that changes its mind.
+if grep -q '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config 2>/dev/null; then
+    mkdir -p /etc/ssh/sshd_config.d
+    printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-xo-template.conf
+else
+    sed -i 's/^[[:space:]]*#*[[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    grep -q '^PasswordAuthentication yes' /etc/ssh/sshd_config \
+        || printf '\nPasswordAuthentication yes\n' >> /etc/ssh/sshd_config
+fi
+
+# Setting the password above is not enough on its own. The image's cloud.cfg
+# declares lock_passwd: True for its default user, and cloud-init's user module
+# re-locks that account on *every* boot -- "Default locking down the account"
+# in cloudinit/distros/__init__.py -- so a clone would come up with the
+# password we just set already locked, and password login would fail however
+# sshd is configured.
+#
+# Written as a drop-in under cloud.cfg.d rather than by editing cloud.cfg,
+# because a drop-in survives a cloud-init package update and does not depend on
+# the exact indentation of the shipped file. Later files win, so the 99- prefix
+# puts this after the image's own configuration.
+#
+# ssh_pwauth is set here too, for completeness rather than necessity: the sshd
+# drop-in above already wins on this image, because Fedora's Include sits near
+# the top of sshd_config and sshd takes the first value it reads, ahead of the
+# line cloud-init writes further down. Setting both means neither mechanism has
+# to be the one that holds.
+#
+# This is the shipped-login convenience the other templates have, and it is
+# meant to be replaced: install your own SSH keys and lock the password again,
+# or supply ssh_authorized_keys at VM creation and never use it.
+mkdir -p /etc/cloud/cloud.cfg.d
+cat > /etc/cloud/cloud.cfg.d/99-xo-template-login.cfg <<'CLOUDCFG_EOF'
+# Written by the XO template build. Ships a usable password login on first
+# boot; remove this file once you have installed your own SSH keys.
+system_info:
+  default_user:
+    lock_passwd: False
+ssh_pwauth: True
+CLOUDCFG_EOF
+
+# --- SELinux ---
+# Enforcing on Fedora. Relabel on next boot: the files written above were
+# created without the contexts SELinux expects, and an unlabelled sshd drop-in
+# is exactly the kind of thing that leaves a clone refusing logins.
+touch /.autorelabel
+
+# --- scrub machine identity ---
+# Everything below this line exists so that clones do not share an identity.
+cloud-init clean --logs --seed
+rm -rf /var/lib/cloud/instances /var/lib/cloud/instance
+rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
+truncate -s 0 /etc/machine-id
+truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
+find /etc/ssh -type f -name 'ssh_host_*' -delete
+
+# A baked-in NetworkManager connection carries the build VM's MAC and DHCP
+# client-id, which a clone then reuses -- two VMs, one lease.
+find /etc/NetworkManager/system-connections -type f -delete 2>/dev/null || true
+
+dnf clean all
+rm -rf /var/cache/dnf
+rm -f /root/.bash_history /home/*/.bash_history
+
+# The build watches for the VM to halt. This must be the last thing that runs.
+shutdown -h now
+PREP_EOF
+}
+
 # Decide whether a VDI actually holds a disk image, by reading its first sector.
 #
 # This replaces a check on physical-utilisation, which cannot answer the
@@ -8731,14 +9469,28 @@ tpl_api_import_image() {
             # workdir is per-run, so there is never anything here worth keeping.
             rm -f "$local_file" "$converted"
 
-            # --progress-bar for the same reason the SSH path has one: this is
+            # A progress bar for the same reason the SSH path has one: this is
             # several minutes of silence otherwise, and silence on the longest
-            # step reads as a hang worth killing. --retry and -C - likewise --
-            # a multi-gigabyte download over one connection eventually hits a
+            # step reads as a hang worth killing. --retry likewise -- a
+            # multi-gigabyte download over one connection eventually hits a
             # transient error, and restarting it from zero is the worst way to
             # find that out.
+            #
+            # deploy_curl_with_progress rather than curl's own --progress-bar:
+            # that one repaints the whole line on every update, which on a
+            # remote terminal is a cursor visibly scribbling back and forth.
+            # Ours appends only the blocks that are new. The size comes from
+            # the origin so there is a percentage to draw; without it the bar
+            # falls back to a running byte count, which is still better than
+            # silence.
             log_info "    downloading the image..."
-            if ! curl -fL --progress-bar -o "$local_file" -C - \
+            local dl_size
+            dl_size=$(curl -fsSLI "$url" 2>/dev/null | tr -d '\r' \
+                | grep -i '^content-length:' | tail -1 | awk '{print $2}')
+            [[ "$dl_size" =~ ^[0-9]+$ ]] || dl_size=""
+
+            if ! deploy_curl_with_progress "$local_file" "$dl_size" \
+                    -fL --no-progress-meter -o "$local_file" \
                     --retry 5 --retry-delay 3 --retry-all-errors \
                     --speed-limit 1024 --speed-time 120 --max-time 3600 "$url"; then
                 log_error "  could not download ${url}"
@@ -8789,16 +9541,30 @@ tpl_api_import_image() {
         # --progress-bar, not -s: this is a multi-gigabyte PUT over the
         # network and is the second-longest step of a build. The bar goes to
         # stderr and the status code to stdout, so the capture is unaffected.
-        http_code=$(curl -k -L --post301 --post302 --post303 -X POST \
-            --progress-bar \
+        #
+        # Our bar, not curl's, for the same reason the download uses ours:
+        # curl repaints the whole line every update and leaves the cursor
+        # sitting in it. The upload cannot measure progress by watching a file
+        # grow the way the download does -- the bytes are leaving, not
+        # arriving -- so the body is fed through a counter; see
+        # deploy_curl_upload_with_progress.
+        #
+        # The size is the file's own, which is what Content-Length has to be
+        # anyway: a fifo has no length curl can discover, and XAPI refuses a
+        # chunked body.
+        local up_size
+        up_size=$(stat -c %s "$upload_file" 2>/dev/null || echo 0)
+        deploy_curl_upload_with_progress "$upload_file" "$up_size" http_code \
+            -k -L --post301 --post302 --post303 -X POST \
             --speed-limit 1024 --speed-time 120 \
             -b "authenticationToken=${XO_API_TOKEN}" \
             -H 'Content-Type: application/octet-stream' \
-            --data-binary "@${upload_file}" \
+            --data-binary @- \
             --output "$resp_file" --write-out '%{http_code}' \
-            "$target") || rc=$?
+            "$target" || rc=$?
     else
-        http_code=$(curl -fL --progress-bar --max-time 0 \
+        http_code=$(COLUMNS="$(deploy_progress_columns)" \
+                curl -fL --progress-bar --max-time 0 \
                 --speed-limit 1024 --speed-time 120 "$url" \
             | curl -s -k -L --post301 --post302 --post303 -X POST \
                 --speed-limit 1024 --speed-time 120 \
