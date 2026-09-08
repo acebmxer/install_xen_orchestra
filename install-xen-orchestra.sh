@@ -685,8 +685,18 @@ migrate_config() {
     log_success "Config migrated from version ${current_ver} to ${LATEST_CONFIG_VERSION}."
 }
 
-# Detect package manager
-detect_package_manager() {
+# Detect package manager, setting PKG_MANAGER / PKG_INSTALL / PKG_UPDATE.
+#
+# Returns non-zero instead of exiting when nothing is recognised, so a caller
+# that can carry on without installing anything -- the template build's API
+# path falls back to SSH -- is not killed. detect_package_manager wraps this
+# and keeps the old exit-on-failure contract for the install flows that cannot.
+#
+# The RPM and dpkg families were here from the start because that is what a Xen
+# Orchestra *host* runs. pacman, zypper and apk were added for the workstation
+# side: --build-templates and --deploy run from wherever the operator sits,
+# which is as likely to be Arch, CachyOS or openSUSE as Debian.
+detect_package_manager_soft() {
     if command -v apt-get &> /dev/null; then
         PKG_MANAGER="apt"
         PKG_INSTALL="sudo apt-get install -y"
@@ -699,8 +709,28 @@ detect_package_manager() {
         PKG_MANAGER="yum"
         PKG_INSTALL="sudo yum install -y"
         PKG_UPDATE="sudo yum makecache"
+    elif command -v pacman &> /dev/null; then
+        PKG_MANAGER="pacman"
+        PKG_INSTALL="sudo pacman -S --needed --noconfirm"
+        PKG_UPDATE="sudo pacman -Sy"
+    elif command -v zypper &> /dev/null; then
+        PKG_MANAGER="zypper"
+        PKG_INSTALL="sudo zypper --non-interactive install"
+        PKG_UPDATE="sudo zypper --non-interactive refresh"
+    elif command -v apk &> /dev/null; then
+        PKG_MANAGER="apk"
+        PKG_INSTALL="sudo apk add"
+        PKG_UPDATE="sudo apk update"
     else
-        log_error "No supported package manager found (apt, dnf, yum)"
+        return 1
+    fi
+    return 0
+}
+
+# Detect package manager
+detect_package_manager() {
+    if ! detect_package_manager_soft; then
+        log_error "No supported package manager found (apt, dnf, yum, pacman, zypper, apk)"
         exit 1
     fi
     log_info "Detected package manager: $PKG_MANAGER"
@@ -4068,7 +4098,7 @@ STREAM_EOF
 #
 #   coreutils   "<hash>  <file>", optionally "*<file>" for binary mode.
 #               Debian, Ubuntu and AlmaLinux.
-#   BSD tag     "SHA256 (<file>) = <hash>". CentOS Stream and Fedora.
+#   BSD tag     "SHA256 (<file>) = <hash>". CentOS Stream, Rocky and Fedora.
 #
 # Fedora wraps its file in a PGP clearsigned envelope. That costs the parse
 # nothing -- the digest lines inside are ordinary BSD tag lines and the awk
@@ -4086,8 +4116,11 @@ STREAM_EOF
 # this catalogue actually requests, not only for the dated filename it points
 # at. Fedora has since been read the same way: BSD tag shape, SHA-256, but
 # under a version-stamped filename rather than a constant one, which is the
-# case the branch below derives instead of naming. Rocky is unverified on this
-# point and keeps the default until someone reads its mirror the same way.
+# case the branch below derives instead of naming. Rocky is the same as CentOS
+# Stream: dl.rockylinux.org publishes a CHECKSUM in the BSD tag shape with
+# SHA-256 digests, filename and all, and the 8, 9 and 10 files each carry an
+# entry for the ".latest" name this catalogue requests -- checked on all three
+# mirrors -- so it needs the case below and no new parser.
 #
 # The default is Debian's SHA512SUMS. An unknown origin therefore gets that
 # name, does not find it, and warns that the image could not be verified --
@@ -4098,6 +4131,7 @@ deploy_checksum_source() {
         *//cloud-images.ubuntu.com/*) printf 'SHA256SUMS 256' ;;
         *//repo.almalinux.org/*)      printf 'CHECKSUM 256' ;;
         *//cloud.centos.org/*)        printf 'CHECKSUM 256' ;;
+        *//dl.rockylinux.org/*)       printf 'CHECKSUM 256' ;;
         *//dl.fedoraproject.org/*)
             # Fedora is the one origin here that does not publish a fixed
             # filename: the sums file carries the release and compose in its
@@ -4599,10 +4633,10 @@ deploy_verify_image_checksum() {
             # case there -- it is the only branch that matches.
             want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
 
-            # BSD tag format: "SHA256 (<name>) = <digest>". cloud.centos.org
-            # publishes this, under a file named CHECKSUM -- the same filename
-            # AlmaLinux uses for the coreutils shape, so the format cannot be
-            # decided from the origin and has to be tried here.
+            # BSD tag format: "SHA256 (<name>) = <digest>". cloud.centos.org and
+            # dl.rockylinux.org publish this, under a file named CHECKSUM -- the
+            # same filename AlmaLinux uses for the coreutils shape, so the format
+            # cannot be decided from the origin and has to be tried here.
             #
             # Tried second, and only when the first found nothing, so the
             # coreutils parse stays the path every existing row takes. The two
@@ -7829,14 +7863,13 @@ show_help() {
 # selection were constructed some other way. tpl_is_placeholder is the one
 # place that decision is made.
 #
-# They are listed rather than left out because the question they answer -- "is
-# my distribution going to be here?" -- otherwise has no answer short of
-# reading this table. Every placeholder URL below was checked to return 200
-# with a published checksum beside it, so each is a real image awaiting the
-# code rather than an aspiration.
+# No row currently uses it -- every entry in the catalogue below is buildable.
+# The mechanism stays for the case of adding a distribution whose image has not
+# yet been read: the row can land with "-" so the menu answers "is my
+# distribution going to be here?" before the code that builds it exists.
 #
-# Three things stand between a placeholder and a working row, and they are
-# shared across every non-Debian entry rather than being per-distribution:
+# Three things a new non-Debian entry needs, all solved generically rather than
+# per-distribution:
 #
 #   1. Image format. Debian publishes raw; everyone else publishes qcow2. The
 #      import writes the file into a VDI over XAPI's raw endpoint, so a qcow2
@@ -7849,22 +7882,23 @@ show_help() {
 #      the algorithm from the image's own URL, and deploy_verify_image_checksum
 #      parses either of the two shapes those files come in -- coreutils'
 #      "<hash>  <file>" (Debian, Ubuntu, AlmaLinux) or the BSD tag
-#      "SHA256 (<file>) = <hash>" (CentOS Stream). The shape is not a property
-#      of the family: AlmaLinux and CentOS Stream both publish a file called
-#      CHECKSUM and disagree on what goes in it, which is why the parse is
-#      tried both ways rather than selected by origin. Fedora publishes the BSD
-#      tag shape too, but under a name carrying the release and compose rather
-#      than a fixed one, so it is the origin that made the filename derived
-#      instead of constant -- see deploy_checksum_source. Rocky is unread on
-#      this point.
+#      "SHA256 (<file>) = <hash>" (CentOS Stream, Rocky). The shape is not a
+#      property of the family: AlmaLinux and CentOS Stream both publish a file
+#      called CHECKSUM and disagree on what goes in it, which is why the parse
+#      is tried both ways rather than selected by origin. Fedora publishes the
+#      BSD tag shape too, but under a name carrying the release and compose
+#      rather than a fixed one, so it is the origin that made the filename
+#      derived instead of constant -- see deploy_checksum_source. Rocky matches
+#      CentOS Stream on all three releases.
 #   3. Guest preparation. tpl_prep_debian is apt-based, and Ubuntu shares it.
 #      Confirmed rather than assumed: Ubuntu packages xe-guest-utilities (which
 #      Debian 13 does not), so there both the ISO path and the apt fallback
-#      work. tpl_prep_rhel is the dnf counterpart and serves the RHEL rebuilds.
-#      Fedora 43 has its own, tpl_prep_fedora: install.sh does not recognise
-#      Fedora and refuses, so its guest tools come from the documented -d/-m
-#      override, the ISO tarball, or Fedora's own package -- the tiers
-#      linux_util's installer already uses. Fedora 44 stays a placeholder.
+#      work. tpl_prep_rhel is the dnf counterpart and serves the RHEL rebuilds
+#      -- AlmaLinux, CentOS Stream and Rocky, all releases. Both Fedora entries
+#      have their own, tpl_prep_fedora: install.sh does not recognise Fedora
+#      and refuses, so its guest tools come from the documented -d/-m override,
+#      the ISO tarball, or Fedora's own package -- the tiers linux_util's
+#      installer already uses.
 #
 # Version coverage below is deliberate: current supported releases only.
 # Ubuntu is the LTS line (interim releases are nine-month lifespans and would
@@ -7923,11 +7957,10 @@ show_help() {
 TPL_CATALOG=(
     # 10 GiB, not the 4 GiB default. Every image in this family is a 10 GiB
     # virtual disk -- read off `qemu-img info`'s "virtual size" for all three
-    # AlmaLinux releases, and the same for Rocky 8/9/10 and CentOS Stream
-    # 9/10 when those are built. That is the figure the VDI has to clear, and
-    # it is a property of the image, not of the download: AlmaLinux 8 is a
-    # 1.55 GiB download and AlmaLinux 10 a 0.48 GiB one, and both expand to
-    # the same 10 GiB.
+    # AlmaLinux releases, both CentOS Stream releases and all three Rocky Linux
+    # releases. That is the figure the VDI has to clear, and it is a property of
+    # the image, not of the download: AlmaLinux 8 is a 1.55 GiB download and
+    # AlmaLinux 10 a 0.48 GiB one, and both expand to the same 10 GiB.
     #
     # XO's own Hub lists its AlmaLinux 9 template at exactly 10 GiB, which
     # agrees. Its AlmaLinux 8 entry says 4 GiB, but that is an image pinned at
@@ -7971,11 +8004,11 @@ TPL_CATALOG=(
     # tpl_prep_fedora, not the RHEL rebuilds' script. Fedora's guest tools do
     # not come from the ISO the way theirs do: install.sh does not recognise
     # Fedora and refuses, and Fedora packages xe-guest-utilities-latest in its
-    # own updates repository, which the rebuilds do not. Its prep script is
-    # therefore separate rather than a shared one with a branch in it, so the
-    # AlmaLinux and CentOS Stream path is not touched. cloud-utils-growpart is
-    # present, its sshd carries the Include line, and SELINUX is enforcing --
-    # all read off the image.
+    # own updates repository, which tpl_prep_rhel does not touch. Its prep
+    # script is therefore separate rather than a shared one with a branch in it,
+    # so the AlmaLinux, CentOS Stream and Rocky path is not touched.
+    # cloud-utils-growpart is present, its sshd carries the Include line, and
+    # SELINUX is enforcing -- all read off the image.
     #
     # No firmware field: the GPT carries an EFI system partition alongside a
     # BIOS boot partition -- read off the image's partition table -- so
@@ -7998,9 +8031,33 @@ TPL_CATALOG=(
     # tpl_disk_supports_uefi looks for and the build never assumes a partition
     # count.
     "fedora44|Fedora 44|44|https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2|fedora|tpl_prep_fedora|5"
-    "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
-    "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
-    "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
+    # Rocky Linux 8, 9 and 10: same family as AlmaLinux and CentOS Stream, so all
+    # three run the same tpl_prep_rhel rather than a copy. Every point below was
+    # read off the GenericCloud image itself -- 8.10, 9.8 and 10.2:
+    #
+    #   - 10 GiB virtual disk on all three, not the 4 GiB default -- `qemu-img
+    #     info` "virtual size" off each qcow2 header (downloads are 1.92, 0.60
+    #     and 0.51 GiB, all expanding to 10 GiB).
+    #   - rocky on all three, from each image's /etc/cloud/cloud.cfg
+    #     (system_info.default_user.name), with lock_passwd: True, so
+    #     tpl_prep_rhel's cloud.cfg.d drop-in is what keeps the shipped password
+    #     login working on a clone.
+    #   - sshd differs by release, and tpl_prep_rhel already handles both: 8's
+    #     OpenSSH ships neither the Include line nor /etc/ssh/sshd_config.d
+    #     (like AlmaLinux 8), so the script edits sshd_config directly; 9 and 10
+    #     ship both, so it drops a file in.
+    #   - No firmware field: each GPT carries an EFI system partition -- a vfat
+    #     /boot/efi in the image's fstab, /boot/efi/EFI/rocky populated -- so
+    #     tpl_disk_supports_uefi finds the ESP and publishes UEFI, the default
+    #     this field would have set anyway.
+    #
+    # 8 is confirmed on Nick's pool (built, cloned, boots UEFI, guest agent
+    # 7.30.0-18, gets an IP). 9 and 10 have not been built on a pool yet -- the
+    # one open question is whether the guest-tools ISO's install.sh recognises
+    # el9/el10 with no -d/-m override, which it did for el8.
+    "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|tpl_prep_rhel|10"
+    "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|tpl_prep_rhel|10"
+    "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|tpl_prep_rhel|10"
     # Deprecated: free support for 22.04 ends 2027-04-30, so this entry is
     # scheduled to go on 2027-06-01. Kept in the list until then so the menu
     # says so rather than the row silently vanishing.
@@ -8232,6 +8289,11 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build gave this VM the hostname "xo-template-build" from the prep drive.
+# Clear it so the template ships no hostname: each clone then takes its own
+# from cloud-init or DHCP instead of inheriting the build VM's name.
+truncate -s 0 /etc/hostname
+hostnamectl set-hostname "" 2>/dev/null || true
 apt-get clean
 rm -f /root/.bash_history /home/*/.bash_history
 
@@ -8259,12 +8321,13 @@ PREP_EOF
 # fixes. The catalogue rows point every RHEL-family entry here, AlmaLinux and
 # CentOS Stream alike.
 #
-# The guest tools come from the ISO, for a stronger reason than on Debian:
-# xe-guest-utilities is packaged by nobody in this family. Confirmed against
-# AlmaLinux 8, 9 and 10 and CentOS Stream 9 -- absent from base repos and
-# absent from EPEL on all of them -- so unlike the Debian path there is no
-# package fallback worth attempting, and the ISO is the only route that
-# exists.
+# The guest tools are installed from the ISO for every row here, with no
+# per-distro branch and no package fallback attempted. AlmaLinux 8/9/10 and
+# CentOS Stream 9/10 package xe-guest-utilities nowhere -- checked against base
+# repos and EPEL. Rocky 8's EPEL does carry xe-guest-utilities-latest, but
+# routing it through the same ISO path as the rest keeps this one function, so
+# the row does not depend on that package. If the ISO is not attached the build
+# fails rather than shipping a template that never reports an IP.
 tpl_prep_rhel() {
     local user="$1"
     # Quoted heredoc for the same reason as the Debian path: the guest script
@@ -8277,10 +8340,9 @@ exec > /var/log/xo-template-prep.log 2>&1
 set -x
 
 # --- guest tools ---
-# ISO only. No release in this family packages xe-guest-utilities, so there is
-# no fallback to fall back to; if the ISO is not attached the template will not
-# report an IP, and that has to be visible in the log rather than silently
-# skipped.
+# ISO only, no package fallback -- see tpl_prep_rhel's header for why. If the
+# ISO is not attached the template will not report an IP, and that has to be
+# visible in the log rather than silently skipped.
 install_guest_tools() {
     local mnt=/mnt
     if ! mountpoint -q "$mnt" && mount /dev/cdrom "$mnt" 2>/dev/null; then
@@ -8371,6 +8433,11 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build gave this VM the hostname "xo-template-build" from the prep drive.
+# Clear it so the template ships no hostname: each clone then takes its own
+# from cloud-init or DHCP instead of inheriting the build VM's name.
+truncate -s 0 /etc/hostname
+hostnamectl set-hostname "" 2>/dev/null || true
 
 # Drop the network config anaconda/cloud-init left behind. On this family a
 # baked-in NetworkManager connection carries the build VM's MAC and DHCP
@@ -8559,6 +8626,11 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build gave this VM the hostname "xo-template-build" from the prep drive.
+# Clear it so the template ships no hostname: each clone then takes its own
+# from cloud-init or DHCP instead of inheriting the build VM's name.
+truncate -s 0 /etc/hostname
+hostnamectl set-hostname "" 2>/dev/null || true
 
 # A baked-in NetworkManager connection carries the build VM's MAC and DHCP
 # client-id, which a clone then reuses -- two VMs, one lease.
@@ -9581,12 +9653,15 @@ tpl_api_import_image() {
             upload_file=""
             ;;
         *)
+            # Safety net: the preflight (tpl_api_ensure_qemu_img) already
+            # offered to install this and routed to SSH if it could not, so
+            # reaching here means something removed qemu-img mid-run.
             if ! command -v qemu-img >/dev/null 2>&1; then
                 log_error "  ${url##*/} is a qcow2 image and XO's import endpoint"
                 log_error "  does not accept qcow2, so it has to be converted first."
-                log_error "  Install qemu-utils (Debian/Ubuntu) or qemu-img (RHEL"
-                log_error "  family), or use TEMPLATE_BUILD_METHOD=ssh, which"
-                log_error "  converts on the pool master instead."
+                log_error "  Install qemu-img (packaged as qemu-utils on Debian/Ubuntu,"
+                log_error "  qemu-tools on openSUSE), or use TEMPLATE_BUILD_METHOD=ssh,"
+                log_error "  which converts on the pool master instead."
                 return 1
             fi
             local_file="${DEPLOY_WORKDIR}/image.qcow2"
@@ -10897,6 +10972,70 @@ tpl_api_ensure_xo_cli() {
     return 0
 }
 
+# Make sure qemu-img is available for the API path, which converts a qcow2
+# image to raw on *this* machine before uploading it (XO's import endpoint
+# takes raw and VHD only). The SSH path does the same conversion on the pool
+# master, where qemu-img is part of dom0 -- so a missing qemu-img here is a
+# reason to use SSH, not a reason to fail.
+#
+# Only the templates actually chosen decide whether it is needed: an all-Debian
+# selection ships raw images and converts nothing.
+#
+# Offered the same way as xo-cli and xorriso: prompt, then install with the
+# detected package manager. The package name is not the same everywhere --
+# qemu-utils on Debian/Ubuntu, qemu-tools on openSUSE, qemu-img on the RPM and
+# Arch families -- but the binary is always qemu-img.
+tpl_api_ensure_qemu_img() {
+    local row needs_convert=0
+    for row in "${TPL_SELECTED[@]}"; do
+        case "$(tpl_field "$row" 4)" in
+            *.raw) ;;
+            *) needs_convert=1 ;;
+        esac
+    done
+    (( needs_convert )) || return 0
+
+    command -v qemu-img >/dev/null 2>&1 && return 0
+
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        TPL_API_UNAVAILABLE_REASON="qemu-img is not installed, and every selected image is a qcow2 that must be converted before upload"
+        return 1
+    fi
+
+    if ! detect_package_manager_soft; then
+        TPL_API_UNAVAILABLE_REASON="qemu-img is not installed and no known package manager was found to install it"
+        return 1
+    fi
+
+    local pkg
+    case "$PKG_MANAGER" in
+        apt)    pkg="qemu-utils" ;;
+        zypper) pkg="qemu-tools" ;;
+        *)      pkg="qemu-img" ;;
+    esac
+
+    echo ""
+    log_info "The API path converts each qcow2 image to raw on this machine"
+    log_info "before uploading it to XO, which needs qemu-img."
+    echo ""
+
+    if ! confirm_or_skip "Install ${pkg} now (${PKG_INSTALL} ${pkg})?"; then
+        TPL_API_UNAVAILABLE_REASON="qemu-img is not installed"
+        return 1
+    fi
+
+    check_sudo
+    log_info "Installing ${pkg}..."
+    # shellcheck disable=SC2086
+    if ! run_cmd $PKG_INSTALL "$pkg" || ! command -v qemu-img >/dev/null 2>&1; then
+        TPL_API_UNAVAILABLE_REASON="${pkg} could not be installed"
+        return 1
+    fi
+
+    log_success "${pkg} installed"
+    return 0
+}
+
 # Decide how this run will reach the pool, and say so.
 #
 # Runs before any build work. Sets TPL_BUILD_METHOD to "api" or "ssh"; returns
@@ -10917,7 +11056,7 @@ tpl_select_build_method() {
 
     log_info "Checking whether Xen Orchestra's API can be used..."
 
-    if tpl_api_check_auth && tpl_api_ensure_xo_cli; then
+    if tpl_api_check_auth && tpl_api_ensure_xo_cli && tpl_api_ensure_qemu_img; then
         TPL_BUILD_METHOD="api"
         log_success "Build method: Xen Orchestra API at $(tpl_api_base_url) as ${TPL_API_ACCOUNT}."
         return 0

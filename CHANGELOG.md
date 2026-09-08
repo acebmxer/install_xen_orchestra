@@ -10,6 +10,66 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **Rocky Linux 8, 9 and 10 templates.** All three rows already named a
+  published image but had no preparation script, so the menu drew them as
+  **Coming Soon...** and refused to build them. They now run `tpl_prep_rhel`,
+  the same script the AlmaLinux and CentOS Stream rows use rather than a copy,
+  since it is the same family. Each image was read: 8.10, 9.8 and 10.2 all have
+  a 10 GiB virtual disk, default user `rocky` with `lock_passwd: True`, and an
+  EFI system partition, so nothing about them is a special case — 8 takes the
+  same no-`Include`-line sshd handling as AlmaLinux 8, 9 and 10 the drop-in
+  branch. Every row in the catalogue is now buildable; nothing is marked
+  **Coming Soon...**. Rocky 8 was built and booted on a real pool; 9 and 10
+  were verified from their images only.
+
+### Added
+
+- **`--build-templates` works from any common workstation distro.**
+  `detect_package_manager` recognised only `apt`, `dnf` and `yum` and `exit`ed
+  otherwise, so on Arch, CachyOS, openSUSE or Alpine the `xorriso` auto-install
+  died and — with the change below — so would the `qemu-img` one. It now also
+  detects `pacman`, `zypper` and `apk`, and reports failure instead of exiting
+  so a caller that can carry on (the API build path falls back to SSH) is not
+  taken down with it.
+
+### Fixed
+
+- **The API build path failed on any workstation without `qemu-img`, after the
+  build had already started.** That path converts each qcow2 image to raw
+  locally before uploading (XO's import endpoint takes raw and VHD only), but
+  `qemu-img` was only checked at the import step — so the operator got through
+  the token check, the `xo-cli` install, the summary and the build confirmation
+  before being told to install a package, and the message only named the
+  Debian and RHEL package names. It is now checked in the same preflight as
+  `xo-cli`: if the selected templates include a qcow2 image and `qemu-img` is
+  missing, the build offers to install it with the detected package manager
+  (`qemu-utils`, `qemu-tools` or `qemu-img` depending on the distro) and, on a
+  decline or under `--non-interactive`, uses the SSH path — which converts on
+  the pool master — rather than failing. A Debian-only selection skips the
+  check, since those images are raw.
+
+- **Every built template shipped the hostname `xo-template-build`.** The prep
+  drive gives the build VM `local-hostname: xo-template-build` via cloud-init,
+  and the machine-identity scrub cleared machine-id, SSH host keys and saved
+  network connections but never `/etc/hostname` — so the sealed template, and
+  any clone deployed without a `hostname:` in its cloud-config, came up as
+  `xo-template-build`. The scrub in all three prep scripts (`tpl_prep_debian`,
+  `tpl_prep_rhel`, `tpl_prep_fedora`) now truncates `/etc/hostname` and clears
+  the static hostname, the same as `virt-sysprep` does, so a clone takes its
+  hostname from cloud-init or DHCP instead. Present since templates first became
+  buildable; not specific to any distribution.
+
+- **Rocky Linux images would have imported unverified.** `deploy_checksum_source`
+  fell through to Debian's `SHA512SUMS` for `dl.rockylinux.org`, so the fetch
+  would have 404'd and the build would have warned and imported anyway. The
+  mirror publishes a `CHECKSUM` in the BSD tag shape `SHA256 (<file>) = <hash>` —
+  the same as `cloud.centos.org`, with an entry for the `.latest` name the
+  catalogue requests on all three releases — so it needs only a
+  `deploy_checksum_source` case and no new parser: the BSD branch added for
+  CentOS Stream already reads it.
+
 ## [0.7.2] - 2026-09-06
 
 ### Fixed

@@ -113,6 +113,16 @@ teardown() {
     [[ "$output" == *"Coming Soon"* ]]
 }
 
+@test "no catalogue row is currently a placeholder" {
+    # Every entry is buildable as of the Rocky Linux 9 and 10 rows landing. The
+    # two tests above stay as dormant guards: if a "-" row is added back before
+    # its image is read, they reactivate and this one flips.
+    local row
+    for row in "${TPL_CATALOG[@]}"; do
+        ! tpl_is_placeholder "$row"
+    done
+}
+
 @test "the catalogue is sorted, so the menu draws in order" {
     local row keys
     keys=""
@@ -208,6 +218,20 @@ teardown() {
     [[ "$output" == *"/etc/machine-id"* ]]
     [[ "$output" == *"ssh_host_"* ]]
     [[ "$output" == *"/var/lib/cloud/instances"* ]]
+    # The build gives the VM the hostname "xo-template-build"; if it is not
+    # cleared here every clone comes up with that name.
+    [[ "$output" == *"/etc/hostname"* ]]
+}
+
+@test "every prep script clears the build VM's hostname" {
+    # The prep drive sets local-hostname: xo-template-build. Without a reset in
+    # the scrub, that name is sealed into the template and a clone deployed
+    # without a hostname in its cloud-config inherits it.
+    local fn
+    for fn in tpl_prep_debian tpl_prep_rhel tpl_prep_fedora; do
+        run "$fn" someuser
+        [[ "$output" == *"truncate -s 0 /etc/hostname"* ]]
+    done
 }
 
 @test "the prep script installs guest tools from the ISO before falling back to apt" {
@@ -257,6 +281,7 @@ teardown() {
     [[ "$output" == *"cloud-init clean"* ]]
     [[ "$output" == *"/etc/machine-id"* ]]
     [[ "$output" == *"ssh_host_"* ]]
+    [[ "$output" == *"/etc/hostname"* ]]
     [[ "$output" == *"/var/lib/cloud/instances"* ]]
     # This family bakes the build VM's MAC into a NetworkManager connection,
     # which a clone would reuse -- two VMs sharing one DHCP lease.
@@ -279,14 +304,12 @@ teardown() {
 }
 
 @test "the rhel prep script takes guest tools from the ISO with no package fallback" {
-    # No release in this family packages xe-guest-utilities -- verified absent
-    # from base repos and EPEL on AlmaLinux 8, 9 and 10 -- so unlike the Debian
-    # script there is nothing to fall back to, and a fallback that looked like
-    # one would just fail quietly.
+    # AlmaLinux 8/9/10 and CentOS Stream 9/10 package xe-guest-utilities
+    # nowhere; Rocky 8's EPEL does, but the script installs from the ISO for
+    # every row rather than branching, so no row depends on a package.
     run tpl_prep_rhel almalinux
     [[ "$output" == *"install.sh"* ]]
-    # No *install* of it -- the name appearing in a comment explaining why
-    # there is no fallback is the point, not a violation.
+    # The emitted script must not install xe-guest-utilities from a repo.
     local code
     code=$(grep -v '^\s*#' <<< "$output")
     [[ "$code" != *"install"*"xe-guest-utilities"* ]]
@@ -381,18 +404,62 @@ teardown() {
     done
 }
 
-@test "the RHEL rebuilds do not use the Fedora prep script" {
-    # The five AlmaLinux and CentOS Stream rows are proven on tpl_prep_rhel.
-    # Nothing about adding Fedora may move them onto another script.
+@test "every Rocky Linux row is buildable and shares the rhel prep script" {
+    # Same family as AlmaLinux and CentOS Stream, so the same script rather than
+    # a copy. All three images were read: 8.10, 9.8 and 10.2.
     local row key prep found=0
     for row in "${TPL_CATALOG[@]}"; do
         key=$(tpl_field "$row" 1)
-        [[ "$key" == almalinux* || "$key" == centos* ]] || continue
+        [[ "$key" == rockylinux* ]] || continue
+        found=$((found + 1))
+        prep=$(tpl_field "$row" 6)
+        [ "$prep" = "tpl_prep_rhel" ]
+        ! tpl_is_placeholder "$row"
+    done
+    # 8, 9 and 10.
+    [ "$found" -eq 3 ]
+}
+
+@test "every Rocky Linux row asks for a disk that fits its 10 GiB image" {
+    # 8.10, 9.8 and 10.2 all report a 10 GiB virtual size off `qemu-img info`
+    # (downloads are 1.92, 0.60 and 0.51 GiB), so each overrides the 4 GiB
+    # default rather than inheriting a disk the image cannot fit in.
+    local row key disk
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == rockylinux* ]] || continue
+        disk=$(tpl_field "$row" 7)
+        [ -n "$disk" ]
+        [ "$disk" -ge 10 ]
+    done
+}
+
+@test "every Rocky Linux row logs in as the account its image actually creates" {
+    # rocky on all three, read out of each image's own /etc/cloud/cloud.cfg
+    # where system_info.default_user.name says so. Getting this wrong produces a
+    # template nobody can log into, and nothing reports an error.
+    local row key
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == rockylinux* ]] || continue
+        [ "$(tpl_field "$row" 5)" = "rocky" ]
+    done
+}
+
+@test "the RHEL rebuilds do not use the Fedora prep script" {
+    # The AlmaLinux, CentOS Stream and Rocky Linux rows are proven on
+    # tpl_prep_rhel. Nothing about adding Fedora may move them onto another
+    # script.
+    local row key prep found=0
+    for row in "${TPL_CATALOG[@]}"; do
+        key=$(tpl_field "$row" 1)
+        [[ "$key" == almalinux* || "$key" == centos* || "$key" == rockylinux* ]] || continue
         found=$((found + 1))
         prep=$(tpl_field "$row" 6)
         [ "$prep" = "tpl_prep_rhel" ]
     done
-    [ "$found" -eq 5 ]
+    # 3 AlmaLinux + 2 CentOS Stream + 3 Rocky Linux.
+    [ "$found" -eq 8 ]
 }
 
 @test "the Fedora prep script installs guest tools in three tiers" {
@@ -425,7 +492,7 @@ teardown() {
 }
 
 @test "the RHEL prep script keeps its ISO-only guest tools step" {
-    # Its guest-tools step is proven on five rows. Fedora needing three tiers
+    # Its guest-tools step is proven on eight rows. Fedora needing three tiers
     # did not change it -- no package fallback, no -d/-m override.
     local body
     body=$(tpl_prep_rhel almalinux)
@@ -1343,6 +1410,36 @@ teardown() {
     done
 }
 
+@test "Rocky Linux images are verified against the CHECKSUM file it publishes" {
+    # dl.rockylinux.org publishes a CHECKSUM in the same BSD tag shape as
+    # cloud.centos.org, so it resolves the same way and the existing BSD parse
+    # reads it. Checked on the 8, 9 and 10 mirrors -- each carries an entry for
+    # the ".latest" name this catalogue requests.
+    local row url
+    for row in "${TPL_CATALOG[@]}"; do
+        url=$(tpl_field "$row" 4)
+        [[ "$url" == *dl.rockylinux.org* ]] || continue
+        [ "$(deploy_checksum_source "$url")" = "CHECKSUM 256" ]
+    done
+}
+
+@test "a BSD-tag CHECKSUM yields the digest for the Rocky 8 image" {
+    # The line the Rocky 8 mirror actually publishes: "SHA256 (<file>) = <hash>"
+    # with the digest in the fourth field. The coreutils parse finds nothing in
+    # it, so without the BSD branch the build imports the image unverified.
+    local sums base want
+    base="Rocky-8-GenericCloud-Base.latest.x86_64.qcow2"
+    sums="# ${base}: 2065760256 bytes
+SHA256 (Rocky-8-GenericCloud-LVM.latest.x86_64.qcow2) = 1111111111111111111111111111111111111111111111111111111111111111
+SHA256 (${base}) = e56066c58606191e96184de9a9183a3af33c59bcbd8740d8b10ca054a7a89c14"
+
+    want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
+    [ -z "$want" ]
+
+    want=$(awk -v f="($base)" '$2 == f && $3 == "=" { print $4; exit }' <<< "$sums")
+    [ "$want" = "e56066c58606191e96184de9a9183a3af33c59bcbd8740d8b10ca054a7a89c14" ]
+}
+
 @test "Fedora's checksum filename is derived from the image, not a constant" {
     # Fedora is the one origin here that stamps the release and compose into
     # the sums filename, so no fixed string can name it and hardcoding today's
@@ -1691,9 +1788,10 @@ SHA256 (${base}) = 659024f5219a57e0be136c2902f624ee4405e307bc6d8fc72c7fabdf8267e
 
 # --- cursor navigation ------------------------------------------------------
 #
-# Most of the catalogue is currently unbuildable, so a cursor that stops on
-# placeholders means scrolling through a dozen inert rows to reach the next
-# real one, at a position where SPACE does nothing.
+# No row is a placeholder today, so the navigation helpers have nothing to skip
+# over -- but the skip logic stays covered here for the case of a future
+# "Coming Soon..." row, where a cursor that stopped on it would read as a
+# broken menu rather than an inert entry.
 
 @test "the cursor opens on the first buildable row, not the first row" {
     # The behaviour under test is that the opening cursor lands somewhere
@@ -1732,8 +1830,8 @@ SHA256 (${base}) = 659024f5219a57e0be136c2902f624ee4405e307bc6d8fc72c7fabdf8267e
     for ((i = 0; i < count; i++)); do
         if ! tpl_is_placeholder "${TPL_CATALOG[$i]}"; then start=$i; break; fi
     done
-    # Wrapping upward from the first buildable row crosses the run of
-    # placeholders at the end of the catalogue.
+    # Wrapping upward from the first buildable row lands on the last selectable
+    # row, crossing any placeholders at the end of the catalogue on the way.
     prev=$(tpl_next_selectable "$start" -1 "$count")
     ! tpl_is_placeholder "${TPL_CATALOG[$prev]}"
 }
