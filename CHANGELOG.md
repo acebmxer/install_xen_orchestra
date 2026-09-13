@@ -10,7 +10,60 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **Pre-update/pre-rebuild VM snapshots are now pruned automatically, and a
+  new `--status` command reports on the install without changing anything.**
+  `snapshot_xo_vm()` (added in an earlier unreleased change) had no cleanup at
+  all — every `--update`/`--rebuild` added another snapshot, forever. Vates'
+  own XOA updater documents a similar "delete after 7 days on a successful
+  update" policy for its own safety snapshots, but that isn't reliable in
+  practice: confirmed against a real production XOA where snapshots from 11
+  and 13 days earlier were still present, and Vates' own docs don't say what
+  mechanism is actually supposed to delete them. So this prunes with its own
+  deterministic pass instead, synchronously, right after every successful
+  snapshot: two new config keys, `SNAPSHOT_KEEP` (default 3) and
+  `SNAPSHOT_RETENTION_DAYS` (default 14), both enforced together and both
+  kept well under XO's own Health-view thresholds (it flags a VM with more
+  than 5 snapshots, and separately flags any snapshot older than 30 days) so
+  a default install never trips either warning even if updates are
+  infrequent. Only ever touches snapshots this project's own naming scheme
+  created — a snapshot made by hand or by a backup job is never a candidate,
+  however old. New config schema version 5; existing configs get both keys
+  appended on the next run, uncommented, since they're active defaults.
+
+  While adding this, found and fixed a real bug in `snapshot_xo_vm()` itself:
+  it read `XO_TASK_CHECK_TOKEN` directly instead of the already-resolved
+  `XO_API_TOKEN` that every other API call in this script uses (`load_config`
+  resolves `XO_API_TOKEN` from either key), so a user who had only set
+  `XO_API_TOKEN` — the name the config migration itself documents as current
+  — got silently skipped snapshots with no explanation. Now checks
+  `XO_API_TOKEN` first, falling back to `XO_TASK_CHECK_TOKEN`.
+
+  `--status` is a new, read-only command: current script/XO commit and how
+  far behind master, the running Node.js version, whether the xo-server
+  service is active, TLS certificate expiry, free disk space and swap,
+  how many file backups and VM snapshots exist against their retention
+  limits, and whether the script's own git checkout is clean. It makes no
+  changes and needs no lock, so it can be run any time, including while
+  another operation is in progress.
+
 ### Fixed
+
+- **`--restore` now checks a backup is actually complete before destroying
+  the current installation to make room for it, and can list backups
+  without restoring.** A backup is a plain directory copy, not an archive, so
+  nothing previously caught an interrupted copy (disk full, process killed
+  mid-`cp`) until partway through a restore that had already deleted the
+  current install. `verify_backup_integrity()` now checks for `package.json`
+  at the backup's root (present in any complete XO checkout, absent if the
+  copy never finished) and, if the backup has a `.git` directory, that `git
+  rev-parse HEAD` actually resolves rather than hitting a truncated object
+  store — and refuses the restore before anything is touched if either check
+  fails. The existing backup listing (both interactively and via
+  `--list-backups`, new, which lists and exits without prompting to restore)
+  now tags any backup that fails this check right in the list, so a bad
+  backup is visible before it's ever selected.
 
 - **Node.js binary downloads are now checksum-verified; two temp files used
   by XO Proxy install could leak on a mid-run failure.** Found in a follow-up

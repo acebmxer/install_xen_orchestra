@@ -107,11 +107,12 @@ backing.
 | Build Templates | `--build-templates` | Build cloud-init VM templates on a XenServer/XCP-ng pool |
 | Install | `--install` | Fresh install of Xen Orchestra |
 | Update | `--update` | Update existing installation (with backup) |
-| Restore | `--restore` | Restore from a previous backup |
+| Restore | `--restore` | Restore from a previous backup (verified for completeness first; add `--list-backups` to just list them) |
 | Rebuild | `--rebuild` | Fresh clone + clean build, preserves settings |
 | Reconfigure | `--reconfigure` | Apply config changes without rebuilding |
 | XO Proxy | `--proxy` | Deploy XO Proxy to a Xen pool master |
 | Adjust Memory | `--adjust-memory` | Raise the heap memory allocated to the `xo-server` process |
+| Status | `--status` | Read-only health report: version, service, TLS cert, disk/swap, backups/snapshots, git state |
 | Edit Config | *(menu only)* | Open `xo-config.cfg` in your preferred editor |
 | Rename Config | *(menu only)* | Rename `sample-xo-config.cfg` to `xo-config.cfg` |
 

@@ -18,6 +18,8 @@ Key settings:
 | `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
 | `SERVICE_USER` | root | Service user (see below) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain (see below) |
+| `SNAPSHOT_KEEP` | 3 | Number of pre-update/pre-rebuild VM snapshots to retain (see below) |
+| `SNAPSHOT_RETENTION_DAYS` | 14 | Also delete a VM snapshot once it's older than this many days (see below) |
 | `TURBO_CACHE_ENABLED` | true | Reuse turbo's local build cache on `--update` instead of rebuilding every package (`--rebuild` always builds cold) |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
@@ -79,6 +81,26 @@ convention and will **not** be counted or pruned by the rotation logic. If you
 are upgrading from an older version, manually review your backup directory
 (`BACKUP_DIR` in config, default `/var/lib/xo-backups`) and remove any
 legacy-named archives you no longer need.
+
+## `SNAPSHOT_KEEP` and `SNAPSHOT_RETENTION_DAYS`
+
+`--update` and `--rebuild` each take a VM snapshot of the XO VM itself (via
+XO's REST API) before doing anything, in addition to the file backup covered
+above — see `snapshot_xo_vm()`. This only happens when XO is running as a
+Xen guest and an XO API token is configured; on bare metal, other
+hypervisors, or with no token set, it's skipped and only the file backup
+runs, same as every version of this script before the snapshot existed.
+
+Both limits are enforced together, right after each successful snapshot:
+whichever snapshot is oldest beyond `SNAPSHOT_KEEP`, or any snapshot older
+than `SNAPSHOT_RETENTION_DAYS` regardless of count, gets deleted. The
+defaults are deliberately kept under XO's own Health-view thresholds — it
+flags any VM with more than 5 snapshots, and separately flags any snapshot
+older than 30 days — so a default install never trips either warning even
+if updates are infrequent. Only ever touches snapshots this project's own
+naming scheme (`xo-install-pre-update-...`, `xo-install-pre-rebuild-...`)
+created; a snapshot you made by hand, or one a backup job made, is never a
+candidate for deletion, however old.
 
 ## `ENCRYPT_REDIS_CREDENTIALS`
 

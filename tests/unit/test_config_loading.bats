@@ -198,7 +198,7 @@ CFG
     grep -q "^#TEMPLATE_BUILD_METHOD=auto" "$CONFIG_FILE"
     grep -q "^#XO_URL=" "$CONFIG_FILE"
     grep -q "^#XO_API_TOKEN=" "$CONFIG_FILE"
-    grep -qx "CONFIG_VERSION=4" "$CONFIG_FILE"
+    grep -qx "CONFIG_VERSION=${LATEST_CONFIG_VERSION}" "$CONFIG_FILE"
 }
 
 @test "the v4 migration does not duplicate keys that are already present" {

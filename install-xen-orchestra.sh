@@ -30,11 +30,12 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 ORIGINAL_ARGS=("$@")
 CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
-LATEST_CONFIG_VERSION=4
+LATEST_CONFIG_VERSION=5
 
 # Runtime mode flags (set via CLI flags in main())
 NON_INTERACTIVE=false
 RESTORE_BACKUP_FILE=""
+LIST_BACKUPS_ONLY=false
 DRY_RUN=false
 ALLOW_EOL_DISTRO=false
 
@@ -416,6 +417,8 @@ load_config() {
     GIT_BRANCH=${GIT_BRANCH:-master}
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
+    SNAPSHOT_KEEP=${SNAPSHOT_KEEP:-3}
+    SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS:-14}
     TURBO_CACHE_ENABLED=${TURBO_CACHE_ENABLED:-true}
     NODE_VERSION=${NODE_VERSION:-24.21.0}
     SERVICE_USER=${SERVICE_USER:-root}
@@ -514,6 +517,20 @@ validate_config() {
         errors+=("BACKUP_KEEP must be a number, got: $BACKUP_KEEP")
     elif [[ $BACKUP_KEEP -lt 1 ]]; then
         errors+=("BACKUP_KEEP must be at least 1, got: $BACKUP_KEEP")
+    fi
+
+    # Validate SNAPSHOT_KEEP is numeric
+    if ! [[ "${SNAPSHOT_KEEP:-3}" =~ ^[0-9]+$ ]]; then
+        errors+=("SNAPSHOT_KEEP must be a number, got: ${SNAPSHOT_KEEP:-}")
+    elif [[ ${SNAPSHOT_KEEP:-3} -lt 1 ]]; then
+        errors+=("SNAPSHOT_KEEP must be at least 1, got: ${SNAPSHOT_KEEP:-}")
+    fi
+
+    # Validate SNAPSHOT_RETENTION_DAYS is numeric
+    if ! [[ "${SNAPSHOT_RETENTION_DAYS:-14}" =~ ^[0-9]+$ ]]; then
+        errors+=("SNAPSHOT_RETENTION_DAYS must be a number, got: ${SNAPSHOT_RETENTION_DAYS:-}")
+    elif [[ ${SNAPSHOT_RETENTION_DAYS:-14} -lt 1 ]]; then
+        errors+=("SNAPSHOT_RETENTION_DAYS must be at least 1, got: ${SNAPSHOT_RETENTION_DAYS:-}")
     fi
 
     # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1)
@@ -706,6 +723,43 @@ migrate_config() {
             } >> "$cfg_file"
         fi
         CONFIG_VERSION=4
+    fi
+
+    # v4 -> v5: add SNAPSHOT_KEEP and SNAPSHOT_RETENTION_DAYS for snapshot_xo_vm.
+    #
+    # Vates' own XOA updater documents a similar pre-update snapshot with a
+    # "delete after 7 days on success" policy, but that isn't reliable in
+    # practice -- confirmed on a real production XOA where snapshots from 11
+    # and 13 days earlier were still present. So this project prunes with its
+    # own deterministic pass at the end of every successful --update/--rebuild
+    # instead of trusting a time-only rule to fire on its own: keep at most
+    # SNAPSHOT_KEEP snapshots, and drop anything older than
+    # SNAPSHOT_RETENTION_DAYS regardless of count. The defaults (3, 14 days)
+    # are deliberately tighter than XO's own Health-view thresholds -- it
+    # flags any VM with more than 5 snapshots, and separately flags any
+    # snapshot older than 30 days -- so a default install never trips either
+    # warning even if an update is skipped for a couple of weeks.
+    if [[ "$current_ver" -lt 5 ]]; then
+        if ! grep -q '^[[:space:]]*SNAPSHOT_KEEP=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# How many pre-update/pre-rebuild VM snapshots (see --update, --rebuild)"
+                echo "# to keep. Older ones beyond this count are deleted after each"
+                echo "# successful run. Kept below XO's own Health-view \"too many"
+                echo "# snapshots\" threshold (>5) by default."
+                echo "SNAPSHOT_KEEP=3"
+            } >> "$cfg_file"
+        fi
+        if ! grep -q '^[[:space:]]*SNAPSHOT_RETENTION_DAYS=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# Delete a pre-update/pre-rebuild VM snapshot once it's older than"
+                echo "# this many days, regardless of SNAPSHOT_KEEP. Kept below XO's own"
+                echo "# Health-view \"old snapshot\" threshold (30 days) by default."
+                echo "SNAPSHOT_RETENTION_DAYS=14"
+            } >> "$cfg_file"
+        fi
+        CONFIG_VERSION=5
     fi
 
     # Stamp the new schema version.
@@ -2445,11 +2499,21 @@ snapshot_xo_vm() {
     # check -- same auth priority, no separate prompt. If none are
     # configured, skip rather than interrupt an otherwise-automatable
     # update/rebuild with a new credential prompt.
+    #
+    # XO_API_TOKEN, not XO_TASK_CHECK_TOKEN directly: load_config() already
+    # resolves XO_API_TOKEN=${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}, and
+    # every other API call in this script (check_active_xo_tasks, the
+    # template builder) reads that resolved variable. Reading
+    # XO_TASK_CHECK_TOKEN here directly skipped the snapshot silently for
+    # anyone who set only XO_API_TOKEN, the name the config migration itself
+    # documents as current.
     local xo_token=""
-    if [[ -n "${XO_TASK_CHECK_TOKEN:-}" ]]; then
+    if [[ -n "${XO_API_TOKEN:-}" ]]; then
+        xo_token="$XO_API_TOKEN"
+    elif [[ -n "${XO_TASK_CHECK_TOKEN:-}" ]]; then
         xo_token="$XO_TASK_CHECK_TOKEN"
     else
-        log_info "No XO_TASK_CHECK_TOKEN configured -- skipping VM snapshot (file backup still runs)."
+        log_info "No XO_API_TOKEN (or XO_TASK_CHECK_TOKEN) configured -- skipping VM snapshot (file backup still runs)."
         return 0
     fi
 
@@ -2484,6 +2548,106 @@ snapshot_xo_vm() {
     fi
 
     log_success "VM snapshot created: ${snap_name} (visible in XO under this VM's Snapshots tab)"
+
+    prune_xo_vm_snapshots "$vm_uuid" "$xo_token" "$base_url"
+}
+
+# Delete this VM's own pre-update/pre-rebuild snapshots (the "xo-install-"
+# prefix snapshot_xo_vm names them with) once there are more than
+# SNAPSHOT_KEEP or any are older than SNAPSHOT_RETENTION_DAYS.
+#
+# Vates' own XOA updater documents a similar policy for its safety
+# snapshots -- delete after a 7-day retention period on a successful update
+# -- but that isn't reliable in practice: confirmed against a real
+# production XOA where "delete after successful upgrade" snapshots from 11
+# and 13 days earlier were still present, and Vates' docs don't say what
+# mechanism is actually supposed to perform that deletion. So this prunes
+# with its own deterministic pass, synchronously, right after every
+# successful snapshot -- not a background timer that can silently not fire.
+#
+# Only ever touches snapshots this function's own naming scheme created, on
+# this VM. It never deletes a snapshot a user made by hand, or one made by a
+# backup job, however old.
+#
+# Called only from snapshot_xo_vm after a confirmed-successful snapshot, so
+# it inherits the same best-effort, silent-safe posture: any failure here
+# logs a warning and returns 0 rather than failing the update/rebuild that
+# is otherwise already complete.
+prune_xo_vm_snapshots() {
+    local vm_uuid="$1" xo_token="$2" base_url="$3"
+
+    local list_resp
+    list_resp=$(curl -sk --max-time 30 \
+        -b "authenticationToken=${xo_token}" \
+        -G --data-urlencode "filter=\$snapshot_of:${vm_uuid}" \
+        --data-urlencode "fields=id,name_label,snapshot_time" \
+        "${base_url}/rest/v0/vm-snapshots" \
+        2>/dev/null) || true
+
+    if [[ -z "$list_resp" ]]; then
+        log_warning "Could not list VM snapshots for pruning; leaving them as-is."
+        return 0
+    fi
+
+    # "id snapshot_time" lines, our own snapshots only, newest first.
+    # jq preferred, Node.js fallback (guaranteed present on any XO install) --
+    # same pattern check_active_xo_tasks already uses for the same reason.
+    local candidates
+    if command -v jq &>/dev/null; then
+        candidates=$(printf '%s' "$list_resp" | jq -r '
+            [.[] | select(.name_label // "" | startswith("xo-install-"))]
+            | sort_by(-.snapshot_time)
+            | .[] | "\(.id) \(.snapshot_time)"' 2>/dev/null) || candidates=""
+    else
+        # shellcheck disable=SC2016
+        candidates=$(printf '%s' "$list_resp" | node -e '
+            let d = "";
+            process.stdin.on("data", c => d += c);
+            process.stdin.on("end", () => {
+                try {
+                    const a = JSON.parse(d);
+                    const ours = a.filter(s => (s.name_label || "").startsWith("xo-install-"));
+                    ours.sort((x, y) => (y.snapshot_time || 0) - (x.snapshot_time || 0));
+                    process.stdout.write(ours.map(s => `${s.id} ${s.snapshot_time}`).join("\n"));
+                } catch (e) { /* leave candidates empty on any parse error */ }
+            });
+        ' 2>/dev/null) || candidates=""
+    fi
+
+    [[ -z "$candidates" ]] && return 0
+
+    local now_epoch
+    now_epoch=$(date +%s)
+    local max_age=$(( SNAPSHOT_RETENTION_DAYS * 86400 ))
+    local idx=0 deleted=0
+    while IFS=' ' read -r snap_id snap_time; do
+        [[ -z "$snap_id" ]] && continue
+        idx=$(( idx + 1 ))
+
+        local reason=""
+        if (( idx > SNAPSHOT_KEEP )); then
+            reason="beyond SNAPSHOT_KEEP=${SNAPSHOT_KEEP}"
+        elif [[ "$snap_time" =~ ^[0-9]+$ ]] && (( now_epoch - snap_time > max_age )); then
+            reason="older than SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS}"
+        fi
+        [[ -z "$reason" ]] && continue
+
+        local del_code
+        del_code=$(curl -sk --max-time 30 --output /dev/null --write-out "%{http_code}" \
+            -X DELETE \
+            -b "authenticationToken=${xo_token}" \
+            "${base_url}/rest/v0/vm-snapshots/${snap_id}" \
+            2>/dev/null) || del_code=""
+
+        if [[ "$del_code" == "200" || "$del_code" == "202" || "$del_code" == "204" ]]; then
+            deleted=$(( deleted + 1 ))
+            log_info "Pruned old VM snapshot ${snap_id} (${reason})."
+        else
+            log_warning "Could not delete VM snapshot ${snap_id} (HTTP ${del_code:-unreachable}); leaving it."
+        fi
+    done <<< "$candidates"
+
+    [[ $deleted -gt 0 ]] && log_success "Pruned ${deleted} old VM snapshot(s)."
 }
 
 # Create backup
@@ -2543,6 +2707,58 @@ create_backup() {
     log_success "Old backups cleaned"
 }
 
+# Sanity-check a backup directory before restore_xo() destroys the current
+# installation to make room for it. create_backup() copies $INSTALL_DIR as a
+# plain directory tree (not an archive), so "corrupted" here means: an
+# interrupted copy that never finished, a directory that isn't actually an XO
+# checkout, or a git object store too damaged to read HEAD from -- not a
+# checksum mismatch, since there is no single-file checksum to check against.
+#
+# Deliberately conservative: this only refuses backups that are clearly
+# incomplete or broken. A backup that's merely old, or from a different
+# branch/commit than what's about to be reconfigured, is not this function's
+# business -- that's what the backup listing's date/commit columns are for.
+verify_backup_integrity() {
+    local backup_path="$1"
+
+    if [[ ! -d "$backup_path" ]]; then
+        log_error "  ${backup_path} is not a directory."
+        return 1
+    fi
+
+    # package.json at the root is the one file every XO checkout has,
+    # regardless of branch, commit, or how deep the monorepo's packages
+    # directory tree goes -- so its absence means the copy never completed,
+    # or this directory never held an XO checkout at all. This runs as
+    # whatever restore_xo itself is running as (root, per check_not_root
+    # elsewhere), which can always read a path it's about to sudo rm -rf --
+    # so a plain existence test is enough, no sudo -u re-exec needed here.
+    if [[ ! -f "${backup_path}/package.json" ]]; then
+        log_error "  ${backup_path}/package.json is missing."
+        return 1
+    fi
+
+    # If it has a .git directory, HEAD must actually resolve. A backup taken
+    # mid-write (disk full, process killed) can leave a .git directory with a
+    # truncated object store, which every other file in the tree can look
+    # perfectly fine next to.
+    #
+    # git itself does care about ownership here (its "dubious ownership"
+    # safety check), so this one read -- unlike the existence test above --
+    # does run as the backup's own owner, matching how the backup listing
+    # loop above already reads a backup's commit.
+    if [[ -d "${backup_path}/.git" ]]; then
+        local owner
+        owner=$(stat -c '%U' "$backup_path" 2>/dev/null) || owner="root"
+        if ! sudo -u "$owner" git -C "$backup_path" rev-parse HEAD &>/dev/null; then
+            log_error "  ${backup_path}/.git exists but HEAD could not be read."
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # Restore Xen Orchestra from a backup
 restore_xo() {
     if [[ ! -d "$BACKUP_DIR" ]]; then
@@ -2592,16 +2808,23 @@ restore_xo() {
         elif [[ $i -eq $TOTAL_TO_LIST ]]; then
             LABEL=" (oldest)"
         fi
+        local INTEGRITY_TAG=""
+        verify_backup_integrity "$BACKUP" &>/dev/null || INTEGRITY_TAG="  [INCOMPLETE/CORRUPT]"
         if [[ -n "$BACKUP_COMMIT" ]]; then
-            printf "  [%d] %s  (%s)  commit: %s%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$BACKUP_COMMIT" "$LABEL"
+            printf "  [%d] %s  (%s)  commit: %s%s%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$BACKUP_COMMIT" "$LABEL" "$INTEGRITY_TAG"
         else
-            printf "  [%d] %s  (%s)%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$LABEL"
+            printf "  [%d] %s  (%s)%s%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$LABEL" "$INTEGRITY_TAG"
         fi
         ((i++))
     done
 
     local TOTAL=$((i - 1))
     echo ""
+
+    if [[ "$LIST_BACKUPS_ONLY" == "true" ]]; then
+        return 0
+    fi
+
     local CHOICE
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
         if [[ -n "$RESTORE_BACKUP_FILE" ]]; then
@@ -2637,6 +2860,12 @@ restore_xo() {
     local SELECTED_BACKUP="${BACKUPS[$((CHOICE - 1))]}"
     local SELECTED_NAME
     SELECTED_NAME=$(basename "$SELECTED_BACKUP")
+
+    if ! verify_backup_integrity "$SELECTED_BACKUP"; then
+        log_error "Refusing to restore ${SELECTED_NAME}: it does not look like a complete backup."
+        log_error "Pick a different one, or pass --backup-file to select one directly."
+        exit 1
+    fi
 
     echo ""
     log_warning "You are about to restore: $SELECTED_NAME"
@@ -7943,6 +8172,136 @@ show_version() {
     echo "  Based on: https://docs.xen-orchestra.com/install-from-sources"
 }
 
+# A read-only health report: is XO reachable and up to date, is the service
+# running, is the TLS cert about to expire, is there enough disk/swap, is the
+# script/XO git state clean. Makes no changes -- every check here either
+# already exists (menu_gather_info, check_cert_expiry) or reads state the
+# same way those do, just printed on demand instead of only as a side effect
+# of another command.
+show_status() {
+    echo "=============================================="
+    echo "  Xen Orchestra Status"
+    echo "=============================================="
+    echo ""
+
+    # Reuses the exact same commit/version gathering the interactive menu
+    # header uses, so this and the menu can never disagree with each other.
+    menu_gather_info
+
+    echo "Script:"
+    echo "  Commit:  ${MENU_SCRIPT_COMMIT} (branch: ${MENU_SCRIPT_BRANCH:-unknown})"
+    echo "  Master:  ${MENU_SCRIPT_MASTER} (branch: ${MENU_SCRIPT_MASTER_BRANCH:-unknown})"
+    echo ""
+
+    echo "Xen Orchestra:"
+    if [[ "$MENU_XO_COMMIT" == "N/A" ]]; then
+        echo "  Not installed at ${INSTALL_DIR:-/opt/xen-orchestra}."
+    else
+        echo "  Commit:  ${MENU_XO_COMMIT} (branch: ${MENU_XO_BRANCH:-unknown})"
+        if [[ -n "$MENU_XO_BEHIND" ]]; then
+            echo "  Master:  ${MENU_XO_MASTER} -- ${MENU_XO_BEHIND}"
+        else
+            echo "  Master:  ${MENU_XO_MASTER} (up to date)"
+        fi
+    fi
+    echo "  Node:    ${MENU_NODE_VERSION}"
+
+    if command -v systemctl &>/dev/null; then
+        if systemctl is-active --quiet xo-server 2>/dev/null; then
+            echo "  Service: running"
+        elif systemctl is-enabled --quiet xo-server 2>/dev/null; then
+            echo "  Service: not running (enabled)"
+        else
+            echo "  Service: not installed"
+        fi
+    fi
+    echo ""
+
+    # Same cert file and threshold check_cert_expiry uses, just reported
+    # unconditionally here instead of only as a warning when it's close.
+    echo "TLS certificate:"
+    local cert_file="${SSL_CERT_DIR:-/etc/ssl/xo}/${SSL_CERT_FILE:-xo-cert.pem}"
+    if [[ ! -f "$cert_file" ]]; then
+        echo "  Not generated yet (${cert_file})."
+    elif ! command -v openssl &>/dev/null; then
+        echo "  Present (${cert_file}), but openssl is unavailable to check its expiry."
+    else
+        local end_date end_epoch now_epoch days_left
+        end_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+        if [[ -z "$end_date" ]]; then
+            echo "  Present (${cert_file}), but its expiry could not be read."
+        else
+            end_epoch=$(date -d "$end_date" +%s 2>/dev/null) || end_epoch=""
+            if [[ -z "$end_epoch" ]]; then
+                echo "  Present (${cert_file}), but its expiry date could not be parsed."
+            else
+                now_epoch=$(date +%s)
+                days_left=$(( (end_epoch - now_epoch) / 86400 ))
+                if (( days_left < 0 )); then
+                    echo "  EXPIRED $(( -days_left )) day(s) ago (${cert_file})."
+                elif (( days_left < 30 )); then
+                    echo "  Expires in ${days_left} day(s) (${cert_file}) -- run --reconfigure soon."
+                else
+                    echo "  Valid for ${days_left} more day(s)."
+                fi
+            fi
+        fi
+    fi
+    echo ""
+
+    echo "Disk and swap:"
+    local backup_dir="${BACKUP_DIR:-/opt/xo-backups}"
+    # df fails outright on a path that doesn't exist yet (e.g. before the
+    # first --update/--rebuild has ever run) -- fall back to its nearest
+    # existing parent so a fresh install still gets a real number instead of
+    # a blank "could not be read".
+    local df_target="$backup_dir"
+    while [[ ! -e "$df_target" && "$df_target" != "/" ]]; do
+        df_target=$(dirname "$df_target")
+    done
+    local avail_mb
+    avail_mb=$(df -BM --output=avail "$df_target" 2>/dev/null | tail -1 | tr -d ' M') || avail_mb=""
+    if [[ "$avail_mb" =~ ^[0-9]+$ ]]; then
+        if [[ "$df_target" == "$backup_dir" ]]; then
+            echo "  Free space at ${backup_dir}: ${avail_mb}MB"
+        else
+            echo "  Free space at ${df_target} (${backup_dir} doesn't exist yet): ${avail_mb}MB"
+        fi
+    else
+        echo "  Free space at ${backup_dir}: df failed to report it"
+    fi
+    if command -v free &>/dev/null; then
+        local swap_mb
+        swap_mb=$(free -m 2>/dev/null | awk '/^Swap:/ {print $2}') || swap_mb=""
+        if [[ "$swap_mb" =~ ^[0-9]+$ ]]; then
+            echo "  Swap: ${swap_mb}MB"
+        else
+            echo "  Swap: could not be read"
+        fi
+    else
+        echo "  Swap: unknown (the 'free' command is not installed)"
+    fi
+    echo ""
+
+    echo "Backups and snapshots:"
+    local backup_count=0
+    if [[ -d "$backup_dir" ]]; then
+        backup_count=$(find "$backup_dir" -maxdepth 1 -name "xo-backup-*" -type d 2>/dev/null | wc -l)
+    fi
+    echo "  File backups in ${backup_dir}: ${backup_count} (keeping ${BACKUP_KEEP:-5})"
+    echo "  VM snapshot pruning: keep ${SNAPSHOT_KEEP:-3}, max ${SNAPSHOT_RETENTION_DAYS:-14} day(s)"
+    echo ""
+
+    echo "Git working tree:"
+    if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
+        if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+            echo "  This script's checkout has uncommitted changes."
+        else
+            echo "  This script's checkout is clean."
+        fi
+    fi
+}
+
 show_help() {
     echo "Xen Orchestra Installation Script"
     echo ""
@@ -7962,6 +8321,8 @@ show_help() {
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
     echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
+    echo "  --status               Read-only health report: version, service, TLS cert,"
+    echo "                         disk/swap, backups/snapshots, git state. Makes no changes."
     echo "  --version              Show this script's version and branch, then exit"
     echo "  --help                 Show this help message"
     echo ""
@@ -7969,6 +8330,8 @@ show_help() {
     echo "  --non-interactive      Bypass all interactive prompts; use config defaults"
     echo "  --yes                  Alias for --non-interactive"
     echo "  --backup-file NAME     With --restore: select specific backup by directory name"
+    echo "  --list-backups         With --restore: list available backups (with an integrity"
+    echo "                         check on each) and exit, without prompting to restore"
     echo "  --dry-run, --check     Show what would be done without making any changes"
     echo "  --log-file PATH        Append log output to PATH (plain-text by default)"
     echo "  --json-logs            Write structured JSON lines to --log-file instead of plain text"
@@ -12555,6 +12918,9 @@ main() {
                 shift
                 RESTORE_BACKUP_FILE="${1:-}"
                 ;;
+            --list-backups)
+                LIST_BACKUPS_ONLY=true
+                ;;
             --log-file)
                 shift
                 LOG_FILE="${1:-}"
@@ -12570,7 +12936,7 @@ main() {
                 show_version
                 exit 0
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--status|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -12610,8 +12976,10 @@ main() {
     # Acquire exclusive lock for all mutating operations (not --help).
     # --deploy is excluded: it changes nothing on this machine, and holding the
     # install lock for the length of a remote deploy would block unrelated
-    # local operations for no reason.
-    if [[ "$OPERATION" != "--help" ]] && [[ "$OPERATION" != "--deploy" ]]; then
+    # local operations for no reason. --status is excluded for the same
+    # reason: it only reads state to report it, so it should never have to
+    # wait on -- or block -- a real install/update/rebuild in progress.
+    if [[ "$OPERATION" != "--help" ]] && [[ "$OPERATION" != "--deploy" ]] && [[ "$OPERATION" != "--status" ]]; then
         acquire_lock
     fi
 
@@ -12702,6 +13070,12 @@ main() {
             ;;
         --uninstall)
             cleanup_xo
+            ;;
+        --status)
+            check_required_commands
+            check_not_root
+            load_config
+            show_status
             ;;
         --help)
             show_help
