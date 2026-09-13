@@ -50,6 +50,19 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Opening the interactive menu now migrates `xo-config.cfg` to the latest
+  schema immediately, instead of waiting for an operation to be picked from
+  it.** `run_menu()` read the config with a plain `source` for header display
+  only, bypassing `load_config()` (and therefore `migrate_config()`) entirely
+  — every other entry point (`--update`, `--rebuild`, `--reconfigure`,
+  `--proxy`, `--build-templates`, `--status`) already calls `load_config()`
+  and migrates on the spot, but a menu session that never selected one of
+  those stayed on whatever schema version the file was already at. Now
+  `run_menu()` calls `load_config()` when `xo-config.cfg` exists, same as
+  every other operation; a missing config still falls back to sourcing
+  `sample-xo-config.cfg` so the menu remains reachable for a first-time setup
+  with no config file yet.
+
 - **CI's ShellCheck job was failing on `dev`** (SC2155, "declare and assign
   separately to avoid masking return values") at two call sites this
   session's own changes added: the snapshot name in `snapshot_xo_vm()` and

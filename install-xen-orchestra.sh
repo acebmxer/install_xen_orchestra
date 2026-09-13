@@ -12727,9 +12727,15 @@ process_menu_selections() {
 
 # Run the interactive menu
 run_menu() {
-    # Load config silently for header info (don't error if missing)
+    # Run the same load_config() every operation runs, so an existing
+    # xo-config.cfg is migrated to the latest schema just from opening the
+    # menu -- not only once an operation is picked from it. This is a no-op
+    # (source and default-fill only) when there is no config file yet, so a
+    # first-time user with neither xo-config.cfg nor sample-xo-config.cfg
+    # still gets the menu, from which "Rename Sample-xo-config.cfg" and
+    # "Edit xo-config.cfg" are reachable.
     if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE" 2>/dev/null || true
+        load_config
     elif [[ -f "$SAMPLE_CONFIG" ]]; then
         source "$SAMPLE_CONFIG" 2>/dev/null || true
     fi
