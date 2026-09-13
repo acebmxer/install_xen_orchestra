@@ -7,7 +7,7 @@
 [![Issues](https://img.shields.io/github/issues/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/issues)
 [![Stars](https://img.shields.io/github/stars/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/stargazers)
 [![Forks](https://img.shields.io/github/forks/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/forks)
-[![Unique cloners](https://img.shields.io/badge/unique%20cloners-101-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
+[![Unique cloners](https://img.shields.io/badge/unique%20cloners-148-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
 [![Tests](https://img.shields.io/badge/tests-391%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
@@ -75,6 +75,29 @@ Orchestra](https://xen-orchestra.com/) from source.
 | Update-safety task detection and REST API auth | [docs/authentication.md](docs/authentication.md) |
 | Something went wrong | [docs/troubleshooting.md](docs/troubleshooting.md) |
 | Code style, tests, releases | [CONTRIBUTING.md](CONTRIBUTING.md) |
+
+## Relationship to Vates' own documentation
+
+For the three core actions — **installing** Xen Orchestra, **updating** it,
+and deploying an **XO Proxy** — this script's actual mechanics follow Vates'
+own documented method exactly:
+
+- Install: the same build-from-source steps as
+  [docs.xen-orchestra.com/install-from-sources](https://docs.xen-orchestra.com/install-from-sources)
+  (Node.js latest LTS, the same system packages, the same build commands).
+- Update: the same `git pull && yarn && yarn build` Vates documents.
+- XO Proxy: the same `wget -qO- https://xoa.io/proxy/deploy | bash` one-liner
+  Vates publishes — this script only automates typing it over SSH.
+
+Everything beyond that — the pre-update/rebuild VM snapshot, the file
+backup, the TLS certificate expiry warning, the Node.js download checksum
+verification, file-permission hardening on generated config and swap
+files — is this project's **own addition**, layered on top of Vates'
+method. None of it is documented or required by Vates, and none of it
+changes or replaces the core action itself; it only adds safety nets
+around it. Where Vates' docs are silent (as with all of the above), this
+script's choices are its own engineering judgment, not a claim of official
+backing.
 
 ## Available Functions
 

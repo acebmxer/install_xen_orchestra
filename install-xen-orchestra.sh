@@ -254,7 +254,16 @@ check_git() {
     fi
 }
 
-# Self-update the installation script from git
+# Self-update the installation script from git.
+#
+# Trust note: this fetches and fast-forwards from `origin` over HTTPS (TLS
+# protects the transfer, git's object hashing protects against corruption)
+# but does not verify a GPG signature on the commits/tags it pulls -- there
+# is currently nothing to verify them against, since this repo doesn't sign
+# its commits or tags. Anyone who can push to `origin`, or sit on the path
+# between this machine and it with a way to bypass TLS, can change what this
+# function pulls in and immediately re-execs. Treat `origin` the same as you
+# would any other unattended `git pull` you run as part of provisioning.
 self_update_script() {
     # Skip self-update if XO_NO_SELF_UPDATE is set
     if [[ "${XO_NO_SELF_UPDATE:-0}" == "1" ]]; then
@@ -408,7 +417,7 @@ load_config() {
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
     TURBO_CACHE_ENABLED=${TURBO_CACHE_ENABLED:-true}
-    NODE_VERSION=${NODE_VERSION:-24.15.0}
+    NODE_VERSION=${NODE_VERSION:-24.21.0}
     SERVICE_USER=${SERVICE_USER:-root}
     DEBUG_MODE=${DEBUG_MODE:-false}
     BIND_ADDRESS=${BIND_ADDRESS:-0.0.0.0}
@@ -438,6 +447,35 @@ load_config() {
     # Migrate config schema if needed, then validate
     migrate_config "$CONFIG_FILE"
     validate_config
+    check_cert_expiry
+}
+
+# Warn if the TLS certificate xo-server presents is close to expiring.
+# Every operation that calls load_config() hits this, so it fires on
+# --update, --restore, --rebuild, --reconfigure and --proxy without needing
+# its own hook. Best-effort: a missing cert (not generated yet), a missing
+# openssl, or an unparseable date all just skip the check rather than fail
+# the run -- this is a nag, not a precondition.
+check_cert_expiry() {
+    local cert_file="${SSL_CERT_DIR}/${SSL_CERT_FILE}"
+    [[ -f "$cert_file" ]] || return 0
+    command -v openssl >/dev/null 2>&1 || return 0
+
+    local end_date end_epoch now_epoch days_left
+    end_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+    [[ -n "$end_date" ]] || return 0
+    end_epoch=$(date -d "$end_date" +%s 2>/dev/null) || return 0
+    now_epoch=$(date +%s)
+    days_left=$(( (end_epoch - now_epoch) / 86400 ))
+
+    if (( days_left < 0 )); then
+        log_warning "TLS certificate (${cert_file}) expired $(( -days_left )) day(s) ago."
+        log_warning "  Browsers and API clients will reject it outright. Regenerate: delete"
+        log_warning "  the files in ${SSL_CERT_DIR} and run --reconfigure."
+    elif (( days_left < 30 )); then
+        log_warning "TLS certificate (${cert_file}) expires in ${days_left} day(s)."
+        log_warning "  Regenerate before then: delete the files in ${SSL_CERT_DIR} and run --reconfigure."
+    fi
 }
 
 # Validate configuration values
@@ -985,6 +1023,44 @@ version_satisfies() {
     return 1
 }
 
+# Verify a downloaded Node.js tarball against the SHA-256 digest nodejs.org
+# publishes for that release, the same way deploy_verify_image_checksum
+# verifies template images against their origin's published checksums.
+# Usage: verify_nodejs_checksum "22.3.0" "node-v22.3.0-linux-x64.tar.xz" "/path/to/file"
+verify_nodejs_checksum() {
+    local full_version="$1" filename="$2" file_path="$3"
+
+    local sums_url="https://nodejs.org/dist/v${full_version}/SHASUMS256.txt"
+    local sums
+    sums=$(curl -fsSL --max-time 60 "$sums_url" 2>/dev/null | tr -d '\r') || true
+    if [[ -z "$sums" ]]; then
+        log_warning "  could not fetch ${sums_url}; skipping checksum verification."
+        return 0
+    fi
+
+    # Lines are "<digest>  <name>", coreutils sha256sum format.
+    local want
+    want=$(awk -v f="$filename" '$2 == f { print $1; exit }' <<< "$sums")
+    if [[ ! "$want" =~ ^[a-fA-F0-9]{64}$ ]]; then
+        log_warning "  no published SHASUMS256.txt entry for ${filename}; skipping checksum verification."
+        return 0
+    fi
+
+    local got
+    got=$(sha256sum "$file_path" | awk '{print $1}')
+    if [[ "${got,,}" != "${want,,}" ]]; then
+        log_error "The downloaded Node.js tarball does not match its published checksum."
+        log_error "  expected: ${want,,}"
+        log_error "  actual:   ${got,,}"
+        log_error "Refusing to install it. This is a corrupted download or the wrong"
+        log_error "file; if it repeats, treat the mirror as suspect."
+        return 1
+    fi
+
+    log_success "  Node.js tarball checksum verified"
+    return 0
+}
+
 # Download and install a specific Node.js version from nodejs.org.
 # Usage: install_nodejs_binary "22.3"
 # Normalises 22.3 → v22.3.0 and downloads the linux binary tarball.
@@ -1026,6 +1102,11 @@ install_nodejs_binary() {
     chmod 700 "$TMP_DIR"
 
     if ! curl -fsSL "$URL" -o "${TMP_DIR}/${FILENAME}"; then
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    if ! verify_nodejs_checksum "$FULL_VERSION" "$FILENAME" "${TMP_DIR}/${FILENAME}"; then
         rm -rf "$TMP_DIR"
         return 1
     fi
@@ -1531,7 +1612,12 @@ ensure_swap_space() {
         run_cmd sudo rm -f "$SWAP_FILE"
     fi
 
-    # Create swap file
+    # Create swap file. Touch it with mode 600 *before* allocating into it --
+    # fallocate/dd create the file at the process umask (typically 644,
+    # world-readable) and swap contents can include sensitive process memory,
+    # so a chmod after allocation leaves a window where the file is readable
+    # by any local user while it's being filled.
+    run_cmd sudo install -m 600 /dev/null "$SWAP_FILE"
     run_cmd sudo fallocate -l "${MIN_SWAP_MB}M" "$SWAP_FILE" 2>/dev/null || run_cmd sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$MIN_SWAP_MB" status=progress
     run_cmd sudo chmod 600 "$SWAP_FILE"
     run_cmd sudo mkswap "$SWAP_FILE"
@@ -1957,6 +2043,9 @@ fi)
 mountsDir = '/run/xo-server/mounts'
 useSudo = true
 EOF
+    # config.toml can hold Redis credentials (REDIS_URI) in plaintext, so it
+    # must not be left at tee's default world-readable mode.
+    run_cmd sudo chmod 600 "$XO_CONFIG_FILE"
     fi # end DRY_RUN check
 
     # Set ownership if service user is defined
@@ -2296,6 +2385,105 @@ get_installed_commit() {
 # Get remote commit
 get_remote_commit() {
     git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/"$GIT_BRANCH" 2>/dev/null | cut -f1
+}
+
+# Snapshot the XO VM itself via XO's REST API, so a bad update/rebuild can be
+# rolled back from a normal VM snapshot in the UI -- the same recovery path
+# as any other VM, and unlike create_backup() below, one that also covers
+# the VM's disk as a whole (Redis included: pool connections, users, jobs,
+# settings), not just $INSTALL_DIR.
+#
+# This does NOT necessarily cover ENCRYPT_REDIS_CREDENTIALS's XenStore key
+# half (vm-data/xo-encryption-key): whether a XAPI VM snapshot preserves
+# xenstore-data is not something either XO's or XCP-ng's docs state one way
+# or the other, so it is not claimed here. Treat this the same as
+# create_backup() for that purpose -- the config export documented under
+# ENCRYPT_REDIS_CREDENTIALS is still the only confirmed recovery artifact
+# for the key.
+#
+# This is this project's own safety net, not something XO's own docs ask
+# for: upstream's documented update-from-sources procedure is `git pull`,
+# `yarn`, `yarn build` -- no pre-update snapshot or backup step. The request
+# shape here (cookie authenticationToken, POST .../actions/snapshot?sync=true,
+# {"name_label": ...} body) matches docs.xen-orchestra.com/automation/restapi
+# and was checked against a live instance's own swagger.json.
+#
+# Best-effort and silent-safe by design, same posture as check_active_xo_tasks:
+# this only works when XO is itself a Xen guest (bare metal and other
+# hypervisors have nothing to snapshot), needs the guest's own UUID to be
+# readable, and needs the same admin-level API access the task check already
+# requires. Any of those being unavailable is not an error -- it just means
+# this run proceeds with the file backup only, which is what every version
+# of this script has done until now.
+#
+# The VM's own UUID is read from /sys/hypervisor/uuid rather than via
+# xenstore-read: it's a stable Linux kernel sysfs ABI (documented at
+# kernel.org/doc/Documentation/ABI/stable/sysfs-hypervisor-xen, present
+# since 2.6.30), needs no guest-tools package, needs no elevated
+# permissions, and XCP-ng/XO forum guidance points at this exact file as
+# the one that reliably matches the UUID XO's own API uses -- unlike
+# dmidecode's product UUID, which the same guidance warns can disagree with
+# it over byte-order.
+snapshot_xo_vm() {
+    local label="$1"  # e.g. "pre-update" or "pre-rebuild"
+
+    local virt_type
+    virt_type=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+    if [[ "$virt_type" != "xen" ]]; then
+        log_info "Not running as a Xen guest -- skipping VM snapshot (file backup still runs)."
+        return 0
+    fi
+
+    local vm_uuid
+    vm_uuid=$(cat /sys/hypervisor/uuid 2>/dev/null) || vm_uuid=""
+    if [[ -z "$vm_uuid" ]]; then
+        log_warning "Could not read this VM's UUID from /sys/hypervisor/uuid -- skipping VM snapshot."
+        return 0
+    fi
+
+    # Reuse whichever XO credentials are already configured for the task
+    # check -- same auth priority, no separate prompt. If none are
+    # configured, skip rather than interrupt an otherwise-automatable
+    # update/rebuild with a new credential prompt.
+    local xo_token=""
+    if [[ -n "${XO_TASK_CHECK_TOKEN:-}" ]]; then
+        xo_token="$XO_TASK_CHECK_TOKEN"
+    else
+        log_info "No XO_TASK_CHECK_TOKEN configured -- skipping VM snapshot (file backup still runs)."
+        return 0
+    fi
+
+    local snap_name="xo-install-${label}-$(date -u +%Y%m%d_%H%M%S)"
+    local resp_file http_code base_url proto port connected=false
+    resp_file=$(mktemp /tmp/xo-snap-resp-XXXXXX)
+
+    for proto in https http; do
+        if [[ "$proto" == "https" ]]; then port="$HTTPS_PORT"; else port="$HTTP_PORT"; fi
+        base_url="${proto}://localhost:${port}"
+        local curl_opts=(-s --max-time 30 --output "$resp_file" --write-out "%{http_code}")
+        [[ "$proto" == "https" ]] && curl_opts+=(-k)
+
+        http_code=$(curl "${curl_opts[@]}" -X POST \
+            -b "authenticationToken=${xo_token}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name_label\": \"${snap_name}\"}" \
+            "${base_url}/rest/v0/vms/${vm_uuid}/actions/snapshot?sync=true" \
+            2>/dev/null) || true
+
+        if [[ "$http_code" == "200" || "$http_code" == "201" || "$http_code" == "202" ]]; then
+            connected=true
+            break
+        fi
+    done
+
+    rm -f "$resp_file"
+
+    if [[ "$connected" != "true" ]]; then
+        log_warning "Could not snapshot the XO VM (HTTP ${http_code:-unreachable}) -- continuing with file backup only."
+        return 0
+    fi
+
+    log_success "VM snapshot created: ${snap_name} (visible in XO under this VM's Snapshots tab)"
 }
 
 # Create backup
@@ -2929,6 +3117,7 @@ update_xo() {
 
     # Create backup
     create_backup
+    snapshot_xo_vm "pre-update"
 
     # Update repository
     log_info "Pulling latest changes..."
@@ -3065,6 +3254,7 @@ rebuild_xo() {
 
     # Backup current installation (node_modules excluded, same as update)
     create_backup
+    snapshot_xo_vm "pre-rebuild"
 
     # Wipe current installation directory
     log_info "Removing current installation directory..."
@@ -3186,7 +3376,11 @@ reconfigure_xo() {
     # Backup current config file
     if [[ -f "/etc/xo-server/config.toml" ]]; then
         log_info "Backing up current configuration..."
-        run_cmd sudo cp /etc/xo-server/config.toml "/etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)"
+        local CONFIG_BACKUP="/etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)"
+        run_cmd sudo cp /etc/xo-server/config.toml "$CONFIG_BACKUP"
+        # cp doesn't preserve mode by default -- the backup can hold the same
+        # Redis credentials as the file it's copied from, so lock it down too.
+        run_cmd sudo chmod 600 "$CONFIG_BACKUP"
         log_success "Backup created"
     fi
 
@@ -3531,13 +3725,22 @@ install_xo_proxy() {
     TEMP_SCRIPT=$(mktemp --tmpdir xo-proxy-XXXXXX)
     cp "$HELPER_SCRIPT" "$TEMP_SCRIPT"
     chmod 700 "$TEMP_SCRIPT"
+    # Matches deploy_cleanup/tpl_cleanup elsewhere: an EXIT trap so a failure
+    # between here and the explicit rm below (a signal, a parsing error under
+    # set -euo pipefail) doesn't leave a copy of the helper script in /tmp.
+    trap 'rm -f "$TEMP_SCRIPT"' EXIT
 
     # Run the expect script
     log_info "Starting XO Proxy installer on Pool Master..."
     log_info "This may take several minutes..."
     echo ""
 
-    OUTPUT=$("$TEMP_SCRIPT" "$POOL_MASTER_IP" "$HOST_USERNAME" "$HOST_PASSWORD" "$PROXY_IP" "$NTP_SERVER" "$XO_USERNAME" "$XO_PASSWORD" 2>&1 | tee /dev/tty)
+    # Passwords go via environment, not argv: a process's command line is
+    # readable by any other local user (ps, /proc/<pid>/cmdline) for as long
+    # as it runs, while its environment is not. Matches the SSHPASS/-e
+    # pattern used for the sshpass calls elsewhere in this script.
+    OUTPUT=$(XO_HELPER_HOST_PASSWORD="$HOST_PASSWORD" XO_HELPER_XO_PASSWORD="$XO_PASSWORD" \
+        "$TEMP_SCRIPT" "$POOL_MASTER_IP" "$HOST_USERNAME" "$PROXY_IP" "$NTP_SERVER" "$XO_USERNAME" 2>&1 | tee /dev/tty)
 
     # Extract values from output (look after CAPTURED_VALUES marker)
     ACTUAL_PROXY_IP=$(echo "$OUTPUT" | grep "^PROXY_IP=" | tail -1 | cut -d'=' -f2)
@@ -3546,6 +3749,7 @@ install_xo_proxy() {
 
     # Clean up temp script
     rm -f "$TEMP_SCRIPT"
+    trap - EXIT
 
     # Use user-specified IP if not captured
     if [[ -z "$ACTUAL_PROXY_IP" ]]; then
@@ -3596,6 +3800,7 @@ install_xo_proxy() {
     # Create a temporary expect script for xo-cli registration
     XO_CLI_SCRIPT=$(mktemp --tmpdir xo-cli-XXXXXX)
     chmod 700 "$XO_CLI_SCRIPT"
+    trap 'rm -f "$XO_CLI_SCRIPT"' EXIT
     cat > "$XO_CLI_SCRIPT" << 'XO_CLI_EXPECT_END'
 #!/usr/bin/expect -f
 
@@ -3626,10 +3831,12 @@ XO_CLI_EXPECT_END
         log_warning "Failed to register xo-cli automatically"
         log_info "Please run manually: xo-cli --register http://localhost"
         rm -f "$XO_CLI_SCRIPT"
+        trap - EXIT
         exit 1
     fi
 
     rm -f "$XO_CLI_SCRIPT"
+    trap - EXIT
 
     # Register the proxy with Xen Orchestra
     log_info "Registering XO Proxy with Xen Orchestra..."

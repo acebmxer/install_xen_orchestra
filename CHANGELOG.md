@@ -10,7 +10,94 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **Node.js binary downloads are now checksum-verified; two temp files used
+  by XO Proxy install could leak on a mid-run failure.** Found in a follow-up
+  security audit. `install_nodejs_binary()` downloaded the Node.js tarball
+  straight from `nodejs.org` and extracted it as root with no integrity check
+  at all — every other download in this script (VM template images) verifies
+  against a published checksum, but this one path had no equivalent. It now
+  fetches nodejs.org's own `SHASUMS256.txt` for that release and verifies the
+  tarball's SHA-256 against it before extraction, the same way
+  `deploy_verify_image_checksum()` already verifies template images; a
+  mismatch or corrupted download is refused rather than installed. The
+  `NODE_VERSION` fallback default was also bumped from a stale pinned patch
+  (24.15.0) to the current latest LTS (24.21.0) — this only affects a config
+  with `NODE_VERSION` unset entirely, since the shipped sample config already
+  pins the major version only. Separately, `install_xo_proxy()` created two
+  temporary `expect` scripts (`xo-proxy-XXXXXX`, `xo-cli-XXXXXX`) and removed
+  them with a plain `rm -f` later in the function; under `set -euo pipefail`,
+  any failure in between (a parsing error, a signal) skipped that line and
+  left a copy of the helper script behind in `/tmp`. Both now use an `EXIT`
+  trap for cleanup, matching the pattern `deploy_cleanup`/`tpl_cleanup`
+  already use elsewhere in the script.
+
+- **Hardened credential and file-permission handling found in a security
+  audit.** The XO Proxy helper (`xo-proxy-helper.exp`) received the pool
+  master's SSH password and the XO web UI password as command-line
+  arguments, which are readable by any other local user via `ps` or
+  `/proc/<pid>/cmdline` for as long as the process runs; it now reads them
+  from the environment (`XO_HELPER_HOST_PASSWORD`, `XO_HELPER_XO_PASSWORD`),
+  matching the `SSHPASS`/`-e` pattern the rest of the script already uses.
+  The same helper piped Vates' XO Proxy installer straight into `bash` on
+  the pool master (`bash -c "$(wget -qO- ...)"`); it now downloads it to a
+  file and runs that, so there is a copy on disk to inspect, the same
+  reasoning already applied to the NodeSource setup script. `/etc/xo-server/
+  config.toml`, which can hold a Redis URI with an embedded password, was
+  written with no explicit mode and inherited `tee`'s default (typically
+  world-readable); it and its timestamped backup copy are now `chmod 600`
+  immediately after being written. The swap file created under low-memory
+  conditions was `fallocate`/`dd`-written before being `chmod 600`'d,
+  leaving a window where it was readable by any local user while being
+  filled with process memory contents; it's now created pre-locked with
+  `install -m 600` before anything is written into it. Self-update
+  (`self_update_script`, `git pull --ff-only` / `reset --hard` from
+  `origin`) now documents in a comment that it trusts `origin` with no
+  commit/tag signature verification, since this repo doesn't currently sign
+  either — no behaviour change, this closes a gap where the trust boundary
+  was undocumented.
+
 ### Added
+
+- **`--update` and `--rebuild` now snapshot the XO VM itself before touching
+  anything, alongside the existing file backup.** `create_backup()` only ever
+  copied `$INSTALL_DIR` (the source/build tree) — it never covered the VM's
+  disk as a whole, including Redis, where pool connections, users, jobs and
+  settings actually live. The new `snapshot_xo_vm()` calls XO's REST API
+  (`POST /vms/{id}/actions/snapshot`, matching
+  docs.xen-orchestra.com/automation/restapi and checked against a live
+  instance's own swagger.json) to take a normal VM snapshot, visible in XO's
+  UI under the VM's own Snapshots tab like any other. This only works when
+  XO is itself a Xen guest — bare metal and other hypervisors have nothing to
+  snapshot — and reuses whichever `XO_TASK_CHECK_TOKEN` is already configured
+  for the pre-update task check, so it needs no new credentials. The VM's own
+  UUID is read from `/sys/hypervisor/uuid`, a stable Linux kernel sysfs ABI
+  present since 2.6.30 that needs no guest-tools package — XCP-ng/XO forum
+  guidance points at this exact file as the one that reliably matches the
+  UUID XO's own API uses, unlike `dmidecode`'s product UUID, which can
+  disagree with it over byte-order. Best-effort throughout: not a Xen guest,
+  an unreadable `/sys/hypervisor/uuid`, no configured token, or an
+  unreachable API all just skip the snapshot silently and let the existing
+  file backup run alone, exactly as every prior version did. It does **not**
+  necessarily cover `ENCRYPT_REDIS_CREDENTIALS`'s XenStore key half — whether
+  a XAPI snapshot preserves `vm-data` is undocumented upstream, so this is
+  not claimed as a fix for that; the config export already documented under
+  `ENCRYPT_REDIS_CREDENTIALS` remains the only confirmed recovery artifact
+  for the key. This is this project's own safety net on top of XO's
+  documented update procedure (`git pull && yarn && yarn build`), which does
+  not itself call for a pre-update backup or snapshot.
+
+- **A warning when the TLS certificate is close to expiring.** `SSL_CERT_DAYS`
+  stays 825 by default (the CA/Browser Forum's historical ceiling for a
+  public certificate — still the right default and unchanged by this), but
+  nothing previously told an operator their self-signed cert was approaching
+  that date. `check_cert_expiry()` runs as part of `load_config()`, so it
+  fires on `--update`, `--restore`, `--rebuild`, `--reconfigure`, `--proxy`
+  and `--build-templates` without a separate hook, and warns once the
+  certificate has fewer than 30 days left (or has already expired), naming
+  the exact remediation already documented for `SSL_CERT_DAYS`: delete the
+  files in `SSL_CERT_DIR` and run `--reconfigure`.
 
 - **Rocky Linux 8, 9 and 10 templates.** All three rows already named a
   published image but had no preparation script, so the menu drew them as

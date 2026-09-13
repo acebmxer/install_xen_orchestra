@@ -6,13 +6,19 @@ on:
   pull_request:
     branches: ["**"]
 
+# This workflow only checks out the repo, lints, and runs tests -- it never
+# pushes or otherwise writes back, so the default token gets read-only access
+# rather than the broader default GitHub grants an unscoped workflow.
+permissions:
+  contents: read
+
 jobs:
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
@@ -25,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # This project ships a shell script, not a container image, so there is
       # no `trivy image` target and no dependency manifest for a vuln scan to
@@ -46,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install bats-core and test tools
         # genisoimage is what tpl_build_prep_drive uses to build the cloud-init
@@ -104,7 +110,7 @@ jobs:
             dockerfile: tests/integration/Dockerfile.centosstream9
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build integration image (${{ matrix.distro }})
         run: docker build -f ${{ matrix.dockerfile }} -t xo-test-${{ matrix.distro }} .
