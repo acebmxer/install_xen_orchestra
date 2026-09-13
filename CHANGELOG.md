@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-13
+
 ### Added
 
 - **Pre-update/pre-rebuild VM snapshots are now pruned automatically, and a
@@ -47,6 +49,65 @@ This installer builds Xen Orchestra from source and tracks the official
   limits, and whether the script's own git checkout is clean. It makes no
   changes and needs no lock, so it can be run any time, including while
   another operation is in progress.
+
+- **`--update` and `--rebuild` now snapshot the XO VM itself before touching
+  anything, alongside the existing file backup.** `create_backup()` only ever
+  copied `$INSTALL_DIR` (the source/build tree) — it never covered the VM's
+  disk as a whole, including Redis, where pool connections, users, jobs and
+  settings actually live. The new `snapshot_xo_vm()` calls XO's REST API
+  (`POST /vms/{id}/actions/snapshot`, matching
+  docs.xen-orchestra.com/automation/restapi and checked against a live
+  instance's own swagger.json) to take a normal VM snapshot, visible in XO's
+  UI under the VM's own Snapshots tab like any other. This only works when
+  XO is itself a Xen guest — bare metal and other hypervisors have nothing to
+  snapshot — and reuses whichever `XO_TASK_CHECK_TOKEN` is already configured
+  for the pre-update task check, so it needs no new credentials. The VM's own
+  UUID is read from `/sys/hypervisor/uuid`, a stable Linux kernel sysfs ABI
+  present since 2.6.30 that needs no guest-tools package — XCP-ng/XO forum
+  guidance points at this exact file as the one that reliably matches the
+  UUID XO's own API uses, unlike `dmidecode`'s product UUID, which can
+  disagree with it over byte-order. Best-effort throughout: not a Xen guest,
+  an unreadable `/sys/hypervisor/uuid`, no configured token, or an
+  unreachable API all just skip the snapshot silently and let the existing
+  file backup run alone, exactly as every prior version did. It does **not**
+  necessarily cover `ENCRYPT_REDIS_CREDENTIALS`'s XenStore key half — whether
+  a XAPI snapshot preserves `vm-data` is undocumented upstream, so this is
+  not claimed as a fix for that; the config export already documented under
+  `ENCRYPT_REDIS_CREDENTIALS` remains the only confirmed recovery artifact
+  for the key. This is this project's own safety net on top of XO's
+  documented update procedure (`git pull && yarn && yarn build`), which does
+  not itself call for a pre-update backup or snapshot.
+
+- **A warning when the TLS certificate is close to expiring.** `SSL_CERT_DAYS`
+  stays 825 by default (the CA/Browser Forum's historical ceiling for a
+  public certificate — still the right default and unchanged by this), but
+  nothing previously told an operator their self-signed cert was approaching
+  that date. `check_cert_expiry()` runs as part of `load_config()`, so it
+  fires on `--update`, `--restore`, `--rebuild`, `--reconfigure`, `--proxy`
+  and `--build-templates` without a separate hook, and warns once the
+  certificate has fewer than 30 days left (or has already expired), naming
+  the exact remediation already documented for `SSL_CERT_DAYS`: delete the
+  files in `SSL_CERT_DIR` and run `--reconfigure`.
+
+- **Rocky Linux 8, 9 and 10 templates.** All three rows already named a
+  published image but had no preparation script, so the menu drew them as
+  **Coming Soon...** and refused to build them. They now run `tpl_prep_rhel`,
+  the same script the AlmaLinux and CentOS Stream rows use rather than a copy,
+  since it is the same family. Each image was read: 8.10, 9.8 and 10.2 all have
+  a 10 GiB virtual disk, default user `rocky` with `lock_passwd: True`, and an
+  EFI system partition, so nothing about them is a special case — 8 takes the
+  same no-`Include`-line sshd handling as AlmaLinux 8, 9 and 10 the drop-in
+  branch. Every row in the catalogue is now buildable; nothing is marked
+  **Coming Soon...**. Rocky 8 was built and booted on a real pool; 9 and 10
+  were verified from their images only.
+
+- **`--build-templates` works from any common workstation distro.**
+  `detect_package_manager` recognised only `apt`, `dnf` and `yum` and `exit`ed
+  otherwise, so on Arch, CachyOS, openSUSE or Alpine the `xorriso` auto-install
+  died and — with the change below — so would the `qemu-img` one. It now also
+  detects `pacman`, `zypper` and `apk`, and reports failure instead of exiting
+  so a caller that can carry on (the API build path falls back to SSH) is not
+  taken down with it.
 
 ### Fixed
 
@@ -158,71 +219,6 @@ This installer builds Xen Orchestra from source and tracks the official
   commit/tag signature verification, since this repo doesn't currently sign
   either — no behaviour change, this closes a gap where the trust boundary
   was undocumented.
-
-### Added
-
-- **`--update` and `--rebuild` now snapshot the XO VM itself before touching
-  anything, alongside the existing file backup.** `create_backup()` only ever
-  copied `$INSTALL_DIR` (the source/build tree) — it never covered the VM's
-  disk as a whole, including Redis, where pool connections, users, jobs and
-  settings actually live. The new `snapshot_xo_vm()` calls XO's REST API
-  (`POST /vms/{id}/actions/snapshot`, matching
-  docs.xen-orchestra.com/automation/restapi and checked against a live
-  instance's own swagger.json) to take a normal VM snapshot, visible in XO's
-  UI under the VM's own Snapshots tab like any other. This only works when
-  XO is itself a Xen guest — bare metal and other hypervisors have nothing to
-  snapshot — and reuses whichever `XO_TASK_CHECK_TOKEN` is already configured
-  for the pre-update task check, so it needs no new credentials. The VM's own
-  UUID is read from `/sys/hypervisor/uuid`, a stable Linux kernel sysfs ABI
-  present since 2.6.30 that needs no guest-tools package — XCP-ng/XO forum
-  guidance points at this exact file as the one that reliably matches the
-  UUID XO's own API uses, unlike `dmidecode`'s product UUID, which can
-  disagree with it over byte-order. Best-effort throughout: not a Xen guest,
-  an unreadable `/sys/hypervisor/uuid`, no configured token, or an
-  unreachable API all just skip the snapshot silently and let the existing
-  file backup run alone, exactly as every prior version did. It does **not**
-  necessarily cover `ENCRYPT_REDIS_CREDENTIALS`'s XenStore key half — whether
-  a XAPI snapshot preserves `vm-data` is undocumented upstream, so this is
-  not claimed as a fix for that; the config export already documented under
-  `ENCRYPT_REDIS_CREDENTIALS` remains the only confirmed recovery artifact
-  for the key. This is this project's own safety net on top of XO's
-  documented update procedure (`git pull && yarn && yarn build`), which does
-  not itself call for a pre-update backup or snapshot.
-
-- **A warning when the TLS certificate is close to expiring.** `SSL_CERT_DAYS`
-  stays 825 by default (the CA/Browser Forum's historical ceiling for a
-  public certificate — still the right default and unchanged by this), but
-  nothing previously told an operator their self-signed cert was approaching
-  that date. `check_cert_expiry()` runs as part of `load_config()`, so it
-  fires on `--update`, `--restore`, `--rebuild`, `--reconfigure`, `--proxy`
-  and `--build-templates` without a separate hook, and warns once the
-  certificate has fewer than 30 days left (or has already expired), naming
-  the exact remediation already documented for `SSL_CERT_DAYS`: delete the
-  files in `SSL_CERT_DIR` and run `--reconfigure`.
-
-- **Rocky Linux 8, 9 and 10 templates.** All three rows already named a
-  published image but had no preparation script, so the menu drew them as
-  **Coming Soon...** and refused to build them. They now run `tpl_prep_rhel`,
-  the same script the AlmaLinux and CentOS Stream rows use rather than a copy,
-  since it is the same family. Each image was read: 8.10, 9.8 and 10.2 all have
-  a 10 GiB virtual disk, default user `rocky` with `lock_passwd: True`, and an
-  EFI system partition, so nothing about them is a special case — 8 takes the
-  same no-`Include`-line sshd handling as AlmaLinux 8, 9 and 10 the drop-in
-  branch. Every row in the catalogue is now buildable; nothing is marked
-  **Coming Soon...**. Rocky 8 was built and booted on a real pool; 9 and 10
-  were verified from their images only.
-
-### Added
-
-- **`--build-templates` works from any common workstation distro.**
-  `detect_package_manager` recognised only `apt`, `dnf` and `yum` and `exit`ed
-  otherwise, so on Arch, CachyOS, openSUSE or Alpine the `xorriso` auto-install
-  died and — with the change below — so would the `qemu-img` one. It now also
-  detects `pacman`, `zypper` and `apk`, and reports failure instead of exiting
-  so a caller that can carry on (the API build path falls back to SSH) is not
-  taken down with it.
-
-### Fixed
 
 - **The API build path failed on any workstation without `qemu-img`, after the
   build had already started.** That path converts each qcow2 image to raw
