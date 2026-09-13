@@ -2517,7 +2517,8 @@ snapshot_xo_vm() {
         return 0
     fi
 
-    local snap_name="xo-install-${label}-$(date -u +%Y%m%d_%H%M%S)"
+    local snap_name
+    snap_name="xo-install-${label}-$(date -u +%Y%m%d_%H%M%S)"
     local resp_file http_code base_url proto port connected=false
     resp_file=$(mktemp /tmp/xo-snap-resp-XXXXXX)
 
@@ -3605,7 +3606,8 @@ reconfigure_xo() {
     # Backup current config file
     if [[ -f "/etc/xo-server/config.toml" ]]; then
         log_info "Backing up current configuration..."
-        local CONFIG_BACKUP="/etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)"
+        local CONFIG_BACKUP
+        CONFIG_BACKUP="/etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)"
         run_cmd sudo cp /etc/xo-server/config.toml "$CONFIG_BACKUP"
         # cp doesn't preserve mode by default -- the backup can hold the same
         # Redis credentials as the file it's copied from, so lock it down too.

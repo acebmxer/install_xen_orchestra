@@ -50,6 +50,15 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **CI's ShellCheck job was failing on `dev`** (SC2155, "declare and assign
+  separately to avoid masking return values") at two call sites this
+  session's own changes added: the snapshot name in `snapshot_xo_vm()` and
+  the config backup path in `reconfigure_xo()` both declared a `local` and
+  assigned it from a command substitution on the same line. Both now declare
+  first and assign on the next line, matching the pattern already used
+  everywhere else in the file. Verified against the exact ShellCheck version
+  CI runs (0.9.0): zero warnings.
+
 - **`--restore` now checks a backup is actually complete before destroying
   the current installation to make room for it, and can list backups
   without restoring.** A backup is a plain directory copy, not an archive, so
