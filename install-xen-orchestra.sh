@@ -30,11 +30,12 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 ORIGINAL_ARGS=("$@")
 CONFIG_FILE="${SCRIPT_DIR}/xo-config.cfg"
 SAMPLE_CONFIG="${SCRIPT_DIR}/sample-xo-config.cfg"
-LATEST_CONFIG_VERSION=4
+LATEST_CONFIG_VERSION=5
 
 # Runtime mode flags (set via CLI flags in main())
 NON_INTERACTIVE=false
 RESTORE_BACKUP_FILE=""
+LIST_BACKUPS_ONLY=false
 DRY_RUN=false
 ALLOW_EOL_DISTRO=false
 
@@ -254,7 +255,16 @@ check_git() {
     fi
 }
 
-# Self-update the installation script from git
+# Self-update the installation script from git.
+#
+# Trust note: this fetches and fast-forwards from `origin` over HTTPS (TLS
+# protects the transfer, git's object hashing protects against corruption)
+# but does not verify a GPG signature on the commits/tags it pulls -- there
+# is currently nothing to verify them against, since this repo doesn't sign
+# its commits or tags. Anyone who can push to `origin`, or sit on the path
+# between this machine and it with a way to bypass TLS, can change what this
+# function pulls in and immediately re-execs. Treat `origin` the same as you
+# would any other unattended `git pull` you run as part of provisioning.
 self_update_script() {
     # Skip self-update if XO_NO_SELF_UPDATE is set
     if [[ "${XO_NO_SELF_UPDATE:-0}" == "1" ]]; then
@@ -407,8 +417,10 @@ load_config() {
     GIT_BRANCH=${GIT_BRANCH:-master}
     BACKUP_DIR=${BACKUP_DIR:-/opt/xo-backups}
     BACKUP_KEEP=${BACKUP_KEEP:-5}
+    SNAPSHOT_KEEP=${SNAPSHOT_KEEP:-3}
+    SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS:-14}
     TURBO_CACHE_ENABLED=${TURBO_CACHE_ENABLED:-true}
-    NODE_VERSION=${NODE_VERSION:-24.15.0}
+    NODE_VERSION=${NODE_VERSION:-24.21.0}
     SERVICE_USER=${SERVICE_USER:-root}
     DEBUG_MODE=${DEBUG_MODE:-false}
     BIND_ADDRESS=${BIND_ADDRESS:-0.0.0.0}
@@ -438,6 +450,35 @@ load_config() {
     # Migrate config schema if needed, then validate
     migrate_config "$CONFIG_FILE"
     validate_config
+    check_cert_expiry
+}
+
+# Warn if the TLS certificate xo-server presents is close to expiring.
+# Every operation that calls load_config() hits this, so it fires on
+# --update, --restore, --rebuild, --reconfigure and --proxy without needing
+# its own hook. Best-effort: a missing cert (not generated yet), a missing
+# openssl, or an unparseable date all just skip the check rather than fail
+# the run -- this is a nag, not a precondition.
+check_cert_expiry() {
+    local cert_file="${SSL_CERT_DIR}/${SSL_CERT_FILE}"
+    [[ -f "$cert_file" ]] || return 0
+    command -v openssl >/dev/null 2>&1 || return 0
+
+    local end_date end_epoch now_epoch days_left
+    end_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+    [[ -n "$end_date" ]] || return 0
+    end_epoch=$(date -d "$end_date" +%s 2>/dev/null) || return 0
+    now_epoch=$(date +%s)
+    days_left=$(( (end_epoch - now_epoch) / 86400 ))
+
+    if (( days_left < 0 )); then
+        log_warning "TLS certificate (${cert_file}) expired $(( -days_left )) day(s) ago."
+        log_warning "  Browsers and API clients will reject it outright. Regenerate: delete"
+        log_warning "  the files in ${SSL_CERT_DIR} and run --reconfigure."
+    elif (( days_left < 30 )); then
+        log_warning "TLS certificate (${cert_file}) expires in ${days_left} day(s)."
+        log_warning "  Regenerate before then: delete the files in ${SSL_CERT_DIR} and run --reconfigure."
+    fi
 }
 
 # Validate configuration values
@@ -476,6 +517,20 @@ validate_config() {
         errors+=("BACKUP_KEEP must be a number, got: $BACKUP_KEEP")
     elif [[ $BACKUP_KEEP -lt 1 ]]; then
         errors+=("BACKUP_KEEP must be at least 1, got: $BACKUP_KEEP")
+    fi
+
+    # Validate SNAPSHOT_KEEP is numeric
+    if ! [[ "${SNAPSHOT_KEEP:-3}" =~ ^[0-9]+$ ]]; then
+        errors+=("SNAPSHOT_KEEP must be a number, got: ${SNAPSHOT_KEEP:-}")
+    elif [[ ${SNAPSHOT_KEEP:-3} -lt 1 ]]; then
+        errors+=("SNAPSHOT_KEEP must be at least 1, got: ${SNAPSHOT_KEEP:-}")
+    fi
+
+    # Validate SNAPSHOT_RETENTION_DAYS is numeric
+    if ! [[ "${SNAPSHOT_RETENTION_DAYS:-14}" =~ ^[0-9]+$ ]]; then
+        errors+=("SNAPSHOT_RETENTION_DAYS must be a number, got: ${SNAPSHOT_RETENTION_DAYS:-}")
+    elif [[ ${SNAPSHOT_RETENTION_DAYS:-14} -lt 1 ]]; then
+        errors+=("SNAPSHOT_RETENTION_DAYS must be at least 1, got: ${SNAPSHOT_RETENTION_DAYS:-}")
     fi
 
     # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1)
@@ -670,6 +725,43 @@ migrate_config() {
         CONFIG_VERSION=4
     fi
 
+    # v4 -> v5: add SNAPSHOT_KEEP and SNAPSHOT_RETENTION_DAYS for snapshot_xo_vm.
+    #
+    # Vates' own XOA updater documents a similar pre-update snapshot with a
+    # "delete after 7 days on success" policy, but that isn't reliable in
+    # practice -- confirmed on a real production XOA where snapshots from 11
+    # and 13 days earlier were still present. So this project prunes with its
+    # own deterministic pass at the end of every successful --update/--rebuild
+    # instead of trusting a time-only rule to fire on its own: keep at most
+    # SNAPSHOT_KEEP snapshots, and drop anything older than
+    # SNAPSHOT_RETENTION_DAYS regardless of count. The defaults (3, 14 days)
+    # are deliberately tighter than XO's own Health-view thresholds -- it
+    # flags any VM with more than 5 snapshots, and separately flags any
+    # snapshot older than 30 days -- so a default install never trips either
+    # warning even if an update is skipped for a couple of weeks.
+    if [[ "$current_ver" -lt 5 ]]; then
+        if ! grep -q '^[[:space:]]*SNAPSHOT_KEEP=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# How many pre-update/pre-rebuild VM snapshots (see --update, --rebuild)"
+                echo "# to keep. Older ones beyond this count are deleted after each"
+                echo "# successful run. Kept below XO's own Health-view \"too many"
+                echo "# snapshots\" threshold (>5) by default."
+                echo "SNAPSHOT_KEEP=3"
+            } >> "$cfg_file"
+        fi
+        if ! grep -q '^[[:space:]]*SNAPSHOT_RETENTION_DAYS=' "$cfg_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# Delete a pre-update/pre-rebuild VM snapshot once it's older than"
+                echo "# this many days, regardless of SNAPSHOT_KEEP. Kept below XO's own"
+                echo "# Health-view \"old snapshot\" threshold (30 days) by default."
+                echo "SNAPSHOT_RETENTION_DAYS=14"
+            } >> "$cfg_file"
+        fi
+        CONFIG_VERSION=5
+    fi
+
     # Stamp the new schema version.
     if grep -q '^[[:space:]]*CONFIG_VERSION=' "$cfg_file" 2>/dev/null; then
         sed -i "s/^[[:space:]]*CONFIG_VERSION=.*/CONFIG_VERSION=${LATEST_CONFIG_VERSION}/" "$cfg_file"
@@ -685,8 +777,18 @@ migrate_config() {
     log_success "Config migrated from version ${current_ver} to ${LATEST_CONFIG_VERSION}."
 }
 
-# Detect package manager
-detect_package_manager() {
+# Detect package manager, setting PKG_MANAGER / PKG_INSTALL / PKG_UPDATE.
+#
+# Returns non-zero instead of exiting when nothing is recognised, so a caller
+# that can carry on without installing anything -- the template build's API
+# path falls back to SSH -- is not killed. detect_package_manager wraps this
+# and keeps the old exit-on-failure contract for the install flows that cannot.
+#
+# The RPM and dpkg families were here from the start because that is what a Xen
+# Orchestra *host* runs. pacman, zypper and apk were added for the workstation
+# side: --build-templates and --deploy run from wherever the operator sits,
+# which is as likely to be Arch, CachyOS or openSUSE as Debian.
+detect_package_manager_soft() {
     if command -v apt-get &> /dev/null; then
         PKG_MANAGER="apt"
         PKG_INSTALL="sudo apt-get install -y"
@@ -699,8 +801,28 @@ detect_package_manager() {
         PKG_MANAGER="yum"
         PKG_INSTALL="sudo yum install -y"
         PKG_UPDATE="sudo yum makecache"
+    elif command -v pacman &> /dev/null; then
+        PKG_MANAGER="pacman"
+        PKG_INSTALL="sudo pacman -S --needed --noconfirm"
+        PKG_UPDATE="sudo pacman -Sy"
+    elif command -v zypper &> /dev/null; then
+        PKG_MANAGER="zypper"
+        PKG_INSTALL="sudo zypper --non-interactive install"
+        PKG_UPDATE="sudo zypper --non-interactive refresh"
+    elif command -v apk &> /dev/null; then
+        PKG_MANAGER="apk"
+        PKG_INSTALL="sudo apk add"
+        PKG_UPDATE="sudo apk update"
     else
-        log_error "No supported package manager found (apt, dnf, yum)"
+        return 1
+    fi
+    return 0
+}
+
+# Detect package manager
+detect_package_manager() {
+    if ! detect_package_manager_soft; then
+        log_error "No supported package manager found (apt, dnf, yum, pacman, zypper, apk)"
         exit 1
     fi
     log_info "Detected package manager: $PKG_MANAGER"
@@ -955,6 +1077,44 @@ version_satisfies() {
     return 1
 }
 
+# Verify a downloaded Node.js tarball against the SHA-256 digest nodejs.org
+# publishes for that release, the same way deploy_verify_image_checksum
+# verifies template images against their origin's published checksums.
+# Usage: verify_nodejs_checksum "22.3.0" "node-v22.3.0-linux-x64.tar.xz" "/path/to/file"
+verify_nodejs_checksum() {
+    local full_version="$1" filename="$2" file_path="$3"
+
+    local sums_url="https://nodejs.org/dist/v${full_version}/SHASUMS256.txt"
+    local sums
+    sums=$(curl -fsSL --max-time 60 "$sums_url" 2>/dev/null | tr -d '\r') || true
+    if [[ -z "$sums" ]]; then
+        log_warning "  could not fetch ${sums_url}; skipping checksum verification."
+        return 0
+    fi
+
+    # Lines are "<digest>  <name>", coreutils sha256sum format.
+    local want
+    want=$(awk -v f="$filename" '$2 == f { print $1; exit }' <<< "$sums")
+    if [[ ! "$want" =~ ^[a-fA-F0-9]{64}$ ]]; then
+        log_warning "  no published SHASUMS256.txt entry for ${filename}; skipping checksum verification."
+        return 0
+    fi
+
+    local got
+    got=$(sha256sum "$file_path" | awk '{print $1}')
+    if [[ "${got,,}" != "${want,,}" ]]; then
+        log_error "The downloaded Node.js tarball does not match its published checksum."
+        log_error "  expected: ${want,,}"
+        log_error "  actual:   ${got,,}"
+        log_error "Refusing to install it. This is a corrupted download or the wrong"
+        log_error "file; if it repeats, treat the mirror as suspect."
+        return 1
+    fi
+
+    log_success "  Node.js tarball checksum verified"
+    return 0
+}
+
 # Download and install a specific Node.js version from nodejs.org.
 # Usage: install_nodejs_binary "22.3"
 # Normalises 22.3 → v22.3.0 and downloads the linux binary tarball.
@@ -996,6 +1156,11 @@ install_nodejs_binary() {
     chmod 700 "$TMP_DIR"
 
     if ! curl -fsSL "$URL" -o "${TMP_DIR}/${FILENAME}"; then
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    if ! verify_nodejs_checksum "$FULL_VERSION" "$FILENAME" "${TMP_DIR}/${FILENAME}"; then
         rm -rf "$TMP_DIR"
         return 1
     fi
@@ -1501,7 +1666,12 @@ ensure_swap_space() {
         run_cmd sudo rm -f "$SWAP_FILE"
     fi
 
-    # Create swap file
+    # Create swap file. Touch it with mode 600 *before* allocating into it --
+    # fallocate/dd create the file at the process umask (typically 644,
+    # world-readable) and swap contents can include sensitive process memory,
+    # so a chmod after allocation leaves a window where the file is readable
+    # by any local user while it's being filled.
+    run_cmd sudo install -m 600 /dev/null "$SWAP_FILE"
     run_cmd sudo fallocate -l "${MIN_SWAP_MB}M" "$SWAP_FILE" 2>/dev/null || run_cmd sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$MIN_SWAP_MB" status=progress
     run_cmd sudo chmod 600 "$SWAP_FILE"
     run_cmd sudo mkswap "$SWAP_FILE"
@@ -1927,6 +2097,9 @@ fi)
 mountsDir = '/run/xo-server/mounts'
 useSudo = true
 EOF
+    # config.toml can hold Redis credentials (REDIS_URI) in plaintext, so it
+    # must not be left at tee's default world-readable mode.
+    run_cmd sudo chmod 600 "$XO_CONFIG_FILE"
     fi # end DRY_RUN check
 
     # Set ownership if service user is defined
@@ -2268,6 +2441,219 @@ get_remote_commit() {
     git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/"$GIT_BRANCH" 2>/dev/null | cut -f1
 }
 
+# Snapshot the XO VM itself via XO's REST API, so a bad update/rebuild can be
+# rolled back from a normal VM snapshot in the UI -- the same recovery path
+# as any other VM, and unlike create_backup() below, one that also covers
+# the VM's disk as a whole (Redis included: pool connections, users, jobs,
+# settings), not just $INSTALL_DIR.
+#
+# This does NOT necessarily cover ENCRYPT_REDIS_CREDENTIALS's XenStore key
+# half (vm-data/xo-encryption-key): whether a XAPI VM snapshot preserves
+# xenstore-data is not something either XO's or XCP-ng's docs state one way
+# or the other, so it is not claimed here. Treat this the same as
+# create_backup() for that purpose -- the config export documented under
+# ENCRYPT_REDIS_CREDENTIALS is still the only confirmed recovery artifact
+# for the key.
+#
+# This is this project's own safety net, not something XO's own docs ask
+# for: upstream's documented update-from-sources procedure is `git pull`,
+# `yarn`, `yarn build` -- no pre-update snapshot or backup step. The request
+# shape here (cookie authenticationToken, POST .../actions/snapshot?sync=true,
+# {"name_label": ...} body) matches docs.xen-orchestra.com/automation/restapi
+# and was checked against a live instance's own swagger.json.
+#
+# Best-effort and silent-safe by design, same posture as check_active_xo_tasks:
+# this only works when XO is itself a Xen guest (bare metal and other
+# hypervisors have nothing to snapshot), needs the guest's own UUID to be
+# readable, and needs the same admin-level API access the task check already
+# requires. Any of those being unavailable is not an error -- it just means
+# this run proceeds with the file backup only, which is what every version
+# of this script has done until now.
+#
+# The VM's own UUID is read from /sys/hypervisor/uuid rather than via
+# xenstore-read: it's a stable Linux kernel sysfs ABI (documented at
+# kernel.org/doc/Documentation/ABI/stable/sysfs-hypervisor-xen, present
+# since 2.6.30), needs no guest-tools package, needs no elevated
+# permissions, and XCP-ng/XO forum guidance points at this exact file as
+# the one that reliably matches the UUID XO's own API uses -- unlike
+# dmidecode's product UUID, which the same guidance warns can disagree with
+# it over byte-order.
+snapshot_xo_vm() {
+    local label="$1"  # e.g. "pre-update" or "pre-rebuild"
+
+    local virt_type
+    virt_type=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+    if [[ "$virt_type" != "xen" ]]; then
+        log_info "Not running as a Xen guest -- skipping VM snapshot (file backup still runs)."
+        return 0
+    fi
+
+    local vm_uuid
+    vm_uuid=$(cat /sys/hypervisor/uuid 2>/dev/null) || vm_uuid=""
+    if [[ -z "$vm_uuid" ]]; then
+        log_warning "Could not read this VM's UUID from /sys/hypervisor/uuid -- skipping VM snapshot."
+        return 0
+    fi
+
+    # Reuse whichever XO credentials are already configured for the task
+    # check -- same auth priority, no separate prompt. If none are
+    # configured, skip rather than interrupt an otherwise-automatable
+    # update/rebuild with a new credential prompt.
+    #
+    # XO_API_TOKEN, not XO_TASK_CHECK_TOKEN directly: load_config() already
+    # resolves XO_API_TOKEN=${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}, and
+    # every other API call in this script (check_active_xo_tasks, the
+    # template builder) reads that resolved variable. Reading
+    # XO_TASK_CHECK_TOKEN here directly skipped the snapshot silently for
+    # anyone who set only XO_API_TOKEN, the name the config migration itself
+    # documents as current.
+    local xo_token=""
+    if [[ -n "${XO_API_TOKEN:-}" ]]; then
+        xo_token="$XO_API_TOKEN"
+    elif [[ -n "${XO_TASK_CHECK_TOKEN:-}" ]]; then
+        xo_token="$XO_TASK_CHECK_TOKEN"
+    else
+        log_info "No XO_API_TOKEN (or XO_TASK_CHECK_TOKEN) configured -- skipping VM snapshot (file backup still runs)."
+        return 0
+    fi
+
+    local snap_name
+    snap_name="xo-install-${label}-$(date -u +%Y%m%d_%H%M%S)"
+    local resp_file http_code base_url proto port connected=false
+    resp_file=$(mktemp /tmp/xo-snap-resp-XXXXXX)
+
+    for proto in https http; do
+        if [[ "$proto" == "https" ]]; then port="$HTTPS_PORT"; else port="$HTTP_PORT"; fi
+        base_url="${proto}://localhost:${port}"
+        local curl_opts=(-s --max-time 30 --output "$resp_file" --write-out "%{http_code}")
+        [[ "$proto" == "https" ]] && curl_opts+=(-k)
+
+        http_code=$(curl "${curl_opts[@]}" -X POST \
+            -b "authenticationToken=${xo_token}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name_label\": \"${snap_name}\"}" \
+            "${base_url}/rest/v0/vms/${vm_uuid}/actions/snapshot?sync=true" \
+            2>/dev/null) || true
+
+        if [[ "$http_code" == "200" || "$http_code" == "201" || "$http_code" == "202" ]]; then
+            connected=true
+            break
+        fi
+    done
+
+    rm -f "$resp_file"
+
+    if [[ "$connected" != "true" ]]; then
+        log_warning "Could not snapshot the XO VM (HTTP ${http_code:-unreachable}) -- continuing with file backup only."
+        return 0
+    fi
+
+    log_success "VM snapshot created: ${snap_name} (visible in XO under this VM's Snapshots tab)"
+
+    prune_xo_vm_snapshots "$vm_uuid" "$xo_token" "$base_url" || true
+}
+
+# Delete this VM's own pre-update/pre-rebuild snapshots (the "xo-install-"
+# prefix snapshot_xo_vm names them with) once there are more than
+# SNAPSHOT_KEEP or any are older than SNAPSHOT_RETENTION_DAYS.
+#
+# Vates' own XOA updater documents a similar policy for its safety
+# snapshots -- delete after a 7-day retention period on a successful update
+# -- but that isn't reliable in practice: confirmed against a real
+# production XOA where "delete after successful upgrade" snapshots from 11
+# and 13 days earlier were still present, and Vates' docs don't say what
+# mechanism is actually supposed to perform that deletion. So this prunes
+# with its own deterministic pass, synchronously, right after every
+# successful snapshot -- not a background timer that can silently not fire.
+#
+# Only ever touches snapshots this function's own naming scheme created, on
+# this VM. It never deletes a snapshot a user made by hand, or one made by a
+# backup job, however old.
+#
+# Called only from snapshot_xo_vm after a confirmed-successful snapshot, so
+# it inherits the same best-effort, silent-safe posture: any failure here
+# logs a warning and returns 0 rather than failing the update/rebuild that
+# is otherwise already complete.
+prune_xo_vm_snapshots() {
+    local vm_uuid="$1" xo_token="$2" base_url="$3"
+
+    local list_resp
+    list_resp=$(curl -sk --max-time 30 \
+        -b "authenticationToken=${xo_token}" \
+        -G --data-urlencode "filter=\$snapshot_of:${vm_uuid}" \
+        --data-urlencode "fields=id,name_label,snapshot_time" \
+        "${base_url}/rest/v0/vm-snapshots" \
+        2>/dev/null) || true
+
+    if [[ -z "$list_resp" ]]; then
+        log_warning "Could not list VM snapshots for pruning; leaving them as-is."
+        return 0
+    fi
+
+    # "id snapshot_time" lines, our own snapshots only, newest first.
+    # jq preferred, Node.js fallback (guaranteed present on any XO install) --
+    # same pattern check_active_xo_tasks already uses for the same reason.
+    local candidates
+    if command -v jq &>/dev/null; then
+        candidates=$(printf '%s' "$list_resp" | jq -r '
+            [.[] | select(.name_label // "" | startswith("xo-install-"))]
+            | sort_by(-.snapshot_time)
+            | .[] | "\(.id) \(.snapshot_time)"' 2>/dev/null) || candidates=""
+    else
+        # shellcheck disable=SC2016
+        candidates=$(printf '%s' "$list_resp" | node -e '
+            let d = "";
+            process.stdin.on("data", c => d += c);
+            process.stdin.on("end", () => {
+                try {
+                    const a = JSON.parse(d);
+                    const ours = a.filter(s => (s.name_label || "").startsWith("xo-install-"));
+                    ours.sort((x, y) => (y.snapshot_time || 0) - (x.snapshot_time || 0));
+                    process.stdout.write(ours.map(s => `${s.id} ${s.snapshot_time}`).join("\n"));
+                } catch (e) { /* leave candidates empty on any parse error */ }
+            });
+        ' 2>/dev/null) || candidates=""
+    fi
+
+    [[ -z "$candidates" ]] && return 0
+
+    local now_epoch
+    now_epoch=$(date +%s)
+    local max_age=$(( SNAPSHOT_RETENTION_DAYS * 86400 ))
+    local idx=0 deleted=0
+    while IFS=' ' read -r snap_id snap_time; do
+        [[ -z "$snap_id" ]] && continue
+        idx=$(( idx + 1 ))
+
+        local reason=""
+        if (( idx > SNAPSHOT_KEEP )); then
+            reason="beyond SNAPSHOT_KEEP=${SNAPSHOT_KEEP}"
+        elif [[ "$snap_time" =~ ^[0-9]+$ ]] && (( now_epoch - snap_time > max_age )); then
+            reason="older than SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS}"
+        fi
+        [[ -z "$reason" ]] && continue
+
+        local del_code
+        del_code=$(curl -sk --max-time 30 --output /dev/null --write-out "%{http_code}" \
+            -X DELETE \
+            -b "authenticationToken=${xo_token}" \
+            "${base_url}/rest/v0/vm-snapshots/${snap_id}" \
+            2>/dev/null) || del_code=""
+
+        if [[ "$del_code" == "200" || "$del_code" == "202" || "$del_code" == "204" ]]; then
+            deleted=$(( deleted + 1 ))
+            log_info "Pruned old VM snapshot ${snap_id} (${reason})."
+        else
+            log_warning "Could not delete VM snapshot ${snap_id} (HTTP ${del_code:-unreachable}); leaving it."
+        fi
+    done <<< "$candidates"
+
+    if [[ $deleted -gt 0 ]]; then
+        log_success "Pruned ${deleted} old VM snapshot(s)."
+    fi
+    return 0
+}
+
 # Create backup
 create_backup() {
     log_info "Creating backup of current installation..."
@@ -2325,6 +2711,58 @@ create_backup() {
     log_success "Old backups cleaned"
 }
 
+# Sanity-check a backup directory before restore_xo() destroys the current
+# installation to make room for it. create_backup() copies $INSTALL_DIR as a
+# plain directory tree (not an archive), so "corrupted" here means: an
+# interrupted copy that never finished, a directory that isn't actually an XO
+# checkout, or a git object store too damaged to read HEAD from -- not a
+# checksum mismatch, since there is no single-file checksum to check against.
+#
+# Deliberately conservative: this only refuses backups that are clearly
+# incomplete or broken. A backup that's merely old, or from a different
+# branch/commit than what's about to be reconfigured, is not this function's
+# business -- that's what the backup listing's date/commit columns are for.
+verify_backup_integrity() {
+    local backup_path="$1"
+
+    if [[ ! -d "$backup_path" ]]; then
+        log_error "  ${backup_path} is not a directory."
+        return 1
+    fi
+
+    # package.json at the root is the one file every XO checkout has,
+    # regardless of branch, commit, or how deep the monorepo's packages
+    # directory tree goes -- so its absence means the copy never completed,
+    # or this directory never held an XO checkout at all. This runs as
+    # whatever restore_xo itself is running as (root, per check_not_root
+    # elsewhere), which can always read a path it's about to sudo rm -rf --
+    # so a plain existence test is enough, no sudo -u re-exec needed here.
+    if [[ ! -f "${backup_path}/package.json" ]]; then
+        log_error "  ${backup_path}/package.json is missing."
+        return 1
+    fi
+
+    # If it has a .git directory, HEAD must actually resolve. A backup taken
+    # mid-write (disk full, process killed) can leave a .git directory with a
+    # truncated object store, which every other file in the tree can look
+    # perfectly fine next to.
+    #
+    # git itself does care about ownership here (its "dubious ownership"
+    # safety check), so this one read -- unlike the existence test above --
+    # does run as the backup's own owner, matching how the backup listing
+    # loop above already reads a backup's commit.
+    if [[ -d "${backup_path}/.git" ]]; then
+        local owner
+        owner=$(stat -c '%U' "$backup_path" 2>/dev/null) || owner="root"
+        if ! sudo -u "$owner" git -C "$backup_path" rev-parse HEAD &>/dev/null; then
+            log_error "  ${backup_path}/.git exists but HEAD could not be read."
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # Restore Xen Orchestra from a backup
 restore_xo() {
     if [[ ! -d "$BACKUP_DIR" ]]; then
@@ -2374,16 +2812,23 @@ restore_xo() {
         elif [[ $i -eq $TOTAL_TO_LIST ]]; then
             LABEL=" (oldest)"
         fi
+        local INTEGRITY_TAG=""
+        verify_backup_integrity "$BACKUP" &>/dev/null || INTEGRITY_TAG="  [INCOMPLETE/CORRUPT]"
         if [[ -n "$BACKUP_COMMIT" ]]; then
-            printf "  [%d] %s  (%s)  commit: %s%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$BACKUP_COMMIT" "$LABEL"
+            printf "  [%d] %s  (%s)  commit: %s%s%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$BACKUP_COMMIT" "$LABEL" "$INTEGRITY_TAG"
         else
-            printf "  [%d] %s  (%s)%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$LABEL"
+            printf "  [%d] %s  (%s)%s%s\n" "$i" "$BACKUP_NAME" "$DATETIME" "$LABEL" "$INTEGRITY_TAG"
         fi
         ((i++))
     done
 
     local TOTAL=$((i - 1))
     echo ""
+
+    if [[ "$LIST_BACKUPS_ONLY" == "true" ]]; then
+        return 0
+    fi
+
     local CHOICE
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
         if [[ -n "$RESTORE_BACKUP_FILE" ]]; then
@@ -2419,6 +2864,12 @@ restore_xo() {
     local SELECTED_BACKUP="${BACKUPS[$((CHOICE - 1))]}"
     local SELECTED_NAME
     SELECTED_NAME=$(basename "$SELECTED_BACKUP")
+
+    if ! verify_backup_integrity "$SELECTED_BACKUP"; then
+        log_error "Refusing to restore ${SELECTED_NAME}: it does not look like a complete backup."
+        log_error "Pick a different one, or pass --backup-file to select one directly."
+        exit 1
+    fi
 
     echo ""
     log_warning "You are about to restore: $SELECTED_NAME"
@@ -2889,6 +3340,12 @@ update_xo() {
     # Check for active tasks before stopping the service
     check_active_xo_tasks
 
+    # Snapshot while xo-server is still up -- it talks to the REST API on
+    # localhost, so it must run before the service stops below or every
+    # attempt fails to connect (HTTP 000) and silently falls back to file
+    # backup only.
+    snapshot_xo_vm "pre-update"
+
     # Stop service
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
@@ -3026,6 +3483,12 @@ rebuild_xo() {
     echo ""
     confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; exit 0; }
 
+    # Snapshot while xo-server is still up -- it talks to the REST API on
+    # localhost, so it must run before the service stops below or every
+    # attempt fails to connect (HTTP 000) and silently falls back to file
+    # backup only.
+    snapshot_xo_vm "pre-rebuild"
+
     # Stop the service before touching anything
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
@@ -3156,7 +3619,12 @@ reconfigure_xo() {
     # Backup current config file
     if [[ -f "/etc/xo-server/config.toml" ]]; then
         log_info "Backing up current configuration..."
-        run_cmd sudo cp /etc/xo-server/config.toml "/etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)"
+        local CONFIG_BACKUP
+        CONFIG_BACKUP="/etc/xo-server/config.toml.backup-$(date +%Y%m%d-%H%M%S)"
+        run_cmd sudo cp /etc/xo-server/config.toml "$CONFIG_BACKUP"
+        # cp doesn't preserve mode by default -- the backup can hold the same
+        # Redis credentials as the file it's copied from, so lock it down too.
+        run_cmd sudo chmod 600 "$CONFIG_BACKUP"
         log_success "Backup created"
     fi
 
@@ -3501,13 +3969,22 @@ install_xo_proxy() {
     TEMP_SCRIPT=$(mktemp --tmpdir xo-proxy-XXXXXX)
     cp "$HELPER_SCRIPT" "$TEMP_SCRIPT"
     chmod 700 "$TEMP_SCRIPT"
+    # Matches deploy_cleanup/tpl_cleanup elsewhere: an EXIT trap so a failure
+    # between here and the explicit rm below (a signal, a parsing error under
+    # set -euo pipefail) doesn't leave a copy of the helper script in /tmp.
+    trap 'rm -f "$TEMP_SCRIPT"' EXIT
 
     # Run the expect script
     log_info "Starting XO Proxy installer on Pool Master..."
     log_info "This may take several minutes..."
     echo ""
 
-    OUTPUT=$("$TEMP_SCRIPT" "$POOL_MASTER_IP" "$HOST_USERNAME" "$HOST_PASSWORD" "$PROXY_IP" "$NTP_SERVER" "$XO_USERNAME" "$XO_PASSWORD" 2>&1 | tee /dev/tty)
+    # Passwords go via environment, not argv: a process's command line is
+    # readable by any other local user (ps, /proc/<pid>/cmdline) for as long
+    # as it runs, while its environment is not. Matches the SSHPASS/-e
+    # pattern used for the sshpass calls elsewhere in this script.
+    OUTPUT=$(XO_HELPER_HOST_PASSWORD="$HOST_PASSWORD" XO_HELPER_XO_PASSWORD="$XO_PASSWORD" \
+        "$TEMP_SCRIPT" "$POOL_MASTER_IP" "$HOST_USERNAME" "$PROXY_IP" "$NTP_SERVER" "$XO_USERNAME" 2>&1 | tee /dev/tty)
 
     # Extract values from output (look after CAPTURED_VALUES marker)
     ACTUAL_PROXY_IP=$(echo "$OUTPUT" | grep "^PROXY_IP=" | tail -1 | cut -d'=' -f2)
@@ -3516,6 +3993,7 @@ install_xo_proxy() {
 
     # Clean up temp script
     rm -f "$TEMP_SCRIPT"
+    trap - EXIT
 
     # Use user-specified IP if not captured
     if [[ -z "$ACTUAL_PROXY_IP" ]]; then
@@ -3566,6 +4044,7 @@ install_xo_proxy() {
     # Create a temporary expect script for xo-cli registration
     XO_CLI_SCRIPT=$(mktemp --tmpdir xo-cli-XXXXXX)
     chmod 700 "$XO_CLI_SCRIPT"
+    trap 'rm -f "$XO_CLI_SCRIPT"' EXIT
     cat > "$XO_CLI_SCRIPT" << 'XO_CLI_EXPECT_END'
 #!/usr/bin/expect -f
 
@@ -3596,10 +4075,12 @@ XO_CLI_EXPECT_END
         log_warning "Failed to register xo-cli automatically"
         log_info "Please run manually: xo-cli --register http://localhost"
         rm -f "$XO_CLI_SCRIPT"
+        trap - EXIT
         exit 1
     fi
 
     rm -f "$XO_CLI_SCRIPT"
+    trap - EXIT
 
     # Register the proxy with Xen Orchestra
     log_info "Registering XO Proxy with Xen Orchestra..."
@@ -4068,7 +4549,7 @@ STREAM_EOF
 #
 #   coreutils   "<hash>  <file>", optionally "*<file>" for binary mode.
 #               Debian, Ubuntu and AlmaLinux.
-#   BSD tag     "SHA256 (<file>) = <hash>". CentOS Stream and Fedora.
+#   BSD tag     "SHA256 (<file>) = <hash>". CentOS Stream, Rocky and Fedora.
 #
 # Fedora wraps its file in a PGP clearsigned envelope. That costs the parse
 # nothing -- the digest lines inside are ordinary BSD tag lines and the awk
@@ -4086,8 +4567,11 @@ STREAM_EOF
 # this catalogue actually requests, not only for the dated filename it points
 # at. Fedora has since been read the same way: BSD tag shape, SHA-256, but
 # under a version-stamped filename rather than a constant one, which is the
-# case the branch below derives instead of naming. Rocky is unverified on this
-# point and keeps the default until someone reads its mirror the same way.
+# case the branch below derives instead of naming. Rocky is the same as CentOS
+# Stream: dl.rockylinux.org publishes a CHECKSUM in the BSD tag shape with
+# SHA-256 digests, filename and all, and the 8, 9 and 10 files each carry an
+# entry for the ".latest" name this catalogue requests -- checked on all three
+# mirrors -- so it needs the case below and no new parser.
 #
 # The default is Debian's SHA512SUMS. An unknown origin therefore gets that
 # name, does not find it, and warns that the image could not be verified --
@@ -4098,6 +4582,7 @@ deploy_checksum_source() {
         *//cloud-images.ubuntu.com/*) printf 'SHA256SUMS 256' ;;
         *//repo.almalinux.org/*)      printf 'CHECKSUM 256' ;;
         *//cloud.centos.org/*)        printf 'CHECKSUM 256' ;;
+        *//dl.rockylinux.org/*)       printf 'CHECKSUM 256' ;;
         *//dl.fedoraproject.org/*)
             # Fedora is the one origin here that does not publish a fixed
             # filename: the sums file carries the release and compose in its
@@ -4599,10 +5084,10 @@ deploy_verify_image_checksum() {
             # case there -- it is the only branch that matches.
             want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<< "$sums")
 
-            # BSD tag format: "SHA256 (<name>) = <digest>". cloud.centos.org
-            # publishes this, under a file named CHECKSUM -- the same filename
-            # AlmaLinux uses for the coreutils shape, so the format cannot be
-            # decided from the origin and has to be tried here.
+            # BSD tag format: "SHA256 (<name>) = <digest>". cloud.centos.org and
+            # dl.rockylinux.org publish this, under a file named CHECKSUM -- the
+            # same filename AlmaLinux uses for the coreutils shape, so the format
+            # cannot be decided from the origin and has to be tried here.
             #
             # Tried second, and only when the first found nothing, so the
             # coreutils parse stays the path every existing row takes. The two
@@ -7702,6 +8187,136 @@ show_version() {
     echo "  Based on: https://docs.xen-orchestra.com/install-from-sources"
 }
 
+# A read-only health report: is XO reachable and up to date, is the service
+# running, is the TLS cert about to expire, is there enough disk/swap, is the
+# script/XO git state clean. Makes no changes -- every check here either
+# already exists (menu_gather_info, check_cert_expiry) or reads state the
+# same way those do, just printed on demand instead of only as a side effect
+# of another command.
+show_status() {
+    echo "=============================================="
+    echo "  Xen Orchestra Status"
+    echo "=============================================="
+    echo ""
+
+    # Reuses the exact same commit/version gathering the interactive menu
+    # header uses, so this and the menu can never disagree with each other.
+    menu_gather_info
+
+    echo "Script:"
+    echo "  Commit:  ${MENU_SCRIPT_COMMIT} (branch: ${MENU_SCRIPT_BRANCH:-unknown})"
+    echo "  Master:  ${MENU_SCRIPT_MASTER} (branch: ${MENU_SCRIPT_MASTER_BRANCH:-unknown})"
+    echo ""
+
+    echo "Xen Orchestra:"
+    if [[ "$MENU_XO_COMMIT" == "N/A" ]]; then
+        echo "  Not installed at ${INSTALL_DIR:-/opt/xen-orchestra}."
+    else
+        echo "  Commit:  ${MENU_XO_COMMIT} (branch: ${MENU_XO_BRANCH:-unknown})"
+        if [[ -n "$MENU_XO_BEHIND" ]]; then
+            echo "  Master:  ${MENU_XO_MASTER} -- ${MENU_XO_BEHIND}"
+        else
+            echo "  Master:  ${MENU_XO_MASTER} (up to date)"
+        fi
+    fi
+    echo "  Node:    ${MENU_NODE_VERSION}"
+
+    if command -v systemctl &>/dev/null; then
+        if systemctl is-active --quiet xo-server 2>/dev/null; then
+            echo "  Service: running"
+        elif systemctl is-enabled --quiet xo-server 2>/dev/null; then
+            echo "  Service: not running (enabled)"
+        else
+            echo "  Service: not installed"
+        fi
+    fi
+    echo ""
+
+    # Same cert file and threshold check_cert_expiry uses, just reported
+    # unconditionally here instead of only as a warning when it's close.
+    echo "TLS certificate:"
+    local cert_file="${SSL_CERT_DIR:-/etc/ssl/xo}/${SSL_CERT_FILE:-xo-cert.pem}"
+    if [[ ! -f "$cert_file" ]]; then
+        echo "  Not generated yet (${cert_file})."
+    elif ! command -v openssl &>/dev/null; then
+        echo "  Present (${cert_file}), but openssl is unavailable to check its expiry."
+    else
+        local end_date end_epoch now_epoch days_left
+        end_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+        if [[ -z "$end_date" ]]; then
+            echo "  Present (${cert_file}), but its expiry could not be read."
+        else
+            end_epoch=$(date -d "$end_date" +%s 2>/dev/null) || end_epoch=""
+            if [[ -z "$end_epoch" ]]; then
+                echo "  Present (${cert_file}), but its expiry date could not be parsed."
+            else
+                now_epoch=$(date +%s)
+                days_left=$(( (end_epoch - now_epoch) / 86400 ))
+                if (( days_left < 0 )); then
+                    echo "  EXPIRED $(( -days_left )) day(s) ago (${cert_file})."
+                elif (( days_left < 30 )); then
+                    echo "  Expires in ${days_left} day(s) (${cert_file}) -- run --reconfigure soon."
+                else
+                    echo "  Valid for ${days_left} more day(s)."
+                fi
+            fi
+        fi
+    fi
+    echo ""
+
+    echo "Disk and swap:"
+    local backup_dir="${BACKUP_DIR:-/opt/xo-backups}"
+    # df fails outright on a path that doesn't exist yet (e.g. before the
+    # first --update/--rebuild has ever run) -- fall back to its nearest
+    # existing parent so a fresh install still gets a real number instead of
+    # a blank "could not be read".
+    local df_target="$backup_dir"
+    while [[ ! -e "$df_target" && "$df_target" != "/" ]]; do
+        df_target=$(dirname "$df_target")
+    done
+    local avail_mb
+    avail_mb=$(df -BM --output=avail "$df_target" 2>/dev/null | tail -1 | tr -d ' M') || avail_mb=""
+    if [[ "$avail_mb" =~ ^[0-9]+$ ]]; then
+        if [[ "$df_target" == "$backup_dir" ]]; then
+            echo "  Free space at ${backup_dir}: ${avail_mb}MB"
+        else
+            echo "  Free space at ${df_target} (${backup_dir} doesn't exist yet): ${avail_mb}MB"
+        fi
+    else
+        echo "  Free space at ${backup_dir}: df failed to report it"
+    fi
+    if command -v free &>/dev/null; then
+        local swap_mb
+        swap_mb=$(free -m 2>/dev/null | awk '/^Swap:/ {print $2}') || swap_mb=""
+        if [[ "$swap_mb" =~ ^[0-9]+$ ]]; then
+            echo "  Swap: ${swap_mb}MB"
+        else
+            echo "  Swap: could not be read"
+        fi
+    else
+        echo "  Swap: unknown (the 'free' command is not installed)"
+    fi
+    echo ""
+
+    echo "Backups and snapshots:"
+    local backup_count=0
+    if [[ -d "$backup_dir" ]]; then
+        backup_count=$(find "$backup_dir" -maxdepth 1 -name "xo-backup-*" -type d 2>/dev/null | wc -l)
+    fi
+    echo "  File backups in ${backup_dir}: ${backup_count} (keeping ${BACKUP_KEEP:-5})"
+    echo "  VM snapshot pruning: keep ${SNAPSHOT_KEEP:-3}, max ${SNAPSHOT_RETENTION_DAYS:-14} day(s)"
+    echo ""
+
+    echo "Git working tree:"
+    if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
+        if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+            echo "  This script's checkout has uncommitted changes."
+        else
+            echo "  This script's checkout is clean."
+        fi
+    fi
+}
+
 show_help() {
     echo "Xen Orchestra Installation Script"
     echo ""
@@ -7721,6 +8336,8 @@ show_help() {
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
     echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
+    echo "  --status               Read-only health report: version, service, TLS cert,"
+    echo "                         disk/swap, backups/snapshots, git state. Makes no changes."
     echo "  --version              Show this script's version and branch, then exit"
     echo "  --help                 Show this help message"
     echo ""
@@ -7728,6 +8345,8 @@ show_help() {
     echo "  --non-interactive      Bypass all interactive prompts; use config defaults"
     echo "  --yes                  Alias for --non-interactive"
     echo "  --backup-file NAME     With --restore: select specific backup by directory name"
+    echo "  --list-backups         With --restore: list available backups (with an integrity"
+    echo "                         check on each) and exit, without prompting to restore"
     echo "  --dry-run, --check     Show what would be done without making any changes"
     echo "  --log-file PATH        Append log output to PATH (plain-text by default)"
     echo "  --json-logs            Write structured JSON lines to --log-file instead of plain text"
@@ -7829,14 +8448,13 @@ show_help() {
 # selection were constructed some other way. tpl_is_placeholder is the one
 # place that decision is made.
 #
-# They are listed rather than left out because the question they answer -- "is
-# my distribution going to be here?" -- otherwise has no answer short of
-# reading this table. Every placeholder URL below was checked to return 200
-# with a published checksum beside it, so each is a real image awaiting the
-# code rather than an aspiration.
+# No row currently uses it -- every entry in the catalogue below is buildable.
+# The mechanism stays for the case of adding a distribution whose image has not
+# yet been read: the row can land with "-" so the menu answers "is my
+# distribution going to be here?" before the code that builds it exists.
 #
-# Three things stand between a placeholder and a working row, and they are
-# shared across every non-Debian entry rather than being per-distribution:
+# Three things a new non-Debian entry needs, all solved generically rather than
+# per-distribution:
 #
 #   1. Image format. Debian publishes raw; everyone else publishes qcow2. The
 #      import writes the file into a VDI over XAPI's raw endpoint, so a qcow2
@@ -7849,22 +8467,23 @@ show_help() {
 #      the algorithm from the image's own URL, and deploy_verify_image_checksum
 #      parses either of the two shapes those files come in -- coreutils'
 #      "<hash>  <file>" (Debian, Ubuntu, AlmaLinux) or the BSD tag
-#      "SHA256 (<file>) = <hash>" (CentOS Stream). The shape is not a property
-#      of the family: AlmaLinux and CentOS Stream both publish a file called
-#      CHECKSUM and disagree on what goes in it, which is why the parse is
-#      tried both ways rather than selected by origin. Fedora publishes the BSD
-#      tag shape too, but under a name carrying the release and compose rather
-#      than a fixed one, so it is the origin that made the filename derived
-#      instead of constant -- see deploy_checksum_source. Rocky is unread on
-#      this point.
+#      "SHA256 (<file>) = <hash>" (CentOS Stream, Rocky). The shape is not a
+#      property of the family: AlmaLinux and CentOS Stream both publish a file
+#      called CHECKSUM and disagree on what goes in it, which is why the parse
+#      is tried both ways rather than selected by origin. Fedora publishes the
+#      BSD tag shape too, but under a name carrying the release and compose
+#      rather than a fixed one, so it is the origin that made the filename
+#      derived instead of constant -- see deploy_checksum_source. Rocky matches
+#      CentOS Stream on all three releases.
 #   3. Guest preparation. tpl_prep_debian is apt-based, and Ubuntu shares it.
 #      Confirmed rather than assumed: Ubuntu packages xe-guest-utilities (which
 #      Debian 13 does not), so there both the ISO path and the apt fallback
-#      work. tpl_prep_rhel is the dnf counterpart and serves the RHEL rebuilds.
-#      Fedora 43 has its own, tpl_prep_fedora: install.sh does not recognise
-#      Fedora and refuses, so its guest tools come from the documented -d/-m
-#      override, the ISO tarball, or Fedora's own package -- the tiers
-#      linux_util's installer already uses. Fedora 44 stays a placeholder.
+#      work. tpl_prep_rhel is the dnf counterpart and serves the RHEL rebuilds
+#      -- AlmaLinux, CentOS Stream and Rocky, all releases. Both Fedora entries
+#      have their own, tpl_prep_fedora: install.sh does not recognise Fedora
+#      and refuses, so its guest tools come from the documented -d/-m override,
+#      the ISO tarball, or Fedora's own package -- the tiers linux_util's
+#      installer already uses.
 #
 # Version coverage below is deliberate: current supported releases only.
 # Ubuntu is the LTS line (interim releases are nine-month lifespans and would
@@ -7923,11 +8542,10 @@ show_help() {
 TPL_CATALOG=(
     # 10 GiB, not the 4 GiB default. Every image in this family is a 10 GiB
     # virtual disk -- read off `qemu-img info`'s "virtual size" for all three
-    # AlmaLinux releases, and the same for Rocky 8/9/10 and CentOS Stream
-    # 9/10 when those are built. That is the figure the VDI has to clear, and
-    # it is a property of the image, not of the download: AlmaLinux 8 is a
-    # 1.55 GiB download and AlmaLinux 10 a 0.48 GiB one, and both expand to
-    # the same 10 GiB.
+    # AlmaLinux releases, both CentOS Stream releases and all three Rocky Linux
+    # releases. That is the figure the VDI has to clear, and it is a property of
+    # the image, not of the download: AlmaLinux 8 is a 1.55 GiB download and
+    # AlmaLinux 10 a 0.48 GiB one, and both expand to the same 10 GiB.
     #
     # XO's own Hub lists its AlmaLinux 9 template at exactly 10 GiB, which
     # agrees. Its AlmaLinux 8 entry says 4 GiB, but that is an image pinned at
@@ -7971,11 +8589,11 @@ TPL_CATALOG=(
     # tpl_prep_fedora, not the RHEL rebuilds' script. Fedora's guest tools do
     # not come from the ISO the way theirs do: install.sh does not recognise
     # Fedora and refuses, and Fedora packages xe-guest-utilities-latest in its
-    # own updates repository, which the rebuilds do not. Its prep script is
-    # therefore separate rather than a shared one with a branch in it, so the
-    # AlmaLinux and CentOS Stream path is not touched. cloud-utils-growpart is
-    # present, its sshd carries the Include line, and SELINUX is enforcing --
-    # all read off the image.
+    # own updates repository, which tpl_prep_rhel does not touch. Its prep
+    # script is therefore separate rather than a shared one with a branch in it,
+    # so the AlmaLinux, CentOS Stream and Rocky path is not touched.
+    # cloud-utils-growpart is present, its sshd carries the Include line, and
+    # SELINUX is enforcing -- all read off the image.
     #
     # No firmware field: the GPT carries an EFI system partition alongside a
     # BIOS boot partition -- read off the image's partition table -- so
@@ -7998,9 +8616,33 @@ TPL_CATALOG=(
     # tpl_disk_supports_uefi looks for and the build never assumes a partition
     # count.
     "fedora44|Fedora 44|44|https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2|fedora|tpl_prep_fedora|5"
-    "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
-    "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
-    "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|-|"
+    # Rocky Linux 8, 9 and 10: same family as AlmaLinux and CentOS Stream, so all
+    # three run the same tpl_prep_rhel rather than a copy. Every point below was
+    # read off the GenericCloud image itself -- 8.10, 9.8 and 10.2:
+    #
+    #   - 10 GiB virtual disk on all three, not the 4 GiB default -- `qemu-img
+    #     info` "virtual size" off each qcow2 header (downloads are 1.92, 0.60
+    #     and 0.51 GiB, all expanding to 10 GiB).
+    #   - rocky on all three, from each image's /etc/cloud/cloud.cfg
+    #     (system_info.default_user.name), with lock_passwd: True, so
+    #     tpl_prep_rhel's cloud.cfg.d drop-in is what keeps the shipped password
+    #     login working on a clone.
+    #   - sshd differs by release, and tpl_prep_rhel already handles both: 8's
+    #     OpenSSH ships neither the Include line nor /etc/ssh/sshd_config.d
+    #     (like AlmaLinux 8), so the script edits sshd_config directly; 9 and 10
+    #     ship both, so it drops a file in.
+    #   - No firmware field: each GPT carries an EFI system partition -- a vfat
+    #     /boot/efi in the image's fstab, /boot/efi/EFI/rocky populated -- so
+    #     tpl_disk_supports_uefi finds the ESP and publishes UEFI, the default
+    #     this field would have set anyway.
+    #
+    # 8 is confirmed on Nick's pool (built, cloned, boots UEFI, guest agent
+    # 7.30.0-18, gets an IP). 9 and 10 have not been built on a pool yet -- the
+    # one open question is whether the guest-tools ISO's install.sh recognises
+    # el9/el10 with no -d/-m override, which it did for el8.
+    "rockylinux8|Rocky Linux 8|8|https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2|rocky|tpl_prep_rhel|10"
+    "rockylinux9|Rocky Linux 9|9|https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2|rocky|tpl_prep_rhel|10"
+    "rockylinux10|Rocky Linux 10|10|https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2|rocky|tpl_prep_rhel|10"
     # Deprecated: free support for 22.04 ends 2027-04-30, so this entry is
     # scheduled to go on 2027-06-01. Kept in the list until then so the menu
     # says so rather than the row silently vanishing.
@@ -8232,6 +8874,11 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build gave this VM the hostname "xo-template-build" from the prep drive.
+# Clear it so the template ships no hostname: each clone then takes its own
+# from cloud-init or DHCP instead of inheriting the build VM's name.
+truncate -s 0 /etc/hostname
+hostnamectl set-hostname "" 2>/dev/null || true
 apt-get clean
 rm -f /root/.bash_history /home/*/.bash_history
 
@@ -8259,12 +8906,13 @@ PREP_EOF
 # fixes. The catalogue rows point every RHEL-family entry here, AlmaLinux and
 # CentOS Stream alike.
 #
-# The guest tools come from the ISO, for a stronger reason than on Debian:
-# xe-guest-utilities is packaged by nobody in this family. Confirmed against
-# AlmaLinux 8, 9 and 10 and CentOS Stream 9 -- absent from base repos and
-# absent from EPEL on all of them -- so unlike the Debian path there is no
-# package fallback worth attempting, and the ISO is the only route that
-# exists.
+# The guest tools are installed from the ISO for every row here, with no
+# per-distro branch and no package fallback attempted. AlmaLinux 8/9/10 and
+# CentOS Stream 9/10 package xe-guest-utilities nowhere -- checked against base
+# repos and EPEL. Rocky 8's EPEL does carry xe-guest-utilities-latest, but
+# routing it through the same ISO path as the rest keeps this one function, so
+# the row does not depend on that package. If the ISO is not attached the build
+# fails rather than shipping a template that never reports an IP.
 tpl_prep_rhel() {
     local user="$1"
     # Quoted heredoc for the same reason as the Debian path: the guest script
@@ -8277,10 +8925,9 @@ exec > /var/log/xo-template-prep.log 2>&1
 set -x
 
 # --- guest tools ---
-# ISO only. No release in this family packages xe-guest-utilities, so there is
-# no fallback to fall back to; if the ISO is not attached the template will not
-# report an IP, and that has to be visible in the log rather than silently
-# skipped.
+# ISO only, no package fallback -- see tpl_prep_rhel's header for why. If the
+# ISO is not attached the template will not report an IP, and that has to be
+# visible in the log rather than silently skipped.
 install_guest_tools() {
     local mnt=/mnt
     if ! mountpoint -q "$mnt" && mount /dev/cdrom "$mnt" 2>/dev/null; then
@@ -8371,6 +9018,11 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build gave this VM the hostname "xo-template-build" from the prep drive.
+# Clear it so the template ships no hostname: each clone then takes its own
+# from cloud-init or DHCP instead of inheriting the build VM's name.
+truncate -s 0 /etc/hostname
+hostnamectl set-hostname "" 2>/dev/null || true
 
 # Drop the network config anaconda/cloud-init left behind. On this family a
 # baked-in NetworkManager connection carries the build VM's MAC and DHCP
@@ -8559,6 +9211,11 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build gave this VM the hostname "xo-template-build" from the prep drive.
+# Clear it so the template ships no hostname: each clone then takes its own
+# from cloud-init or DHCP instead of inheriting the build VM's name.
+truncate -s 0 /etc/hostname
+hostnamectl set-hostname "" 2>/dev/null || true
 
 # A baked-in NetworkManager connection carries the build VM's MAC and DHCP
 # client-id, which a clone then reuses -- two VMs, one lease.
@@ -9581,12 +10238,15 @@ tpl_api_import_image() {
             upload_file=""
             ;;
         *)
+            # Safety net: the preflight (tpl_api_ensure_qemu_img) already
+            # offered to install this and routed to SSH if it could not, so
+            # reaching here means something removed qemu-img mid-run.
             if ! command -v qemu-img >/dev/null 2>&1; then
                 log_error "  ${url##*/} is a qcow2 image and XO's import endpoint"
                 log_error "  does not accept qcow2, so it has to be converted first."
-                log_error "  Install qemu-utils (Debian/Ubuntu) or qemu-img (RHEL"
-                log_error "  family), or use TEMPLATE_BUILD_METHOD=ssh, which"
-                log_error "  converts on the pool master instead."
+                log_error "  Install qemu-img (packaged as qemu-utils on Debian/Ubuntu,"
+                log_error "  qemu-tools on openSUSE), or use TEMPLATE_BUILD_METHOD=ssh,"
+                log_error "  which converts on the pool master instead."
                 return 1
             fi
             local_file="${DEPLOY_WORKDIR}/image.qcow2"
@@ -10897,6 +11557,70 @@ tpl_api_ensure_xo_cli() {
     return 0
 }
 
+# Make sure qemu-img is available for the API path, which converts a qcow2
+# image to raw on *this* machine before uploading it (XO's import endpoint
+# takes raw and VHD only). The SSH path does the same conversion on the pool
+# master, where qemu-img is part of dom0 -- so a missing qemu-img here is a
+# reason to use SSH, not a reason to fail.
+#
+# Only the templates actually chosen decide whether it is needed: an all-Debian
+# selection ships raw images and converts nothing.
+#
+# Offered the same way as xo-cli and xorriso: prompt, then install with the
+# detected package manager. The package name is not the same everywhere --
+# qemu-utils on Debian/Ubuntu, qemu-tools on openSUSE, qemu-img on the RPM and
+# Arch families -- but the binary is always qemu-img.
+tpl_api_ensure_qemu_img() {
+    local row needs_convert=0
+    for row in "${TPL_SELECTED[@]}"; do
+        case "$(tpl_field "$row" 4)" in
+            *.raw) ;;
+            *) needs_convert=1 ;;
+        esac
+    done
+    (( needs_convert )) || return 0
+
+    command -v qemu-img >/dev/null 2>&1 && return 0
+
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        TPL_API_UNAVAILABLE_REASON="qemu-img is not installed, and every selected image is a qcow2 that must be converted before upload"
+        return 1
+    fi
+
+    if ! detect_package_manager_soft; then
+        TPL_API_UNAVAILABLE_REASON="qemu-img is not installed and no known package manager was found to install it"
+        return 1
+    fi
+
+    local pkg
+    case "$PKG_MANAGER" in
+        apt)    pkg="qemu-utils" ;;
+        zypper) pkg="qemu-tools" ;;
+        *)      pkg="qemu-img" ;;
+    esac
+
+    echo ""
+    log_info "The API path converts each qcow2 image to raw on this machine"
+    log_info "before uploading it to XO, which needs qemu-img."
+    echo ""
+
+    if ! confirm_or_skip "Install ${pkg} now (${PKG_INSTALL} ${pkg})?"; then
+        TPL_API_UNAVAILABLE_REASON="qemu-img is not installed"
+        return 1
+    fi
+
+    check_sudo
+    log_info "Installing ${pkg}..."
+    # shellcheck disable=SC2086
+    if ! run_cmd $PKG_INSTALL "$pkg" || ! command -v qemu-img >/dev/null 2>&1; then
+        TPL_API_UNAVAILABLE_REASON="${pkg} could not be installed"
+        return 1
+    fi
+
+    log_success "${pkg} installed"
+    return 0
+}
+
 # Decide how this run will reach the pool, and say so.
 #
 # Runs before any build work. Sets TPL_BUILD_METHOD to "api" or "ssh"; returns
@@ -10917,7 +11641,7 @@ tpl_select_build_method() {
 
     log_info "Checking whether Xen Orchestra's API can be used..."
 
-    if tpl_api_check_auth && tpl_api_ensure_xo_cli; then
+    if tpl_api_check_auth && tpl_api_ensure_xo_cli && tpl_api_ensure_qemu_img; then
         TPL_BUILD_METHOD="api"
         log_success "Build method: Xen Orchestra API at $(tpl_api_base_url) as ${TPL_API_ACCOUNT}."
         return 0
@@ -12016,9 +12740,15 @@ process_menu_selections() {
 
 # Run the interactive menu
 run_menu() {
-    # Load config silently for header info (don't error if missing)
+    # Run the same load_config() every operation runs, so an existing
+    # xo-config.cfg is migrated to the latest schema just from opening the
+    # menu -- not only once an operation is picked from it. This is a no-op
+    # (source and default-fill only) when there is no config file yet, so a
+    # first-time user with neither xo-config.cfg nor sample-xo-config.cfg
+    # still gets the menu, from which "Rename Sample-xo-config.cfg" and
+    # "Edit xo-config.cfg" are reachable.
     if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE" 2>/dev/null || true
+        load_config
     elif [[ -f "$SAMPLE_CONFIG" ]]; then
         source "$SAMPLE_CONFIG" 2>/dev/null || true
     fi
@@ -12209,6 +12939,9 @@ main() {
                 shift
                 RESTORE_BACKUP_FILE="${1:-}"
                 ;;
+            --list-backups)
+                LIST_BACKUPS_ONLY=true
+                ;;
             --log-file)
                 shift
                 LOG_FILE="${1:-}"
@@ -12224,7 +12957,7 @@ main() {
                 show_version
                 exit 0
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--status|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -12264,8 +12997,10 @@ main() {
     # Acquire exclusive lock for all mutating operations (not --help).
     # --deploy is excluded: it changes nothing on this machine, and holding the
     # install lock for the length of a remote deploy would block unrelated
-    # local operations for no reason.
-    if [[ "$OPERATION" != "--help" ]] && [[ "$OPERATION" != "--deploy" ]]; then
+    # local operations for no reason. --status is excluded for the same
+    # reason: it only reads state to report it, so it should never have to
+    # wait on -- or block -- a real install/update/rebuild in progress.
+    if [[ "$OPERATION" != "--help" ]] && [[ "$OPERATION" != "--deploy" ]] && [[ "$OPERATION" != "--status" ]]; then
         acquire_lock
     fi
 
@@ -12356,6 +13091,12 @@ main() {
             ;;
         --uninstall)
             cleanup_xo
+            ;;
+        --status)
+            check_required_commands
+            check_not_root
+            load_config
+            show_status
             ;;
         --help)
             show_help

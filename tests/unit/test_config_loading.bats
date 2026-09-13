@@ -198,7 +198,7 @@ CFG
     grep -q "^#TEMPLATE_BUILD_METHOD=auto" "$CONFIG_FILE"
     grep -q "^#XO_URL=" "$CONFIG_FILE"
     grep -q "^#XO_API_TOKEN=" "$CONFIG_FILE"
-    grep -qx "CONFIG_VERSION=4" "$CONFIG_FILE"
+    grep -qx "CONFIG_VERSION=${LATEST_CONFIG_VERSION}" "$CONFIG_FILE"
 }
 
 @test "the v4 migration does not duplicate keys that are already present" {
@@ -263,4 +263,59 @@ CFG
     [ "$status" -eq 0 ]
     [[ "$output" == *"SSH"* ]]
     [[ "$output" == *"no XO_API_TOKEN"* ]]
+}
+
+# --- workstation package manager -------------------------------------------
+
+@test "detect_package_manager_soft handles the workstation families, not just RPM and dpkg" {
+    # --build-templates and --deploy run from the operator's machine, which is
+    # as likely to be Arch, CachyOS or openSUSE as Debian. Missing any of these
+    # sent those users to a dead end.
+    local body
+    body=$(declare -f detect_package_manager_soft)
+    [[ "$body" == *"apt-get"* ]]
+    [[ "$body" == *"dnf"* ]]
+    [[ "$body" == *"pacman"* ]]
+    [[ "$body" == *"zypper"* ]]
+    [[ "$body" == *"apk"* ]]
+    # It reports failure rather than killing the process, so a caller that can
+    # carry on without installing anything is not taken down with it.
+    [[ "$body" == *"return 1"* ]]
+    [[ "$body" != *"exit 1"* ]]
+}
+
+@test "detect_package_manager still exits for the install flows that cannot continue" {
+    local body
+    body=$(declare -f detect_package_manager)
+    [[ "$body" == *"detect_package_manager_soft"* ]]
+    [[ "$body" == *"exit 1"* ]]
+}
+
+@test "the qemu-img preflight skips an all-raw selection" {
+    # Debian ships raw images, which stream straight to XO with nothing to
+    # convert -- so a Debian-only build needs no qemu-img even on the API path.
+    TPL_SELECTED=("debian12|Debian 12|bookworm|https://e/debian-12-generic-amd64.raw|debian|tpl_prep_debian|")
+    run tpl_api_ensure_qemu_img
+    [ "$status" -eq 0 ]
+}
+
+@test "the qemu-img preflight names the right package per distro and degrades to SSH" {
+    local body
+    body=$(declare -f tpl_api_ensure_qemu_img)
+    # A qcow2 in the selection is what makes it required.
+    [[ "$body" == *'*.raw)'* ]]
+    [[ "$body" == *"command -v qemu-img"* ]]
+    # Package name is not uniform: qemu-utils on Debian, qemu-tools on openSUSE.
+    [[ "$body" == *'apt)'*'qemu-utils'* ]]
+    [[ "$body" == *'zypper)'*'qemu-tools'* ]]
+    # Non-interactive or a decline sets a reason and returns non-zero, which
+    # routes tpl_select_build_method to SSH rather than failing the build.
+    [[ "$body" == *"NON_INTERACTIVE"* ]]
+    [[ "$body" == *"TPL_API_UNAVAILABLE_REASON="* ]]
+}
+
+@test "the build-method preflight checks qemu-img alongside xo-cli" {
+    local body
+    body=$(declare -f tpl_select_build_method)
+    [[ "$body" == *"tpl_api_ensure_qemu_img"* ]]
 }

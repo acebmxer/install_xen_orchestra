@@ -10,6 +10,254 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **Pre-update/pre-rebuild VM snapshots are now pruned automatically, and a
+  new `--status` command reports on the install without changing anything.**
+  `snapshot_xo_vm()` (added in an earlier unreleased change) had no cleanup at
+  all — every `--update`/`--rebuild` added another snapshot, forever. Vates'
+  own XOA updater documents a similar "delete after 7 days on a successful
+  update" policy for its own safety snapshots, but that isn't reliable in
+  practice: confirmed against a real production XOA where snapshots from 11
+  and 13 days earlier were still present, and Vates' own docs don't say what
+  mechanism is actually supposed to delete them. So this prunes with its own
+  deterministic pass instead, synchronously, right after every successful
+  snapshot: two new config keys, `SNAPSHOT_KEEP` (default 3) and
+  `SNAPSHOT_RETENTION_DAYS` (default 14), both enforced together and both
+  kept well under XO's own Health-view thresholds (it flags a VM with more
+  than 5 snapshots, and separately flags any snapshot older than 30 days) so
+  a default install never trips either warning even if updates are
+  infrequent. Only ever touches snapshots this project's own naming scheme
+  created — a snapshot made by hand or by a backup job is never a candidate,
+  however old. New config schema version 5; existing configs get both keys
+  appended on the next run, uncommented, since they're active defaults.
+
+  While adding this, found and fixed a real bug in `snapshot_xo_vm()` itself:
+  it read `XO_TASK_CHECK_TOKEN` directly instead of the already-resolved
+  `XO_API_TOKEN` that every other API call in this script uses (`load_config`
+  resolves `XO_API_TOKEN` from either key), so a user who had only set
+  `XO_API_TOKEN` — the name the config migration itself documents as current
+  — got silently skipped snapshots with no explanation. Now checks
+  `XO_API_TOKEN` first, falling back to `XO_TASK_CHECK_TOKEN`.
+
+  `--status` is a new, read-only command: current script/XO commit and how
+  far behind master, the running Node.js version, whether the xo-server
+  service is active, TLS certificate expiry, free disk space and swap,
+  how many file backups and VM snapshots exist against their retention
+  limits, and whether the script's own git checkout is clean. It makes no
+  changes and needs no lock, so it can be run any time, including while
+  another operation is in progress.
+
+### Fixed
+
+- **A successful pre-update/pre-rebuild snapshot could abort the entire
+  update or rebuild immediately afterward, before the service was even
+  stopped.** `prune_xo_vm_snapshots()`'s last statement was
+  `[[ $deleted -gt 0 ]] && log_success ...` — under this script's
+  `set -euo pipefail`, a `[[ ]] && cmd` whose test is false returns a nonzero
+  exit status even though nothing actually went wrong, and since that was the
+  last command in the function, its nonzero status became the function's own
+  return status. On the very first snapshot ever taken (nothing yet old
+  enough to prune, so `deleted` stayed `0`), that propagated straight out of
+  the uncaught call in `snapshot_xo_vm()` and killed the whole script right
+  after printing "VM snapshot created" — before `systemctl stop xo-server`,
+  before the backup, before the update itself ran. `prune_xo_vm_snapshots()`
+  now ends with an explicit `if`/`return 0`, and the call site also guards
+  with `|| true` so pruning can never take the caller down with it.
+
+- **The pre-update and pre-rebuild VM snapshot always failed with "HTTP 000"
+  and silently fell back to file backup only.** Both `update_xo()` and
+  `rebuild_xo()` called `snapshot_xo_vm()` *after* `systemctl stop xo-server`,
+  but the snapshot request goes to XO's own REST API on `localhost` — with
+  the service already stopped, nothing was listening on either port and every
+  connection attempt failed at the transport level (curl's `000`), not with a
+  real HTTP error. So the pre-update/pre-rebuild snapshot could never
+  succeed, on any run, for anyone. `snapshot_xo_vm()` is now called before
+  the service is stopped in both flows, while xo-server is still up to
+  answer the request.
+
+- **Opening the interactive menu now migrates `xo-config.cfg` to the latest
+  schema immediately, instead of waiting for an operation to be picked from
+  it.** `run_menu()` read the config with a plain `source` for header display
+  only, bypassing `load_config()` (and therefore `migrate_config()`) entirely
+  — every other entry point (`--update`, `--rebuild`, `--reconfigure`,
+  `--proxy`, `--build-templates`, `--status`) already calls `load_config()`
+  and migrates on the spot, but a menu session that never selected one of
+  those stayed on whatever schema version the file was already at. Now
+  `run_menu()` calls `load_config()` when `xo-config.cfg` exists, same as
+  every other operation; a missing config still falls back to sourcing
+  `sample-xo-config.cfg` so the menu remains reachable for a first-time setup
+  with no config file yet.
+
+- **CI's ShellCheck job was failing on `dev`** (SC2155, "declare and assign
+  separately to avoid masking return values") at two call sites this
+  session's own changes added: the snapshot name in `snapshot_xo_vm()` and
+  the config backup path in `reconfigure_xo()` both declared a `local` and
+  assigned it from a command substitution on the same line. Both now declare
+  first and assign on the next line, matching the pattern already used
+  everywhere else in the file. Verified against the exact ShellCheck version
+  CI runs (0.9.0): zero warnings.
+
+- **`--restore` now checks a backup is actually complete before destroying
+  the current installation to make room for it, and can list backups
+  without restoring.** A backup is a plain directory copy, not an archive, so
+  nothing previously caught an interrupted copy (disk full, process killed
+  mid-`cp`) until partway through a restore that had already deleted the
+  current install. `verify_backup_integrity()` now checks for `package.json`
+  at the backup's root (present in any complete XO checkout, absent if the
+  copy never finished) and, if the backup has a `.git` directory, that `git
+  rev-parse HEAD` actually resolves rather than hitting a truncated object
+  store — and refuses the restore before anything is touched if either check
+  fails. The existing backup listing (both interactively and via
+  `--list-backups`, new, which lists and exits without prompting to restore)
+  now tags any backup that fails this check right in the list, so a bad
+  backup is visible before it's ever selected.
+
+- **Node.js binary downloads are now checksum-verified; two temp files used
+  by XO Proxy install could leak on a mid-run failure.** Found in a follow-up
+  security audit. `install_nodejs_binary()` downloaded the Node.js tarball
+  straight from `nodejs.org` and extracted it as root with no integrity check
+  at all — every other download in this script (VM template images) verifies
+  against a published checksum, but this one path had no equivalent. It now
+  fetches nodejs.org's own `SHASUMS256.txt` for that release and verifies the
+  tarball's SHA-256 against it before extraction, the same way
+  `deploy_verify_image_checksum()` already verifies template images; a
+  mismatch or corrupted download is refused rather than installed. The
+  `NODE_VERSION` fallback default was also bumped from a stale pinned patch
+  (24.15.0) to the current latest LTS (24.21.0) — this only affects a config
+  with `NODE_VERSION` unset entirely, since the shipped sample config already
+  pins the major version only. Separately, `install_xo_proxy()` created two
+  temporary `expect` scripts (`xo-proxy-XXXXXX`, `xo-cli-XXXXXX`) and removed
+  them with a plain `rm -f` later in the function; under `set -euo pipefail`,
+  any failure in between (a parsing error, a signal) skipped that line and
+  left a copy of the helper script behind in `/tmp`. Both now use an `EXIT`
+  trap for cleanup, matching the pattern `deploy_cleanup`/`tpl_cleanup`
+  already use elsewhere in the script.
+
+- **Hardened credential and file-permission handling found in a security
+  audit.** The XO Proxy helper (`xo-proxy-helper.exp`) received the pool
+  master's SSH password and the XO web UI password as command-line
+  arguments, which are readable by any other local user via `ps` or
+  `/proc/<pid>/cmdline` for as long as the process runs; it now reads them
+  from the environment (`XO_HELPER_HOST_PASSWORD`, `XO_HELPER_XO_PASSWORD`),
+  matching the `SSHPASS`/`-e` pattern the rest of the script already uses.
+  The same helper piped Vates' XO Proxy installer straight into `bash` on
+  the pool master (`bash -c "$(wget -qO- ...)"`); it now downloads it to a
+  file and runs that, so there is a copy on disk to inspect, the same
+  reasoning already applied to the NodeSource setup script. `/etc/xo-server/
+  config.toml`, which can hold a Redis URI with an embedded password, was
+  written with no explicit mode and inherited `tee`'s default (typically
+  world-readable); it and its timestamped backup copy are now `chmod 600`
+  immediately after being written. The swap file created under low-memory
+  conditions was `fallocate`/`dd`-written before being `chmod 600`'d,
+  leaving a window where it was readable by any local user while being
+  filled with process memory contents; it's now created pre-locked with
+  `install -m 600` before anything is written into it. Self-update
+  (`self_update_script`, `git pull --ff-only` / `reset --hard` from
+  `origin`) now documents in a comment that it trusts `origin` with no
+  commit/tag signature verification, since this repo doesn't currently sign
+  either — no behaviour change, this closes a gap where the trust boundary
+  was undocumented.
+
+### Added
+
+- **`--update` and `--rebuild` now snapshot the XO VM itself before touching
+  anything, alongside the existing file backup.** `create_backup()` only ever
+  copied `$INSTALL_DIR` (the source/build tree) — it never covered the VM's
+  disk as a whole, including Redis, where pool connections, users, jobs and
+  settings actually live. The new `snapshot_xo_vm()` calls XO's REST API
+  (`POST /vms/{id}/actions/snapshot`, matching
+  docs.xen-orchestra.com/automation/restapi and checked against a live
+  instance's own swagger.json) to take a normal VM snapshot, visible in XO's
+  UI under the VM's own Snapshots tab like any other. This only works when
+  XO is itself a Xen guest — bare metal and other hypervisors have nothing to
+  snapshot — and reuses whichever `XO_TASK_CHECK_TOKEN` is already configured
+  for the pre-update task check, so it needs no new credentials. The VM's own
+  UUID is read from `/sys/hypervisor/uuid`, a stable Linux kernel sysfs ABI
+  present since 2.6.30 that needs no guest-tools package — XCP-ng/XO forum
+  guidance points at this exact file as the one that reliably matches the
+  UUID XO's own API uses, unlike `dmidecode`'s product UUID, which can
+  disagree with it over byte-order. Best-effort throughout: not a Xen guest,
+  an unreadable `/sys/hypervisor/uuid`, no configured token, or an
+  unreachable API all just skip the snapshot silently and let the existing
+  file backup run alone, exactly as every prior version did. It does **not**
+  necessarily cover `ENCRYPT_REDIS_CREDENTIALS`'s XenStore key half — whether
+  a XAPI snapshot preserves `vm-data` is undocumented upstream, so this is
+  not claimed as a fix for that; the config export already documented under
+  `ENCRYPT_REDIS_CREDENTIALS` remains the only confirmed recovery artifact
+  for the key. This is this project's own safety net on top of XO's
+  documented update procedure (`git pull && yarn && yarn build`), which does
+  not itself call for a pre-update backup or snapshot.
+
+- **A warning when the TLS certificate is close to expiring.** `SSL_CERT_DAYS`
+  stays 825 by default (the CA/Browser Forum's historical ceiling for a
+  public certificate — still the right default and unchanged by this), but
+  nothing previously told an operator their self-signed cert was approaching
+  that date. `check_cert_expiry()` runs as part of `load_config()`, so it
+  fires on `--update`, `--restore`, `--rebuild`, `--reconfigure`, `--proxy`
+  and `--build-templates` without a separate hook, and warns once the
+  certificate has fewer than 30 days left (or has already expired), naming
+  the exact remediation already documented for `SSL_CERT_DAYS`: delete the
+  files in `SSL_CERT_DIR` and run `--reconfigure`.
+
+- **Rocky Linux 8, 9 and 10 templates.** All three rows already named a
+  published image but had no preparation script, so the menu drew them as
+  **Coming Soon...** and refused to build them. They now run `tpl_prep_rhel`,
+  the same script the AlmaLinux and CentOS Stream rows use rather than a copy,
+  since it is the same family. Each image was read: 8.10, 9.8 and 10.2 all have
+  a 10 GiB virtual disk, default user `rocky` with `lock_passwd: True`, and an
+  EFI system partition, so nothing about them is a special case — 8 takes the
+  same no-`Include`-line sshd handling as AlmaLinux 8, 9 and 10 the drop-in
+  branch. Every row in the catalogue is now buildable; nothing is marked
+  **Coming Soon...**. Rocky 8 was built and booted on a real pool; 9 and 10
+  were verified from their images only.
+
+### Added
+
+- **`--build-templates` works from any common workstation distro.**
+  `detect_package_manager` recognised only `apt`, `dnf` and `yum` and `exit`ed
+  otherwise, so on Arch, CachyOS, openSUSE or Alpine the `xorriso` auto-install
+  died and — with the change below — so would the `qemu-img` one. It now also
+  detects `pacman`, `zypper` and `apk`, and reports failure instead of exiting
+  so a caller that can carry on (the API build path falls back to SSH) is not
+  taken down with it.
+
+### Fixed
+
+- **The API build path failed on any workstation without `qemu-img`, after the
+  build had already started.** That path converts each qcow2 image to raw
+  locally before uploading (XO's import endpoint takes raw and VHD only), but
+  `qemu-img` was only checked at the import step — so the operator got through
+  the token check, the `xo-cli` install, the summary and the build confirmation
+  before being told to install a package, and the message only named the
+  Debian and RHEL package names. It is now checked in the same preflight as
+  `xo-cli`: if the selected templates include a qcow2 image and `qemu-img` is
+  missing, the build offers to install it with the detected package manager
+  (`qemu-utils`, `qemu-tools` or `qemu-img` depending on the distro) and, on a
+  decline or under `--non-interactive`, uses the SSH path — which converts on
+  the pool master — rather than failing. A Debian-only selection skips the
+  check, since those images are raw.
+
+- **Every built template shipped the hostname `xo-template-build`.** The prep
+  drive gives the build VM `local-hostname: xo-template-build` via cloud-init,
+  and the machine-identity scrub cleared machine-id, SSH host keys and saved
+  network connections but never `/etc/hostname` — so the sealed template, and
+  any clone deployed without a `hostname:` in its cloud-config, came up as
+  `xo-template-build`. The scrub in all three prep scripts (`tpl_prep_debian`,
+  `tpl_prep_rhel`, `tpl_prep_fedora`) now truncates `/etc/hostname` and clears
+  the static hostname, the same as `virt-sysprep` does, so a clone takes its
+  hostname from cloud-init or DHCP instead. Present since templates first became
+  buildable; not specific to any distribution.
+
+- **Rocky Linux images would have imported unverified.** `deploy_checksum_source`
+  fell through to Debian's `SHA512SUMS` for `dl.rockylinux.org`, so the fetch
+  would have 404'd and the build would have warned and imported anyway. The
+  mirror publishes a `CHECKSUM` in the BSD tag shape `SHA256 (<file>) = <hash>` —
+  the same as `cloud.centos.org`, with an entry for the `.latest` name the
+  catalogue requests on all three releases — so it needs only a
+  `deploy_checksum_source` case and no new parser: the BSD branch added for
+  CentOS Stream already reads it.
+
 ## [0.7.2] - 2026-09-06
 
 ### Fixed

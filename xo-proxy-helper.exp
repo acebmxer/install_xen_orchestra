@@ -6,11 +6,15 @@
 # Arguments (positional):
 #   $argv 0  pool_master   IP/hostname of the Xen pool master
 #   $argv 1  username      SSH username for the pool master
-#   $argv 2  password      SSH password for the pool master
-#   $argv 3  proxy_ip      Desired proxy IP address, or "dhcp"
-#   $argv 4  ntp_server    NTP server address (empty string = use default)
-#   $argv 5  xo_username   Xen Orchestra web UI username (email)
-#   $argv 6  xo_password   Xen Orchestra web UI password
+#   $argv 2  proxy_ip      Desired proxy IP address, or "dhcp"
+#   $argv 3  ntp_server    NTP server address (empty string = use default)
+#   $argv 4  xo_username   Xen Orchestra web UI username (email)
+#
+# Passwords are NOT passed as arguments: a process's command line is
+# world-readable (ps, /proc/<pid>/cmdline) for as long as it runs, while its
+# environment is not. The caller sets these instead:
+#   XO_HELPER_HOST_PASSWORD   SSH password for the pool master
+#   XO_HELPER_XO_PASSWORD     Xen Orchestra web UI password
 #
 # Outputs lines of the form:
 #   CAPTURED_VALUES:
@@ -22,11 +26,11 @@
 set timeout 600
 set pool_master [lindex $argv 0]
 set username    [lindex $argv 1]
-set password    [lindex $argv 2]
-set proxy_ip    [lindex $argv 3]
-set ntp_server  [lindex $argv 4]
-set xo_username [lindex $argv 5]
-set xo_password [lindex $argv 6]
+set proxy_ip    [lindex $argv 2]
+set ntp_server  [lindex $argv 3]
+set xo_username [lindex $argv 4]
+set password    $env(XO_HELPER_HOST_PASSWORD)
+set xo_password $env(XO_HELPER_XO_PASSWORD)
 
 # Variables to capture output
 set proxy_uuid      ""
@@ -45,10 +49,17 @@ expect {
     }
 }
 
-# Wait for shell prompt and run installer
+# Wait for shell prompt and run installer.
+#
+# Saved to a file on the pool master first, rather than piped straight into
+# bash, so there is a copy on disk to inspect if this ever needs auditing --
+# same reasoning as the NodeSource setup script in install-xen-orchestra.sh.
+# This is still Vates' own documented one-liner with no signature or
+# checksum to verify it against; running it unattended trusts xoa.io and the
+# network path to it, same as running it by hand would.
 expect {
     -re ".*#" {
-        send "bash -c \"\$(wget -qO- https://xoa.io/proxy/deploy)\"\r"
+        send "wget -qO /tmp/xo-proxy-deploy.sh https://xoa.io/proxy/deploy && bash /tmp/xo-proxy-deploy.sh; rm -f /tmp/xo-proxy-deploy.sh\r"
     }
 }
 

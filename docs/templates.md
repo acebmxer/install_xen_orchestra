@@ -18,9 +18,13 @@ distribution's own published cloud image:
 
 It is also the **VM Template Library** entry in the interactive menu.
 
-Run it from your workstation. Like `--deploy`, it works over SSH against the
-pool master and installs nothing locally — your Xen Orchestra installation is
-not touched.
+Run it from your workstation — Debian, Ubuntu, Fedora, Arch, CachyOS, openSUSE
+or anything with `apt`, `dnf`, `pacman`, `zypper` or `apk`. It talks to XO's API
+(or falls back to SSH against the pool master) and does not touch your Xen
+Orchestra installation. The few tools it needs on that machine — `xo-cli`,
+`qemu-img`, and an ISO writer for the SSH path — it checks for up front and
+offers to install with your package manager; nothing is installed without a
+prompt.
 
 ## What you get
 
@@ -49,9 +53,10 @@ Each template ships with:
   firmware" dropdown — the template just gives you the right default.
 
 Defaults are 2 vCPUs, 2 GiB of RAM and a 4 GiB disk — 6 GiB for Ubuntu 24.04
-and 26.04, 5 GiB for the Fedora entries, and 10 GiB for the AlmaLinux and CentOS Stream
-entries, whose images expand to more than the default would hold. They are starting points, pre-filled in XO's New VM
-form, not limits.
+and 26.04, 5 GiB for the Fedora entries, and 10 GiB for the AlmaLinux, CentOS
+Stream and Rocky Linux entries, whose images expand to more than the default
+would hold. They are starting points, pre-filled in XO's New VM form, not
+limits.
 
 ## Available templates
 
@@ -66,6 +71,9 @@ form, not limits.
 | Debian 13 (Trixie) | `debian-13-generic-amd64.raw` from `cloud.debian.org` | `debian` |
 | Fedora 43 | `Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2` from `dl.fedoraproject.org` | `fedora` |
 | Fedora 44 | `Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2` from `dl.fedoraproject.org` | `fedora` |
+| Rocky Linux 8 | `Rocky-8-GenericCloud-Base.latest.x86_64.qcow2` from `dl.rockylinux.org` | `rocky` |
+| Rocky Linux 9 | `Rocky-9-GenericCloud-Base.latest.x86_64.qcow2` from `dl.rockylinux.org` | `rocky` |
+| Rocky Linux 10 | `Rocky-10-GenericCloud-Base.latest.x86_64.qcow2` from `dl.rockylinux.org` | `rocky` |
 | Ubuntu 22.04 LTS (Jammy) | `jammy-server-cloudimg-amd64.img` from `cloud-images.ubuntu.com` | `ubuntu` |
 | Ubuntu 24.04 LTS (Noble) | `noble-server-cloudimg-amd64.img` from `cloud-images.ubuntu.com` | `ubuntu` |
 | Ubuntu 26.04 LTS (Resolute) | `resolute-server-cloudimg-amd64.img` from `cloud-images.ubuntu.com` | `ubuntu` |
@@ -91,24 +99,27 @@ from Debian and are handled automatically:
 Ubuntu 22.04's free security maintenance ends on 2027-04-30, and this entry is
 scheduled to be removed on **2027-06-01**. It is buildable until then.
 
-The three AlmaLinux entries and both CentOS Stream entries share a preparation
-script of their own — `tpl_prep_rhel`, the `dnf` counterpart to the `apt` one
-Debian and Ubuntu use. It is named for the family rather than for any one
-distribution because Rocky Linux will be the same script when it is built. Five
-things differ from the Debian path:
+The three AlmaLinux entries, both CentOS Stream entries and the three Rocky Linux
+entries share a preparation script of their own — `tpl_prep_rhel`, the `dnf`
+counterpart to the `apt` one Debian and Ubuntu use. It is named for the family
+rather than for any one distribution. Five things differ from the Debian path:
 
-- **Guest tools come from the ISO with no package fallback.** No release in this
-  family packages `xe-guest-utilities` — checked against the base repositories
-  and EPEL on AlmaLinux 8, 9 and 10 and on CentOS Stream 9 and 10 — so unlike
-  Debian there is nothing to fall back to.
+- **Guest tools come from the ISO, with no package fallback attempted.**
+  AlmaLinux 8, 9 and 10 and CentOS Stream 9 and 10 package `xe-guest-utilities`
+  nowhere — checked against their base repositories and EPEL. Rocky Linux's EPEL
+  does carry `xe-guest-utilities-latest`, but the script installs from the ISO
+  for every row rather than branching per distribution, so no template depends
+  on it. If the ISO is not attached the build fails rather than producing a
+  template that never reports an IP.
 - **SELinux is enforcing.** The script touches `/.autorelabel` so the files it
   writes are relabelled on first boot; without it an unlabelled sshd drop-in can
   leave a clone refusing logins with nothing obvious in the log.
-- **Password login is enabled differently per release.** AlmaLinux 8 ships
-  neither `/etc/ssh/sshd_config.d` nor the `Include` line that reads it, so a
-  drop-in alone would be silently ignored there; AlmaLinux 9 and 10 and both
-  CentOS Stream releases ship both. The script tests for a working include and
-  edits `sshd_config` directly when there is none.
+- **Password login is enabled differently per release.** AlmaLinux 8 and
+  Rocky Linux 8 ship neither `/etc/ssh/sshd_config.d` nor the `Include` line
+  that reads it, so a drop-in alone would be silently ignored there; AlmaLinux
+  9 and 10, both CentOS Stream releases and Rocky Linux 9 and 10 ship both. The
+  script tests for a working include and edits `sshd_config` directly when
+  there is none.
 - **NetworkManager connections are removed.** This family bakes the build VM's
   MAC and DHCP client-id into a saved connection, which every clone would
   otherwise inherit and reuse.
@@ -116,13 +127,14 @@ things differ from the Debian path:
   and cloud-init re-locks that account on every boot, so setting a password
   during the build is not enough on its own — see the note below.
 
-The five AlmaLinux and CentOS Stream entries are built with a 10 GiB disk rather
-than the 4 GiB default. Every one of those images is a 10 GiB virtual disk
-however small the download is — AlmaLinux 8 downloads as 1.55 GiB and
-AlmaLinux 10 as 0.48 GiB, CentOS Stream 9 as 1.19 GiB and 10 as 1.00 GiB, and
-all of them expand to the same 10 GiB. AlmaLinux 8 is supported until
-2029-05-31; its image being frozen at the final 8.10 point release is not the
-same thing as the distribution approaching end of life.
+The eight AlmaLinux, CentOS Stream and Rocky Linux entries are built with a
+10 GiB disk rather than the 4 GiB default. Every one of those images is a 10 GiB
+virtual disk however small the download is — AlmaLinux 8 downloads as 1.55 GiB
+and AlmaLinux 10 as 0.48 GiB, CentOS Stream 9 as 1.19 GiB and 10 as 1.00 GiB,
+Rocky Linux 8 as 1.92 GiB and 9 and 10 as roughly 0.6 GiB each, and all of them
+expand to the same 10 GiB. AlmaLinux 8 and Rocky Linux 8 are supported until
+2029-05-31, and both ship an image frozen at the final 8.10 point release —
+which is not the same thing as the distribution approaching end of life.
 
 Both Fedora entries are the exception to that figure: each expands to a 5 GiB
 disk, so both are built with 5 GiB. The size is read off each image's own
@@ -137,8 +149,9 @@ carrying no separate `/boot`, which changes nothing: the build looks for the
 ESP and never assumes a partition count. The rest of the work is the same, but the guest tools are
 not: the ISO's `install.sh` recognises Debian, CentOS, RHEL, SLES and Ubuntu by
 name and refuses anything else, and Fedora packages `xe-guest-utilities-latest`
-in its own `updates` repository where the rebuilds package nothing. Keeping it
-separate means the five rows already building on `tpl_prep_rhel` are untouched.
+in its own `updates` repository where the RHEL rebuilds take theirs from the
+ISO. Keeping it separate means the eight rows already building on `tpl_prep_rhel`
+are untouched.
 
 Its guest-tools step follows the tiers `linux_util`'s installer already uses:
 
@@ -167,54 +180,45 @@ disturbing the username. **Delete that file once you have installed your own
 SSH keys**, or supply `ssh_authorized_keys` at VM creation and never use the
 password.
 
-The same `lock_passwd: True` is present in the AlmaLinux and CentOS Stream
-images, so `tpl_prep_rhel` writes the same drop-in for the same reason. The
-merge was confirmed on cloud-init 23.4 (AlmaLinux 8) as well as 25.2, since
-AlmaLinux 8 carries a much older release. Debian and Ubuntu need none of this —
-their images do not lock the default user.
+The same `lock_passwd: True` is present in the AlmaLinux, CentOS Stream and
+Rocky Linux images, so `tpl_prep_rhel` writes the same drop-in for the same
+reason. The `cloud.cfg.d` deep-merge was tested on cloud-init 23.4 (AlmaLinux 8,
+and Rocky Linux 8, which ships the same) and 25.2 (Fedora); Rocky Linux 9 and 10
+ship versions inside that span. Debian and Ubuntu need none of this — their
+images do not lock the default user.
 
-The CentOS Stream default account is `cloud-user`, not `centos`, and Fedora's is
-`fedora` — read out of each image's own `/etc/cloud/cloud.cfg`, where
-`system_info.default_user.name` says so.
+The CentOS Stream default account is `cloud-user`, not `centos`, Fedora's is
+`fedora`, and Rocky Linux's is `rocky` — read out of each image's own
+`/etc/cloud/cloud.cfg`, where `system_info.default_user.name` says so.
 
 Fedora's root filesystem is btrfs with subvolumes, unlike every other entry
 here. Nothing in the build reads the filesystem — the import is block-level and
 growpart works on the partition — so it changes nothing in practice.
 
-## Coming soon
+## Adding a distribution
 
-These appear in the menu marked **Coming Soon...** and cannot be selected. They
-are listed rather than left out so the catalogue answers "will my distribution
-be here?" without anyone reading the source. Each one names a real published
-cloud image — the URLs were checked, and each returns a live image with a
-published checksum beside it — so what is missing is the code, not the image.
+Every distribution in the catalogue is buildable today — nothing is marked
+**Coming Soon...**. Adding another is additive: the catalogue is one row per
+entry and the build loops over it. The three things that once needed
+per-distribution work are all solved generically:
 
-| Template | Image origin |
-| --- | --- |
-| Rocky Linux 8 / 9 / 10 | `dl.rockylinux.org` |
-
-Three things stood between these and a working entry. All three are now solved
-for every image rather than per-distribution, which is what made the Ubuntu and
-AlmaLinux entries buildable and leaves the remaining rows here:
-
-1. **Image format.** ~~Debian publishes `raw`; everyone else publishes
-   `qcow2`.~~ **Solved.** A non-raw image is now converted to raw with
-   `qemu-img` on the pool master before the import. This needs the staged path,
-   since there is nothing to convert in a stream, so a qcow2 image cannot fall
-   back to streaming when `/var/tmp` is short on space.
-2. **Checksum format.** ~~The verification reads Debian's `SHA512SUMS`.~~
-   **Solved.** The checksum file and algorithm are chosen from the image's own
-   URL, and the two shapes those files come in are both parsed: coreutils'
-   `<hash>  <file>` (Debian's `SHA512SUMS`, Ubuntu's `SHA256SUMS`, AlmaLinux's
-   `CHECKSUM`) and the BSD tag `SHA256 (<file>) = <hash>` (CentOS Stream's
-   `CHECKSUM`, on both releases).
+1. **Image format.** Debian publishes `raw`; everyone else publishes `qcow2`. A
+   non-raw image is converted to raw with `qemu-img` on the pool master before
+   the import. This needs the staged path, since there is nothing to convert in
+   a stream, so a qcow2 image cannot fall back to streaming when `/var/tmp` is
+   short on space.
+2. **Checksum format.** The checksum file and algorithm are chosen from the
+   image's own URL, and the two shapes those files come in are both parsed:
+   coreutils' `<hash>  <file>` (Debian's `SHA512SUMS`, Ubuntu's `SHA256SUMS`,
+   AlmaLinux's `CHECKSUM`) and the BSD tag `SHA256 (<file>) = <hash>` (CentOS
+   Stream's and Rocky Linux's `CHECKSUM`, all releases).
 
    The shape is not a property of the distribution family, which is why it is
-   tried both ways rather than selected by origin: `repo.almalinux.org` and
-   `cloud.centos.org` publish a file with the same name, `CHECKSUM`, and
-   disagree on what goes inside it. Both carry an entry for the `-latest`
-   filename this catalogue requests rather than only the dated name it points
-   at.
+   tried both ways rather than selected by origin: `repo.almalinux.org`,
+   `cloud.centos.org` and `dl.rockylinux.org` all publish a file named
+   `CHECKSUM` and do not agree on what goes inside it. Each carries an entry for
+   the `.latest` / `-latest` filename this catalogue requests rather than only
+   the dated name it points at.
 
    Fedora publishes the BSD shape too, but under a filename carrying the
    release and compose — `Fedora-Cloud-43-1.6-x86_64-CHECKSUM` — rather than a
@@ -222,29 +226,22 @@ AlmaLinux entries buildable and leaves the remaining rows here:
    name instead of being a constant. Its file is PGP clearsigned; the digest
    lines inside are ordinary BSD tag lines, so the parse reaches them, but the
    signature itself is not verified.
+3. **Guest preparation.** `tpl_prep_rhel` is the `dnf` counterpart to
+   `tpl_prep_debian` and serves the RHEL rebuilds — AlmaLinux, CentOS Stream
+   and Rocky Linux, all releases. Both Fedora entries have their own,
+   `tpl_prep_fedora`, because their guest tools do not come from the ISO the way
+   the rebuilds' do.
 
-   This section previously said the whole RHEL family publishes
-   `SHA256 (file) = hash` and that this was why those rows were placeholders.
-   That was half wrong and had never been checked against a mirror — AlmaLinux
-   uses the coreutils shape, CentOS Stream does use the BSD one. Rocky has not
-   been read the same way and is still assumed rather than known.
-3. **Guest preparation.** ~~The preparation script is `apt`-based.~~ **Solved
-   for the RHEL rebuilds and Fedora 43.** `tpl_prep_rhel` is the `dnf`
-   equivalent and is what made the AlmaLinux and CentOS Stream entries
-   buildable; it is named for the family because Rocky Linux is the same script
-   when it is built. Both Fedora entries have their own, `tpl_prep_fedora`,
-   because their guest tools do not come from the ISO the way the rebuilds'
-   do.
-
-Adding a distribution beyond these is additive — the catalogue is a table of
-one row per entry and the build loops over it.
+A new row whose image has not been read yet can land with a `-` in its
+prep-function field: the menu then shows it as **Coming Soon...** and refuses
+to build it until the row is finished. Nothing uses that today.
 
 Images come from the distribution's own mirror, so nothing is redistributed and
 you can see exactly what you are installing. Checksums are not pinned in the
 script: every origin publishes a checksum file beside its image — `SHA512SUMS`
-for Debian, `SHA256SUMS` for Ubuntu, `CHECKSUM` for AlmaLinux and CentOS Stream,
-and a release-stamped `Fedora-Cloud-<release>-<compose>-x86_64-CHECKSUM` for
-Fedora — which is fetched and verified at build time, so a new upstream release
+for Debian, `SHA256SUMS` for Ubuntu, `CHECKSUM` for AlmaLinux, CentOS Stream and
+Rocky Linux, and a release-stamped `Fedora-Cloud-<release>-<compose>-x86_64-CHECKSUM`
+for Fedora — which is fetched and verified at build time, so a new upstream release
 is picked up without anyone editing the catalogue. Which file and which algorithm
 is worked out from the image's URL, so adding an image does not mean declaring
 its checksum format alongside it.
@@ -263,8 +260,9 @@ its checksum format alongside it.
    disk actually holds a partition table before going further.
 4. **Boots the VM once.** A cloud-init drive installs the guest tools, adds
    cloud-init and growroot, sets the shipped login, then scrubs the machine
-   identity a clone must not inherit — machine-id, SSH host keys, cloud-init
-   state, logs and shell history — and powers the VM off. This is the slow part;
+   identity a clone must not inherit — machine-id, SSH host keys, hostname,
+   saved network connections, cloud-init state, logs and shell history — and
+   powers the VM off. This is the slow part;
    allow roughly five to ten minutes per template.
 5. **Seals the result**: destroys the preparation drive so cloud-init does not
    find a used seed on every clone, ejects the tools ISO, sets the firmware and
@@ -280,23 +278,30 @@ Storage and network are not prompted for. The build uses the pool's default SR
   it is short, the build streams the image straight into the disk instead,
   which cannot resume a broken transfer.
 
-  **The Ubuntu templates need more, and cannot fall back to streaming.** A
-  qcow2 has to be downloaded and then converted, so both files exist at once:
-  allow around 4.5 GB. Streaming is not an option for it because there is nothing to convert
-  in a pipe, so a pool master short on `/var/tmp` fails the build with a
-  message saying so rather than importing something that will not boot.
+  **Every template except the two Debian ones needs more on the SSH path, and
+  cannot fall back to streaming.** Their images are qcow2 and have to be
+  downloaded and then converted, so both files exist at once: allow around
+  4.5 GB. Streaming is not an option because there is nothing to convert in a
+  pipe, so a pool master short on `/var/tmp` fails the build with a message
+  saying so rather than importing something that will not boot.
 
-- `qemu-img` on the pool master, for any template whose image is not raw —
-  currently the Ubuntu ones. XCP-ng does not always ship it, so the build checks
-  before downloading anything and offers to install it from XCP-ng's own base
-  repository (`yum install --enablerepo=base -y qemu-img`). Decline and the
-  build stops without having downloaded the image.
+- **`qemu-img`, to convert those qcow2 images to raw** (XO's import endpoint
+  takes raw and VHD only). Where it is needed depends on the build method:
+  - **API path** — on your workstation, since that is where the image is
+    downloaded. The build checks in its preflight and, if it is missing, offers
+    to install it with your package manager (`qemu-utils` on Debian/Ubuntu,
+    `qemu-tools` on openSUSE, `qemu-img` on the Fedora/RHEL and Arch families).
+    Decline and the build uses the SSH path instead.
+  - **SSH path** — on the pool master, where it is part of dom0 on any normal
+    XCP-ng install. If it is somehow absent the build stops rather than
+    installing anything onto dom0.
+  A Debian-only selection needs `qemu-img` on neither: those images are raw.
 - `guest-tools.iso` must be present on the pool. It normally lives in the
   **XCP-ng Tools** storage repository. A build stops if it is missing rather
   than producing a template whose VMs never report an IP.
-- `genisoimage` or `xorriso` on your workstation, to build the preparation
-  drive. If neither is present the script offers to install `xorriso`, which is
-  packaged on both Debian and RHEL families.
+- `genisoimage` or `xorriso` on your workstation (SSH path only — the API path
+  has XO build the config drive). If neither is present the script offers to
+  install `xorriso` with your package manager.
 
 ## If a build fails
 

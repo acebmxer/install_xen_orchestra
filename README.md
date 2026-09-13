@@ -7,10 +7,10 @@
 [![Issues](https://img.shields.io/github/issues/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/issues)
 [![Stars](https://img.shields.io/github/stars/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/stargazers)
 [![Forks](https://img.shields.io/github/forks/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/forks)
-[![Unique cloners](https://img.shields.io/badge/unique%20cloners-101-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
+[![Unique cloners](https://img.shields.io/badge/unique%20cloners-148-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-353%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-391%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -76,6 +76,29 @@ Orchestra](https://xen-orchestra.com/) from source.
 | Something went wrong | [docs/troubleshooting.md](docs/troubleshooting.md) |
 | Code style, tests, releases | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
+## Relationship to Vates' own documentation
+
+For the three core actions — **installing** Xen Orchestra, **updating** it,
+and deploying an **XO Proxy** — this script's actual mechanics follow Vates'
+own documented method exactly:
+
+- Install: the same build-from-source steps as
+  [docs.xen-orchestra.com/install-from-sources](https://docs.xen-orchestra.com/install-from-sources)
+  (Node.js latest LTS, the same system packages, the same build commands).
+- Update: the same `git pull && yarn && yarn build` Vates documents.
+- XO Proxy: the same `wget -qO- https://xoa.io/proxy/deploy | bash` one-liner
+  Vates publishes — this script only automates typing it over SSH.
+
+Everything beyond that — the pre-update/rebuild VM snapshot, the file
+backup, the TLS certificate expiry warning, the Node.js download checksum
+verification, file-permission hardening on generated config and swap
+files — is this project's **own addition**, layered on top of Vates'
+method. None of it is documented or required by Vates, and none of it
+changes or replaces the core action itself; it only adds safety nets
+around it. Where Vates' docs are silent (as with all of the above), this
+script's choices are its own engineering judgment, not a claim of official
+backing.
+
 ## Available Functions
 
 | Function | CLI Flag | Description |
@@ -84,11 +107,12 @@ Orchestra](https://xen-orchestra.com/) from source.
 | Build Templates | `--build-templates` | Build cloud-init VM templates on a XenServer/XCP-ng pool |
 | Install | `--install` | Fresh install of Xen Orchestra |
 | Update | `--update` | Update existing installation (with backup) |
-| Restore | `--restore` | Restore from a previous backup |
+| Restore | `--restore` | Restore from a previous backup (verified for completeness first; add `--list-backups` to just list them) |
 | Rebuild | `--rebuild` | Fresh clone + clean build, preserves settings |
 | Reconfigure | `--reconfigure` | Apply config changes without rebuilding |
 | XO Proxy | `--proxy` | Deploy XO Proxy to a Xen pool master |
 | Adjust Memory | `--adjust-memory` | Raise the heap memory allocated to the `xo-server` process |
+| Status | `--status` | Read-only health report: version, service, TLS cert, disk/swap, backups/snapshots, git state |
 | Edit Config | *(menu only)* | Open `xo-config.cfg` in your preferred editor |
 | Rename Config | *(menu only)* | Rename `sample-xo-config.cfg` to `xo-config.cfg` |
 
@@ -213,9 +237,9 @@ template uses:
     [ ] Debian 13 (Trixie) (login: debian)
     [ ] Fedora 43 (login: fedora)
     [ ] Fedora 44 (login: fedora)
-      Rocky Linux 8  Coming Soon...
-      Rocky Linux 9  Coming Soon...
-      Rocky Linux 10  Coming Soon...
+    [ ] Rocky Linux 8 (login: rocky)
+    [ ] Rocky Linux 9 (login: rocky)
+    [ ] Rocky Linux 10 (login: rocky)
     [ ] Ubuntu 22.04 LTS (Jammy) (login: ubuntu)
     [ ] Ubuntu 24.04 LTS (Noble) (login: ubuntu)
     [ ] Ubuntu 26.04 LTS (Resolute) (login: ubuntu)
@@ -234,11 +258,10 @@ the machine identity a clone must not inherit, and sealing the result. Once
 built they appear in Xen Orchestra under **New → VM**, alongside any Hub
 templates you already have.
 
-AlmaLinux 8, 9 and 10, CentOS Stream 9 and 10, Debian 12 (Bookworm), Debian 13
-(Trixie), Fedora 43 and 44, and the three Ubuntu LTS releases — 22.04 (Jammy),
-24.04 (Noble) and 26.04 (Resolute) — are buildable today. Rocky Linux is listed
-in the menu as **Coming Soon...**: each row names a published cloud image, and
-what is missing is the preparation script rather than the image. The full walkthrough — what each
+Every distribution in the catalogue is buildable: AlmaLinux 8, 9 and 10,
+CentOS Stream 9 and 10, Debian 12 (Bookworm) and 13 (Trixie), Fedora 43 and 44,
+Rocky Linux 8, 9 and 10, and the three Ubuntu LTS releases — 22.04 (Jammy),
+24.04 (Noble) and 26.04 (Resolute). The full walkthrough — what each
 template contains, how the boot firmware is chosen, requirements, and what to do
 when a build fails — is in [docs/templates.md](docs/templates.md).
 
