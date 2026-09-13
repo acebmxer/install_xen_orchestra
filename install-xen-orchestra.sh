@@ -2550,7 +2550,7 @@ snapshot_xo_vm() {
 
     log_success "VM snapshot created: ${snap_name} (visible in XO under this VM's Snapshots tab)"
 
-    prune_xo_vm_snapshots "$vm_uuid" "$xo_token" "$base_url"
+    prune_xo_vm_snapshots "$vm_uuid" "$xo_token" "$base_url" || true
 }
 
 # Delete this VM's own pre-update/pre-rebuild snapshots (the "xo-install-"
@@ -2648,7 +2648,10 @@ prune_xo_vm_snapshots() {
         fi
     done <<< "$candidates"
 
-    [[ $deleted -gt 0 ]] && log_success "Pruned ${deleted} old VM snapshot(s)."
+    if [[ $deleted -gt 0 ]]; then
+        log_success "Pruned ${deleted} old VM snapshot(s)."
+    fi
+    return 0
 }
 
 # Create backup

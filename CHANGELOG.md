@@ -50,6 +50,21 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **A successful pre-update/pre-rebuild snapshot could abort the entire
+  update or rebuild immediately afterward, before the service was even
+  stopped.** `prune_xo_vm_snapshots()`'s last statement was
+  `[[ $deleted -gt 0 ]] && log_success ...` — under this script's
+  `set -euo pipefail`, a `[[ ]] && cmd` whose test is false returns a nonzero
+  exit status even though nothing actually went wrong, and since that was the
+  last command in the function, its nonzero status became the function's own
+  return status. On the very first snapshot ever taken (nothing yet old
+  enough to prune, so `deleted` stayed `0`), that propagated straight out of
+  the uncaught call in `snapshot_xo_vm()` and killed the whole script right
+  after printing "VM snapshot created" — before `systemctl stop xo-server`,
+  before the backup, before the update itself ran. `prune_xo_vm_snapshots()`
+  now ends with an explicit `if`/`return 0`, and the call site also guards
+  with `|| true` so pruning can never take the caller down with it.
+
 - **The pre-update and pre-rebuild VM snapshot always failed with "HTTP 000"
   and silently fell back to file backup only.** Both `update_xo()` and
   `rebuild_xo()` called `snapshot_xo_vm()` *after* `systemctl stop xo-server`,
