@@ -50,6 +50,17 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The pre-update and pre-rebuild VM snapshot always failed with "HTTP 000"
+  and silently fell back to file backup only.** Both `update_xo()` and
+  `rebuild_xo()` called `snapshot_xo_vm()` *after* `systemctl stop xo-server`,
+  but the snapshot request goes to XO's own REST API on `localhost` — with
+  the service already stopped, nothing was listening on either port and every
+  connection attempt failed at the transport level (curl's `000`), not with a
+  real HTTP error. So the pre-update/pre-rebuild snapshot could never
+  succeed, on any run, for anyone. `snapshot_xo_vm()` is now called before
+  the service is stopped in both flows, while xo-server is still up to
+  answer the request.
+
 - **Opening the interactive menu now migrates `xo-config.cfg` to the latest
   schema immediately, instead of waiting for an operation to be picked from
   it.** `run_menu()` read the config with a plain `source` for header display

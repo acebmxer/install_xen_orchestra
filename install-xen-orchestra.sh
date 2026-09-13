@@ -3337,6 +3337,12 @@ update_xo() {
     # Check for active tasks before stopping the service
     check_active_xo_tasks
 
+    # Snapshot while xo-server is still up -- it talks to the REST API on
+    # localhost, so it must run before the service stops below or every
+    # attempt fails to connect (HTTP 000) and silently falls back to file
+    # backup only.
+    snapshot_xo_vm "pre-update"
+
     # Stop service
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
@@ -3347,7 +3353,6 @@ update_xo() {
 
     # Create backup
     create_backup
-    snapshot_xo_vm "pre-update"
 
     # Update repository
     log_info "Pulling latest changes..."
@@ -3475,6 +3480,12 @@ rebuild_xo() {
     echo ""
     confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; exit 0; }
 
+    # Snapshot while xo-server is still up -- it talks to the REST API on
+    # localhost, so it must run before the service stops below or every
+    # attempt fails to connect (HTTP 000) and silently falls back to file
+    # backup only.
+    snapshot_xo_vm "pre-rebuild"
+
     # Stop the service before touching anything
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
@@ -3484,7 +3495,6 @@ rebuild_xo() {
 
     # Backup current installation (node_modules excluded, same as update)
     create_backup
-    snapshot_xo_vm "pre-rebuild"
 
     # Wipe current installation directory
     log_info "Removing current installation directory..."
