@@ -20,6 +20,27 @@ jobs:
       - name: Run ShellCheck on main script
         run: shellcheck -S warning install-xen-orchestra.sh
 
+  trivy:
+    name: Trivy (secrets & misconfig)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # This project ships a shell script, not a container image, so there is
+      # no `trivy image` target and no dependency manifest for a vuln scan to
+      # walk. What applies is a filesystem scan: secrets accidentally
+      # committed anywhere in the repo, and misconfigurations in the
+      # integration Dockerfiles (test fixtures, not a published image).
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret,misconfig
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
   unit-tests:
     name: BATS Unit Tests
     runs-on: ubuntu-latest
