@@ -12784,6 +12784,12 @@ manage_custom_plugins() {
         menu_interactive_pick
         MENU_ALLOW_CANCEL=false
 
+        # Snapshot the plugin picker's own preselection before restoring the
+        # main menu's state below, which clears MENU_PRESELECTED (the main
+        # menu doesn't use preselection) -- the diff against it has to happen
+        # first, or every index read here is unbound under `set -u`.
+        local plugin_preselected=("${MENU_PRESELECTED[@]}")
+
         MENU_NAMES=("${saved_menu_names[@]}")
         MENU_HINTS=("${saved_menu_hints[@]}")
         MENU_TITLE="$saved_menu_title"
@@ -12796,9 +12802,9 @@ manage_custom_plugins() {
         fi
 
         for ((i = 0; i < ${#names[@]}; i++)); do
-            if [[ ${MENU_SELECTED[$i]} -eq 1 && ${MENU_PRESELECTED[$i]} -eq 0 ]]; then
+            if [[ ${MENU_SELECTED[$i]} -eq 1 && ${plugin_preselected[$i]:-0} -eq 0 ]]; then
                 to_install+=("${names[$i]}")
-            elif [[ ${MENU_SELECTED[$i]} -eq 0 && ${MENU_PRESELECTED[$i]} -eq 1 ]]; then
+            elif [[ ${MENU_SELECTED[$i]} -eq 0 && ${plugin_preselected[$i]:-0} -eq 1 ]]; then
                 to_uninstall+=("${names[$i]}")
             fi
         done

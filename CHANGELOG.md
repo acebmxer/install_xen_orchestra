@@ -41,6 +41,16 @@ This installer builds Xen Orchestra from source and tracks the official
   screen loading rather than a continuation of the same menu. See
   [docs/custom-plugins.md](docs/custom-plugins.md).
 
+  While adding this, found and fixed a real bug in `manage_custom_plugins()`:
+  after the picker returned, it reset `MENU_PRESELECTED` to an empty array
+  (so the array doesn't leak into the main menu, which doesn't use
+  preselection) and only *then* diffed the picker's selections against that
+  same now-empty array to work out what changed — reading an unset array
+  index under `set -u`, which crashed with `MENU_PRESELECTED[$i]: unbound
+  variable` on every run of the picker, selecting any plugin at all. The
+  picker's preselection is now snapshotted into a local variable before the
+  reset, so the diff runs against the real values.
+
 - **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
   integration matrix.** The RHEL family was represented by one release each
   (Rocky 9, AlmaLinux 9, CentOS Stream 9), even though the deploy catalogue in
