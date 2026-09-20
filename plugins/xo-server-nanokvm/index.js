@@ -13,6 +13,7 @@
 // xo-server-host-power-manager for the policy (CPU/memory thresholds).
 
 const { NanoKvmClient } = require('./lib/client')
+const log = require('./lib/log')
 
 exports.configurationSchema = {
   type: 'object',
@@ -135,12 +136,18 @@ exports.default = function ({ xo }) {
 
     // Logs in and reads GPIO state without pressing anything, to check the
     // configured URL/credentials are correct.
+    //
+    // XO's own "Test plugin" dialog only ever shows a static "appears to be
+    // working" message on success -- it discards whatever this returns. So
+    // the actual reading is logged here rather than returned, or it would
+    // never be visible to whoever clicked Test.
     async test({ hostId }) {
       const entry = devicesByHostId.get(hostId)
       if (entry === undefined) {
         throw new Error(`xo-server-nanokvm: no device configured for host ${hostId}`)
       }
-      await entry.client.getPowerLedOn()
+      const powerLedOn = await entry.client.getPowerLedOn()
+      log.info(`test for device "${entry.device.label || hostId}": reachable, power LED is ${powerLedOn ? 'on' : 'off'}`)
     },
   }
 }

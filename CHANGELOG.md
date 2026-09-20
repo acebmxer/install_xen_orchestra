@@ -80,8 +80,9 @@ This installer builds Xen Orchestra from source and tracks the official
   power-off. `configure()` logs a warning for a rule left with neither
   trigger active, and a second warning (new `cpuTriggerIncomplete()`/
   `memoryTriggerIncomplete()`) for a rule with a real metric picked but a
-  threshold still missing — both surfaced through the Test button's result
-  too. The Rule label's example text was also changed from a generic host
+  threshold still missing — both also included in the Test button's result
+  object (`cpuTriggerActive`, `cpuTriggerIncomplete`, and their memory
+  counterparts). The Rule label's example text was also changed from a generic host
   name (`"host3"`) to one that reflects what the label is actually for
   (`"Power on/off extra host"`). The README's **Behavior** section states
   what a single-trigger rule does: that one trigger alone decides both
@@ -130,6 +131,29 @@ This installer builds Xen Orchestra from source and tracks the official
   the exact sequence an initial activation followed by a settings save
   produces): exactly one timer running throughout, never zero, never
   duplicated.
+
+  Also found, while using the Test button to chase the timer bug above: XO's
+  own "Test plugin" dialog discards whatever a plugin's `test()` method
+  returns and always shows a static "The test appears to be working."
+  message on success — it never displays the payload. This plugin's `test()`
+  had just been given a detailed diagnostic return value (trigger states,
+  computed CPU/memory values, `wouldDo`), and an earlier entry in this same
+  changelog claimed those were "surfaced through the Test button's result" —
+  true of the API response, but not of anything a user actually sees when
+  clicking that button in XO, which made that data effectively invisible.
+  `test()` now also logs its full result via this plugin's own logger before
+  returning it, so `sudo journalctl -u xo-server` shows exactly what a Test
+  click computed — trigger states, values, and what it would do — which is
+  otherwise the only way to see it.
+
+  Checked `xo-server-nanokvm`'s `test()` for the same gap: it doesn't have
+  the discarded-data problem (it only checks the URL/credentials work and
+  throws on failure, which XO's dialog does show), but it read the power
+  LED's GPIO state and threw that reading away without logging it either —
+  a working test told you nothing about what it actually found. It now has
+  the same small logger this project's other plugins use (new
+  `plugins/xo-server-nanokvm/lib/log.js`) and logs the device label and
+  power LED reading on a successful test.
 
 - **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
   integration matrix.** The RHEL family was represented by one release each

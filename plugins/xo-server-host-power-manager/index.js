@@ -242,7 +242,7 @@ exports.default = function ({ xo }) {
         now: Date.now(),
       })
 
-      return {
+      const testResult = {
         hostPowerState: host.power_state,
         alwaysOnHostCount: hosts.length,
         cpuTriggerActive: cpuTriggerActive(rule),
@@ -255,6 +255,12 @@ exports.default = function ({ xo }) {
         memoryValue,
         wouldDo: result.action,
       }
+      // XO's own "Test plugin" button discards whatever this method
+      // returns and shows a static "appears to be working" message on
+      // success -- it never displays the payload. Logging it is the only
+      // way these numbers are actually visible to whoever clicked Test.
+      log.info(`rule "${rule.label || rule.targetHostId}" test result`, testResult)
+      return testResult
     },
   }
 }

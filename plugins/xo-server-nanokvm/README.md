@@ -43,6 +43,17 @@ Multi-user support (separate `admin`/`user` roles) requires **NanoKVM
 firmware 2.5.1 or later** — on older firmware there's only a single admin
 account, in which case use that instead.
 
+## Test button
+
+The **Test** button on a device's config page logs in and reads the power
+LED's GPIO state, without pressing anything — a way to check the URL and
+credentials are correct before relying on it.
+
+XO's own "Test plugin" dialog only ever shows a static "appears to be
+working" message on success — it discards the actual result. To see the
+power LED reading, check `sudo journalctl -u xo-server` right after
+clicking Test; it's logged there.
+
 ## What it can't do
 
 NanoKVM only knows how to press a button — it can't tell "host is off" from

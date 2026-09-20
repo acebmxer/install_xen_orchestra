@@ -74,6 +74,12 @@ The **Test** button on this plugin's config page does not power anything on
 or off. It evaluates one rule's current metrics and reports what action
 would be taken, so you can sanity-check thresholds before relying on them.
 
+XO's own "Test plugin" dialog only ever shows a static "appears to be
+working" message — it discards the actual result. To see what a Test click
+actually computed (current CPU/memory values, whether each trigger is
+active, and `wouldDo`), check `sudo journalctl -u xo-server` right after
+clicking it; the result is logged there.
+
 ## Requires
 
 `xo-server-nanokvm` only if any rule uses the `nanokvm` power-on provider.
