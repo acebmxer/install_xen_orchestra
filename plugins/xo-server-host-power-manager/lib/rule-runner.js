@@ -5,19 +5,35 @@ const log = require('./log')
 
 const BYTES_PER_GB = 1024 * 1024 * 1024
 
-// A trigger (CPU or memory) is only in play for a rule once both its
-// thresholds are set — leaving either blank in the config form is how a
-// rule opts out of using that resource, so it can use CPU only, memory
-// only, or both.
+// A trigger (CPU or memory) is only in play for a rule once its Metric is
+// set to something other than "not used" AND both its thresholds are set —
+// setting Metric to "Not used" (the default for a new rule) is how a rule
+// opts out of using that resource, so it can use CPU only, memory only, or
+// both. The threshold check also covers a metric picked with thresholds
+// not yet filled in, which configure()'s warning flags separately.
 function cpuTriggerActive(rule) {
-  return rule.cpu.powerOnAbove !== undefined && rule.cpu.powerOffBelow !== undefined
+  return rule.cpu.metric !== 'none' && rule.cpu.powerOnAbove !== undefined && rule.cpu.powerOffBelow !== undefined
 }
 exports.cpuTriggerActive = cpuTriggerActive
 
 function memoryTriggerActive(rule) {
-  return rule.memory.powerOnBelow !== undefined && rule.memory.powerOffAbove !== undefined
+  return (
+    rule.memory.metric !== 'none' && rule.memory.powerOnBelow !== undefined && rule.memory.powerOffAbove !== undefined
+  )
 }
 exports.memoryTriggerActive = memoryTriggerActive
+
+// A trigger whose Metric is set but is missing one or both thresholds —
+// distinct from "not used", this is a rule left half-configured.
+function cpuTriggerIncomplete(rule) {
+  return rule.cpu.metric !== 'none' && !cpuTriggerActive(rule)
+}
+exports.cpuTriggerIncomplete = cpuTriggerIncomplete
+
+function memoryTriggerIncomplete(rule) {
+  return rule.memory.metric !== 'none' && !memoryTriggerActive(rule)
+}
+exports.memoryTriggerIncomplete = memoryTriggerIncomplete
 
 // Decides what (if anything) to do about one rule's target host, given the
 // current metrics. Kept pure/synchronous so it's easy to reason about (and
@@ -172,7 +188,29 @@ async function powerOn({ xo, rule, host, powerProviders }) {
   await xo.getXapi(host.id).powerOnHost(host.id)
 }
 
+// shutdownHost() (default options: no force, no bypassEvacuate) already
+// disables the host and evacuates its VMs via live migration before
+// shutting it down — the exact same xapi.clearHost() path XO's own
+// "enable maintenance mode" goes through. It never uses NanoKVM/IPMI;
+// power-off always goes through this one XO/XAPI call.
+//
+// If the pool has HA enabled, XAPI itself refuses an evacuate/disable that
+// would leave the pool without enough spare capacity to honor its
+// configured "host failures to tolerate" (HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN).
+// That check depends on live pool capacity and the HA failover plan XAPI
+// already computes, so it's left to XAPI rather than re-implemented here —
+// this just turns that rejection into a clear log message instead of a
+// generic failure.
 async function powerOff({ xo, rule, host }) {
   log.info(`shutting down host ${host.name_label} (${host.id}) (evacuating any running VMs first)`)
-  await xo.getXapi(host.id).shutdownHost(host.id)
+  try {
+    await xo.getXapi(host.id).shutdownHost(host.id)
+  } catch (error) {
+    if (error?.code === 'HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN') {
+      throw new Error(
+        `cannot power off host ${host.name_label} (${host.id}): the pool's HA failover plan needs it to stay up (Pool > Advanced > HA, "host failures to tolerate") — leave it running or lower that setting`
+      )
+    }
+    throw error
+  }
 }

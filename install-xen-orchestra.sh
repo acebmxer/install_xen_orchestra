@@ -12706,6 +12706,20 @@ install_custom_plugin() {
     log_success "${plugin_name} installed."
 }
 
+# True (exit 0) if an already-installed plugin's on-disk copy differs from
+# this repo's checkout -- lets manage_custom_plugins() refresh a plugin left
+# checked in the picker (an unchanged selection) instead of requiring an
+# uncheck-then-recheck round trip to pick up a newer checkout. Read-only, so
+# it runs outside run_cmd/DRY_RUN like the script's other sudo-gated checks.
+custom_plugin_needs_update() {
+    local plugin_name="$1"
+    local src="${SCRIPT_DIR}/plugins/${plugin_name}"
+    local dest="/usr/local/lib/node_modules/${plugin_name}"
+
+    sudo test -d "$dest" || return 0
+    ! sudo diff -rq "$src" "$dest" >/dev/null 2>&1
+}
+
 # Removes one plugin's folder from xo-server's plugin lookup path. Its
 # configuration (credentials, thresholds, ...) is not touched here -- that
 # lives in XO's own Redis-backed plugin metadata, not on disk, so it stays
@@ -12746,6 +12760,7 @@ manage_custom_plugins() {
 
     local to_install=()
     local to_uninstall=()
+    local to_update=()
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
         log_info "Non-interactive: installing all custom plugins."
         to_install=("${names[@]}")
@@ -12766,7 +12781,7 @@ manage_custom_plugins() {
             IFS='|' read -r dir label desc <<< "$entry"
             MENU_NAMES+=("$label")
             if [[ -d "/usr/local/lib/node_modules/${dir}" ]]; then
-                MENU_HINTS+=("($desc) [installed -- uncheck to remove]")
+                MENU_HINTS+=("($desc) [installed -- uncheck to remove, leave checked to refresh]")
                 MENU_PRESELECTED[i]=1
             else
                 MENU_HINTS+=("($desc)")
@@ -12806,17 +12821,29 @@ manage_custom_plugins() {
                 to_install+=("${names[$i]}")
             elif [[ ${MENU_SELECTED[$i]} -eq 0 && ${plugin_preselected[$i]:-0} -eq 1 ]]; then
                 to_uninstall+=("${names[$i]}")
+            elif [[ ${MENU_SELECTED[$i]} -eq 1 && ${plugin_preselected[$i]:-0} -eq 1 ]]; then
+                # Left checked and already installed: refresh it if this
+                # repo's checkout no longer matches what's on disk, so
+                # re-running the picker with nothing toggled is how an
+                # already-live plugin picks up newer code.
+                if custom_plugin_needs_update "${names[$i]}"; then
+                    to_update+=("${names[$i]}")
+                fi
             fi
         done
     fi
 
-    if [[ ${#to_install[@]} -eq 0 && ${#to_uninstall[@]} -eq 0 ]]; then
+    if [[ ${#to_install[@]} -eq 0 && ${#to_uninstall[@]} -eq 0 && ${#to_update[@]} -eq 0 ]]; then
         log_info "Nothing changed."
         return 0
     fi
 
     local plugin_name
     for plugin_name in "${to_install[@]}"; do
+        install_custom_plugin "$plugin_name"
+    done
+    for plugin_name in "${to_update[@]}"; do
+        log_info "${plugin_name} is already installed but out of date -- refreshing it."
         install_custom_plugin "$plugin_name"
     done
     for plugin_name in "${to_uninstall[@]}"; do

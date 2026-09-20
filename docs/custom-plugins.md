@@ -53,29 +53,43 @@ memory, and powers it back off (evacuating VMs first) once it isn't needed.
 Per managed host, you choose:
 
 - A CPU trigger: average utilization % **or** vCPU:pCPU ratio. Optional —
-  leave its thresholds blank to not use it.
-- A memory trigger: free memory % **or** free memory in GB. Optional —
-  leave its thresholds blank to not use it. At least one of the two triggers
-  must be configured.
+  its Metric defaults to `Not used`; pick a metric and fill in both
+  thresholds to turn it on.
+- A memory trigger: free memory % **or** free memory in GB. Optional, same
+  `Not used` default. At least one of the two triggers must be configured.
 - Which provider powers it back **on**: XO's own built-in host power-on
   (iLO/DRAC/Wake-on-LAN — whatever's already set on the host under **Host >
   Advanced**), or `xo-server-nanokvm` for hosts that only have a NanoKVM.
 
 Power-**off** always goes through XO's own `Host.shutdown`, regardless of
-provider, since that already evacuates running VMs and cleanly powers off
-standard hardware. Power-on reacts immediately (either resource being tight
-is reason enough); power-off requires both to be comfortable continuously
-for a configurable cooldown, so a brief dip doesn't cause flapping.
+provider — never NanoKVM or IPMI. It evacuates running VMs first (the same
+path as XO's "enable maintenance mode") and cleanly powers off standard
+hardware. If the pool has HA enabled and this would break its failover
+plan, XAPI refuses the power-off and the plugin logs why, rather than
+forcing it through. Power-on reacts immediately (either resource being
+tight is reason enough); power-off requires both to be comfortable
+continuously for a configurable cooldown, so a brief dip doesn't cause
+flapping.
 
 See
 [`plugins/xo-server-host-power-manager/README.md`](../plugins/xo-server-host-power-manager/README.md)
 for the full configuration reference.
 
-## Uninstalling one
+## Updating or uninstalling one
 
 Run `--custom-plugins` (or the menu entry) again — already-installed plugins
 show up pre-checked. Uncheck one and confirm to remove it; check a new one
-to install it. Both can be done in the same pass.
+to install it; leave an already-checked one checked to refresh it from this
+repo's current checkout, if it's changed since it was installed (nothing
+happens if it hasn't). All three can be done in the same pass.
 
-Its configuration stays in XO's own database (Redis) until you also remove
-it from **Settings > Plugins**.
+This is also how an already-live plugin picks up a newer version later: pull
+this repo, then run `--custom-plugins` again and leave it checked. Custom
+plugins live outside `/opt/xen-orchestra` specifically so `--update`'s XO
+rebuild never touches them, and for the same reason `--update` doesn't touch
+them either — refreshing a plugin is a separate, explicit step, same as
+installing one.
+
+A plugin's configuration stays in XO's own database (Redis) until you also
+remove it from **Settings > Plugins** — uninstalling or updating here never
+touches it.

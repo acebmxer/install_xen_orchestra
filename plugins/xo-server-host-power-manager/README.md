@@ -9,8 +9,13 @@ isn't needed anymore.
   **Host > Advanced**) or [xo-server-nanokvm](../xo-server-nanokvm), for
   hosts that only have a NanoKVM device. Pick per rule.
 - **Power-off** always goes through XO's own `Host.shutdown`, regardless of
-  provider — it evacuates any running VMs first, then shuts the host down
-  cleanly (which physically powers off standard hardware).
+  provider — never NanoKVM or IPMI. It disables the host and evacuates any
+  running VMs first (live migration, the same path XO's own "enable
+  maintenance mode" uses), then shuts it down cleanly.
+- If the pool has **HA** enabled and powering off this host would leave it
+  without enough spare capacity for its configured failover plan, XAPI
+  refuses the power-off; the plugin logs that plainly instead of a generic
+  error.
 
 ## Install
 
@@ -27,14 +32,15 @@ extra host:
 | --- | --- |
 | Extra host | The XO UUID of the host to manage |
 | Power-on provider | `native` (iLO/DRAC/WoL) or `nanokvm` |
-| CPU trigger | Metric (average % **or** vCPU:pCPU ratio) + power-on/power-off thresholds |
-| Memory trigger | Metric (free % **or** free GB) + power-on/power-off thresholds |
+| CPU trigger | Metric (`Not used`, average % **or** vCPU:pCPU ratio) + power-on/power-off thresholds |
+| Memory trigger | Metric (`Not used`, free % **or** free GB) + power-on/power-off thresholds |
 | Poll interval | How often to re-check, in seconds (default 60) |
 | Cooldown | Minutes; see **Behavior** below |
 
-Both triggers are optional — leave a trigger's two threshold fields blank to
-not use it for that rule. Use CPU only, memory only, or both; at least one
-must be configured or the rule will never power the host on.
+Both triggers are optional and default to `Not used` on a new rule — pick a
+Metric other than `Not used` and fill in its two thresholds to turn a trigger
+on. Use CPU only, memory only, or both; at least one must be configured or
+the rule will never power the host on.
 
 All metrics are computed from the pool's other **currently running**
 hosts — the managed host's own (lack of) load never affects the decision to
@@ -54,6 +60,9 @@ power it on.
 - If only one trigger is configured (see **Configure** above), that trigger
   alone decides both power-on and power-off — the unset one is ignored
   entirely.
+- If a power-off is blocked by the pool's HA failover plan, the rule leaves
+  the host running and retries on the next poll — it never forces the
+  evacuation or bypasses HA.
 
 ## Test button
 

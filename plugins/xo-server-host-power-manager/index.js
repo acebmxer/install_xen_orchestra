@@ -12,32 +12,41 @@
 // This plugin only holds policy (thresholds, which host, which provider).
 // It never talks to a BMC or a NanoKVM device directly.
 
-const { RuleState, tick, decide, computeCpuValue, computeMemoryValue, cpuTriggerActive, memoryTriggerActive } =
-  require('./lib/rule-runner')
+const {
+  RuleState,
+  tick,
+  decide,
+  computeCpuValue,
+  computeMemoryValue,
+  cpuTriggerActive,
+  memoryTriggerActive,
+  cpuTriggerIncomplete,
+  memoryTriggerIncomplete,
+} = require('./lib/rule-runner')
 const { getAlwaysOnHosts } = require('./lib/metrics')
 const log = require('./lib/log')
 
 const cpuMetricSchema = {
   type: 'object',
   title: 'CPU trigger',
-  description: 'Leave both thresholds blank to not use CPU for this rule.',
+  description: 'Set Metric to "Not used" to skip CPU for this rule.',
   properties: {
     metric: {
       type: 'string',
       title: 'Metric',
-      enum: ['percent', 'vcpuRatio'],
-      enumNames: ['Average CPU utilization %', 'vCPU:pCPU ratio'],
-      default: 'percent',
+      enum: ['none', 'percent', 'vcpuRatio'],
+      enumNames: ['Not used', 'Average CPU utilization %', 'vCPU:pCPU ratio'],
+      default: 'none',
     },
     powerOnAbove: {
       type: 'number',
       title: 'Power on when at/above',
-      description: 'e.g. 80 for 80% utilization, or 4 for a 4:1 vCPU:pCPU ratio. Leave blank to not use CPU as a trigger.',
+      description: 'e.g. 80 for 80% utilization, or 4 for a 4:1 vCPU:pCPU ratio. Ignored when Metric is "Not used".',
     },
     powerOffBelow: {
       type: 'number',
       title: 'Power off when at/below',
-      description: 'Must be lower than "power on" — the gap between them prevents flapping. Leave blank to not use CPU as a trigger.',
+      description: 'Must be lower than "power on" — the gap between them prevents flapping. Ignored when Metric is "Not used".',
     },
   },
   required: ['metric'],
@@ -46,24 +55,24 @@ const cpuMetricSchema = {
 const memoryMetricSchema = {
   type: 'object',
   title: 'Memory trigger',
-  description: 'Leave both thresholds blank to not use memory for this rule.',
+  description: 'Set Metric to "Not used" to skip memory for this rule.',
   properties: {
     metric: {
       type: 'string',
       title: 'Metric',
-      enum: ['percentFree', 'absoluteFreeGb'],
-      enumNames: ['Free memory %', 'Free memory (GB)'],
-      default: 'percentFree',
+      enum: ['none', 'percentFree', 'absoluteFreeGb'],
+      enumNames: ['Not used', 'Free memory %', 'Free memory (GB)'],
+      default: 'none',
     },
     powerOnBelow: {
       type: 'number',
       title: 'Power on when at/below',
-      description: 'e.g. 15 for 15% free, or 32 for 32 GB free. Leave blank to not use memory as a trigger.',
+      description: 'e.g. 15 for 15% free, or 32 for 32 GB free. Ignored when Metric is "Not used".',
     },
     powerOffAbove: {
       type: 'number',
       title: 'Power off when at/above',
-      description: 'Must be higher than "power on" — the gap between them prevents flapping. Leave blank to not use memory as a trigger.',
+      description: 'Must be higher than "power on" — the gap between them prevents flapping. Ignored when Metric is "Not used".',
     },
   },
   required: ['metric'],
@@ -76,7 +85,7 @@ exports.configurationSchema = {
       type: 'array',
       title: 'Rules',
       description:
-        'One rule per extra host to manage. Power-on: either CPU or memory being tight is enough. Power-off: every configured trigger must be comfortable at once (just the one, if only CPU or only memory is set).',
+        'One rule per extra host to manage. Set a trigger\'s Metric to "Not used" to skip it. Power-on: either CPU or memory being tight is enough. Power-off: every configured trigger must be comfortable at once (just the one, if only CPU or only memory is set).',
       items: {
         type: 'object',
         title: 'Rule',
@@ -180,10 +189,15 @@ exports.default = function ({ xo }) {
         }
       }
       for (const rule of rules) {
+        const label = rule.label || rule.targetHostId
         if (!cpuTriggerActive(rule) && !memoryTriggerActive(rule)) {
-          log.warn(
-            `rule "${rule.label || rule.targetHostId}" has neither a CPU nor a memory trigger configured — it will never power the host on`
-          )
+          log.warn(`rule "${label}" has neither a CPU nor a memory trigger configured — it will never power the host on`)
+        }
+        if (cpuTriggerIncomplete(rule)) {
+          log.warn(`rule "${label}" has a CPU metric selected but is missing a power-on/power-off threshold — CPU trigger is ignored until both are set`)
+        }
+        if (memoryTriggerIncomplete(rule)) {
+          log.warn(`rule "${label}" has a memory metric selected but is missing a power-on/power-off threshold — memory trigger is ignored until both are set`)
         }
       }
     },
@@ -223,9 +237,11 @@ exports.default = function ({ xo }) {
         hostPowerState: host.power_state,
         alwaysOnHostCount: hosts.length,
         cpuTriggerActive: cpuTriggerActive(rule),
+        cpuTriggerIncomplete: cpuTriggerIncomplete(rule),
         cpuMetric: rule.cpu.metric,
         cpuValue,
         memoryTriggerActive: memoryTriggerActive(rule),
+        memoryTriggerIncomplete: memoryTriggerIncomplete(rule),
         memoryMetric: rule.memory.metric,
         memoryValue,
         wouldDo: result.action,

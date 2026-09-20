@@ -22,7 +22,13 @@ This installer builds Xen Orchestra from source and tracks the official
   so `--update`'s `git pull`/rebuild never touches it) and restart
   `xo-server` so it loads. Running it again shows already-installed plugins
   pre-checked — unchecking one removes it, checking a new one installs it,
-  both in the same pass — so there's no separate uninstall path to remember.
+  leaving an already-checked one checked refreshes it if this repo's
+  checkout has changed since it was installed (new `custom_plugin_needs_update()`,
+  a `diff -rq` between the checkout and what's on disk) — all three in the
+  same pass, so there's no separate uninstall or update path to remember.
+  Before this, refreshing an already-installed plugin's code needed an
+  uncheck-then-recheck round trip across two runs, since the picker only
+  acted on a selection that actually changed.
   `--install` never installs any of these on its own; it's a separate,
   opt-in step, and configuration itself still happens in XO's own
   **Settings > Plugins**. Two plugins ship initially:
@@ -60,22 +66,51 @@ This installer builds Xen Orchestra from source and tracks the official
   the CPU and memory triggers' threshold fields were required, so once a
   metric was selected in the form there was no way to clear it back out —
   a rule was forced to always use both CPU and memory, with no way to use
-  only one. Both triggers' thresholds are now optional; leaving a trigger's
-  two threshold fields blank means that rule doesn't use it, so a rule can
-  use CPU only, memory only, or both. `decide()`, `computeCpuValue()` and
-  `computeMemoryValue()` in `lib/rule-runner.js` treat an unset trigger as
-  never wanting power-on and always "comfortable" for power-off, and
-  `configure()` now logs a warning for any rule left with neither trigger
-  configured, since that rule can never power its host on. The Rule
-  label's example text was also changed from a generic host name
-  (`"host3"`) to one that reflects what the label is actually for
-  (`"Power on/off extra host"`). The README's **Behavior** section now also
-  says what a single-trigger rule does: that one trigger alone decides both
-  power-on and power-off, with the unset one ignored entirely. That same
-  OR/AND behavior is now also stated directly in the plugin's own config
-  form (the **Rules** field description in Settings > Plugins), so it's
-  visible right where a user is changing the thresholds, not only in the
-  README.
+  only one. Both triggers' thresholds are now optional, so a rule can use
+  CPU only, memory only, or both. The first attempt at this made "not used"
+  an implicit state (leave both threshold fields blank), which left the
+  Metric dropdown still showing a real selection ("Average CPU utilization
+  %") with nothing on screen indicating the trigger was actually off — so
+  each Metric dropdown now has its own explicit `Not used` option (the
+  default for a new rule), and that, not blank thresholds, is what a trigger
+  being off actually means. `cpuTriggerActive()`/`memoryTriggerActive()` in
+  `lib/rule-runner.js` now check the metric as well as the thresholds;
+  `decide()`, `computeCpuValue()` and `computeMemoryValue()` treat an
+  inactive trigger as never wanting power-on and always "comfortable" for
+  power-off. `configure()` logs a warning for a rule left with neither
+  trigger active, and a second warning (new `cpuTriggerIncomplete()`/
+  `memoryTriggerIncomplete()`) for a rule with a real metric picked but a
+  threshold still missing — both surfaced through the Test button's result
+  too. The Rule label's example text was also changed from a generic host
+  name (`"host3"`) to one that reflects what the label is actually for
+  (`"Power on/off extra host"`). The README's **Behavior** section states
+  what a single-trigger rule does: that one trigger alone decides both
+  power-on and power-off, with the unset one ignored entirely — and that
+  same OR/AND behavior is stated directly in the plugin's own config form
+  (the **Rules** field description in Settings > Plugins), so it's visible
+  right where a user is changing the thresholds, not only in the README.
+
+- **`xo-server-host-power-manager`'s power-off is now HA-aware.** Asked
+  whether the plugin accounted for the pool's HA failover plan before
+  powering a host off, the answer was no — nothing in it checked HA at all.
+  `powerOff()` in `lib/rule-runner.js` now catches XAPI's
+  `HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN` error (raised when disabling/
+  evacuating this host would leave the pool without enough spare capacity
+  for its configured "host failures to tolerate") and turns it into a clear
+  log message naming the host and pointing at **Pool > Advanced > HA**,
+  instead of a generic failure. The pool's own HA failover math (which
+  depends on live capacity and every VM's resource needs) isn't
+  re-implemented here — XAPI already computes it accurately on every
+  attempt, so the plugin defers to that rather than approximating it
+  client-side and drifting out of sync. On rejection the rule just leaves
+  the host running and retries on its next poll; it never forces the
+  evacuation through. Power-off was also confirmed to already do what was
+  separately asked for: it never touches NanoKVM or IPMI — power-off always
+  goes through XO's own `shutdownHost()`, which disables the host and
+  evacuates its VMs via live migration (the exact same `xapi.clearHost()`
+  path XO's own "enable maintenance mode" uses) before shutting it down;
+  NanoKVM is only ever used for power-**on**. README and
+  `docs/custom-plugins.md` now say both of these explicitly.
 
 - **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
   integration matrix.** The RHEL family was represented by one release each
