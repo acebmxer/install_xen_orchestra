@@ -66,3 +66,17 @@ on every push and pull request.
 Use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
 `fix:`, `refactor:`, `docs:`, `test:`, `chore:`, etc. Add notable user-facing
 changes to [CHANGELOG.md](CHANGELOG.md) under the `[Unreleased]` heading.
+
+## Opening a pull request
+
+GitHub pre-fills new PRs from
+[.github/pull_request_template.md](.github/pull_request_template.md) —
+fill it in rather than replacing it.
+
+## Release process
+
+Release notes follow the skeleton in
+[.github/RELEASE_TEMPLATE.md](.github/RELEASE_TEMPLATE.md), matching the
+style of past releases: a dated version heading, `Added`/`Changed`/`Fixed`
+sections in plain language for the person installing it, and an explicit
+line on what (if anything) upgrading requires.
