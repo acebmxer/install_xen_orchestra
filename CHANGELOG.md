@@ -10,6 +10,30 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **`xo-server-nanokvm` and `xo-server-host-power-manager` are now also
+  maintained standalone in [xo-plugins](https://github.com/acebmxer/xo-plugins),**
+  for anyone who wants them without the rest of this project. Content is
+  identical in both places — code, version numbers, license, and (after
+  rewording the plugin READMEs' install instructions to be accurate
+  either way) the docs too. `xo-plugins` has `dev` and `main` branches
+  mirroring this repo's own workflow, so unreleased plugin work never
+  reaches its `main` early. Both copies stay in sync via `git subtree` and
+  a pair of wrapper scripts (`scripts/plugin-push.sh` /
+  `scripts/plugin-pull.sh`), each syncing whichever branch (`dev`/`main`)
+  is currently checked out. While adding this, ShellCheck (once actually
+  run against the new scripts, which CI wasn't yet checking) found both
+  scripts' branch-guard used `=~` with a quoted right-hand side (SC2076),
+  which matches literally rather than as the regex the syntax implies —
+  harmless here since a literal match was the intent, but fragile and
+  confusing to read; switched to a plain glob match instead. CI's
+  ShellCheck step now also covers `scripts/*.sh`, and
+  `tests/unit/test_plugin_sync_scripts.bats` exercises both scripts
+  end-to-end against throwaway local repos, so a regression in the sync
+  logic itself (or in the branch guard) fails the build instead of going
+  unnoticed.
+
 ## [0.9.0] - 2026-09-20
 
 ### Added

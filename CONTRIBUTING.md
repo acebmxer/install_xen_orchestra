@@ -18,19 +18,32 @@ files. To work on it you need:
 - `bash`
 - [ShellCheck](https://www.shellcheck.net/) (>= 0.9)
 - [bats-core](https://github.com/bats-core/bats-core) for the unit tests
+- `git-subtree` and `rsync` — used by `scripts/plugin-push.sh` /
+  `scripts/plugin-pull.sh`, and by the unit tests that exercise them
 - Docker (optional) for the multi-distro integration tests
+
+Don't have ShellCheck or bats installed natively? Run them via Docker instead
+of installing anything on the host:
+
+```bash
+docker run --rm -v "$PWD:/work:ro" -w /work koalaman/shellcheck:stable \
+  -S warning install-xen-orchestra.sh scripts/*.sh
+
+docker run --rm -v "$PWD:/work" -w /work bats/bats:latest tests/unit/
+```
 
 ## Before opening a pull request
 
 Run the same checks CI runs:
 
-1. **Lint** the main script (CI gates at warning level):
+1. **Lint** the main script and helper scripts (CI gates at warning level):
    ```bash
-   shellcheck -S warning install-xen-orchestra.sh
+   shellcheck -S warning install-xen-orchestra.sh scripts/*.sh
    ```
-2. **Syntax-check** the script:
+2. **Syntax-check** the scripts:
    ```bash
    bash -n install-xen-orchestra.sh
+   for f in scripts/*.sh; do bash -n "$f"; done
    ```
 3. **Run the unit tests:**
    ```bash
@@ -66,3 +79,17 @@ on every push and pull request.
 Use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
 `fix:`, `refactor:`, `docs:`, `test:`, `chore:`, etc. Add notable user-facing
 changes to [CHANGELOG.md](CHANGELOG.md) under the `[Unreleased]` heading.
+
+## Opening a pull request
+
+GitHub pre-fills new PRs from
+[.github/pull_request_template.md](.github/pull_request_template.md) —
+fill it in rather than replacing it.
+
+## Release process
+
+Release notes follow the skeleton in
+[.github/RELEASE_TEMPLATE.md](.github/RELEASE_TEMPLATE.md), matching the
+style of past releases: a dated version heading, `Added`/`Changed`/`Fixed`
+sections in plain language for the person installing it, and an explicit
+line on what (if anything) upgrading requires.

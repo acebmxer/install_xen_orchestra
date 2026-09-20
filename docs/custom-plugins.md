@@ -10,6 +10,11 @@ growing set of such plugins in [`plugins/`](../plugins) — this is **not**
 XO's own official plugin catalogue, and none of this touches XO's web UI
 (`xo-web`) itself.
 
+These plugins are also maintained standalone in
+[github.com/acebmxer/xo-plugins](https://github.com/acebmxer/xo-plugins),
+for anyone who wants them without the rest of this project — the two are
+kept in sync.
+
 `--custom-plugins` (or the **Custom Plugins** entry in the interactive menu)
 installs them onto an already-running XO. It is a separate, opt-in step —
 `--install` never installs any of these on its own.
@@ -98,3 +103,36 @@ installing one.
 A plugin's configuration stays in XO's own database (Redis) until you also
 remove it from **Settings > Plugins** — uninstalling or updating here never
 touches it.
+
+## Keeping `xo-plugins` in sync
+
+[xo-plugins](https://github.com/acebmxer/xo-plugins) has `dev` and `main`
+branches mirroring this repo's own workflow, so unreleased plugin work
+never reaches its `main` early. Two scripts keep the two repos identical:
+
+- `scripts/plugin-push.sh <plugin-name>` — this repo → `xo-plugins`.
+  Commits here only; run it after committing a plugin change.
+- `scripts/plugin-pull.sh <plugin-name>` — `xo-plugins` → this repo. Copies
+  files over `plugins/<plugin-name>/` but doesn't commit; review and commit
+  yourself.
+
+Both sync whichever branch (`dev`/`main`) you're currently on, and refuse
+to run from any other branch.
+
+**Adding a new plugin:** put it in `plugins/<name>/` here as usual, then
+one-time import it into `xo-plugins` (once per branch, `dev` and `main`):
+
+```bash
+git subtree split --prefix=plugins/<name> -b tmp-import-<name>
+git clone https://github.com/acebmxer/xo-plugins.git /tmp/xo-plugins-import
+cd /tmp/xo-plugins-import
+git checkout <dev-or-main>
+git remote add source /home/nick/Projects/github/install_xen_orchestra
+git fetch source tmp-import-<name>
+git subtree add --prefix=<name> source tmp-import-<name> -m "Import <name>"
+git push origin <dev-or-main>
+cd -; git branch -D tmp-import-<name>; rm -rf /tmp/xo-plugins-import
+```
+
+After that, `plugin-push.sh`/`plugin-pull.sh` work the same as for the
+existing plugins — nothing plugin-specific about them.
