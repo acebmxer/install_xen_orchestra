@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-20
+
 ### Added
 
 - **A new `--custom-plugins` command (and "Custom Plugins" menu entry)

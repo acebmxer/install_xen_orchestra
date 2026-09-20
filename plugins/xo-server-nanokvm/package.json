@@ -1,7 +1,7 @@
 {
   "private": true,
   "name": "xo-server-nanokvm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Xen Orchestra plugin providing power control for hosts fitted with a Sipeed NanoKVM device (used by xo-server-host-power-manager and any other plugin that needs to power a host on).",
   "license": "AGPL-3.0-or-later",
   "main": "index.js",
