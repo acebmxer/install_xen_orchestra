@@ -19,7 +19,9 @@ if [[ $# -ne 1 ]]; then
 fi
 
 plugin_name="$1"
-plugins_remote_url="https://github.com/acebmxer/xo-plugins.git"
+# Overridable so tests/unit/test_plugin_sync_scripts.bats can point this at a
+# throwaway local repo instead of the real xo-plugins on GitHub.
+plugins_remote_url="${PLUGINS_REMOTE_URL:-https://github.com/acebmxer/xo-plugins.git}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plugin_dir="plugins/${plugin_name}"
 
@@ -29,7 +31,7 @@ if [[ ! -d "${repo_root}/${plugin_dir}" ]]; then
 fi
 
 current_branch="$(git -C "${repo_root}" rev-parse --abbrev-ref HEAD)"
-if [[ ! " ${allowed_branches[*]} " =~ " ${current_branch} " ]]; then
+if [[ ! " ${allowed_branches[*]} " == *" ${current_branch} "* ]]; then
     echo "Refusing to sync from branch '${current_branch}' -- only ${allowed_branches[*]} are mirrored to xo-plugins." >&2
     exit 1
 fi

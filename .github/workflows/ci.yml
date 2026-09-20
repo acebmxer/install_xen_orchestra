@@ -23,8 +23,8 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
 
-      - name: Run ShellCheck on main script
-        run: shellcheck -S warning install-xen-orchestra.sh
+      - name: Run ShellCheck on main script and helper scripts
+        run: shellcheck -S warning install-xen-orchestra.sh scripts/*.sh
 
   trivy:
     name: Trivy (secrets & misconfig)
@@ -67,7 +67,14 @@ jobs:
         # rather than failing, which is worse than a failure: the escaping of a
         # 60-line cloud-init document inside a JSON string, and the per-template
         # key regression, would go unchecked and the run would still be green.
-        run: sudo apt-get install -y bats genisoimage python3 openssh-client openssl
+        #
+        # rsync is what scripts/plugin-pull.sh uses to sync plugin files
+        # from the standalone xo-plugins repo -- test_plugin_sync_scripts.bats
+        # exercises both plugin-push.sh and plugin-pull.sh for real, against
+        # throwaway local repos. Both scripts also use `git subtree`, but
+        # that's bundled into Ubuntu's `git` package (unlike Fedora, which
+        # ships it separately) and the runner already has git installed.
+        run: sudo apt-get install -y bats genisoimage python3 openssh-client openssl rsync
 
       - name: Run unit tests
         run: bats tests/unit/
