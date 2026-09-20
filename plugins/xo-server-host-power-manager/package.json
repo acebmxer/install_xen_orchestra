@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "name": "xo-server-host-power-manager",
+  "version": "0.1.0",
+  "description": "Powers an extra pool host on/off based on CPU or memory thresholds, via XO's built-in host power-on or xo-server-nanokvm.",
+  "license": "AGPL-3.0-or-later",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  }
+}

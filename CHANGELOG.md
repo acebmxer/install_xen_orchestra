@@ -12,6 +12,35 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Added
 
+- **A new `--custom-plugins` command (and "Custom Plugins" menu entry)
+  installs optional `xo-server-*` plugins onto an already-running XO.**
+  These are ordinary Xen Orchestra plugins — `xo-server` discovers and
+  configures them itself, the same way it discovers `xo-server-auth-ldap` or
+  `xo-server-load-balancer` — this project just ships a growing set of them
+  in a new `plugins/` directory and gives a one-command way to copy one onto
+  the box (`/usr/local/lib/node_modules/<name>`, outside `/opt/xen-orchestra`
+  so `--update`'s `git pull`/rebuild never touches it) and restart
+  `xo-server` so it loads. Running it again shows already-installed plugins
+  pre-checked — unchecking one removes it, checking a new one installs it,
+  both in the same pass — so there's no separate uninstall path to remember.
+  `--install` never installs any of these on its own; it's a separate,
+  opt-in step, and configuration itself still happens in XO's own
+  **Settings > Plugins**. Two plugins ship initially:
+  `xo-server-nanokvm` (power control for hosts fitted with a Sipeed NanoKVM
+  device, over its REST API — not its MCP endpoint, which only exposes
+  keyboard/mouse/screenshot tools) and `xo-server-host-power-manager` (powers
+  an extra pool host on when CPU or memory is tight and back off, evacuated
+  first, once it isn't needed — power-on can go through NanoKVM or XO's own
+  built-in iLO/DRAC/Wake-on-LAN). From the interactive menu, pressing `q` in
+  the picker backs out to the main menu instead of quitting the script.
+  The picker also reuses the header info (commit/version) the main menu just
+  gathered rather than re-fetching it — opening it right after the main menu
+  no longer pauses on a second round of `git`/network lookups — and no
+  longer draws narrower than the main menu just did merely because it has
+  far fewer rows, which previously made it read as a different, smaller
+  screen loading rather than a continuation of the same menu. See
+  [docs/custom-plugins.md](docs/custom-plugins.md).
+
 - **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
   integration matrix.** The RHEL family was represented by one release each
   (Rocky 9, AlmaLinux 9, CentOS Stream 9), even though the deploy catalogue in

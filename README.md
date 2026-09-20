@@ -71,6 +71,7 @@ Orchestra](https://xen-orchestra.com/) from source.
 | --- | --- |
 | Building the VM for you (`--deploy`) | [docs/deployment.md](docs/deployment.md) |
 | Building cloud-init VM templates (`--build-templates`) | [docs/templates.md](docs/templates.md) |
+| Optional plugins (NanoKVM power control, host power manager) (`--custom-plugins`) | [docs/custom-plugins.md](docs/custom-plugins.md) |
 | Every config option, and the environment variables | [docs/configuration.md](docs/configuration.md) |
 | Update-safety task detection and REST API auth | [docs/authentication.md](docs/authentication.md) |
 | Something went wrong | [docs/troubleshooting.md](docs/troubleshooting.md) |
@@ -113,6 +114,7 @@ backing.
 | XO Proxy | `--proxy` | Deploy XO Proxy to a Xen pool master |
 | Adjust Memory | `--adjust-memory` | Raise the heap memory allocated to the `xo-server` process |
 | Status | `--status` | Read-only health report: version, service, TLS cert, disk/swap, backups/snapshots, git state |
+| Custom Plugins | `--custom-plugins` | Install or remove optional xo-server plugins shipped in `plugins/` (NanoKVM power control, host power manager) |
 | Edit Config | *(menu only)* | Open `xo-config.cfg` in your preferred editor |
 | Rename Config | *(menu only)* | Rename `sample-xo-config.cfg` to `xo-config.cfg` |
 
@@ -146,7 +148,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
     [ ] Rename Sample-xo-config.cfg             [ ] Edit xo-config.cfg
     [ ] Install XO Proxy                        [ ] Restore Backup
     [ ] Deploy XO to a new VM (creates VM)      [ ] Adjust XO Memory Allocation
-    [ ] VM Template Library
+    [ ] VM Template Library                     [ ] Custom Plugins
 
   ─────────────────────────────────────────────────────────────────────────────────────
 
