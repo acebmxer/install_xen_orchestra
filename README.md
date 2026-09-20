@@ -414,9 +414,10 @@ gated, but they are not tested either.
 > or 26.04 LTS before then.
 
 > [!NOTE]
-> Continuously smoke-tested in CI on Debian 12/13, Ubuntu 22.04/24.04/26.04 LTS,
-> Rocky Linux 9, AlmaLinux 9, CentOS Stream 9, and Fedora — plus Debian 11 until
-> its removal on 2026-10-01, and Ubuntu 22.04 until its removal on 2027-06-01.
+> Continuously smoke-tested in CI on every distribution in the catalogue:
+> Debian 12/13, Ubuntu 22.04/24.04/26.04 LTS, Rocky Linux 8/9/10,
+> AlmaLinux 8/9/10, CentOS Stream 9/10, and Fedora — plus Debian 11 until its
+> removal on 2026-10-01, and Ubuntu 22.04 until its removal on 2027-06-01.
 > RHEL uses the same `dnf` path as its rebuilds; Ubuntu interim releases use the
 > same `apt` path as the LTS ones.
 

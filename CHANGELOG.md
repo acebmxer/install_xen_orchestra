@@ -10,6 +10,24 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
+  integration matrix.** The RHEL family was represented by one release each
+  (Rocky 9, AlmaLinux 9, CentOS Stream 9), even though the deploy catalogue in
+  `install-xen-orchestra.sh` has built all three Rocky, all three AlmaLinux,
+  and both CentOS Stream releases for some time — so five of those eight were
+  claimed as supported with nothing in CI actually running the installer
+  against them. New Dockerfiles
+  (`Dockerfile.almalinux8`, `Dockerfile.almalinux10`, `Dockerfile.rockylinux8`,
+  `Dockerfile.rockylinux10`, `Dockerfile.centosstream10`) mirror the existing
+  same-family images, changing only the `FROM` line — except Rocky 10, which
+  has no image yet under the `rockylinux` Docker Hub namespace and pulls from
+  `rockylinux/rockylinux:10` instead. Verified locally before landing: all
+  five images build and pass the integration smoke suite. The README's CI
+  coverage note is updated to match — it now names every distribution in the
+  catalogue instead of one release per RHEL family.
+
 ## [0.8.0] - 2026-09-13
 
 ### Added

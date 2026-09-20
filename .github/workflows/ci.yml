@@ -92,8 +92,12 @@ jobs:
             dockerfile: tests/integration/Dockerfile.ubuntu2404
           - distro: ubuntu2604
             dockerfile: tests/integration/Dockerfile.ubuntu2604
+          - distro: rockylinux8
+            dockerfile: tests/integration/Dockerfile.rockylinux8
           - distro: rockylinux9
             dockerfile: tests/integration/Dockerfile.rockylinux9
+          - distro: rockylinux10
+            dockerfile: tests/integration/Dockerfile.rockylinux10
           - distro: fedora
             dockerfile: tests/integration/Dockerfile.fedora
           # DEPRECATED: Debian 11 (Bullseye) left Debian LTS on 2026-08-31.
@@ -104,10 +108,16 @@ jobs:
             label: debian11 (deprecated, removed 2026-10-01)
           - distro: debian13
             dockerfile: tests/integration/Dockerfile.debian13
+          - distro: almalinux8
+            dockerfile: tests/integration/Dockerfile.almalinux8
           - distro: almalinux9
             dockerfile: tests/integration/Dockerfile.almalinux9
+          - distro: almalinux10
+            dockerfile: tests/integration/Dockerfile.almalinux10
           - distro: centosstream9
             dockerfile: tests/integration/Dockerfile.centosstream9
+          - distro: centosstream10
+            dockerfile: tests/integration/Dockerfile.centosstream10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
