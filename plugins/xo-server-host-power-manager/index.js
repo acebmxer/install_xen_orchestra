@@ -12,13 +12,15 @@
 // This plugin only holds policy (thresholds, which host, which provider).
 // It never talks to a BMC or a NanoKVM device directly.
 
-const { RuleState, tick, decide } = require('./lib/rule-runner')
-const { getAlwaysOnHosts, getAverageCpuPercent, getMemory, getVcpuRatio } = require('./lib/metrics')
+const { RuleState, tick, decide, computeCpuValue, computeMemoryValue, cpuTriggerActive, memoryTriggerActive } =
+  require('./lib/rule-runner')
+const { getAlwaysOnHosts } = require('./lib/metrics')
 const log = require('./lib/log')
 
 const cpuMetricSchema = {
   type: 'object',
   title: 'CPU trigger',
+  description: 'Leave both thresholds blank to not use CPU for this rule.',
   properties: {
     metric: {
       type: 'string',
@@ -30,20 +32,21 @@ const cpuMetricSchema = {
     powerOnAbove: {
       type: 'number',
       title: 'Power on when at/above',
-      description: 'e.g. 80 for 80% utilization, or 4 for a 4:1 vCPU:pCPU ratio.',
+      description: 'e.g. 80 for 80% utilization, or 4 for a 4:1 vCPU:pCPU ratio. Leave blank to not use CPU as a trigger.',
     },
     powerOffBelow: {
       type: 'number',
       title: 'Power off when at/below',
-      description: 'Must be lower than "power on" — the gap between them prevents flapping.',
+      description: 'Must be lower than "power on" — the gap between them prevents flapping. Leave blank to not use CPU as a trigger.',
     },
   },
-  required: ['metric', 'powerOnAbove', 'powerOffBelow'],
+  required: ['metric'],
 }
 
 const memoryMetricSchema = {
   type: 'object',
   title: 'Memory trigger',
+  description: 'Leave both thresholds blank to not use memory for this rule.',
   properties: {
     metric: {
       type: 'string',
@@ -55,15 +58,15 @@ const memoryMetricSchema = {
     powerOnBelow: {
       type: 'number',
       title: 'Power on when at/below',
-      description: 'e.g. 15 for 15% free, or 32 for 32 GB free.',
+      description: 'e.g. 15 for 15% free, or 32 for 32 GB free. Leave blank to not use memory as a trigger.',
     },
     powerOffAbove: {
       type: 'number',
       title: 'Power off when at/above',
-      description: 'Must be higher than "power on" — the gap between them prevents flapping.',
+      description: 'Must be higher than "power on" — the gap between them prevents flapping. Leave blank to not use memory as a trigger.',
     },
   },
-  required: ['metric', 'powerOnBelow', 'powerOffAbove'],
+  required: ['metric'],
 }
 
 exports.configurationSchema = {
@@ -72,7 +75,8 @@ exports.configurationSchema = {
     rules: {
       type: 'array',
       title: 'Rules',
-      description: 'One rule per extra host to manage.',
+      description:
+        'One rule per extra host to manage. Power-on: either CPU or memory being tight is enough. Power-off: every configured trigger must be comfortable at once (just the one, if only CPU or only memory is set).',
       items: {
         type: 'object',
         title: 'Rule',
@@ -80,7 +84,7 @@ exports.configurationSchema = {
           label: {
             type: 'string',
             title: 'Label',
-            description: 'Free-text name for logs, e.g. "host3".',
+            description: 'Free-text name for logs, e.g. "Power on/off extra host".',
           },
           enabled: {
             type: 'boolean',
@@ -175,6 +179,13 @@ exports.default = function ({ xo }) {
           ruleStates.delete(id)
         }
       }
+      for (const rule of rules) {
+        if (!cpuTriggerActive(rule) && !memoryTriggerActive(rule)) {
+          log.warn(
+            `rule "${rule.label || rule.targetHostId}" has neither a CPU nor a memory trigger configured — it will never power the host on`
+          )
+        }
+      }
     },
 
     load() {
@@ -195,14 +206,8 @@ exports.default = function ({ xo }) {
 
       const host = xo.getObject(targetHostId)
       const hosts = getAlwaysOnHosts(xo, host.$poolId, host.id)
-      const cpuValue = rule.cpu.metric === 'vcpuRatio' ? getVcpuRatio(xo, hosts) : await getAverageCpuPercent(xo, hosts)
-      const { totalBytes, freeBytes } = getMemory(hosts)
-      const memoryValue =
-        rule.memory.metric === 'absoluteFreeGb'
-          ? freeBytes / (1024 * 1024 * 1024)
-          : totalBytes === 0
-            ? 100
-            : (freeBytes / totalBytes) * 100
+      const cpuValue = await computeCpuValue(xo, rule, hosts)
+      const memoryValue = computeMemoryValue(rule, hosts)
 
       const state = ruleStates.get(targetHostId) || new RuleState()
       const result = decide({
@@ -217,8 +222,10 @@ exports.default = function ({ xo }) {
       return {
         hostPowerState: host.power_state,
         alwaysOnHostCount: hosts.length,
+        cpuTriggerActive: cpuTriggerActive(rule),
         cpuMetric: rule.cpu.metric,
         cpuValue,
+        memoryTriggerActive: memoryTriggerActive(rule),
         memoryMetric: rule.memory.metric,
         memoryValue,
         wouldDo: result.action,

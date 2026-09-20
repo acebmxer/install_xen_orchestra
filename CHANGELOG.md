@@ -51,6 +51,32 @@ This installer builds Xen Orchestra from source and tracks the official
   picker's preselection is now snapshotted into a local variable before the
   reset, so the diff runs against the real values.
 
+  Also while adding this: `xo-server-nanokvm`'s config form example text
+  named a specific `host3` and a real domain (`pozzatech.com`) instead of
+  generic placeholders. Both `plugins/xo-server-nanokvm/index.js` and its
+  `README.md` now use `host` and `host.example.com`.
+
+  Also found and fixed a real bug in `xo-server-host-power-manager`:
+  the CPU and memory triggers' threshold fields were required, so once a
+  metric was selected in the form there was no way to clear it back out —
+  a rule was forced to always use both CPU and memory, with no way to use
+  only one. Both triggers' thresholds are now optional; leaving a trigger's
+  two threshold fields blank means that rule doesn't use it, so a rule can
+  use CPU only, memory only, or both. `decide()`, `computeCpuValue()` and
+  `computeMemoryValue()` in `lib/rule-runner.js` treat an unset trigger as
+  never wanting power-on and always "comfortable" for power-off, and
+  `configure()` now logs a warning for any rule left with neither trigger
+  configured, since that rule can never power its host on. The Rule
+  label's example text was also changed from a generic host name
+  (`"host3"`) to one that reflects what the label is actually for
+  (`"Power on/off extra host"`). The README's **Behavior** section now also
+  says what a single-trigger rule does: that one trigger alone decides both
+  power-on and power-off, with the unset one ignored entirely. That same
+  OR/AND behavior is now also stated directly in the plugin's own config
+  form (the **Rules** field description in Settings > Plugins), so it's
+  visible right where a user is changing the thresholds, not only in the
+  README.
+
 - **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
   integration matrix.** The RHEL family was represented by one release each
   (Rocky 9, AlmaLinux 9, CentOS Stream 9), even though the deploy catalogue in

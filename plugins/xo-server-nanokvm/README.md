@@ -24,8 +24,8 @@ per host that has a NanoKVM attached:
 
 | Field | Meaning |
 | --- | --- |
-| Label | Free-text name shown in logs, e.g. `host3 NanoKVM` |
-| Base URL | e.g. `https://host3.pozzatech.com` |
+| Label | Free-text name shown in logs, e.g. `host NanoKVM` |
+| Base URL | e.g. `https://host.example.com` |
 | Username / Password | A NanoKVM account — see **Account** below |
 | XO host UUID | The XCP-ng host this device's power header is wired to |
 

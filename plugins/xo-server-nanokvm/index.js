@@ -29,12 +29,12 @@ exports.configurationSchema = {
           label: {
             type: 'string',
             title: 'Label',
-            description: 'A name to identify this device in logs, e.g. "host3 NanoKVM".',
+            description: 'A name to identify this device in logs, e.g. "host NanoKVM".',
           },
           baseUrl: {
             type: 'string',
             title: 'Base URL',
-            description: 'e.g. https://host3.pozzatech.com (include the scheme, no trailing slash needed).',
+            description: 'e.g. https://host.example.com (include the scheme, no trailing slash needed).',
           },
           username: {
             type: 'string',

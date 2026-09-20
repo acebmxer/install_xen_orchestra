@@ -52,8 +52,11 @@ Powers an extra pool host on when the rest of the pool is short on CPU or
 memory, and powers it back off (evacuating VMs first) once it isn't needed.
 Per managed host, you choose:
 
-- A CPU trigger: average utilization % **or** vCPU:pCPU ratio.
-- A memory trigger: free memory % **or** free memory in GB.
+- A CPU trigger: average utilization % **or** vCPU:pCPU ratio. Optional —
+  leave its thresholds blank to not use it.
+- A memory trigger: free memory % **or** free memory in GB. Optional —
+  leave its thresholds blank to not use it. At least one of the two triggers
+  must be configured.
 - Which provider powers it back **on**: XO's own built-in host power-on
   (iLO/DRAC/Wake-on-LAN — whatever's already set on the host under **Host >
   Advanced**), or `xo-server-nanokvm` for hosts that only have a NanoKVM.

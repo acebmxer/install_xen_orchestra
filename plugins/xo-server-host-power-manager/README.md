@@ -32,6 +32,10 @@ extra host:
 | Poll interval | How often to re-check, in seconds (default 60) |
 | Cooldown | Minutes; see **Behavior** below |
 
+Both triggers are optional — leave a trigger's two threshold fields blank to
+not use it for that rule. Use CPU only, memory only, or both; at least one
+must be configured or the rule will never power the host on.
+
 All metrics are computed from the pool's other **currently running**
 hosts — the managed host's own (lack of) load never affects the decision to
 power it on.
@@ -47,6 +51,9 @@ power it on.
   in load doesn't cause the host to flap on and off.
 - Cooldown also applies as a minimum gap between any two actions on the same
   host, regardless of direction.
+- If only one trigger is configured (see **Configure** above), that trigger
+  alone decides both power-on and power-off — the unset one is ignored
+  entirely.
 
 ## Test button
 

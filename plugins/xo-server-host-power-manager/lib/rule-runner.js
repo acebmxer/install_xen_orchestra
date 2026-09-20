@@ -5,6 +5,20 @@ const log = require('./log')
 
 const BYTES_PER_GB = 1024 * 1024 * 1024
 
+// A trigger (CPU or memory) is only in play for a rule once both its
+// thresholds are set — leaving either blank in the config form is how a
+// rule opts out of using that resource, so it can use CPU only, memory
+// only, or both.
+function cpuTriggerActive(rule) {
+  return rule.cpu.powerOnAbove !== undefined && rule.cpu.powerOffBelow !== undefined
+}
+exports.cpuTriggerActive = cpuTriggerActive
+
+function memoryTriggerActive(rule) {
+  return rule.memory.powerOnBelow !== undefined && rule.memory.powerOffAbove !== undefined
+}
+exports.memoryTriggerActive = memoryTriggerActive
+
 // Decides what (if anything) to do about one rule's target host, given the
 // current metrics. Kept pure/synchronous so it's easy to reason about (and
 // test) independently of XAPI calls and timers.
@@ -13,10 +27,15 @@ const BYTES_PER_GB = 1024 * 1024 * 1024
 // to bring the extra host up. Power-off requires *both* resources to be
 // comfortable, and only after they've stayed that way continuously for
 // `cooldownMinutes` (via `offEligibleSinceMs`) — scale up fast, scale down
-// slow, so a brief dip doesn't cause flapping.
+// slow, so a brief dip doesn't cause flapping. A trigger that isn't active
+// never asks for power-on and is always "comfortable", so a rule using only
+// one resource behaves as if the other were never tight.
 function decide({ rule, cpuValue, memoryValue, hostIsRunning, offEligibleSinceMs, now }) {
-  const cpuWantsMore = cpuValue >= rule.cpu.powerOnAbove
-  const memoryWantsMore = memoryValue <= rule.memory.powerOnBelow
+  const cpuActive = cpuTriggerActive(rule)
+  const memoryActive = memoryTriggerActive(rule)
+
+  const cpuWantsMore = cpuActive && cpuValue >= rule.cpu.powerOnAbove
+  const memoryWantsMore = memoryActive && memoryValue <= rule.memory.powerOnBelow
 
   if (!hostIsRunning) {
     if (cpuWantsMore || memoryWantsMore) {
@@ -25,8 +44,8 @@ function decide({ rule, cpuValue, memoryValue, hostIsRunning, offEligibleSinceMs
     return { action: 'none', offEligibleSinceMs: null }
   }
 
-  const cpuComfortable = cpuValue <= rule.cpu.powerOffBelow
-  const memoryComfortable = memoryValue >= rule.memory.powerOffAbove
+  const cpuComfortable = !cpuActive || cpuValue <= rule.cpu.powerOffBelow
+  const memoryComfortable = !memoryActive || memoryValue >= rule.memory.powerOffAbove
   const comfortable = cpuComfortable && memoryComfortable
 
   if (!comfortable) {
@@ -43,16 +62,24 @@ function decide({ rule, cpuValue, memoryValue, hostIsRunning, offEligibleSinceMs
 exports.decide = decide
 
 async function computeCpuValue(xo, rule, hosts) {
+  if (!cpuTriggerActive(rule)) {
+    return null
+  }
   return rule.cpu.metric === 'vcpuRatio' ? getVcpuRatio(xo, hosts) : getAverageCpuPercent(xo, hosts)
 }
+exports.computeCpuValue = computeCpuValue
 
 function computeMemoryValue(rule, hosts) {
+  if (!memoryTriggerActive(rule)) {
+    return null
+  }
   const { totalBytes, freeBytes } = getMemory(hosts)
   if (rule.memory.metric === 'absoluteFreeGb') {
     return freeBytes / BYTES_PER_GB
   }
   return totalBytes === 0 ? 100 : (freeBytes / totalBytes) * 100
 }
+exports.computeMemoryValue = computeMemoryValue
 
 // One rule's live state between ticks: is a power action already in flight,
 // when did it last run, and (for power-off) since when have both resources
