@@ -89,11 +89,17 @@ function computeMemoryValue(rule, hosts) {
   if (!memoryTriggerActive(rule)) {
     return null
   }
-  const { totalBytes, freeBytes } = getMemory(hosts)
-  if (rule.memory.metric === 'absoluteFreeGb') {
-    return freeBytes / BYTES_PER_GB
+  const { totalBytes, freeBytes, minFreeBytes, minFreePercent } = getMemory(hosts)
+  switch (rule.memory.metric) {
+    case 'absoluteFreeGb':
+      return freeBytes / BYTES_PER_GB
+    case 'absoluteFreeMinGb':
+      return minFreeBytes / BYTES_PER_GB
+    case 'percentFreeMin':
+      return minFreePercent
+    default:
+      return totalBytes === 0 ? 100 : (freeBytes / totalBytes) * 100
   }
-  return totalBytes === 0 ? 100 : (freeBytes / totalBytes) * 100
 }
 exports.computeMemoryValue = computeMemoryValue
 

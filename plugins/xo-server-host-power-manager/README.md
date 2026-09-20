@@ -34,7 +34,7 @@ extra host:
 | Extra host | The XO UUID of the host to manage |
 | Power-on provider | `native` (iLO/DRAC/WoL) or `nanokvm` |
 | CPU trigger | Metric (`Not used`, average % **or** vCPU:pCPU ratio) + power-on/power-off thresholds |
-| Memory trigger | Metric (`Not used`, free % **or** free GB) + power-on/power-off thresholds |
+| Memory trigger | Metric (`Not used`, pool-wide free % or GB, **or** lowest free % or GB on any one running host) + power-on/power-off thresholds |
 | Poll interval | How often to re-check, in seconds (default 60) |
 | Cooldown | Minutes; see **Behavior** below |
 
@@ -48,10 +48,18 @@ needed. Each rule's polling restarts fresh on save, so a lowered Cooldown or
 Poll interval applies right away rather than waiting for the next restart.
 
 All metrics are computed from **every currently running host in the pool,
-including the managed host itself** when it's running — matching what XO's
-own pool dashboard shows. A host being considered for power-on is already
-not running, so it's naturally excluded from its own trigger's calculation
-without any special-casing.
+including the managed host itself** when it's running. A host being
+considered for power-on is already not running, so it's naturally excluded
+from its own trigger's calculation without any special-casing.
+
+The two pool-wide memory metrics (free % and free GB) sum every running
+host together, matching what XO's own pool dashboard shows — so as more
+hosts are running, the same threshold is measured against a bigger pool.
+This can hide one host running tight while another has slack, since it's
+the total that's compared to the threshold. The two "lowest ... on any one
+running host" metrics instead take the tightest single host's own free
+memory, so a host under pressure gets caught even when the pool average
+looks comfortable.
 
 This isn't a safety check — the actual guarantee that powering a host off
 won't strand VMs is XAPI's own evacuation, which refuses (and leaves the

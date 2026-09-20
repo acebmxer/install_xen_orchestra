@@ -89,17 +89,31 @@ function getVcpuRatio(xo, hosts) {
 }
 exports.getVcpuRatio = getVcpuRatio
 
-// { totalBytes, freeBytes } summed across the given hosts' live memory
-// state (not historical stats — this is XAPI's current view).
+// { totalBytes, freeBytes, minFreeBytes, minFreePercent } across the given
+// hosts' live memory state (not historical stats — this is XAPI's current
+// view). totalBytes/freeBytes are pool-wide sums; minFreeBytes/minFreePercent
+// are the tightest single host, for spotting a host under pressure that a
+// pool-wide average can hide (e.g. one host at 10GB free, another at 40GB
+// free averages out to a comfortable-looking pool total).
 function getMemory(hosts) {
   let totalBytes = 0
   let freeBytes = 0
-  for (const host of hosts) {
+  let minFreeBytes = 0
+  let minFreePercent = 0
+  for (const [index, host] of hosts.entries()) {
     const size = host.memory?.size || 0
     const usage = host.memory?.usage || 0
+    const hostFreeBytes = size - usage
+    const hostFreePercent = size === 0 ? 100 : (hostFreeBytes / size) * 100
     totalBytes += size
-    freeBytes += size - usage
+    freeBytes += hostFreeBytes
+    if (index === 0 || hostFreeBytes < minFreeBytes) {
+      minFreeBytes = hostFreeBytes
+    }
+    if (index === 0 || hostFreePercent < minFreePercent) {
+      minFreePercent = hostFreePercent
+    }
   }
-  return { totalBytes, freeBytes }
+  return { totalBytes, freeBytes, minFreeBytes, minFreePercent }
 }
 exports.getMemory = getMemory

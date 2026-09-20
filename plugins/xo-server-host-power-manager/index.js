@@ -60,8 +60,14 @@ const memoryMetricSchema = {
     metric: {
       type: 'string',
       title: 'Metric',
-      enum: ['none', 'percentFree', 'absoluteFreeGb'],
-      enumNames: ['Not used', 'Free memory %', 'Free memory (GB)'],
+      enum: ['none', 'percentFree', 'absoluteFreeGb', 'percentFreeMin', 'absoluteFreeMinGb'],
+      enumNames: [
+        'Not used',
+        'Free memory % (pool-wide)',
+        'Free memory GB (pool-wide)',
+        'Lowest free memory % on any one running host',
+        'Lowest free memory GB on any one running host',
+      ],
       default: 'none',
     },
     powerOnBelow: {
