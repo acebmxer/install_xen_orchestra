@@ -10,6 +10,191 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-20
+
+### Added
+
+- **A new `--custom-plugins` command (and "Custom Plugins" menu entry)
+  installs optional `xo-server-*` plugins onto an already-running XO.**
+  These are ordinary Xen Orchestra plugins — `xo-server` discovers and
+  configures them itself, the same way it discovers `xo-server-auth-ldap` or
+  `xo-server-load-balancer` — this project just ships a growing set of them
+  in a new `plugins/` directory and gives a one-command way to copy one onto
+  the box (`/usr/local/lib/node_modules/<name>`, outside `/opt/xen-orchestra`
+  so `--update`'s `git pull`/rebuild never touches it) and restart
+  `xo-server` so it loads. Running it again shows already-installed plugins
+  pre-checked — unchecking one removes it, checking a new one installs it,
+  leaving an already-checked one checked refreshes it if this repo's
+  checkout has changed since it was installed (new `custom_plugin_needs_update()`,
+  a `diff -rq` between the checkout and what's on disk) — all three in the
+  same pass, so there's no separate uninstall or update path to remember.
+  Before this, refreshing an already-installed plugin's code needed an
+  uncheck-then-recheck round trip across two runs, since the picker only
+  acted on a selection that actually changed.
+  `--install` never installs any of these on its own; it's a separate,
+  opt-in step, and configuration itself still happens in XO's own
+  **Settings > Plugins**. Two plugins ship initially:
+  `xo-server-nanokvm` (power control for hosts fitted with a Sipeed NanoKVM
+  device, over its REST API — not its MCP endpoint, which only exposes
+  keyboard/mouse/screenshot tools) and `xo-server-host-power-manager` (powers
+  an extra pool host on when CPU or memory is tight and back off, evacuated
+  first, once it isn't needed — power-on can go through NanoKVM or XO's own
+  built-in iLO/DRAC/Wake-on-LAN). From the interactive menu, pressing `q` in
+  the picker backs out to the main menu instead of quitting the script.
+  The picker also reuses the header info (commit/version) the main menu just
+  gathered rather than re-fetching it — opening it right after the main menu
+  no longer pauses on a second round of `git`/network lookups — and no
+  longer draws narrower than the main menu just did merely because it has
+  far fewer rows, which previously made it read as a different, smaller
+  screen loading rather than a continuation of the same menu. See
+  [docs/custom-plugins.md](docs/custom-plugins.md).
+
+  While adding this, found and fixed a real bug in `manage_custom_plugins()`:
+  after the picker returned, it reset `MENU_PRESELECTED` to an empty array
+  (so the array doesn't leak into the main menu, which doesn't use
+  preselection) and only *then* diffed the picker's selections against that
+  same now-empty array to work out what changed — reading an unset array
+  index under `set -u`, which crashed with `MENU_PRESELECTED[$i]: unbound
+  variable` on every run of the picker, selecting any plugin at all. The
+  picker's preselection is now snapshotted into a local variable before the
+  reset, so the diff runs against the real values.
+
+  Also while adding this: `xo-server-nanokvm`'s config form example text
+  named a specific `host3` and a real domain (`pozzatech.com`) instead of
+  generic placeholders. Both `plugins/xo-server-nanokvm/index.js` and its
+  `README.md` now use `host` and `host.example.com`.
+
+  Also found and fixed a real bug in `xo-server-host-power-manager`:
+  the CPU and memory triggers' threshold fields were required, so once a
+  metric was selected in the form there was no way to clear it back out —
+  a rule was forced to always use both CPU and memory, with no way to use
+  only one. Both triggers' thresholds are now optional, so a rule can use
+  CPU only, memory only, or both. The first attempt at this made "not used"
+  an implicit state (leave both threshold fields blank), which left the
+  Metric dropdown still showing a real selection ("Average CPU utilization
+  %") with nothing on screen indicating the trigger was actually off — so
+  each Metric dropdown now has its own explicit `Not used` option (the
+  default for a new rule), and that, not blank thresholds, is what a trigger
+  being off actually means. `cpuTriggerActive()`/`memoryTriggerActive()` in
+  `lib/rule-runner.js` now check the metric as well as the thresholds;
+  `decide()`, `computeCpuValue()` and `computeMemoryValue()` treat an
+  inactive trigger as never wanting power-on and always "comfortable" for
+  power-off. `configure()` logs a warning for a rule left with neither
+  trigger active, and a second warning (new `cpuTriggerIncomplete()`/
+  `memoryTriggerIncomplete()`) for a rule with a real metric picked but a
+  threshold still missing — both also included in the Test button's result
+  object (`cpuTriggerActive`, `cpuTriggerIncomplete`, and their memory
+  counterparts). The Rule label's example text was also changed from a generic host
+  name (`"host3"`) to one that reflects what the label is actually for
+  (`"Power on/off extra host"`). The README's **Behavior** section states
+  what a single-trigger rule does: that one trigger alone decides both
+  power-on and power-off, with the unset one ignored entirely — and that
+  same OR/AND behavior is stated directly in the plugin's own config form
+  (the **Rules** field description in Settings > Plugins), so it's visible
+  right where a user is changing the thresholds, not only in the README.
+
+- **`xo-server-host-power-manager`'s power-off is now HA-aware.** Asked
+  whether the plugin accounted for the pool's HA failover plan before
+  powering a host off, the answer was no — nothing in it checked HA at all.
+  `powerOff()` in `lib/rule-runner.js` now catches XAPI's
+  `HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN` error (raised when disabling/
+  evacuating this host would leave the pool without enough spare capacity
+  for its configured "host failures to tolerate") and turns it into a clear
+  log message naming the host and pointing at **Pool > Advanced > HA**,
+  instead of a generic failure. The pool's own HA failover math (which
+  depends on live capacity and every VM's resource needs) isn't
+  re-implemented here — XAPI already computes it accurately on every
+  attempt, so the plugin defers to that rather than approximating it
+  client-side and drifting out of sync. On rejection the rule just leaves
+  the host running and retries on its next poll; it never forces the
+  evacuation through. Power-off was also confirmed to already do what was
+  separately asked for: it never touches NanoKVM or IPMI — power-off always
+  goes through XO's own `shutdownHost()`, which disables the host and
+  evacuates its VMs via live migration (the exact same `xapi.clearHost()`
+  path XO's own "enable maintenance mode" uses) before shutting it down;
+  NanoKVM is only ever used for power-**on**. README and
+  `docs/custom-plugins.md` now say both of these explicitly.
+
+  While testing that against a live pool, found and fixed a serious bug:
+  saving settings on an already-running `xo-server-host-power-manager`
+  silently killed it. xo-server's plugin framework calls `configure()`
+  again on every settings save, passing `{ loaded: true }` — but only ever
+  calls `load()` once, at initial activation; it does **not** call `load()`
+  again just because settings changed. This plugin's `configure()` called
+  `clearTimers()` but only `load()` called `startTimers()`, so the first
+  settings save after startup (a threshold, the cooldown, anything) tore
+  down every rule's timer and never rescheduled it — every rule went
+  silently inert until the next `xo-server` restart, with no error anywhere
+  to point at why. `configure()` now takes that second `{ loaded }`
+  argument xo-server already provides and calls `startTimers()` itself when
+  `loaded` is true, so a live settings change reschedules polling
+  immediately instead of going dark. Verified against xo-server's real
+  lifecycle (`configure(loaded:false)` → `load()` → `configure(loaded:true)`,
+  the exact sequence an initial activation followed by a settings save
+  produces): exactly one timer running throughout, never zero, never
+  duplicated.
+
+  Also found, while using the Test button to chase the timer bug above: XO's
+  own "Test plugin" dialog discards whatever a plugin's `test()` method
+  returns and always shows a static "The test appears to be working."
+  message on success — it never displays the payload. This plugin's `test()`
+  had just been given a detailed diagnostic return value (trigger states,
+  computed CPU/memory values, `wouldDo`), and an earlier entry in this same
+  changelog claimed those were "surfaced through the Test button's result" —
+  true of the API response, but not of anything a user actually sees when
+  clicking that button in XO, which made that data effectively invisible.
+  `test()` now also logs its full result via this plugin's own logger before
+  returning it, so `sudo journalctl -u xo-server` shows exactly what a Test
+  click computed — trigger states, values, and what it would do — which is
+  otherwise the only way to see it.
+
+  Checked `xo-server-nanokvm`'s `test()` for the same gap: it doesn't have
+  the discarded-data problem (it only checks the URL/credentials work and
+  throws on failure, which XO's dialog does show), but it read the power
+  LED's GPIO state and threw that reading away without logging it either —
+  a working test told you nothing about what it actually found. It now has
+  the same small logger this project's other plugins use (new
+  `plugins/xo-server-nanokvm/lib/log.js`) and logs the device label and
+  power LED reading on a successful test.
+
+- **`xo-server-host-power-manager`'s CPU/memory thresholds now measure the
+  whole pool, including the managed host itself.** They previously excluded
+  it (`getAlwaysOnHosts()`), on the reasoning that its own (lack of) load
+  shouldn't influence the decision to power it on. In practice this made
+  the plugin's numbers diverge from XO's own pool dashboard — reported as
+  "backwards" when a dashboard reading of 68.57% free didn't match the
+  plugin's own Test result of 57.00% free for the same pool, because the
+  Test result was computed from only 2 of the pool's 3 running hosts.
+  Pointed at directly: the real guarantee that a power-off won't strand VMs
+  is XAPI's own evacuation (`host.evacuate`, via `shutdownHost()` ->
+  `clearHost()`), which already refuses and leaves the host running if its
+  VMs can't actually be placed elsewhere — this plugin's thresholds only
+  ever decided *when to try*, never *whether it's safe*, so excluding the
+  managed host bought no real safety, just a smaller and more confusing
+  number. `getAlwaysOnHosts()` is now `getRunningHosts()` in
+  `lib/metrics.js`, dropped the exclusion parameter, and includes every
+  running host in the pool — a host being considered for power-on is
+  already not running, so it's still naturally excluded from its own
+  trigger's calculation, with no special-casing needed. The Test button's
+  result field for this was also renamed from `alwaysOnHostCount` to
+  `runningHostCount`, since it no longer excludes the managed host.
+
+- **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
+  integration matrix.** The RHEL family was represented by one release each
+  (Rocky 9, AlmaLinux 9, CentOS Stream 9), even though the deploy catalogue in
+  `install-xen-orchestra.sh` has built all three Rocky, all three AlmaLinux,
+  and both CentOS Stream releases for some time — so five of those eight were
+  claimed as supported with nothing in CI actually running the installer
+  against them. New Dockerfiles
+  (`Dockerfile.almalinux8`, `Dockerfile.almalinux10`, `Dockerfile.rockylinux8`,
+  `Dockerfile.rockylinux10`, `Dockerfile.centosstream10`) mirror the existing
+  same-family images, changing only the `FROM` line — except Rocky 10, which
+  has no image yet under the `rockylinux` Docker Hub namespace and pulls from
+  `rockylinux/rockylinux:10` instead. Verified locally before landing: all
+  five images build and pass the integration smoke suite. The README's CI
+  coverage note is updated to match — it now names every distribution in the
+  catalogue instead of one release per RHEL family.
+
 ## [0.8.0] - 2026-09-13
 
 ### Added

@@ -8338,6 +8338,8 @@ show_help() {
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
     echo "  --status               Read-only health report: version, service, TLS cert,"
     echo "                         disk/swap, backups/snapshots, git state. Makes no changes."
+    echo "  --custom-plugins       Install or remove optional xo-server plugins shipped in"
+    echo "                         plugins/ (NanoKVM power control, host power manager, ...)"
     echo "  --version              Show this script's version and branch, then exit"
     echo "  --help                 Show this help message"
     echo ""
@@ -11836,6 +11838,7 @@ MENU_NAMES=(
     "Edit xo-config.cfg"
     "Restore Backup"
     "Adjust Xen Orchestra Memory Allocation"
+    "Custom Plugins"
 )
 MENU_HINTS=(
     ""
@@ -11849,6 +11852,7 @@ MENU_HINTS=(
     ""
     ""
     ""
+    "(NanoKVM power control, host power manager, ...)"
 )
 
 MENU_TITLE="Install Xen Orchestra from Sources Setup and Update"
@@ -11884,6 +11888,22 @@ MENU_KEY=""
 # Set by the SIGWINCH trap; polled by menu_read_key
 MENU_RESIZED=0
 
+# When a caller sets this true before menu_interactive_pick, Q backs out of
+# that picker instead of quitting the whole script -- see MENU_CANCELLED.
+# The top-level menu never sets it, so Q there still exits the script as
+# before.
+MENU_ALLOW_CANCEL=false
+
+# Set true (by menu_interactive_pick's QUIT handler) when the picker was
+# backed out of rather than confirmed with ENTER. Reset to 0 at the top of
+# every menu_interactive_pick call; a caller checks it right after that call
+# returns.
+MENU_CANCELLED=0
+
+# Set true by a submenu (e.g. manage_custom_plugins) to tell run_menu's loop
+# to redisplay the top-level menu instead of letting the script end.
+MENU_REOPEN_MAIN=false
+
 # How long menu_read_key waits before letting a pending SIGWINCH trap run. Also
 # the worst-case delay between resizing the window and seeing the reflow.
 MENU_READ_TIMEOUT=0.2
@@ -11910,6 +11930,14 @@ ML_MIN_W=0          # minimum usable width, reported when ML_TOO_SMALL=1
 ML_MIN_H=0          # minimum usable height, reported when ML_TOO_SMALL=1
 ML_INFO_LABELS=()   # header info labels, built by menu_compute_layout
 ML_INFO_VALUES=()   # header info values, matching ML_INFO_LABELS
+
+# Widest content width any menu screen has drawn at so far this run. A later
+# screen (e.g. the Custom Plugins picker, reusing this same code with far
+# fewer items) never draws narrower than this -- a box that suddenly shrinks
+# reads as a different, freshly loading menu rather than a continuation of
+# the one just on screen. Reset to 0 at the top of each run; menu_compute_layout
+# raises it and floors ML_CONTENT_W against it on every draw.
+MENU_CONTENT_W_FLOOR=0
 
 # Truncated result from menu_truncate
 MTRUNC=""
@@ -11939,6 +11967,15 @@ MENU_XO_MASTER="N/A"
 MENU_XO_BEHIND=""
 MENU_NODE_VERSION="N/A"
 
+# Set once menu_gather_info has run this script invocation, so a second
+# picker screen reusing this same code later in the same run (e.g. the
+# Custom Plugins picker, opened moments after the main menu) redraws
+# instantly instead of repeating its git fetch/ls-remote round trips. That
+# network pause was what made the submenu look like a separate, freshly
+# loading menu rather than a continuation of the one just shown -- the
+# commit/version info it re-fetched hadn't changed in the few seconds since.
+MENU_INFO_GATHERED=false
+
 # Hide/show cursor
 menu_hide_cursor() { printf "${M_CSI}?25l"; }
 menu_show_cursor() { printf "${M_CSI}?25h"; }
@@ -11949,8 +11986,13 @@ menu_show_cursor() { printf "${M_CSI}?25h"; }
 menu_disable_wrap() { printf "${M_CSI}?7l"; }
 menu_enable_wrap() { printf "${M_CSI}?7h"; }
 
-# Gather commit and version info for the menu header
+# Gather commit and version info for the menu header. Runs its git
+# fetch/ls-remote round trips only once per script invocation -- see
+# MENU_INFO_GATHERED.
 menu_gather_info() {
+    [[ "$MENU_INFO_GATHERED" == "true" ]] && return 0
+    MENU_INFO_GATHERED=true
+
     # Current Script Commit (local HEAD) and branch
     if [[ -d "${SCRIPT_DIR}/.git" ]] && command -v git &>/dev/null; then
         MENU_SCRIPT_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null | cut -c1-5) || MENU_SCRIPT_COMMIT="N/A"
@@ -12145,6 +12187,11 @@ menu_compute_layout() {
     local title_w=$(( ${#MENU_TITLE} + 2 ))
     (( title_w > ML_CONTENT_W && title_w <= avail )) && ML_CONTENT_W=$title_w
     (( ML_CONTENT_W < 1 )) && ML_CONTENT_W=1
+
+    # Never draw narrower than a menu already has this run (see
+    # MENU_CONTENT_W_FLOOR) unless the terminal itself can't take it.
+    (( ML_CONTENT_W < MENU_CONTENT_W_FLOOR && MENU_CONTENT_W_FLOOR <= avail )) && ML_CONTENT_W=$MENU_CONTENT_W_FLOOR
+    (( ML_CONTENT_W > MENU_CONTENT_W_FLOOR )) && MENU_CONTENT_W_FLOOR=$ML_CONTENT_W
 
     # Height ladder: shed decoration in order of how little it costs to lose.
     # Row budget = top blank + banner(3) + blank + info(5) + blank + rule +
@@ -12398,11 +12445,15 @@ draw_menu() {
     _buf+="${pad}${M_CYAN}Selected: ${M_GREEN}${sel_count}${M_RESET}${eol}"$'\n'
 
     # Key legend. The long form names every key; the short form keeps the same
-    # information in roughly half the width.
+    # information in roughly half the width. A cancellable picker (see
+    # MENU_ALLOW_CANCEL) labels Q "Back" instead of "Quit" -- it returns to
+    # the main menu here rather than exiting the script.
     if (( ML_LEGEND )); then
         _buf+="$blank_hi"
-        local keys="↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Quit"
-        (( ML_TWO_COL == 0 )) && keys="↑↓ Move  SPACE Select  ENTER Go  Q Quit"
+        local quit_label="Quit"
+        [[ "$MENU_ALLOW_CANCEL" == "true" ]] && quit_label="Back"
+        local keys="↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   Q ${quit_label}"
+        (( ML_TWO_COL == 0 )) && keys="↑↓ Move  SPACE Select  ENTER Go  Q ${quit_label}"
         menu_truncate "$keys" "$content_width"
         _buf+="${pad}${M_YELLOW}${MTRUNC}${M_RESET}${eol}"$'\n'
         if (( content_width >= 38 )); then
@@ -12610,6 +12661,214 @@ menu_edit_config() {
     log_success "Configuration editing complete."
 }
 
+# ============================================================================
+# Custom Plugins
+#
+# These are separate xo-server plugins (packages/xo-server-*, discovered by
+# xo-server itself -- not by this script) shipped in plugins/ next to this
+# script. They are not installed by --install; a user opts in after XO is
+# already running, from this menu or --custom-plugins.
+#
+# Catalogue of what's available. Each entry is
+# "directory-name|display-label|description". The directory name must match
+# a folder under plugins/ and keep its xo-server- prefix -- that prefix is
+# how xo-server's own plugin loader recognizes it as a plugin at all, the
+# same as xo-server-auth-ldap or xo-server-load-balancer. The display label
+# is what this menu shows instead (XO's own Settings > Plugins page already
+# drops that prefix on its own, e.g. "xo-server-nanokvm" shows there as just
+# "nanokvm" -- this label matches that). Add a line here when a new plugin
+# ships.
+# ============================================================================
+CUSTOM_PLUGIN_CATALOG=(
+    "xo-server-nanokvm|nanokvm|NanoKVM device connections (power control) -- used by other custom plugins"
+    "xo-server-host-power-manager|host-power-manager|Powers an extra pool host on/off from CPU/memory thresholds"
+)
+
+# Copies one plugin's folder from plugins/ into xo-server's global plugin
+# lookup path (/usr/local/lib/node_modules, unaffected by --update's git
+# pull/rebuild). Replaces any existing copy, so this also serves as
+# "reinstall/update this plugin from a newer checkout of this repo".
+install_custom_plugin() {
+    local plugin_name="$1"
+    local src="${SCRIPT_DIR}/plugins/${plugin_name}"
+    local dest="/usr/local/lib/node_modules/${plugin_name}"
+
+    if [[ ! -d "$src" ]]; then
+        log_error "Unknown plugin: ${plugin_name} (expected ${src})"
+        return 1
+    fi
+
+    log_info "Installing ${plugin_name} to ${dest}..."
+    run_cmd sudo mkdir -p /usr/local/lib/node_modules
+    run_cmd sudo rm -rf "$dest"
+    run_cmd sudo cp -r "$src" "$dest"
+    run_cmd sudo chown -R root:root "$dest"
+    log_success "${plugin_name} installed."
+}
+
+# True (exit 0) if an already-installed plugin's on-disk copy differs from
+# this repo's checkout -- lets manage_custom_plugins() refresh a plugin left
+# checked in the picker (an unchanged selection) instead of requiring an
+# uncheck-then-recheck round trip to pick up a newer checkout. Read-only, so
+# it runs outside run_cmd/DRY_RUN like the script's other sudo-gated checks.
+custom_plugin_needs_update() {
+    local plugin_name="$1"
+    local src="${SCRIPT_DIR}/plugins/${plugin_name}"
+    local dest="/usr/local/lib/node_modules/${plugin_name}"
+
+    sudo test -d "$dest" || return 0
+    ! sudo diff -rq "$src" "$dest" >/dev/null 2>&1
+}
+
+# Removes one plugin's folder from xo-server's plugin lookup path. Its
+# configuration (credentials, thresholds, ...) is not touched here -- that
+# lives in XO's own Redis-backed plugin metadata, not on disk, so it stays
+# until also removed from XO: Settings > Plugins.
+uninstall_custom_plugin() {
+    local plugin_name="$1"
+    local dest="/usr/local/lib/node_modules/${plugin_name}"
+
+    if [[ ! -d "$dest" ]]; then
+        log_warning "${plugin_name} is not installed (${dest} not found)."
+        return 0
+    fi
+
+    log_info "Uninstalling ${plugin_name} from ${dest}..."
+    run_cmd sudo rm -rf "$dest"
+    log_success "${plugin_name} uninstalled."
+}
+
+# Interactive/CLI entry point: the "Custom Plugins" menu item and the
+# --custom-plugins flag both call this. In the menu, already-installed
+# plugins show up pre-checked -- same convention as linux_util's own
+# install/uninstall picker: checking a new box installs it, unchecking an
+# already-checked one uninstalls it. Configuration itself happens afterwards
+# in XO: Settings > Plugins -- this only gets the code onto disk and loaded
+# (or removed).
+manage_custom_plugins() {
+    if [[ ! -d "${SCRIPT_DIR}/plugins" ]]; then
+        log_error "No plugins/ directory found next to this script."
+        return 1
+    fi
+
+    local names=()
+    local entry dir label desc
+    for entry in "${CUSTOM_PLUGIN_CATALOG[@]}"; do
+        IFS='|' read -r dir label desc <<< "$entry"
+        names+=("$dir")
+    done
+
+    local to_install=()
+    local to_uninstall=()
+    local to_update=()
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_info "Non-interactive: installing all custom plugins."
+        to_install=("${names[@]}")
+    else
+        # The exact same arrow-key/checkbox picker as the main menu, just
+        # pointed at the plugin catalogue instead of the top-level
+        # operations, so this looks and behaves like one menu system rather
+        # than a different UI grafted onto one corner of it.
+        local saved_menu_names=("${MENU_NAMES[@]}")
+        local saved_menu_hints=("${MENU_HINTS[@]}")
+        local saved_menu_title="$MENU_TITLE"
+
+        MENU_NAMES=()
+        MENU_HINTS=()
+        MENU_PRESELECTED=()
+        local i=0
+        for entry in "${CUSTOM_PLUGIN_CATALOG[@]}"; do
+            IFS='|' read -r dir label desc <<< "$entry"
+            MENU_NAMES+=("$label")
+            if [[ -d "/usr/local/lib/node_modules/${dir}" ]]; then
+                MENU_HINTS+=("($desc) [installed -- uncheck to remove, leave checked to refresh]")
+                MENU_PRESELECTED[i]=1
+            else
+                MENU_HINTS+=("($desc)")
+                MENU_PRESELECTED[i]=0
+            fi
+            i=$((i + 1))
+        done
+        MENU_TITLE="Custom Plugins"
+
+        # Q here backs out to the main menu instead of quitting the whole
+        # script -- this is a submenu reached from a choice on that menu, not
+        # a fresh operation the user committed to, so cancelling it should
+        # feel like backing out of it, not aborting the run.
+        MENU_ALLOW_CANCEL=true
+        menu_interactive_pick
+        MENU_ALLOW_CANCEL=false
+
+        # Snapshot the plugin picker's own preselection before restoring the
+        # main menu's state below, which clears MENU_PRESELECTED (the main
+        # menu doesn't use preselection) -- the diff against it has to happen
+        # first, or every index read here is unbound under `set -u`.
+        local plugin_preselected=("${MENU_PRESELECTED[@]}")
+
+        MENU_NAMES=("${saved_menu_names[@]}")
+        MENU_HINTS=("${saved_menu_hints[@]}")
+        MENU_TITLE="$saved_menu_title"
+        MENU_PRESELECTED=()
+        menu_derive_layout
+
+        if [[ "$MENU_CANCELLED" == "1" ]]; then
+            MENU_REOPEN_MAIN=true
+            return 0
+        fi
+
+        for ((i = 0; i < ${#names[@]}; i++)); do
+            if [[ ${MENU_SELECTED[$i]} -eq 1 && ${plugin_preselected[$i]:-0} -eq 0 ]]; then
+                to_install+=("${names[$i]}")
+            elif [[ ${MENU_SELECTED[$i]} -eq 0 && ${plugin_preselected[$i]:-0} -eq 1 ]]; then
+                to_uninstall+=("${names[$i]}")
+            elif [[ ${MENU_SELECTED[$i]} -eq 1 && ${plugin_preselected[$i]:-0} -eq 1 ]]; then
+                # Left checked and already installed: refresh it if this
+                # repo's checkout no longer matches what's on disk, so
+                # re-running the picker with nothing toggled is how an
+                # already-live plugin picks up newer code.
+                if custom_plugin_needs_update "${names[$i]}"; then
+                    to_update+=("${names[$i]}")
+                fi
+            fi
+        done
+    fi
+
+    if [[ ${#to_install[@]} -eq 0 && ${#to_uninstall[@]} -eq 0 && ${#to_update[@]} -eq 0 ]]; then
+        log_info "Nothing changed."
+        return 0
+    fi
+
+    local plugin_name
+    for plugin_name in "${to_install[@]}"; do
+        install_custom_plugin "$plugin_name"
+    done
+    for plugin_name in "${to_update[@]}"; do
+        log_info "${plugin_name} is already installed but out of date -- refreshing it."
+        install_custom_plugin "$plugin_name"
+    done
+    for plugin_name in "${to_uninstall[@]}"; do
+        uninstall_custom_plugin "$plugin_name"
+    done
+
+    log_info "Restarting xo-server to apply the change(s)..."
+    run_cmd sudo systemctl restart xo-server
+    sleep 2
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if systemctl is-active --quiet xo-server; then
+            log_success "xo-server is running."
+        else
+            log_warning "xo-server may have failed to restart. Check: sudo systemctl status xo-server"
+        fi
+    fi
+
+    echo ""
+    if [[ ${#to_install[@]} -gt 0 ]]; then
+        log_success "Done. Configure the plugin(s) in XO: Settings > Plugins."
+    else
+        log_success "Done."
+    fi
+}
+
 # Process selected menu items after user confirms
 process_menu_selections() {
     local has_selection=false
@@ -12736,33 +12995,45 @@ process_menu_selections() {
         load_config
         build_vm_templates
     fi
+
+    # Custom Plugins
+    if [[ ${MENU_SELECTED[11]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        check_sudo
+        check_systemctl
+        manage_custom_plugins
+    fi
 }
 
-# Run the interactive menu
-run_menu() {
-    # Run the same load_config() every operation runs, so an existing
-    # xo-config.cfg is migrated to the latest schema just from opening the
-    # menu -- not only once an operation is picked from it. This is a no-op
-    # (source and default-fill only) when there is no config file yet, so a
-    # first-time user with neither xo-config.cfg nor sample-xo-config.cfg
-    # still gets the menu, from which "Rename Sample-xo-config.cfg" and
-    # "Edit xo-config.cfg" are reachable.
-    if [[ -f "$CONFIG_FILE" ]]; then
-        load_config
-    elif [[ -f "$SAMPLE_CONFIG" ]]; then
-        source "$SAMPLE_CONFIG" 2>/dev/null || true
-    fi
-    INSTALL_DIR=${INSTALL_DIR:-/opt/xen-orchestra}
-    PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
+# The arrow-key/checkbox picker itself, driven entirely by the current
+# MENU_NAMES/MENU_HINTS/MENU_TITLE globals. Extracted out of run_menu so any
+# other screen (e.g. the Custom Plugins submenu) gets the exact same look and
+# navigation instead of inventing a different UI for one corner of the menu
+# system. Recomputes the grid layout for whatever MENU_NAMES currently holds,
+# resets the selection, runs the picker until ENTER (selections left in
+# MENU_SELECTED for the caller) or 'q' -- which exits the whole script, same
+# as the top-level menu, unless the caller set MENU_ALLOW_CANCEL=true first,
+# in which case 'q' instead backs out and leaves MENU_CANCELLED=1 for the
+# caller to check. Callers that set MENU_NAMES/MENU_HINTS/MENU_TITLE
+# themselves are responsible for saving and restoring them if needed
+# afterwards.
+menu_interactive_pick() {
+    menu_derive_layout
+    MENU_CANCELLED=0
 
     # Reset selection state. Sized from MENU_TOTAL rather than written out:
     # a literal list silently drifts when a menu item is added, and every
     # index past its end is an unbound-variable crash under `set -u`.
+    #
+    # A caller can pre-check items (e.g. "already installed") by setting
+    # MENU_PRESELECTED[i]=1 before calling this; anything it doesn't set
+    # defaults to unchecked, same as before this existed.
     MENU_CURSOR=0
     MENU_SELECTED=()
     local i
     for ((i = 0; i < MENU_TOTAL; i++)); do
-        MENU_SELECTED[i]=0
+        MENU_SELECTED[i]=${MENU_PRESELECTED[i]:-0}
     done
 
     # Gather version/commit info for header display
@@ -12897,6 +13168,10 @@ run_menu() {
                 # recomputes the layout, so there is nothing to do here.
                 ;;
             QUIT)
+                if [[ "$MENU_ALLOW_CANCEL" == "true" ]]; then
+                    MENU_CANCELLED=1
+                    break
+                fi
                 cleanup_menu
                 trap - EXIT
                 trap - WINCH
@@ -12909,17 +13184,47 @@ run_menu() {
         draw_menu
     done
 
-    # Restore terminal before running operations
+    # Restore terminal before returning control to the caller
     cleanup_menu
     trap - EXIT
     trap - WINCH
     clear
 
-    # Restore the original ERR trap
+    # Re-assert the script's top-level ERR trap, same as before this was
+    # split out of run_menu
     trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
+}
 
-    # Execute selected operations
-    process_menu_selections
+# Run the interactive menu
+run_menu() {
+    # Run the same load_config() every operation runs, so an existing
+    # xo-config.cfg is migrated to the latest schema just from opening the
+    # menu -- not only once an operation is picked from it. This is a no-op
+    # (source and default-fill only) when there is no config file yet, so a
+    # first-time user with neither xo-config.cfg nor sample-xo-config.cfg
+    # still gets the menu, from which "Rename Sample-xo-config.cfg" and
+    # "Edit xo-config.cfg" are reachable.
+    if [[ -f "$CONFIG_FILE" ]]; then
+        load_config
+    elif [[ -f "$SAMPLE_CONFIG" ]]; then
+        source "$SAMPLE_CONFIG" 2>/dev/null || true
+    fi
+    INSTALL_DIR=${INSTALL_DIR:-/opt/xen-orchestra}
+    PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
+
+    # Backing out of a submenu (e.g. Q in the Custom Plugins picker) sets
+    # MENU_REOPEN_MAIN instead of exiting, which redisplays this same menu
+    # rather than letting the script end -- reset it each pass so only that
+    # signals another round, never a leftover from the previous one.
+    while true; do
+        MENU_REOPEN_MAIN=false
+        menu_interactive_pick
+
+        # Execute selected operations
+        process_menu_selections
+
+        [[ "$MENU_REOPEN_MAIN" == "true" ]] || break
+    done
 }
 
 # Main entry point
@@ -12957,7 +13262,7 @@ main() {
                 show_version
                 exit 0
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--status|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--status|--custom-plugins|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -12981,7 +13286,7 @@ main() {
     fi
 
     if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
-        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --deploy, --adjust-memory, --flush-tokens, --uninstall)"
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --deploy, --adjust-memory, --flush-tokens, --uninstall, --custom-plugins)"
         exit 1
     fi
 
@@ -13097,6 +13402,13 @@ main() {
             check_not_root
             load_config
             show_status
+            ;;
+        --custom-plugins)
+            check_required_commands
+            check_not_root
+            check_sudo
+            check_systemctl
+            manage_custom_plugins
             ;;
         --help)
             show_help
