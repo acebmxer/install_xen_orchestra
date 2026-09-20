@@ -1,0 +1,48 @@
+name: Sync plugins in
+
+# Pulls a plugin's changes from xo-plugins back into plugins/<name>/ here,
+# triggered by xo-plugins' own "notify install_xen_orchestra" workflow.
+# Commits only if the pull actually produced a diff, so a round-trip sync
+# (this repo -> xo-plugins -> back here) doesn't create an empty commit.
+
+on:
+  repository_dispatch:
+    types: [xo-plugins-updated]
+
+permissions:
+  contents: write
+
+jobs:
+  pull-plugin:
+    name: Pull ${{ github.event.client_payload.plugin }} (${{ github.event.client_payload.branch }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.client_payload.branch }}
+
+      - name: Attach to the target branch
+        # actions/checkout leaves HEAD detached. plugin-pull.sh refuses to run
+        # unless `git rev-parse --abbrev-ref HEAD` reports "main" or "dev".
+        run: git checkout -B "${{ github.event.client_payload.branch }}"
+
+      - name: Pull plugin from xo-plugins
+        run: scripts/plugin-pull.sh "${{ github.event.client_payload.plugin }}"
+
+      - name: Commit and push if changed
+        run: |
+          set -euo pipefail
+          plugin="${{ github.event.client_payload.plugin }}"
+          branch="${{ github.event.client_payload.branch }}"
+
+          if git diff --quiet -- "plugins/${plugin}"; then
+            echo "No changes after pulling ${plugin} -- nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "plugins/${plugin}"
+          git commit -m "sync: pull ${plugin} from xo-plugins (${branch})"
+          git push origin "HEAD:${branch}"

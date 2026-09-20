@@ -108,7 +108,24 @@ touches it.
 
 [xo-plugins](https://github.com/acebmxer/xo-plugins) has `dev` and `main`
 branches mirroring this repo's own workflow, so unreleased plugin work
-never reaches its `main` early. Two scripts keep the two repos identical:
+never reaches its `main` early. This repo is the source of truth for the
+plugins; `xo-plugins` is kept identical to it.
+
+CI keeps the two in sync automatically, in both directions, so nobody has
+to remember to run anything by hand:
+
+- A `plugins/<name>/` change pushed here (`sync-plugins-out.yml`) runs
+  `scripts/plugin-push.sh <name>` for you, pushing it to `xo-plugins`.
+- A change made directly in `xo-plugins` (its own `notify-install-repo.yml`)
+  tells this repo (via `repository_dispatch`) to pull it back in
+  (`sync-plugins-in.yml`, using `scripts/plugin-pull.sh <name>`) and commit
+  it here.
+
+Both directions only sync whichever branch (`dev`/`main`) changed, matching
+that branch on the other side.
+
+The two scripts still work the same when run by hand, for a one-off or if
+CI can't reach the other repo:
 
 - `scripts/plugin-push.sh <plugin-name>` — this repo → `xo-plugins`.
   Commits here only; run it after committing a plugin change.
@@ -116,8 +133,7 @@ never reaches its `main` early. Two scripts keep the two repos identical:
   files over `plugins/<plugin-name>/` but doesn't commit; review and commit
   yourself.
 
-Both sync whichever branch (`dev`/`main`) you're currently on, and refuse
-to run from any other branch.
+Both refuse to run from any branch other than `dev`/`main`.
 
 **Adding a new plugin:** put it in `plugins/<name>/` here as usual, then
 one-time import it into `xo-plugins` (once per branch, `dev` and `main`):

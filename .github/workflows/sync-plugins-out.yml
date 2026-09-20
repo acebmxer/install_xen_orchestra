@@ -1,0 +1,66 @@
+name: Sync plugins out
+
+# Pushes plugins/<name>/ changes to the standalone xo-plugins repo whenever
+# they land on main or dev here, via the same plugin-push.sh a human would
+# otherwise have to remember to run by hand.
+
+on:
+  push:
+    branches: ["main", "dev"]
+    paths: ["plugins/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  push-plugins:
+    name: Push changed plugins to xo-plugins
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # Pinned to a commit SHA: a tag can be retargeted, a SHA cannot.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Attach to the pushed branch
+        # actions/checkout leaves HEAD detached. plugin-push.sh refuses to run
+        # unless `git rev-parse --abbrev-ref HEAD` reports "main" or "dev".
+        run: git checkout -B "${{ github.ref_name }}"
+
+      - name: Authenticate git for the xo-plugins push
+        # gh's own credential helper, not a token embedded in the remote URL --
+        # that would risk the token appearing in a printed command or error.
+        env:
+          GH_TOKEN: ${{ secrets.XO_PLUGINS_SYNC_TOKEN }}
+        run: |
+          echo "${GH_TOKEN}" | gh auth login --with-token
+          gh auth setup-git
+
+      - name: Push each changed plugin
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          before="${{ github.event.before }}"
+          if [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            # New branch: nothing to diff against, so treat every existing
+            # plugin folder as changed rather than pushing nothing.
+            changed=$(find plugins -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+          else
+            changed=$(git diff --name-only "$before" "${{ github.event.after }}" -- plugins/ | cut -d/ -f2 | sort -u)
+          fi
+
+          if [ -z "$changed" ]; then
+            echo "No plugin folders changed."
+            exit 0
+          fi
+
+          for plugin in $changed; do
+            if [ -d "plugins/$plugin" ]; then
+              echo "::group::Pushing $plugin"
+              scripts/plugin-push.sh "$plugin"
+              echo "::endgroup::"
+            fi
+          done
