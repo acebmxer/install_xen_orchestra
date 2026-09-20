@@ -32,7 +32,18 @@ This installer builds Xen Orchestra from source and tracks the official
   `tests/unit/test_plugin_sync_scripts.bats` exercises both scripts
   end-to-end against throwaway local repos, so a regression in the sync
   logic itself (or in the branch guard) fails the build instead of going
-  unnoticed.
+  unnoticed. The two manual sync scripts have also been wired into CI on
+  both sides: pushing a `plugins/**` change here now runs
+  `scripts/plugin-push.sh` automatically instead of relying on someone to
+  remember to run it, and a matching change made directly in `xo-plugins`
+  is pulled back here the same way, via a `repository_dispatch` from
+  `xo-plugins`' own workflow that this repo's new
+  `sync-plugins-in.yml` listens for. `plugin-push.sh`/`plugin-pull.sh`
+  still exist and behave the same when run by hand; the new
+  `sync-plugins-out.yml` / `sync-plugins-in.yml` workflows are just
+  automated callers of them, each guarded to only commit when the sync
+  actually produced a diff, so a round trip between the two repos can't
+  create empty commits or loop.
 
 ## [0.9.0] - 2026-09-20
 
