@@ -46,9 +46,17 @@ Saving changes here takes effect immediately — no `xo-server` restart
 needed. Each rule's polling restarts fresh on save, so a lowered Cooldown or
 Poll interval applies right away rather than waiting for the next restart.
 
-All metrics are computed from the pool's other **currently running**
-hosts — the managed host's own (lack of) load never affects the decision to
-power it on.
+All metrics are computed from **every currently running host in the pool,
+including the managed host itself** when it's running — matching what XO's
+own pool dashboard shows. A host being considered for power-on is already
+not running, so it's naturally excluded from its own trigger's calculation
+without any special-casing.
+
+This isn't a safety check — the actual guarantee that powering a host off
+won't strand VMs is XAPI's own evacuation, which refuses (and leaves the
+host running) if its VMs can't really be placed elsewhere. This plugin's
+thresholds only decide *when to try*; XAPI decides whether it's safe, on
+every attempt.
 
 ## Behavior
 

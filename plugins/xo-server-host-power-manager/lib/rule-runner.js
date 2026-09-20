@@ -1,6 +1,6 @@
 'use strict'
 
-const { getAlwaysOnHosts, getAverageCpuPercent, getVcpuRatio, getMemory } = require('./metrics')
+const { getRunningHosts, getAverageCpuPercent, getVcpuRatio, getMemory } = require('./metrics')
 const log = require('./log')
 
 const BYTES_PER_GB = 1024 * 1024 * 1024
@@ -128,7 +128,7 @@ async function tick({ xo, rule, state, powerProviders }) {
     return
   }
 
-  const hosts = getAlwaysOnHosts(xo, host.$poolId, host.id)
+  const hosts = getRunningHosts(xo, host.$poolId)
   const [cpuValue, memoryValue] = await Promise.all([
     computeCpuValue(xo, rule, hosts),
     Promise.resolve(computeMemoryValue(rule, hosts)),

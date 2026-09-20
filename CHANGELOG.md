@@ -155,6 +155,28 @@ This installer builds Xen Orchestra from source and tracks the official
   `plugins/xo-server-nanokvm/lib/log.js`) and logs the device label and
   power LED reading on a successful test.
 
+- **`xo-server-host-power-manager`'s CPU/memory thresholds now measure the
+  whole pool, including the managed host itself.** They previously excluded
+  it (`getAlwaysOnHosts()`), on the reasoning that its own (lack of) load
+  shouldn't influence the decision to power it on. In practice this made
+  the plugin's numbers diverge from XO's own pool dashboard — reported as
+  "backwards" when a dashboard reading of 68.57% free didn't match the
+  plugin's own Test result of 57.00% free for the same pool, because the
+  Test result was computed from only 2 of the pool's 3 running hosts.
+  Pointed at directly: the real guarantee that a power-off won't strand VMs
+  is XAPI's own evacuation (`host.evacuate`, via `shutdownHost()` ->
+  `clearHost()`), which already refuses and leaves the host running if its
+  VMs can't actually be placed elsewhere — this plugin's thresholds only
+  ever decided *when to try*, never *whether it's safe*, so excluding the
+  managed host bought no real safety, just a smaller and more confusing
+  number. `getAlwaysOnHosts()` is now `getRunningHosts()` in
+  `lib/metrics.js`, dropped the exclusion parameter, and includes every
+  running host in the pool — a host being considered for power-on is
+  already not running, so it's still naturally excluded from its own
+  trigger's calculation, with no special-casing needed. The Test button's
+  result field for this was also renamed from `alwaysOnHostCount` to
+  `runningHostCount`, since it no longer excludes the managed host.
+
 - **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
   integration matrix.** The RHEL family was represented by one release each
   (Rocky 9, AlmaLinux 9, CentOS Stream 9), even though the deploy catalogue in

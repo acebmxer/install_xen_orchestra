@@ -1,27 +1,31 @@
 'use strict'
 
 // Pool-wide metrics used to decide whether a managed ("extra") host is
-// needed. All metrics are computed only from the hosts that are currently
-// running and enabled in the pool, excluding the managed host itself — that
-// host may be off, and its own (lack of) load must not affect the decision
-// to power it on.
-
-function getAlwaysOnHosts(xo, poolId, excludeHostId) {
+// needed. All metrics are computed from every currently running and
+// enabled host in the pool, including the managed host itself when it's
+// running -- matching what XO's own pool dashboard shows, rather than a
+// smaller, plugin-specific figure.
+//
+// This does NOT need to exclude the managed host as a safety measure: the
+// real guarantee that powering it off won't strand VMs is XAPI's own
+// evacuate call (via shutdownHost() -> clearHost() -> host.evacuate in
+// powerOff() below), which refuses and leaves the host running if its VMs
+// can't actually be placed elsewhere. This function only decides *when to
+// try*, not whether it's safe to -- that check happens for real, downstream,
+// on every attempt.
+//
+// A host being considered for power-ON is already not Running, so it's
+// naturally excluded here without any special-casing.
+function getRunningHosts(xo, poolId) {
   const hosts = []
   for (const object of Object.values(xo.getObjects())) {
-    if (
-      object.type === 'host' &&
-      object.$poolId === poolId &&
-      object.id !== excludeHostId &&
-      object.enabled === true &&
-      object.power_state === 'Running'
-    ) {
+    if (object.type === 'host' && object.$poolId === poolId && object.enabled === true && object.power_state === 'Running') {
       hosts.push(object)
     }
   }
   return hosts
 }
-exports.getAlwaysOnHosts = getAlwaysOnHosts
+exports.getRunningHosts = getRunningHosts
 
 // Average CPU utilization (0-100) across all cores of all given hosts, over
 // the most recent seconds-granularity samples XAPI has.

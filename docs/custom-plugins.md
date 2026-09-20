@@ -66,10 +66,15 @@ provider — never NanoKVM or IPMI. It evacuates running VMs first (the same
 path as XO's "enable maintenance mode") and cleanly powers off standard
 hardware. If the pool has HA enabled and this would break its failover
 plan, XAPI refuses the power-off and the plugin logs why, rather than
-forcing it through. Power-on reacts immediately (either resource being
-tight is reason enough); power-off requires both to be comfortable
-continuously for a configurable cooldown, so a brief dip doesn't cause
-flapping.
+forcing it through — that XAPI-side evacuation check, not this plugin's own
+thresholds, is what actually guarantees a power-off won't strand VMs.
+Power-on reacts immediately (either resource being tight is reason enough);
+power-off requires both to be comfortable continuously for a configurable
+cooldown, so a brief dip doesn't cause flapping.
+
+CPU/memory thresholds are measured across every currently running host in
+the pool, including the managed host itself while it's running — matching
+XO's own pool dashboard.
 
 See
 [`plugins/xo-server-host-power-manager/README.md`](../plugins/xo-server-host-power-manager/README.md)

@@ -23,7 +23,7 @@ const {
   cpuTriggerIncomplete,
   memoryTriggerIncomplete,
 } = require('./lib/rule-runner')
-const { getAlwaysOnHosts } = require('./lib/metrics')
+const { getRunningHosts } = require('./lib/metrics')
 const log = require('./lib/log')
 
 const cpuMetricSchema = {
@@ -228,7 +228,7 @@ exports.default = function ({ xo }) {
       }
 
       const host = xo.getObject(targetHostId)
-      const hosts = getAlwaysOnHosts(xo, host.$poolId, host.id)
+      const hosts = getRunningHosts(xo, host.$poolId)
       const cpuValue = await computeCpuValue(xo, rule, hosts)
       const memoryValue = computeMemoryValue(rule, hosts)
 
@@ -244,7 +244,7 @@ exports.default = function ({ xo }) {
 
       const testResult = {
         hostPowerState: host.power_state,
-        alwaysOnHostCount: hosts.length,
+        runningHostCount: hosts.length,
         cpuTriggerActive: cpuTriggerActive(rule),
         cpuTriggerIncomplete: cpuTriggerIncomplete(rule),
         cpuMetric: rule.cpu.metric,
