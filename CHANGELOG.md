@@ -43,7 +43,14 @@ This installer builds Xen Orchestra from source and tracks the official
   `sync-plugins-out.yml` / `sync-plugins-in.yml` workflows are just
   automated callers of them, each guarded to only commit when the sync
   actually produced a diff, so a round trip between the two repos can't
-  create empty commits or loop.
+  create empty commits or loop. While this was live, two plugins updated in
+  `xo-plugins` close together fired two `repository_dispatch` events for the
+  same branch at once; each triggered its own `sync-plugins-in.yml` run, and
+  the second one's `git push` was rejected as a non-fast-forward once the
+  first had already moved the branch, silently leaving that branch missing
+  one plugin's sync. `sync-plugins-in.yml`'s commit-and-push step now retries
+  on a rejected push, fetching and rebasing onto the branch's new tip before
+  trying again (up to 5 attempts), instead of failing outright.
 
 ## [0.9.0] - 2026-09-20
 

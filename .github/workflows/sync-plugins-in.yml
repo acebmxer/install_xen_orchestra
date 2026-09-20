@@ -45,4 +45,20 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "plugins/${plugin}"
           git commit -m "sync: pull ${plugin} from xo-plugins (${branch})"
-          git push origin "HEAD:${branch}"
+
+          # Two dispatches for the same branch (e.g. two plugins updated at
+          # once in xo-plugins) can race here, each starting from the same
+          # base commit. Rebase onto the latest branch tip and retry instead
+          # of failing outright on a non-fast-forward push.
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${branch}"; then
+              exit 0
+            fi
+            echo "Push rejected (attempt ${attempt}/5) -- rebasing onto latest ${branch} and retrying."
+            sleep $((attempt * 5))
+            git fetch origin "${branch}"
+            git rebase "origin/${branch}"
+          done
+
+          echo "::error::Failed to push sync commit for ${plugin} (${branch}) after 5 attempts."
+          exit 1
