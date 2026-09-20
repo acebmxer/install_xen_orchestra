@@ -50,7 +50,16 @@ This installer builds Xen Orchestra from source and tracks the official
   first had already moved the branch, silently leaving that branch missing
   one plugin's sync. `sync-plugins-in.yml`'s commit-and-push step now retries
   on a rejected push, fetching and rebasing onto the branch's new tip before
-  trying again (up to 5 attempts), instead of failing outright.
+  trying again (up to 5 attempts), instead of failing outright. Separately,
+  `sync-plugins-out.yml`'s auth step started failing outright: it set
+  `GH_TOKEN` in the step's own env and then ran `gh auth login --with-token`,
+  which current `gh` refuses to do while `GH_TOKEN` is already set (it exits
+  1 rather than log in over an existing env token). The login call was never
+  actually needed — `gh auth setup-git` alone wires up a credential helper
+  that reads `GH_TOKEN` from the environment at the moment git invokes it, no
+  prior login required. `GH_TOKEN` is now set at job level (so it's also
+  present later, when `plugin-push.sh`'s `git push` actually runs) and the
+  `gh auth login` call is gone.
 
 ## [0.9.0] - 2026-09-20
 

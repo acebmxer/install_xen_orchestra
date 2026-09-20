@@ -16,6 +16,11 @@ jobs:
   push-plugins:
     name: Push changed plugins to xo-plugins
     runs-on: ubuntu-latest
+    # Job-level so it's also present when "Push each changed plugin" invokes
+    # git push -- gh's credential helper reads the token from this env var at
+    # the moment git calls it, it doesn't need a prior `gh auth login`.
+    env:
+      GH_TOKEN: ${{ secrets.XO_PLUGINS_SYNC_TOKEN }}
     steps:
       - name: Checkout
         # Pinned to a commit SHA: a tag can be retargeted, a SHA cannot.
@@ -31,11 +36,13 @@ jobs:
       - name: Authenticate git for the xo-plugins push
         # gh's own credential helper, not a token embedded in the remote URL --
         # that would risk the token appearing in a printed command or error.
-        env:
-          GH_TOKEN: ${{ secrets.XO_PLUGINS_SYNC_TOKEN }}
-        run: |
-          echo "${GH_TOKEN}" | gh auth login --with-token
-          gh auth setup-git
+        # No `gh auth login` here: with GH_TOKEN already in env, current gh
+        # refuses `auth login --with-token` outright ("the value of the
+        # GH_TOKEN environment variable is being used for authentication...
+        # clear it first"). `gh auth setup-git` alone is sufficient -- it
+        # just wires up the credential helper, which reads GH_TOKEN from env
+        # at push time.
+        run: gh auth setup-git
 
       - name: Push each changed plugin
         run: |
