@@ -112,6 +112,25 @@ This installer builds Xen Orchestra from source and tracks the official
   NanoKVM is only ever used for power-**on**. README and
   `docs/custom-plugins.md` now say both of these explicitly.
 
+  While testing that against a live pool, found and fixed a serious bug:
+  saving settings on an already-running `xo-server-host-power-manager`
+  silently killed it. xo-server's plugin framework calls `configure()`
+  again on every settings save, passing `{ loaded: true }` — but only ever
+  calls `load()` once, at initial activation; it does **not** call `load()`
+  again just because settings changed. This plugin's `configure()` called
+  `clearTimers()` but only `load()` called `startTimers()`, so the first
+  settings save after startup (a threshold, the cooldown, anything) tore
+  down every rule's timer and never rescheduled it — every rule went
+  silently inert until the next `xo-server` restart, with no error anywhere
+  to point at why. `configure()` now takes that second `{ loaded }`
+  argument xo-server already provides and calls `startTimers()` itself when
+  `loaded` is true, so a live settings change reschedules polling
+  immediately instead of going dark. Verified against xo-server's real
+  lifecycle (`configure(loaded:false)` → `load()` → `configure(loaded:true)`,
+  the exact sequence an initial activation followed by a settings save
+  produces): exactly one timer running throughout, never zero, never
+  duplicated.
+
 - **Rocky Linux 8/10, AlmaLinux 8/10 and CentOS Stream 10 join the CI
   integration matrix.** The RHEL family was represented by one release each
   (Rocky 9, AlmaLinux 9, CentOS Stream 9), even though the deploy catalogue in

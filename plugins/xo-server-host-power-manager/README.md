@@ -42,6 +42,10 @@ Metric other than `Not used` and fill in its two thresholds to turn a trigger
 on. Use CPU only, memory only, or both; at least one must be configured or
 the rule will never power the host on.
 
+Saving changes here takes effect immediately — no `xo-server` restart
+needed. Each rule's polling restarts fresh on save, so a lowered Cooldown or
+Poll interval applies right away rather than waiting for the next restart.
+
 All metrics are computed from the pool's other **currently running**
 hosts — the managed host's own (lack of) load never affects the decision to
 power it on.

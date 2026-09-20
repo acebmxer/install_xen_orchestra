@@ -178,7 +178,13 @@ exports.default = function ({ xo }) {
   }
 
   return {
-    configure(configuration) {
+    // xo-server calls configure() again, with { loaded: true }, every time
+    // settings are saved on an already-running plugin -- it does NOT call
+    // load() a second time (load() only ever fires once, at initial
+    // activation). So a live settings change has to restart the timers
+    // itself here, or the plugin goes inert (rules cleared, never
+    // rescheduled) until xo-server is restarted.
+    configure(configuration, { loaded } = {}) {
       clearTimers()
       rules = (configuration && configuration.rules) || []
       // Rules that no longer exist keep no state around.
@@ -199,6 +205,9 @@ exports.default = function ({ xo }) {
         if (memoryTriggerIncomplete(rule)) {
           log.warn(`rule "${label}" has a memory metric selected but is missing a power-on/power-off threshold — memory trigger is ignored until both are set`)
         }
+      }
+      if (loaded) {
+        startTimers()
       }
     },
 
