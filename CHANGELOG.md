@@ -10,6 +10,20 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **`xo-server-nanokvm` and `xo-server-host-power-manager` are now also
+  maintained standalone in [xo-plugins](https://github.com/acebmxer/xo-plugins),**
+  for anyone who wants them without the rest of this project. Content is
+  identical in both places — code, version numbers, license, and (after
+  rewording the plugin READMEs' install instructions to be accurate
+  either way) the docs too. `xo-plugins` has `dev` and `main` branches
+  mirroring this repo's own workflow, so unreleased plugin work never
+  reaches its `main` early. Both copies stay in sync via `git subtree` and
+  a pair of wrapper scripts (`scripts/plugin-push.sh` /
+  `scripts/plugin-pull.sh`), each syncing whichever branch (`dev`/`main`)
+  is currently checked out.
+
 ## [0.9.0] - 2026-09-20
 
 ### Added

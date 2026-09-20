@@ -10,6 +10,11 @@ growing set of such plugins in [`plugins/`](../plugins) — this is **not**
 XO's own official plugin catalogue, and none of this touches XO's web UI
 (`xo-web`) itself.
 
+These plugins are also maintained standalone in
+[github.com/acebmxer/xo-plugins](https://github.com/acebmxer/xo-plugins),
+for anyone who wants them without the rest of this project — the two are
+kept in sync.
+
 `--custom-plugins` (or the **Custom Plugins** entry in the interactive menu)
 installs them onto an already-running XO. It is a separate, opt-in step —
 `--install` never installs any of these on its own.

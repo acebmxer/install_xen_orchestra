@@ -20,8 +20,9 @@ isn't needed anymore.
 ## Install
 
 Copy this folder to `/usr/local/lib/node_modules/xo-server-host-power-manager`
-on the XO server, then restart `xo-server`. The Custom Plugins entry in
-`install-xen-orchestra.sh`'s menu does this for you.
+on the XO server, then restart `xo-server`. If you're using
+[install_xen_orchestra](https://github.com/acebmxer/install_xen_orchestra),
+its Custom Plugins menu does this for you automatically.
 
 ## Configure
 
