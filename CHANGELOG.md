@@ -10,6 +10,28 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed template build's "left running for inspection" message could
+  not actually be inspected.** When the preparation boot times out, or
+  finishes without the guest agent reporting in, the build VM is
+  deliberately left running rather than destroyed, and the error names its
+  prep log inside the guest. But the SSH key that authorises access to that
+  guest lives under the run's temporary working directory, which is either
+  overwritten by the next template's key generation (in a multi-template
+  run) or shredded and deleted by the script's own exit-trap cleanup —
+  both of which happen before an operator reading the message can use it.
+  The key never left the guest reachable in practice. `tpl_wait_for_prep`
+  and the guest-agent check in `tpl_build_one` now call a new
+  `tpl_save_inspection_key()`, which copies the build's current key pair
+  into its own directory outside the working directory before either
+  failure path returns, and the error message now prints the actual `ssh`
+  command to read the log with. Surfaced building the Fedora 44 template
+  from the catalogue, whose entry had only been checked by reading the
+  image's metadata against Fedora 43's, never by an actual build run — the
+  preparation boot ran past its 900s timeout, and there was no way to see
+  why.
+
 ### Added
 
 - **`xo-server-nanokvm` and `xo-server-host-power-manager` are now also

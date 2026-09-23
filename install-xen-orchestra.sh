@@ -9399,6 +9399,33 @@ tpl_ssh_key_path() {
     printf '%s' "${DEPLOY_WORKDIR}/tpl_key"
 }
 
+# Preserve the current build key for a VM that a failed build is about to
+# leave running "for inspection".
+#
+# The key tpl_build_ssh_key generates lives under DEPLOY_WORKDIR and is
+# deliberately ephemeral: tpl_build_ssh_key deletes it at the start of the
+# *next* build in the same multi-template run, and tpl_cleanup's EXIT trap
+# shreds and removes it (and the rest of DEPLOY_WORKDIR) when this script
+# exits -- both of which happen before an operator reading "left running for
+# inspection" ever gets a chance to use it. Copied here, once, into its own
+# directory outside DEPLOY_WORKDIR so neither the next build nor the exit
+# trap can take it first.
+#
+# Prints the copied private key's path, or nothing if the copy failed --
+# callers fall back to naming the log file alone.
+tpl_save_inspection_key() {
+    local src="$TPL_SSH_KEY"
+    [[ -n "$src" && -f "$src" ]] || return 0
+    local dir
+    dir=$(mktemp -d --tmpdir xo-template-inspect-XXXXXX 2>/dev/null) || return 0
+    if ! cp "$src" "${dir}/tpl_key" 2>/dev/null; then
+        rm -rf "$dir"
+        return 0
+    fi
+    chmod 600 "${dir}/tpl_key"
+    printf '%s' "${dir}/tpl_key"
+}
+
 tpl_build_ssh_key() {
     local TPL_SSH_KEY
     TPL_SSH_KEY=$(tpl_ssh_key_path)
@@ -9462,7 +9489,9 @@ tpl_build_prep_drive() {
     rm -rf "$dir"; mkdir -p "$dir"
 
     # A throwaway key so the build can reach the guest if it has to be
-    # diagnosed. It never leaves DEPLOY_WORKDIR and dies with it.
+    # diagnosed. It lives under DEPLOY_WORKDIR and dies with it -- unless a
+    # failed build leaves the VM running for inspection, in which case
+    # tpl_save_inspection_key copies it out first. See that function.
     #
     # Removed first, and the result checked. ssh-keygen refuses to write over an
     # existing key -- it asks "Overwrite (y/n)?" and, with no answer available,
@@ -9742,7 +9771,7 @@ tpl_agent_version() {
 # path-specific belongs in tpl_power_state or tpl_agent_version, not in a
 # second copy of this loop.
 tpl_wait_for_prep() {
-    local timeout="${1:-900}"
+    local timeout="${1:-900}" user="${2:-}"
     local waited=0 interval=15 state=""
 
     # Wait for the VM to actually start before watching for it to stop.
@@ -9802,6 +9831,14 @@ tpl_wait_for_prep() {
     log_error "The preparation boot did not finish within ${timeout}s."
     log_error "The VM '${TPL_VM_NAME:-build}' is left running for inspection:"
     log_error "  its prep log is at /var/log/xo-template-prep.log inside the guest."
+    local inspect_key
+    inspect_key=$(tpl_save_inspection_key)
+    if [[ -n "$inspect_key" ]]; then
+        log_error "  find its IP in XO, then:"
+        log_error "    ssh -i ${inspect_key} ${user:-<user>}@<vm-ip> 'tail -f /var/log/xo-template-prep.log'"
+    else
+        log_error "  its SSH key could not be preserved for inspection; use XO's console."
+    fi
     return 1
 }
 
@@ -10984,7 +11021,7 @@ tpl_build_one() {
         return 1
     fi
 
-    if ! tpl_wait_for_prep 900; then
+    if ! tpl_wait_for_prep 900 "$user"; then
         # Deliberately not cleaned up: the guest holds the prep log that says
         # why it failed, and destroying it would take the evidence with it.
         TPL_BUILD_STARTED="false"
@@ -11027,6 +11064,14 @@ tpl_build_one() {
         log_error "  from this template."
         log_error "  The build VM is left in place; its log is at"
         log_error "  /var/log/xo-template-prep.log inside it."
+        local inspect_key
+        inspect_key=$(tpl_save_inspection_key)
+        if [[ -n "$inspect_key" ]]; then
+            log_error "  find its IP in XO, then:"
+            log_error "    ssh -i ${inspect_key} ${user:-<user>}@<vm-ip> 'tail -f /var/log/xo-template-prep.log'"
+        else
+            log_error "  its SSH key could not be preserved for inspection; use XO's console."
+        fi
         TPL_BUILD_STARTED="false"
         return 1
     fi
