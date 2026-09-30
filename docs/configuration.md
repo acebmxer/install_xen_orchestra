@@ -22,7 +22,7 @@ Key settings:
 | `SNAPSHOT_RETENTION_DAYS` | 14 | Also delete a VM snapshot once it's older than this many days (see below) |
 | `TURBO_CACHE_ENABLED` | true | Reuse turbo's local build cache on `--update` instead of rebuilding every package (`--rebuild` always builds cold) |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
-| `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
+| `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP (`loopback` is always trusted) |
 | `PUBLIC_URL` | *(unset)* | Public URL advertised to external entities (e.g. XO Lite) |
 | `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see below) |
 | `TEMPLATE_BUILD_METHOD` | auto | How `--build-templates` reaches the pool: `auto`, `api` or `ssh` (see below) |
@@ -68,10 +68,9 @@ the files in `SSL_CERT_DIR` and run `--reconfigure` to reissue.
 ## `SERVICE_USER`
 
 Root is the default because it avoids permission issues with privileged ports,
-NFS/CIFS mounts, XenStore, and VMware V2V import. Set to any username to run
-non-root (recommended by the official XO docs) — the script configures the
-required sudoers, capability, group, and udev rules automatically. V2V import
-requires root.
+NFS/CIFS mounts, and XenStore. Set to any username to run non-root
+(recommended by the official XO docs) — the script configures the required
+sudoers, capability, group, and udev rules automatically.
 
 ## `BACKUP_KEEP` rotation
 

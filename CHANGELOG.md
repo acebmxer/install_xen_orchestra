@@ -10,7 +10,54 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-30
+
+### Fixed
+
+- **Setting `REVERSE_PROXY_TRUST` to a list of IP addresses hid the real
+  client IP from XO's internal proxies.** Xen Orchestra now defaults
+  `useForwardedHeaders` to `['loopback']` (upstream `f187b7931`), because its
+  internal proxies such as `/v5/api` forward requests to xo-server through
+  localhost and need loopback trusted to pass the client's IP on — to the
+  audit log, for instance. The list this installer wrote into `config.toml`
+  replaced that default without `loopback` in it. `'loopback'` is now always
+  written as the first entry. Existing installs using an IP list pick this up
+  with `--reconfigure`; `false` and `true` were never affected.
+
+- **A failed template build's "left running for inspection" message could
+  not actually be inspected.** When the preparation boot times out, or
+  finishes without the guest agent reporting in, the build VM is
+  deliberately left running rather than destroyed, and the error names its
+  prep log inside the guest. But the SSH key that authorises access to that
+  guest lives under the run's temporary working directory, which is either
+  overwritten by the next template's key generation (in a multi-template
+  run) or shredded and deleted by the script's own exit-trap cleanup —
+  both of which happen before an operator reading the message can use it.
+  The key never left the guest reachable in practice. `tpl_wait_for_prep`
+  and the guest-agent check in `tpl_build_one` now call a new
+  `tpl_save_inspection_key()`, which copies the build's current key pair
+  into its own directory outside the working directory before either
+  failure path returns, and the error message now prints the actual `ssh`
+  command to read the log with. Surfaced building the Fedora 44 template
+  from the catalogue, whose entry had only been checked by reading the
+  image's metadata against Fedora 43's, never by an actual build run — the
+  preparation boot ran past its 900s timeout, and there was no way to see
+  why.
+
 ### Added
+
+- **`xo-server-host-power-manager` can trigger on the tightest single
+  host's free memory, not only the pool-wide total.** A pool-wide figure
+  can look comfortable while one host is under pressure — one host at 10 GB
+  free and another at 40 GB free average out to a healthy-looking pool. The
+  memory trigger's Metric dropdown gains two options, **Lowest free memory %
+  on any one running host** and **Lowest free memory GB on any one running
+  host**; the existing two are relabelled as pool-wide. `getMemory()` in
+  `lib/metrics.js` now also returns the per-host minimum, and
+  `computeMemoryValue()` in `lib/rule-runner.js` uses it for the new
+  metrics. Existing rules keep their metric and behave as before. The
+  plugin's version is now 0.2.0, and both plugins now ship `node --test`
+  suites.
 
 - **`xo-server-nanokvm` and `xo-server-host-power-manager` are now also
   maintained standalone in [xo-plugins](https://github.com/acebmxer/xo-plugins),**
@@ -60,6 +107,18 @@ This installer builds Xen Orchestra from source and tracks the official
   prior login required. `GH_TOKEN` is now set at job level (so it's also
   present later, when `plugin-push.sh`'s `git push` actually runs) and the
   `gh auth login` call is gone.
+
+### Changed
+
+- **The installer no longer sets up anything for VMware/ESXi V2V import.**
+  Upstream Xen Orchestra (`master`, the default `GIT_BRANCH`) replaced its
+  VDDK/nbdkit/`nbdinfo` import path with `vectura`, a binary bundled inside
+  `@xen-orchestra/vmware-explorer`, and dropped the root-only check that
+  guarded the old path. The non-root `nbdinfo` package install
+  (`libnbd-bin`/`libnbd`) and the `/usr/local/lib/vddk` directory are gone,
+  and `docs/configuration.md` and `sample-xo-config.cfg` no longer say V2V
+  import needs root. An existing `/usr/local/lib/vddk` or `libnbd` package
+  is left in place; neither is used by current XO.
 
 ## [0.9.0] - 2026-09-20
 
@@ -2311,7 +2370,10 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.1...v0.7.0
