@@ -287,7 +287,7 @@ Key settings:
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `TURBO_CACHE_ENABLED` | true | Reuse turbo's local build cache on `--update` instead of rebuilding every package (`--rebuild` always builds cold) |
 | `BIND_ADDRESS` | 0.0.0.0 | Bind address |
-| `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP |
+| `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP (`loopback` is always trusted) |
 | `PUBLIC_URL` | *(unset)* | Public URL advertised to external entities (e.g. XO Lite) |
 | `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see below) |
 

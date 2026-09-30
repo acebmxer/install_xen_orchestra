@@ -2031,9 +2031,13 @@ if [[ "$REVERSE_PROXY_TRUST" == "true" ]]; then
   echo "# Trust X-Forwarded-* headers from any reverse proxy"
   echo "useForwardedHeaders = true"
 else
-  echo "# Trust X-Forwarded-* headers only from these proxy IP addresses"
+  echo "# Trust X-Forwarded-* headers only from these proxy IP addresses."
+  echo "# 'loopback' must stay: XO's internal proxies (e.g. /v5/api) forward to"
+  echo "# xo-server through localhost and rely on it to pass the client IP on."
   echo "useForwardedHeaders = ["
+  echo "  'loopback',"
   for ip in $REVERSE_PROXY_TRUST; do
+    [[ "$ip" == "loopback" ]] && continue
     echo "  '$ip',"
   done
   echo "]"

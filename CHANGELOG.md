@@ -12,6 +12,16 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Setting `REVERSE_PROXY_TRUST` to a list of IP addresses hid the real
+  client IP from XO's internal proxies.** Xen Orchestra now defaults
+  `useForwardedHeaders` to `['loopback']` (upstream `f187b7931`), because its
+  internal proxies such as `/v5/api` forward requests to xo-server through
+  localhost and need loopback trusted to pass the client's IP on — to the
+  audit log, for instance. The list this installer wrote into `config.toml`
+  replaced that default without `loopback` in it. `'loopback'` is now always
+  written as the first entry. Existing installs using an IP list pick this up
+  with `--reconfigure`; `false` and `true` were never affected.
+
 - **A failed template build's "left running for inspection" message could
   not actually be inspected.** When the preparation boot times out, or
   finishes without the guest agent reporting in, the build VM is
