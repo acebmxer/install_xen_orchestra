@@ -10,6 +10,35 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **README: running `--update` unattended from cron.** A new "Scheduled
+  Updates (cron)" section covers the two things an unattended run needs:
+  passwordless sudo for the account running the script (it refuses to run as
+  root, and there is no config setting for a sudo password), and
+  `--non-interactive`. It also notes that without `XO_API_TOKEN` or a
+  user/password pair in `xo-config.cfg`, a non-interactive run skips the
+  running task check.
+
+### Fixed
+
+- **Unattended runs failed the sudo check for sudo/wheel-group accounts.**
+  `check_sudo()` used only `sudo -v`, which asks for a password unless every
+  sudoers rule matching the user is `NOPASSWD`. An account in the `sudo`
+  (Debian/Ubuntu) or `wheel` (Fedora/RHEL) group still matches that group's
+  password rule, so adding `NOPASSWD:ALL` for it was not enough and a cron run
+  stopped with "You need sudo privileges to run this script." It now tries
+  `sudo -n true` first and falls back to `sudo -v`, so interactive runs are
+  still prompted for a password as before.
+
+- **The running task check ignored `XO_API_TOKEN`.** `check_active_xo_tasks()`
+  read only the old `XO_TASK_CHECK_TOKEN` name, although the sample config
+  documents `XO_API_TOKEN` as covering the task check. A config that set only
+  `XO_API_TOKEN` got the pre-update VM snapshot but no task check: under
+  `--non-interactive` the check was skipped, and interactively it prompted for
+  credentials. It now reads `XO_API_TOKEN`, falling back to
+  `XO_TASK_CHECK_TOKEN`, the same as `snapshot_xo_vm()`.
+
 ## [0.9.1] - 2026-09-30
 
 ### Fixed

@@ -442,6 +442,33 @@ that order — see
 [docs/authentication.md](docs/authentication.md) for how to set one up, and why
 API tokens need a description.
 
+## Scheduled Updates (cron)
+
+`--update` can run unattended from cron. Two things are needed:
+
+1. **Passwordless sudo for the account that runs the script.** The script
+   refuses to run as root and calls `sudo` throughout, and there is no config
+   setting for a sudo password. Run this as that account:
+
+   ```bash
+   echo "$USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/xo-cron
+   sudo chmod 440 /etc/sudoers.d/xo-cron
+   sudo visudo -c
+   ```
+
+   This gives the account full sudo with no password.
+
+2. **`--non-interactive`**, so the update never stops to ask anything:
+
+   ```cron
+   0 3 * * * cd /path/to/install_xen_orchestra && ./install-xen-orchestra.sh --update --non-interactive >> "$HOME/xo-update.log" 2>&1
+   ```
+
+Set `XO_API_TOKEN` (or the user/password pair) in `xo-config.cfg`.
+Without it, a non-interactive run skips the
+[running task check](#running-task-detection-update-safety) instead of
+prompting for credentials.
+
 ## Environment Variables
 
 `XO_DEBUG=1` enables debug mode and `XO_NO_SELF_UPDATE=1` skips the script's

@@ -13,7 +13,7 @@ resolved in priority order:
 
 | Priority | Method | Source |
 |----------|--------|--------|
-| 1 | Auth token | `XO_TASK_CHECK_TOKEN` in `xo-config.cfg` |
+| 1 | Auth token | `XO_API_TOKEN` (or `XO_TASK_CHECK_TOKEN`) in `xo-config.cfg` |
 | 2 | Credentials | `XO_TASK_CHECK_USER` / `XO_TASK_CHECK_PASS` in `xo-config.cfg` |
 | 3 | Interactive | Prompted at runtime (press Enter to skip) |
 

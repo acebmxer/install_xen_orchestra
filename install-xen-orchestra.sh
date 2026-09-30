@@ -236,7 +236,12 @@ check_sudo() {
         exit 1
     fi
 
-    if ! sudo -v >/dev/null 2>&1; then
+    # `sudo -n true` first: `sudo -v` alone asks for a password unless every
+    # sudoers rule matching the user is NOPASSWD, so an account in the
+    # sudo/wheel group with a NOPASSWD:ALL rule added (the unattended cron
+    # setup) still failed here. `sudo -v` stays as the fallback so an
+    # interactive run is prompted for its password as before.
+    if ! sudo -n true >/dev/null 2>&1 && ! sudo -v >/dev/null 2>&1; then
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
             log_warning "[DRY-RUN] No sudo privileges; skipping sudo check."
             return 0
@@ -2912,10 +2917,10 @@ restore_xo() {
 # Check for active Xen Orchestra tasks before updating.
 # Authenticates via token, config credentials, or interactive prompt, then
 # queries the XO REST API for pending tasks and aborts if any are found.
-# Auth priority: 1) XO_TASK_CHECK_TOKEN  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
+# Auth priority: 1) XO_API_TOKEN (or XO_TASK_CHECK_TOKEN)  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
 # Passwords are never logged, cached, or written to disk.
 #
-# NOTE: XO_TASK_CHECK_TOKEN must be a persistent API token created in XO's web
+# NOTE: the token must be a persistent API token created in XO's web
 # UI (open your user menu → Tokens; the exact menu location varies by XO
 # version) or via the REST API with a "description" field in the request body.
 # The token is sent to the REST API via the authenticationToken cookie.
@@ -2939,10 +2944,14 @@ check_active_xo_tasks() {
     local connected=false
 
     # Determine authentication method
-    if [[ -n "${XO_TASK_CHECK_TOKEN:-}" ]]; then
+    #
+    # XO_API_TOKEN, not XO_TASK_CHECK_TOKEN directly -- same as snapshot_xo_vm.
+    # Reading only the old name skipped the check for anyone who set only
+    # XO_API_TOKEN, which the sample config documents as covering this check.
+    if [[ -n "${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}" ]]; then
         # Priority 1: Auth token from config
         auth_method="token"
-        xo_token="$XO_TASK_CHECK_TOKEN"
+        xo_token="${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}"
         auth_label="authentication token"
         log_info "Using authentication token from xo-config.cfg..."
     elif [[ -n "${XO_TASK_CHECK_USER:-}" && -n "${XO_TASK_CHECK_PASS:-}" ]]; then
