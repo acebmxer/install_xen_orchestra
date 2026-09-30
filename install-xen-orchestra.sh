@@ -1020,25 +1020,6 @@ install_dependencies() {
             nfs-utils ntfs-3g openssl curl ca-certificates gnupg2 patch sudo dmidecode libcap fuse-libs
     fi
 
-    # ESXi/VMware import needs the `nbdinfo` binary. XO can build it from source,
-    # but that path is hard-gated on the xo-server process running as root
-    # (packages/xo-server/src/api/esxi.mjs: `id -u` must be 0). A non-root
-    # SERVICE_USER can never satisfy that, so provide nbdinfo from the distro
-    # package instead — XO checks `which nbdinfo` first and skips the root-only
-    # build when the binary already exists on PATH.
-    if [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "root" ]]; then
-        log_info "Non-root SERVICE_USER: installing nbdinfo for ESXi/VMware import..."
-        if [[ "$PKG_MANAGER" == "apt" ]]; then
-            # shellcheck disable=SC2086
-            run_cmd $PKG_INSTALL libnbd-bin \
-                || log_warning "Could not install libnbd-bin; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
-        elif [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
-            # shellcheck disable=SC2086
-            run_cmd $PKG_INSTALL libnbd \
-                || log_warning "Could not install libnbd; ESXi/VMware import over NBD may be unavailable for non-root SERVICE_USER."
-        fi
-    fi
-
     log_success "System dependencies installed"
 }
 
@@ -2107,11 +2088,6 @@ EOF
         run_cmd sudo chown -R "$SERVICE_USER:$SERVICE_USER" /etc/xo-server
     fi
 
-    # Create VDDK library directory expected by xo-server for VMware V2V import
-    # XO extracts the VDDK tar.gz here when uploaded via the UI
-    run_cmd sudo mkdir -p /usr/local/lib/vddk
-    run_cmd sudo chmod 755 /usr/local/lib/vddk
-
     log_success "Configuration written to $XO_CONFIG_FILE"
 }
 
@@ -2131,8 +2107,7 @@ create_systemd_service() {
 
     # Capability hardening is only emitted for a non-root SERVICE_USER. As root,
     # CapabilityBoundingSet acts as a *ceiling* and would strip caps that root
-    # normally holds (CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, ...), breaking
-    # features that shell out to apt-get such as the VMware/ESXi import nbd build.
+    # normally holds (CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, ...).
     local CAP_BLOCK=""
     if [[ "$EXEC_USER" != "root" ]]; then
         CAP_BLOCK=$(cat << 'CAPEOF'

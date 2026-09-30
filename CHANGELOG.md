@@ -83,6 +83,18 @@ This installer builds Xen Orchestra from source and tracks the official
   present later, when `plugin-push.sh`'s `git push` actually runs) and the
   `gh auth login` call is gone.
 
+### Changed
+
+- **The installer no longer sets up anything for VMware/ESXi V2V import.**
+  Upstream Xen Orchestra (`master`, the default `GIT_BRANCH`) replaced its
+  VDDK/nbdkit/`nbdinfo` import path with `vectura`, a binary bundled inside
+  `@xen-orchestra/vmware-explorer`, and dropped the root-only check that
+  guarded the old path. The non-root `nbdinfo` package install
+  (`libnbd-bin`/`libnbd`) and the `/usr/local/lib/vddk` directory are gone,
+  and `docs/configuration.md` and `sample-xo-config.cfg` no longer say V2V
+  import needs root. An existing `/usr/local/lib/vddk` or `libnbd` package
+  is left in place; neither is used by current XO.
+
 ## [0.9.0] - 2026-09-20
 
 ### Added

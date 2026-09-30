@@ -68,10 +68,9 @@ the files in `SSL_CERT_DIR` and run `--reconfigure` to reissue.
 ## `SERVICE_USER`
 
 Root is the default because it avoids permission issues with privileged ports,
-NFS/CIFS mounts, XenStore, and VMware V2V import. Set to any username to run
-non-root (recommended by the official XO docs) — the script configures the
-required sudoers, capability, group, and udev rules automatically. V2V import
-requires root.
+NFS/CIFS mounts, and XenStore. Set to any username to run non-root
+(recommended by the official XO docs) — the script configures the required
+sudoers, capability, group, and udev rules automatically.
 
 ## `BACKUP_KEEP` rotation
 
