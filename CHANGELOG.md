@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-30
+
 ### Fixed
 
 - **Setting `REVERSE_PROXY_TRUST` to a list of IP addresses hid the real
@@ -43,6 +45,19 @@ This installer builds Xen Orchestra from source and tracks the official
   why.
 
 ### Added
+
+- **`xo-server-host-power-manager` can trigger on the tightest single
+  host's free memory, not only the pool-wide total.** A pool-wide figure
+  can look comfortable while one host is under pressure — one host at 10 GB
+  free and another at 40 GB free average out to a healthy-looking pool. The
+  memory trigger's Metric dropdown gains two options, **Lowest free memory %
+  on any one running host** and **Lowest free memory GB on any one running
+  host**; the existing two are relabelled as pool-wide. `getMemory()` in
+  `lib/metrics.js` now also returns the per-host minimum, and
+  `computeMemoryValue()` in `lib/rule-runner.js` uses it for the new
+  metrics. Existing rules keep their metric and behave as before. The
+  plugin's version is now 0.2.0, and both plugins now ship `node --test`
+  suites.
 
 - **`xo-server-nanokvm` and `xo-server-host-power-manager` are now also
   maintained standalone in [xo-plugins](https://github.com/acebmxer/xo-plugins),**
@@ -2355,7 +2370,10 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.6.1...v0.7.0
