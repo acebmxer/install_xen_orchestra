@@ -331,6 +331,14 @@ self_update_script() {
         else
             log_warning "Local modifications detected in ${SCRIPT_DIR}."
         fi
+        # confirm_or_skip auto-confirms under --non-interactive, which would run
+        # reset --hard and clean -fd with nobody there to see the prompt. Never
+        # discard local work unattended; leave the checkout alone instead.
+        if [[ "$NON_INTERACTIVE" == "true" ]]; then
+            log_warning "Non-interactive: not resetting ${SCRIPT_DIR}, as local changes would be lost."
+            log_warning "Self-update skipped. Continuing with current version."
+            return 0
+        fi
         if ! confirm_or_skip "Reset to origin/${current_branch}? Local changes will be lost."; then
             log_warning "Self-update skipped. Continuing with current version."
             return 0

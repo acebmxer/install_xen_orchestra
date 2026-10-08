@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-148-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-421%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-422%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -448,12 +448,14 @@ API tokens need a description.
 
 1. **Passwordless sudo for the account that runs the script.** The script
    refuses to run as root and calls `sudo` throughout, and there is no config
-   setting for a sudo password. Run this as that account:
+   setting for a sudo password. Run this as that account. It checks the rule
+   in a temporary file first, so an invalid rule is never installed:
 
    ```bash
-   echo "$USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/xo-cron
-   sudo chmod 440 /etc/sudoers.d/xo-cron
-   sudo visudo -c
+   tmp="$(mktemp)"
+   echo "$USER ALL=(ALL) NOPASSWD:ALL" > "$tmp"
+   sudo visudo -cf "$tmp" && sudo install -m 440 -o root -g root "$tmp" /etc/sudoers.d/xo-cron
+   rm -f "$tmp"
    ```
 
    This gives the account full sudo with no password.
@@ -463,6 +465,11 @@ API tokens need a description.
    ```cron
    0 3 * * * cd /path/to/install_xen_orchestra && ./install-xen-orchestra.sh --update --non-interactive >> "$HOME/xo-update.log" 2>&1
    ```
+
+If the script's own self-update cannot fast-forward (for example the checkout
+has diverged), a `--non-interactive` run leaves the checkout as it is and
+continues with the current version; it never resets it. Fix the checkout by
+hand, or set `XO_NO_SELF_UPDATE=1` to skip self-update.
 
 Set `XO_API_TOKEN` (or the user/password pair) in `xo-config.cfg`.
 Without it, a non-interactive run skips the

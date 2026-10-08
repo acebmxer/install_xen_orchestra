@@ -34,6 +34,20 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **An unattended update could discard local changes in the script's own
+  checkout.** When the self-update fast-forward failed (for example a diverged
+  branch), `confirm_or_skip()` auto-confirmed the "Reset to origin?" prompt
+  under `--non-interactive`, so a cron run went on to `git reset --hard` and
+  `git clean -fd` with nobody there to see it. Under `--non-interactive` the
+  self-update now leaves the checkout untouched, warns, and carries on with the
+  current version. Interactive runs still ask first.
+
+- **The cron sudoers example installed the rule before validating it.** The
+  README wrote `/etc/sudoers.d/xo-cron` first and ran `visudo -c` afterwards,
+  so an invalid line would already be live when the error showed. It now
+  checks a temporary file with `visudo -cf` and installs it only if that
+  passes.
+
 - **Unattended runs failed the sudo check for sudo/wheel-group accounts.**
   `check_sudo()` used only `sudo -v`, which asks for a password unless every
   sudoers rule matching the user is `NOPASSWD`. An account in the `sudo`
