@@ -436,7 +436,6 @@ load_config() {
     REDIS_SOCKET=${REDIS_SOCKET:-}
     ENCRYPT_REDIS_CREDENTIALS=${ENCRYPT_REDIS_CREDENTIALS:-false}
     DISABLE_WARNINGS=${DISABLE_WARNINGS:-false}
-    DISABLE_LICENSE_CHECK=${DISABLE_LICENSE_CHECK:-false}
     PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
 
     # How --build-templates reaches the pool. See the comment block above
@@ -4080,41 +4079,6 @@ XO_CLI_EXPECT_END
         log_info "You can register manually with:"
         log_info "xo-cli proxy.register authenticationToken=\"$AUTH_TOKEN\" address=\"$ACTUAL_PROXY_IP:443\" vmUuid=\"$PROXY_UUID\""
         exit 1
-    fi
-
-    # Check if license check disabling is enabled in config
-    if [[ "${DISABLE_LICENSE_CHECK:-false}" == "true" ]]; then
-        log_info "Disabling license check on XO Proxy..."
-        # -e/$SSHPASS rather than -p: see the note on the connection test above.
-        if SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new "$HOST_USERNAME@$POOL_MASTER_IP" 'bash -s' << 'REMOTE_LICENSE_PATCH'
-set -e
-APPLIANCE_FILE=$(find /opt/xo-proxy -name 'appliance.mjs' 2>/dev/null | head -1)
-if [[ -z "$APPLIANCE_FILE" ]]; then
-    echo "WARNING: appliance.mjs not found, skipping license bypass"
-    exit 0
-fi
-python3 - "$APPLIANCE_FILE" << 'PYEOF'
-import sys, re
-fname = sys.argv[1]
-with open(fname) as f:
-    content = f.read()
-patched = re.sub(
-    r'((\s*)getSelfLicense\(\) \{).*?(\n\2\})',
-    r'\1\n\2    // modified to disable license check for XO from sources\n\2    return true\3',
-    content,
-    flags=re.DOTALL
-)
-with open(fname, 'w') as f:
-    f.write(patched)
-PYEOF
-systemctl restart xo-proxy
-REMOTE_LICENSE_PATCH
-        then
-            log_success "License check disabled on XO Proxy"
-        else
-            log_warning "Failed to disable license check on XO Proxy"
-            log_info "To manually disable: patch /opt/xo-proxy/app/mixins/appliance.mjs and restart xo-proxy service"
-        fi
     fi
 
     # Print summary

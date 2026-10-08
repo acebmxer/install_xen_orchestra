@@ -20,6 +20,16 @@ This installer builds Xen Orchestra from source and tracks the official
   user/password pair in `xo-config.cfg`, a non-interactive run skips the
   running task check.
 
+### Removed
+
+- **`DISABLE_LICENSE_CHECK` and the XO Proxy license patch.** The patch ran
+  over SSH on the pool master, but the proxy runs in its own VM, so it never
+  found `appliance.mjs` and changed nothing — while still reporting "License
+  check disabled". Xen Orchestra has also stopped refusing proxy backups
+  without a license (upstream `d0645598b`), so there is nothing left to
+  disable. Connecting XO to a proxy never needed a license. A leftover
+  `DISABLE_LICENSE_CHECK` line in `xo-config.cfg` is ignored.
+
 ### Fixed
 
 - **Unattended runs failed the sudo check for sudo/wheel-group accounts.**
