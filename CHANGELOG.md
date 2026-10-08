@@ -10,6 +10,61 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-08
+
+### Added
+
+- **README: running `--update` unattended from cron.** A new "Scheduled
+  Updates (cron)" section covers the two things an unattended run needs:
+  passwordless sudo for the account running the script (it refuses to run as
+  root, and there is no config setting for a sudo password), and
+  `--non-interactive`. It also notes that without `XO_API_TOKEN` or a
+  user/password pair in `xo-config.cfg`, a non-interactive run skips the
+  running task check.
+
+### Removed
+
+- **`DISABLE_LICENSE_CHECK` and the XO Proxy license patch.** The patch ran
+  over SSH on the pool master, but the proxy runs in its own VM, so it never
+  found `appliance.mjs` and changed nothing — while still reporting "License
+  check disabled". Xen Orchestra has also stopped refusing proxy backups
+  without a license (upstream `d0645598b`), so there is nothing left to
+  disable. Connecting XO to a proxy never needed a license. A leftover
+  `DISABLE_LICENSE_CHECK` line in `xo-config.cfg` is ignored.
+
+### Fixed
+
+- **An unattended update could discard local changes in the script's own
+  checkout.** When the self-update fast-forward failed (for example a diverged
+  branch), `confirm_or_skip()` auto-confirmed the "Reset to origin?" prompt
+  under `--non-interactive`, so a cron run went on to `git reset --hard` and
+  `git clean -fd` with nobody there to see it. Under `--non-interactive` the
+  self-update now leaves the checkout untouched, warns, and carries on with the
+  current version. Interactive runs still ask first.
+
+- **The cron sudoers example installed the rule before validating it.** The
+  README wrote `/etc/sudoers.d/xo-cron` first and ran `visudo -c` afterwards,
+  so an invalid line would already be live when the error showed. It now
+  checks a temporary file with `visudo -cf` and installs it only if that
+  passes.
+
+- **Unattended runs failed the sudo check for sudo/wheel-group accounts.**
+  `check_sudo()` used only `sudo -v`, which asks for a password unless every
+  sudoers rule matching the user is `NOPASSWD`. An account in the `sudo`
+  (Debian/Ubuntu) or `wheel` (Fedora/RHEL) group still matches that group's
+  password rule, so adding `NOPASSWD:ALL` for it was not enough and a cron run
+  stopped with "You need sudo privileges to run this script." It now tries
+  `sudo -n true` first and falls back to `sudo -v`, so interactive runs are
+  still prompted for a password as before.
+
+- **The running task check ignored `XO_API_TOKEN`.** `check_active_xo_tasks()`
+  read only the old `XO_TASK_CHECK_TOKEN` name, although the sample config
+  documents `XO_API_TOKEN` as covering the task check. A config that set only
+  `XO_API_TOKEN` got the pre-update VM snapshot but no task check: under
+  `--non-interactive` the check was skipped, and interactively it prompted for
+  credentials. It now reads `XO_API_TOKEN`, falling back to
+  `XO_TASK_CHECK_TOKEN`, the same as `snapshot_xo_vm()`.
+
 ## [0.9.1] - 2026-09-30
 
 ### Fixed
@@ -2370,7 +2425,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.7.2...v0.8.0

@@ -236,7 +236,12 @@ check_sudo() {
         exit 1
     fi
 
-    if ! sudo -v >/dev/null 2>&1; then
+    # `sudo -n true` first: `sudo -v` alone asks for a password unless every
+    # sudoers rule matching the user is NOPASSWD, so an account in the
+    # sudo/wheel group with a NOPASSWD:ALL rule added (the unattended cron
+    # setup) still failed here. `sudo -v` stays as the fallback so an
+    # interactive run is prompted for its password as before.
+    if ! sudo -n true >/dev/null 2>&1 && ! sudo -v >/dev/null 2>&1; then
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
             log_warning "[DRY-RUN] No sudo privileges; skipping sudo check."
             return 0
@@ -325,6 +330,14 @@ self_update_script() {
             log_warning "Local branch has diverged from origin/${current_branch}."
         else
             log_warning "Local modifications detected in ${SCRIPT_DIR}."
+        fi
+        # confirm_or_skip auto-confirms under --non-interactive, which would run
+        # reset --hard and clean -fd with nobody there to see the prompt. Never
+        # discard local work unattended; leave the checkout alone instead.
+        if [[ "$NON_INTERACTIVE" == "true" ]]; then
+            log_warning "Non-interactive: not resetting ${SCRIPT_DIR}, as local changes would be lost."
+            log_warning "Self-update skipped. Continuing with current version."
+            return 0
         fi
         if ! confirm_or_skip "Reset to origin/${current_branch}? Local changes will be lost."; then
             log_warning "Self-update skipped. Continuing with current version."
@@ -431,7 +444,6 @@ load_config() {
     REDIS_SOCKET=${REDIS_SOCKET:-}
     ENCRYPT_REDIS_CREDENTIALS=${ENCRYPT_REDIS_CREDENTIALS:-false}
     DISABLE_WARNINGS=${DISABLE_WARNINGS:-false}
-    DISABLE_LICENSE_CHECK=${DISABLE_LICENSE_CHECK:-false}
     PREFERRED_EDITOR=${PREFERRED_EDITOR:-nano}
 
     # How --build-templates reaches the pool. See the comment block above
@@ -2912,10 +2924,10 @@ restore_xo() {
 # Check for active Xen Orchestra tasks before updating.
 # Authenticates via token, config credentials, or interactive prompt, then
 # queries the XO REST API for pending tasks and aborts if any are found.
-# Auth priority: 1) XO_TASK_CHECK_TOKEN  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
+# Auth priority: 1) XO_API_TOKEN (or XO_TASK_CHECK_TOKEN)  2) XO_TASK_CHECK_USER/PASS  3) interactive prompt
 # Passwords are never logged, cached, or written to disk.
 #
-# NOTE: XO_TASK_CHECK_TOKEN must be a persistent API token created in XO's web
+# NOTE: the token must be a persistent API token created in XO's web
 # UI (open your user menu → Tokens; the exact menu location varies by XO
 # version) or via the REST API with a "description" field in the request body.
 # The token is sent to the REST API via the authenticationToken cookie.
@@ -2939,10 +2951,14 @@ check_active_xo_tasks() {
     local connected=false
 
     # Determine authentication method
-    if [[ -n "${XO_TASK_CHECK_TOKEN:-}" ]]; then
+    #
+    # XO_API_TOKEN, not XO_TASK_CHECK_TOKEN directly -- same as snapshot_xo_vm.
+    # Reading only the old name skipped the check for anyone who set only
+    # XO_API_TOKEN, which the sample config documents as covering this check.
+    if [[ -n "${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}" ]]; then
         # Priority 1: Auth token from config
         auth_method="token"
-        xo_token="$XO_TASK_CHECK_TOKEN"
+        xo_token="${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}"
         auth_label="authentication token"
         log_info "Using authentication token from xo-config.cfg..."
     elif [[ -n "${XO_TASK_CHECK_USER:-}" && -n "${XO_TASK_CHECK_PASS:-}" ]]; then
@@ -4071,41 +4087,6 @@ XO_CLI_EXPECT_END
         log_info "You can register manually with:"
         log_info "xo-cli proxy.register authenticationToken=\"$AUTH_TOKEN\" address=\"$ACTUAL_PROXY_IP:443\" vmUuid=\"$PROXY_UUID\""
         exit 1
-    fi
-
-    # Check if license check disabling is enabled in config
-    if [[ "${DISABLE_LICENSE_CHECK:-false}" == "true" ]]; then
-        log_info "Disabling license check on XO Proxy..."
-        # -e/$SSHPASS rather than -p: see the note on the connection test above.
-        if SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new "$HOST_USERNAME@$POOL_MASTER_IP" 'bash -s' << 'REMOTE_LICENSE_PATCH'
-set -e
-APPLIANCE_FILE=$(find /opt/xo-proxy -name 'appliance.mjs' 2>/dev/null | head -1)
-if [[ -z "$APPLIANCE_FILE" ]]; then
-    echo "WARNING: appliance.mjs not found, skipping license bypass"
-    exit 0
-fi
-python3 - "$APPLIANCE_FILE" << 'PYEOF'
-import sys, re
-fname = sys.argv[1]
-with open(fname) as f:
-    content = f.read()
-patched = re.sub(
-    r'((\s*)getSelfLicense\(\) \{).*?(\n\2\})',
-    r'\1\n\2    // modified to disable license check for XO from sources\n\2    return true\3',
-    content,
-    flags=re.DOTALL
-)
-with open(fname, 'w') as f:
-    f.write(patched)
-PYEOF
-systemctl restart xo-proxy
-REMOTE_LICENSE_PATCH
-        then
-            log_success "License check disabled on XO Proxy"
-        else
-            log_warning "Failed to disable license check on XO Proxy"
-            log_info "To manually disable: patch /opt/xo-proxy/app/mixins/appliance.mjs and restart xo-proxy service"
-        fi
     fi
 
     # Print summary
