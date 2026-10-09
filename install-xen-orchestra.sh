@@ -458,6 +458,10 @@ load_config() {
     # check was its only consumer; it is still honoured, so a config written
     # before the template builder existed keeps working untouched.
     XO_API_TOKEN=${XO_API_TOKEN:-${XO_TASK_CHECK_TOKEN:-}}
+    # Update channel the --proxy instructions tell you to put the proxy on.
+    # Optional and read only when --proxy prints those instructions, so it
+    # needs no config migration: an existing file without it gets "latest".
+    XO_PROXY_CHANNEL=${XO_PROXY_CHANNEL:-latest}
 
     # Migrate config schema if needed, then validate
     migrate_config "$CONFIG_FILE"
@@ -543,6 +547,11 @@ validate_config() {
         errors+=("SNAPSHOT_RETENTION_DAYS must be a number, got: ${SNAPSHOT_RETENTION_DAYS:-}")
     elif [[ ${SNAPSHOT_RETENTION_DAYS:-14} -lt 1 ]]; then
         errors+=("SNAPSHOT_RETENTION_DAYS must be at least 1, got: ${SNAPSHOT_RETENTION_DAYS:-}")
+    fi
+
+    # Validate XO_PROXY_CHANNEL is one of the proxy updater's two channels
+    if [[ "${XO_PROXY_CHANNEL:-latest}" != "stable" && "${XO_PROXY_CHANNEL:-latest}" != "latest" ]]; then
+        errors+=("XO_PROXY_CHANNEL must be 'stable' or 'latest', got: ${XO_PROXY_CHANNEL:-}")
     fi
 
     # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1)
@@ -3930,26 +3939,37 @@ install_xo_proxy() {
 
     read -p "Custom NTP server (leave blank for default): " NTP_SERVER
 
-    echo ""
-    echo "=============================================="
-    echo "  Xen Orchestra Credentials"
-    echo "=============================================="
-    echo ""
+    # With XO_API_TOKEN set, xo-cli is registered with the token, so the XO web
+    # login is never used. Vates' deploy script still asks for an account and
+    # password; they only become the proxy's updater credentials, which
+    # have to be re-entered with `xoa-updater register` on the proxy in any
+    # case (see the README), so empty answers are sent instead of prompting.
+    if [[ -n "${XO_API_TOKEN:-}" ]]; then
+        log_info "XO_API_TOKEN is set: not asking for a Xen Orchestra login."
+        XO_USERNAME=""
+        XO_PASSWORD=""
+    else
+        echo ""
+        echo "=============================================="
+        echo "  Xen Orchestra Credentials"
+        echo "=============================================="
+        echo ""
 
-    read -p "Xen Orchestra login username: " XO_USERNAME
-    if [[ -z "$XO_USERNAME" ]]; then
-        log_error "Xen Orchestra username is required"
-        exit 1
-    fi
+        read -p "Xen Orchestra login username: " XO_USERNAME
+        if [[ -z "$XO_USERNAME" ]]; then
+            log_error "Xen Orchestra username is required"
+            exit 1
+        fi
 
-    { set +x; } 2>/dev/null
-    read -sp "Xen Orchestra login password: " XO_PASSWORD
-    echo ""
-    if [[ -z "$XO_PASSWORD" ]]; then
-        log_error "Xen Orchestra password is required"
-        exit 1
+        { set +x; } 2>/dev/null
+        read -sp "Xen Orchestra login password: " XO_PASSWORD
+        echo ""
+        if [[ -z "$XO_PASSWORD" ]]; then
+            log_error "Xen Orchestra password is required"
+            exit 1
+        fi
+        [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
     fi
-    [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
 
     # Copy the companion expect script to a temp file for execution
     log_info "Creating installation script..."
@@ -4036,6 +4056,11 @@ install_xo_proxy() {
     # Register xo-cli with local Xen Orchestra
     log_info "Registering xo-cli with Xen Orchestra..."
 
+    # The XO this installer was configured for, which is not always this
+    # machine (XO_URL), so not a hardcoded http://localhost.
+    local XO_REGISTER_URL
+    XO_REGISTER_URL=$(tpl_api_base_url)
+
     # Create a temporary expect script for xo-cli registration
     XO_CLI_SCRIPT=$(mktemp --tmpdir xo-cli-XXXXXX)
     chmod 700 "$XO_CLI_SCRIPT"
@@ -4046,8 +4071,9 @@ install_xo_proxy() {
 set timeout 30
 set username [lindex $argv 0]
 set password [lindex $argv 1]
+set url      [lindex $argv 2]
 
-spawn xo-cli register http://localhost $username
+spawn xo-cli register --au $url $username
 
 expect {
     -re "Password:" {
@@ -4076,7 +4102,7 @@ XO_CLI_EXPECT_END
     # the same exposure as the token-in-URL calls elsewhere in this script.
     if [[ -n "${XO_API_TOKEN:-}" ]]; then
         log_info "Using XO_API_TOKEN from the config to register xo-cli."
-        if xo-cli register --token "$XO_API_TOKEN" http://localhost; then
+        if xo-cli register --au --token "$XO_API_TOKEN" "$XO_REGISTER_URL"; then
             log_success "xo-cli registered with Xen Orchestra"
         else
             log_warning "Failed to register xo-cli with XO_API_TOKEN"
@@ -4085,12 +4111,12 @@ XO_CLI_EXPECT_END
             trap - EXIT
             exit 1
         fi
-    elif "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_PASSWORD"; then
+    elif "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_PASSWORD" "$XO_REGISTER_URL"; then
         log_success "xo-cli registered with Xen Orchestra"
     else
         log_warning "Failed to register xo-cli automatically"
         log_info "If this account uses MFA, set XO_API_TOKEN in xo-config.cfg and run again."
-        log_info "Or run manually: xo-cli register http://localhost $XO_USERNAME"
+        log_info "Or run manually: xo-cli register --au $XO_REGISTER_URL $XO_USERNAME"
         rm -f "$XO_CLI_SCRIPT"
         trap - EXIT
         exit 1
@@ -4124,6 +4150,20 @@ XO_CLI_EXPECT_END
     echo ""
     echo "The proxy has been registered with your Xen Orchestra instance."
     echo "You can manage it from the Xen Orchestra web interface."
+    echo ""
+    echo "Next: register the proxy's updater and move it to the '${XO_PROXY_CHANNEL:-latest}' channel."
+    echo ""
+    echo "1. On the pool master ($POOL_MASTER_IP), set a password for the proxy's 'xoa' user"
+    echo "   (choose your own) and reboot the proxy VM:"
+    echo "     xe vm-param-set uuid=$PROXY_UUID xenstore-data:vm-data/system-account-xoa-password='<your password>'"
+    echo "     xe vm-reboot uuid=$PROXY_UUID"
+    echo "2. SSH to the proxy as 'xoa' ($ACTUAL_PROXY_IP) and run:"
+    echo "     sudo xoa-updater register"
+    echo "     sudo xoa-updater configure-channel xo-proxy-appliance-${XO_PROXY_CHANNEL:-latest}"
+    echo "     sudo xoa-updater upgrade"
+    echo "     sudo xoa-updater upgrade     (run it twice: the first run only updates xoa-updater itself)"
+    echo "   The Upgrade button on XO's Proxies page does the same, also pressed twice."
+    echo "   register needs a free xen-orchestra.com account; see the README."
     echo ""
 }
 
