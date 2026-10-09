@@ -88,7 +88,33 @@ own documented method exactly:
   (Node.js latest LTS, the same system packages, the same build commands).
 - Update: the same `git pull && yarn && yarn build` Vates documents.
 - XO Proxy: the same `wget -qO- https://xoa.io/proxy/deploy | bash` one-liner
-  Vates publishes — this script only automates typing it over SSH.
+  Vates publishes — this script only automates typing it over SSH. If the XO
+  account uses MFA, set `XO_API_TOKEN` in `xo-config.cfg` first; the script then
+  registers `xo-cli` with the token instead of the password.
+
+### After `--proxy`: register the proxy and know the license limit
+
+Vates' deploy script saves the XO login you give it as the proxy's updater
+credentials. That is not a xen-orchestra.com account, so the proxy's updater
+cannot sign in: XO shows "Your appliance is not registered", the Upgrade button
+does nothing, and the proxy stays on the image's old version (0.28.14), where
+backups fail with `invalid parameters ... jobData`.
+
+1. SSH to the proxy VM as `xoa` (set its password from the pool master with
+   `xe vm-param-set uuid=<proxy VM uuid> xenstore-data:vm-data/system-account-xoa-password='<password>'`,
+   then reboot the VM).
+2. Run `sudo xoa-updater register` and enter a xen-orchestra.com account (a
+   free account works).
+3. Run `sudo xoa-updater upgrade` until it says "All up to date", then check
+   the Version column on XO's Proxies page.
+
+Do not run `xoa-updater configure-channel latest` on a proxy: that is the full
+XOA channel and replaces the proxy packages.
+
+**License:** with a free account the proxy updates to 0.31.10 and still refuses
+to run backups (`no valid proxy license`), and the "Unlock now!" link leads to
+XOA registration, which Xen Orchestra from sources does not have. Backups to
+remotes that are not connected through the proxy are unaffected.
 
 Everything beyond that — the pre-update/rebuild VM snapshot, the file
 backup, the TLS certificate expiry warning, the Node.js download checksum

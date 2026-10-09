@@ -10,6 +10,33 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **README: XO Proxy needs a registered appliance and a Vates license to run
+  backups.** The 0.9.2 note on removing the license patch said proxy backups
+  no longer need a license (upstream `d0645598b`) and that connecting XO to a
+  proxy never needed one. That change first ships in `@xen-orchestra/proxy`
+  0.32.0 or later, but the proxy VM `--proxy` deploys comes from Vates' frozen
+  `xoa.io/proxy/xva` image and, on a free xen-orchestra.com account, the
+  updater stops at 0.31.10, which still refuses backups with
+  `no valid proxy license`. The deploy script also stores the XO web login as
+  the updater's credentials, so the updater fails `AuthenticationFailed` and
+  the proxy stays on the image's 0.28.14 (backups then fail on `jobData`) until
+  the appliance is registered with `sudo xoa-updater register` on the proxy.
+  The README now says this and gives the registration steps.
+
+- **XO Proxy install: accounts with MFA, and a false "registered" message.**
+  Registering `xo-cli` with the local Xen Orchestra used only the username and
+  password, so an account with MFA enabled was always rejected with
+  `invalid credentials`, and the later `proxy.register` step then failed with
+  "Please use `xo-cli register` first". When `XO_API_TOKEN` is set in
+  `xo-config.cfg`, the installer now registers `xo-cli` with that token
+  instead, which works with MFA; without a token it still uses the username
+  and password. The same step also exited 0 whatever `xo-cli` said, so a
+  rejected login was reported as "xo-cli registered with Xen Orchestra"; it now
+  fails when `xo-cli` does. Uses `xo-cli register` instead of the deprecated
+  `--register`.
+
 ## [0.9.2] - 2026-10-08
 
 ### Added

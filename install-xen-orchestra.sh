@@ -4047,7 +4047,7 @@ set timeout 30
 set username [lindex $argv 0]
 set password [lindex $argv 1]
 
-spawn xo-cli --register http://localhost $username
+spawn xo-cli register http://localhost $username
 
 expect {
     -re "Password:" {
@@ -4060,15 +4060,37 @@ expect {
     }
     eof
 }
+
+# Hand xo-cli's own exit status back to the caller. Without this the script
+# always exited 0, so a rejected login was reported
+# as a successful registration.
+lassign [wait] pid spawnid os_error status
+exit $status
 XO_CLI_EXPECT_END
 
     chmod +x "$XO_CLI_SCRIPT"
 
-    if "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_PASSWORD"; then
+    # A configured API token is used instead of the username and password.
+    # It works for accounts with MFA, which the password login cannot. xo-cli
+    # only accepts the token as an argument, so it is briefly visible in ps --
+    # the same exposure as the token-in-URL calls elsewhere in this script.
+    if [[ -n "${XO_API_TOKEN:-}" ]]; then
+        log_info "Using XO_API_TOKEN from the config to register xo-cli."
+        if xo-cli register --token "$XO_API_TOKEN" http://localhost; then
+            log_success "xo-cli registered with Xen Orchestra"
+        else
+            log_warning "Failed to register xo-cli with XO_API_TOKEN"
+            log_info "Check the token in xo-config.cfg, or remove it to log in with a username and password."
+            rm -f "$XO_CLI_SCRIPT"
+            trap - EXIT
+            exit 1
+        fi
+    elif "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_PASSWORD"; then
         log_success "xo-cli registered with Xen Orchestra"
     else
         log_warning "Failed to register xo-cli automatically"
-        log_info "Please run manually: xo-cli --register http://localhost"
+        log_info "If this account uses MFA, set XO_API_TOKEN in xo-config.cfg and run again."
+        log_info "Or run manually: xo-cli register http://localhost $XO_USERNAME"
         rm -f "$XO_CLI_SCRIPT"
         trap - EXIT
         exit 1

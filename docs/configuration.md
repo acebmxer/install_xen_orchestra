@@ -27,7 +27,7 @@ Key settings:
 | `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see below) |
 | `TEMPLATE_BUILD_METHOD` | auto | How `--build-templates` reaches the pool: `auto`, `api` or `ssh` (see below) |
 | `XO_URL` | *(unset)* | Base URL of the XO instance the API build path talks to; unset means localhost |
-| `XO_API_TOKEN` | *(unset)* | XO API token, used by the pre-update task check and `--build-templates` |
+| `XO_API_TOKEN` | *(unset)* | XO API token, used by the pre-update task check, `--build-templates` and the XO Proxy install (which needs it if the XO account uses MFA) |
 
 ## The config file is migrated automatically
 
