@@ -132,7 +132,7 @@ exports.configurationSchema = {
               'Minimum time between two power actions on this host, and how long CPU and memory must both stay comfortable before powering it off. Power-on is not delayed by this — only throttled by it.',
           },
         },
-        required: ['targetHostId', 'powerProvider', 'cpu', 'memory'],
+        required: ['targetHostId', 'powerProvider'],
       },
     },
   },
@@ -149,6 +149,20 @@ exports.testSchema = {
     },
   },
   required: ['targetHostId'],
+}
+
+// The UI form that renders configurationSchema only submits a `cpu`/`memory`
+// object for a rule if the user actually expanded that trigger's section --
+// leaving it untouched omits the key entirely, rather than sending
+// { metric: 'none' }. The rest of this plugin (rule-runner.js in particular)
+// assumes every rule has both keys, so untrusted configuration is normalized
+// here, at the boundary, before it's used anywhere else.
+function normalizeRule(rule) {
+  return {
+    ...rule,
+    cpu: rule.cpu || { metric: 'none' },
+    memory: rule.memory || { metric: 'none' },
+  }
 }
 
 exports.default = function ({ xo }) {
@@ -192,7 +206,7 @@ exports.default = function ({ xo }) {
     // rescheduled) until xo-server is restarted.
     configure(configuration, { loaded } = {}) {
       clearTimers()
-      rules = (configuration && configuration.rules) || []
+      rules = ((configuration && configuration.rules) || []).map(normalizeRule)
       // Rules that no longer exist keep no state around.
       const currentIds = new Set(rules.map(rule => rule.targetHostId))
       for (const id of ruleStates.keys()) {
