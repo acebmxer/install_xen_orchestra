@@ -46,7 +46,11 @@ if [[ ! -d "${tmp_clone}/${plugin_name}" ]]; then
     exit 1
 fi
 
-rsync -a --delete --exclude .git "${tmp_clone}/${plugin_name}/" "${repo_root}/${plugin_dir}/"
+# --checksum: rsync's default skip test is size + mtime to the second. A fresh
+# checkout and a fresh clone made in the same second have equal mtimes, so a
+# same-length edit (a version bump, "0.2.0" -> "0.2.1") was silently not
+# copied. Compare content instead.
+rsync -a --checksum --delete --exclude .git "${tmp_clone}/${plugin_name}/" "${repo_root}/${plugin_dir}/"
 
 echo "Pulled ${plugin_name} from ${plugins_remote_url} (${current_branch}) into ${plugin_dir}/"
 echo "Review with: git -C '${repo_root}' status -- '${plugin_dir}'"
