@@ -93,8 +93,8 @@ expect {
         send "$xo_password\r"
         exp_continue
     }
-    -re "XO Proxy Appliance IP address: (\[0-9.\]+)" {
-        set actual_proxy_ip $expect_out(1,string)
+    -re "XO Proxy Appliance IP address( is)?:\\s+(\[0-9.\]+)\r?\n" {
+        set actual_proxy_ip $expect_out(2,string)
         exp_continue
     }
     -re "UUID: (\[a-f0-9-\]+)" {

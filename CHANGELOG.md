@@ -10,6 +10,83 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-19
+
+### Added
+
+- **`XO_PROXY_CHANNEL`: choose the update channel for an XO Proxy.** A proxy
+  deployed with `--proxy` sits on Vates' frozen `xo-proxy-appliance` channel,
+  where the updater stops at 0.31.10. Registering the proxy with a
+  free xen-orchestra.com account does not change that channel. Moving it
+  to `xo-proxy-appliance-latest` made 0.33.1 available and a delta backup then
+  ran through it. Setting `XO_PROXY_CHANNEL=latest` (the default) or `stable`
+  in `xo-config.cfg` makes `--proxy` print, at the end of the install, the steps for
+  that channel: set the proxy's `xoa` password and reboot it from the pool
+  master (with the proxy VM's uuid filled in), then `register`,
+  `configure-channel` and `upgrade` (run twice; the first run only updates `xoa-updater`) on
+  the proxy. The value
+  is validated, and the key needs no config migration: a file without it
+  behaves as `latest`. It only changes the printed instructions; an existing
+  proxy is switched by running the same two commands on it, and `latest` to
+  `stable` offers older versions (0.33.1 to 0.31.10) which `upgrade` installs.
+
+### Fixed
+
+- **`xo-server-host-power-manager`: a rule could not be saved with only one
+  trigger set up.** XO's settings form sends a rule's CPU or memory section
+  only if it was opened, but the plugin's settings required both, so a rule
+  that used only the memory trigger (or only CPU) was rejected unless the
+  unused section was opened too. Each trigger is now optional, and one left
+  out is treated as off (`none`), the same as choosing `none` in its Metric
+  dropdown. The plugin's version is now 0.2.1.
+
+- **XO Proxy install: three faults found on a real deploy.** (1) The proxy's
+  IP was never captured: Vates' deploy script prints
+  `Your XO Proxy Appliance IP address is:` with the address on the next line,
+  and the helper only matched `IP address: <ip>`, so a DHCP proxy always made
+  the installer ask for the address (no wait for guest tools was needed; the
+  address was already on screen). It now matches both forms. (2) With
+  `XO_API_TOKEN` set the installer still asked for an XO username and
+  password; it now skips those prompts and answers Vates' account prompts with
+  empty values, which only ever filled the proxy's updater credentials and are
+  replaced by `xoa-updater register` on the proxy anyway. (3) `xo-cli` was
+  always registered against `http://localhost`, so on any machine that is not
+  the XO host `proxy.register` failed `ECONNREFUSED` after the proxy was
+  already deployed. It now registers against `XO_URL` (or `PUBLIC_URL`, else
+  this machine's HTTPS port) with `--au` for self-signed certificates.
+
+- **README: XO Proxy needs a registered appliance and a Vates license to run
+  backups.** The 0.9.2 note on removing the license patch said proxy backups
+  no longer need a license (upstream `d0645598b`) and that connecting XO to a
+  proxy never needed one. That change first ships in `@xen-orchestra/proxy`
+  0.32.0 or later, but the proxy VM `--proxy` deploys comes from Vates' frozen
+  `xoa.io/proxy/xva` image and, on a free xen-orchestra.com account, the
+  updater stops at 0.31.10, which still refuses backups with
+  `no valid proxy license`. The deploy script also stores the XO web login as
+  the updater's credentials, so the updater fails `AuthenticationFailed` and
+  the proxy stays on the image's 0.28.14 (backups then fail on `jobData`) until
+  the appliance is registered with `sudo xoa-updater register` on the proxy.
+  The README now says this and gives the registration steps.
+
+  The license claim was wrong. Moving the proxy to the
+  `xo-proxy-appliance-latest` channel took it to 0.33.1, and a delta backup
+  then ran through it with no license installed; only the old channel's
+  0.31.10 refuses. The README now lists `configure-channel` as a step instead
+  of warning against changing the channel (the warning stays for the bare
+  `latest` channel).
+
+- **XO Proxy install: accounts with MFA, and a false "registered" message.**
+  Registering `xo-cli` with the local Xen Orchestra used only the username and
+  password, so an account with MFA enabled was always rejected with
+  `invalid credentials`, and the later `proxy.register` step then failed with
+  "Please use `xo-cli register` first". When `XO_API_TOKEN` is set in
+  `xo-config.cfg`, the installer now registers `xo-cli` with that token
+  instead, which works with MFA; without a token it still uses the username
+  and password. The same step also exited 0 whatever `xo-cli` said, so a
+  rejected login was reported as "xo-cli registered with Xen Orchestra"; it now
+  fails when `xo-cli` does. Uses `xo-cli register` instead of the deprecated
+  `--register`.
+
 ## [0.9.2] - 2026-10-08
 
 ### Added
@@ -2425,7 +2502,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.8.0...v0.9.0

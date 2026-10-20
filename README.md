@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-148-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-422%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-428%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -88,7 +88,42 @@ own documented method exactly:
   (Node.js latest LTS, the same system packages, the same build commands).
 - Update: the same `git pull && yarn && yarn build` Vates documents.
 - XO Proxy: the same `wget -qO- https://xoa.io/proxy/deploy | bash` one-liner
-  Vates publishes — this script only automates typing it over SSH.
+  Vates publishes — this script only automates typing it over SSH. If the XO
+  account uses MFA, or you want no login prompts, set `XO_API_TOKEN` in
+  `xo-config.cfg` first; the script then registers `xo-cli` with the token
+  against `XO_URL` (or this machine if it is unset) and does not ask for the
+  XO username and password.
+
+### After `--proxy`: register the proxy and choose its update channel
+
+Vates' deploy script saves the XO login you give it as the proxy's updater
+credentials. That is not a xen-orchestra.com account, so the proxy's updater
+cannot sign in: XO shows "Your appliance is not registered", the Upgrade button
+does nothing, and the proxy stays on the image's old version (0.28.14), where
+backups fail with `invalid parameters ... jobData`.
+
+1. SSH to the proxy VM as `xoa` (set its password from the pool master with
+   `xe vm-param-set uuid=<proxy VM uuid> xenstore-data:vm-data/system-account-xoa-password='<password>'`,
+   then reboot the VM).
+2. Run `sudo xoa-updater register` and enter a xen-orchestra.com account (a
+   free account works).
+3. Run `sudo xoa-updater configure-channel xo-proxy-appliance-latest` (or
+   `xo-proxy-appliance-stable`; `XO_PROXY_CHANNEL` in `xo-config.cfg` picks the
+   one `--proxy` prints). On the default channel the updater stops at
+   0.31.10. Do not use the bare `latest` channel: that is the full XOA channel
+   and replaces the proxy packages.
+4. Run `sudo xoa-updater upgrade` twice: the first run only updates
+   `xoa-updater` itself and shuts it down, the second updates the proxy.
+   Pressing Upgrade on XO's Proxies page twice does the same. Then check the
+   Version column on that page.
+
+To switch an existing proxy later, repeat step 3 with the other channel and
+step 4. Going from `latest` to `stable` offers older versions: the updater
+lists `xen-orchestra-proxy` 0.33.1 → 0.31.10 and `upgrade` installs them.
+
+A proxy updated this way (0.33.1) ran a delta backup to an NFS remote with no
+license installed. Version 0.31.10, the last one on the old channel, refused
+backups with `no valid proxy license`.
 
 Everything beyond that — the pre-update/rebuild VM snapshot, the file
 backup, the TLS certificate expiry warning, the Node.js download checksum

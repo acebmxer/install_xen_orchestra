@@ -1,14 +1,17 @@
 #!/usr/bin/env bats
 # Tests for scripts/plugin-push.sh and scripts/plugin-pull.sh, which sync
-# plugins/<name>/ with the standalone xo-plugins repo via git subtree.
+# plugins/<name>/ with the standalone xo-plugins repo by copying files by
+# content (neither script merges history).
 #
 # These run entirely against throwaway local repos -- PLUGINS_REMOTE_URL
 # points the scripts at a local bare repo instead of the real xo-plugins on
 # GitHub, so no network access or credentials are needed.
 #
 # A plain `git subtree push` was tried first and found to silently clobber
-# a sibling plugin's folder when two plugins share a branch -- these tests
-# exist so that regression can't come back unnoticed.
+# a sibling plugin's folder when two plugins share a branch, and a later
+# subtree-based push conflicted when both repos had changed the same line --
+# these tests exist so those regressions can't come back unnoticed. The
+# fixture below still uses `git subtree add` only to build the remote.
 
 setup() {
     TEST_DIR=$(mktemp -d)
@@ -93,6 +96,56 @@ teardown() {
     local check="${TEST_DIR}/check"
     git clone -q --branch main "${REMOTE}" "${check}"
     [ "$(cat "${check}/foo/index.js")" = "foo v1" ]
+}
+
+@test "plugin-push.sh syncs a same-length edit (version bump) after both repos changed that line" {
+    echo '"version": "0.2.0"' > "${SOURCE}/plugins/foo/package.json"
+    git -C "${SOURCE}" add -A
+    git -C "${SOURCE}" commit -q -m "add package.json"
+    run bash "${SOURCE}/scripts/plugin-push.sh" foo
+    [ "$status" -eq 0 ]
+
+    # The same bump lands on the remote as its own commit, then a further
+    # same-length edit here -- the case git subtree conflicted on.
+    local edit="${TEST_DIR}/edit"
+    git clone -q --branch dev "${REMOTE}" "${edit}"
+    echo '"version": "0.2.1"' > "${edit}/foo/package.json"
+    git -C "${edit}" commit -q -am "bump on remote"
+    git -C "${edit}" push -q origin dev
+
+    echo '"version": "0.2.9"' > "${SOURCE}/plugins/foo/package.json"
+    git -C "${SOURCE}" commit -q -am "bump here"
+    run bash "${SOURCE}/scripts/plugin-push.sh" foo
+    [ "$status" -eq 0 ]
+
+    local check="${TEST_DIR}/check"
+    git clone -q --branch dev "${REMOTE}" "${check}"
+    [ "$(cat "${check}/foo/package.json")" = '"version": "0.2.9"' ]
+}
+
+@test "plugin-push.sh makes no commit when the plugin is already in sync" {
+    run bash "${SOURCE}/scripts/plugin-push.sh" foo
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already in sync"* ]]
+}
+
+@test "plugin-pull.sh copies a same-length edit" {
+    echo '"version": "0.2.0"' > "${SOURCE}/plugins/foo/package.json"
+    git -C "${SOURCE}" add -A
+    git -C "${SOURCE}" commit -q -m "add package.json"
+    local edit="${TEST_DIR}/edit"
+    git clone -q --branch dev "${REMOTE}" "${edit}"
+    echo '"version": "0.2.0"' > "${edit}/foo/package.json"
+    git -C "${edit}" add -A
+    git -C "${edit}" commit -q -m "add package.json"
+    git -C "${edit}" push -q origin dev
+    echo '"version": "0.2.1"' > "${edit}/foo/package.json"
+    git -C "${edit}" commit -q -am "bump"
+    git -C "${edit}" push -q origin dev
+
+    run bash "${SOURCE}/scripts/plugin-pull.sh" foo
+    [ "$status" -eq 0 ]
+    [ "$(cat "${SOURCE}/plugins/foo/package.json")" = '"version": "0.2.1"' ]
 }
 
 @test "plugin-push.sh refuses to run from a branch that isn't dev or main" {

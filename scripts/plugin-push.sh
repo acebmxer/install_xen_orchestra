@@ -7,14 +7,12 @@
 # main. This keeps xo-plugins' main release-only, same as this repo, so
 # unreleased plugin work never reaches it early.
 #
-# A plain `git subtree push` doesn't work here: xo-plugins holds two
-# plugins on the same branch, and subtree push does a raw ref push of a
-# freshly split, single-plugin history -- it has no way to merge that in
-# alongside the other plugin's folder without clobbering it. So this
-# script does the merge on the xo-plugins side instead: split this
-# plugin's history locally, then pull that split into a temporary clone of
-# xo-plugins (which merges cleanly, leaving the other plugin's folder
-# untouched) and push.
+# This is the mirror image of plugin-pull.sh: it copies the plugin's files
+# into a temporary clone of xo-plugins by content, commits if anything
+# differs, and pushes. It does not merge history. An earlier version used
+# `git subtree`, which conflicted whenever both repos had touched the same
+# lines -- and every round-trip sync records the same change as two separate
+# commits, so that happened on ordinary version bumps.
 set -euo pipefail
 
 allowed_branches=(dev main)
@@ -31,7 +29,6 @@ plugin_name="$1"
 plugins_remote_url="${PLUGINS_REMOTE_URL:-https://github.com/acebmxer/xo-plugins.git}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plugin_dir="plugins/${plugin_name}"
-split_branch="tmp-plugin-push-${plugin_name}"
 
 if [[ ! -d "${repo_root}/${plugin_dir}" ]]; then
     echo "No such plugin folder: ${plugin_dir}" >&2
@@ -45,18 +42,24 @@ if [[ ! " ${allowed_branches[*]} " == *" ${current_branch} "* ]]; then
     exit 1
 fi
 
-git subtree split --prefix="${plugin_dir}" -b "${split_branch}" >/dev/null
-
 tmp_clone="$(mktemp -d)"
-trap 'cd "${repo_root}"; git branch -D "${split_branch}" >/dev/null 2>&1 || true; rm -rf "${tmp_clone}"' EXIT
+trap 'rm -rf "${tmp_clone}"' EXIT
 
-git clone -q "${plugins_remote_url}" "${tmp_clone}"
+git clone -q --branch "${current_branch}" --depth 1 "${plugins_remote_url}" "${tmp_clone}"
+
+# --checksum: compare content, not size + mtime to the second -- see the same
+# note in plugin-pull.sh (a same-length edit such as a version bump was skipped).
+rsync -a --checksum --delete --exclude .git \
+    "${repo_root}/${plugin_dir}/" "${tmp_clone}/${plugin_name}/"
+
 cd "${tmp_clone}"
-git checkout -q "${current_branch}"
-git remote add source "${repo_root}"
-git fetch -q source "${split_branch}"
-git subtree pull --prefix="${plugin_name}" source "${split_branch}" \
-    -m "sync: pull ${plugin_name} from install_xen_orchestra (${current_branch})"
+git add -A -- "${plugin_name}"
+if git diff --cached --quiet; then
+    echo "${plugin_name} is already in sync with ${plugins_remote_url} (${current_branch})."
+    exit 0
+fi
+
+git commit -q -m "sync: pull ${plugin_name} from install_xen_orchestra (${current_branch})"
 git push -q origin "${current_branch}"
 
 echo "Pushed ${plugin_name} to ${plugins_remote_url} (${current_branch})"

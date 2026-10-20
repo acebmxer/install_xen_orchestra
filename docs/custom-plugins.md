@@ -121,8 +121,11 @@ to remember to run anything by hand:
   (`sync-plugins-in.yml`, using `scripts/plugin-pull.sh <name>`) and commit
   it here.
 
-Both directions only sync whichever branch (`dev`/`main`) changed, matching
-that branch on the other side.
+Pushing out syncs whichever branch (`dev`/`main`) changed to the same branch
+in `xo-plugins`. Pulling in only takes `xo-plugins`' `dev`, into `dev` here.
+A change on `xo-plugins`' `main` came from merging its `dev`, so `dev` here
+already has it. It reaches `main` here through the usual dev → main pull
+request, and no bot commit lands on `main` that `dev` doesn't have.
 
 The two scripts still work the same when run by hand, for a one-off or if
 CI can't reach the other repo:

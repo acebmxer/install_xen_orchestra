@@ -76,3 +76,25 @@ setup() {
     run validate_config
     [ "$status" -eq 0 ]
 }
+
+@test "XO_PROXY_CHANNEL accepts stable and latest" {
+    XO_PROXY_CHANNEL=stable
+    run validate_config
+    [ "$status" -eq 0 ]
+    XO_PROXY_CHANNEL=latest
+    run validate_config
+    [ "$status" -eq 0 ]
+}
+
+@test "XO_PROXY_CHANNEL unset is valid" {
+    unset XO_PROXY_CHANNEL
+    run validate_config
+    [ "$status" -eq 0 ]
+}
+
+@test "XO_PROXY_CHANNEL other than stable or latest fails" {
+    XO_PROXY_CHANNEL=beta
+    run validate_config
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"XO_PROXY_CHANNEL"* ]]
+}

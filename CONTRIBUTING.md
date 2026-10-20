@@ -18,8 +18,9 @@ files. To work on it you need:
 - `bash`
 - [ShellCheck](https://www.shellcheck.net/) (>= 0.9)
 - [bats-core](https://github.com/bats-core/bats-core) for the unit tests
-- `git-subtree` and `rsync` — used by `scripts/plugin-push.sh` /
-  `scripts/plugin-pull.sh`, and by the unit tests that exercise them
+- `rsync` — used by `scripts/plugin-push.sh` / `scripts/plugin-pull.sh`
+- `git-subtree` — used by the unit tests that exercise them, to build their
+  fake xo-plugins remote
 - Docker (optional) for the multi-distro integration tests
 
 Don't have ShellCheck or bats installed natively? Run them via Docker instead
