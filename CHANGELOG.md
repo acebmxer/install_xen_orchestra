@@ -10,6 +10,19 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Security
+
+- **Templates no longer keep the build's temporary SSH key.** The build key
+  cloud-init installs for the template's default user (and root) is now
+  removed before the template is sealed; previously every built template
+  carried that entry in `authorized_keys`. Templates built with an earlier
+  version still have it: delete the line ending `xo template build
+  (temporary)` from `~/.ssh/authorized_keys` in VMs made from them, or rebuild
+  the template. The private half is also no longer left in
+  `/tmp/xo-templates-*/` when Custom Plugins is ticked in the same menu pass
+  as the Template Library: the plugin picker replaced the build's cleanup on
+  exit instead of running after it.
+
 ## [0.9.3] - 2026-10-19
 
 ### Added

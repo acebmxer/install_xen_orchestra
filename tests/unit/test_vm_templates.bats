@@ -234,6 +234,44 @@ teardown() {
     done
 }
 
+@test "every prep script removes the build key from authorized_keys before sealing" {
+    # cloud-init installs the build's public key for the default user (and,
+    # with a "please log in as" prefix, for root). Without removing it, every
+    # template ships an entry for a key this script generated. Run each
+    # script's removal against stand-in home directories and check the build
+    # key's lines are gone while the operator's own key stays.
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not installed"
+    DEPLOY_WORKDIR="$TMPDIR_TEST"
+    local pubkey
+    pubkey=$(tpl_build_ssh_key)
+    [ -n "$pubkey" ]
+
+    local fn line
+    for fn in tpl_prep_debian tpl_prep_rhel tpl_prep_fedora; do
+        local root="${TMPDIR_TEST}/${fn}"
+        mkdir -p "${root}/root/.ssh" "${root}/home/someuser/.ssh"
+        printf 'ssh-ed25519 AAAAown operator@laptop\n%s\n' "$pubkey" \
+            > "${root}/home/someuser/.ssh/authorized_keys"
+        printf 'no-port-forwarding,command="echo login as someuser" %s\n' "$pubkey" \
+            > "${root}/root/.ssh/authorized_keys"
+
+        line=$("$fn" someuser | grep 'authorized_keys' | grep -v '^\s*#')
+        [ -n "$line" ]
+        line=${line//\/root\//${root}\/root\/}
+        line=${line//\/home\//${root}\/home\/}
+        bash -c "$line"
+
+        ! grep -qF "xo template build (temporary)" "${root}/home/someuser/.ssh/authorized_keys"
+        ! grep -qF "xo template build (temporary)" "${root}/root/.ssh/authorized_keys"
+        grep -qF "operator@laptop" "${root}/home/someuser/.ssh/authorized_keys"
+
+        # And it runs before the VM powers off, not after.
+        "$fn" someuser > "${TMPDIR_TEST}/prep.sh"
+        [ "$(grep -n 'authorized_keys' "${TMPDIR_TEST}/prep.sh" | grep -v ':\s*#' | cut -d: -f1)" \
+            -lt "$(grep -n '^shutdown -h now' "${TMPDIR_TEST}/prep.sh" | cut -d: -f1)" ]
+    done
+}
+
 @test "the prep script installs guest tools from the ISO before falling back to apt" {
     # Debian 13 has no xe-guest-utilities package, and a failed apt install
     # does not stop cloud-init — so an ISO-last ordering produces a template

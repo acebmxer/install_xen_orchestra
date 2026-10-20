@@ -260,8 +260,9 @@ its checksum format alongside it.
    disk actually holds a partition table before going further.
 4. **Boots the VM once.** A cloud-init drive installs the guest tools, adds
    cloud-init and growroot, sets the shipped login, then scrubs the machine
-   identity a clone must not inherit — machine-id, SSH host keys, hostname,
-   saved network connections, cloud-init state, logs and shell history — and
+   identity a clone must not inherit — machine-id, SSH host keys, the build's
+   temporary SSH key, hostname, saved network connections, cloud-init state,
+   logs and shell history — and
    powers the VM off. This is the slow part;
    allow roughly five to ten minutes per template.
 5. **Seals the result**: destroys the preparation drive so cloud-init does not

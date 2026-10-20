@@ -8898,6 +8898,10 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build's temporary key was installed by cloud-init for the default user
+# (and for root, behind a "log in as" prefix). Remove it so the template does
+# not carry an entry for a key generated on the build machine.
+sed -i '/xo template build (temporary)/d' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null || true
 # The build gave this VM the hostname "xo-template-build" from the prep drive.
 # Clear it so the template ships no hostname: each clone then takes its own
 # from cloud-init or DHCP instead of inheriting the build VM's name.
@@ -9042,6 +9046,10 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build's temporary key was installed by cloud-init for the default user
+# (and for root, behind a "log in as" prefix). Remove it so the template does
+# not carry an entry for a key generated on the build machine.
+sed -i '/xo template build (temporary)/d' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null || true
 # The build gave this VM the hostname "xo-template-build" from the prep drive.
 # Clear it so the template ships no hostname: each clone then takes its own
 # from cloud-init or DHCP instead of inheriting the build VM's name.
@@ -9235,6 +9243,10 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build's temporary key was installed by cloud-init for the default user
+# (and for root, behind a "log in as" prefix). Remove it so the template does
+# not carry an entry for a key generated on the build machine.
+sed -i '/xo template build (temporary)/d' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null || true
 # The build gave this VM the hostname "xo-template-build" from the prep drive.
 # Clear it so the template ships no hostname: each clone then takes its own
 # from cloud-init or DHCP instead of inheriting the build VM's name.
@@ -13118,7 +13130,27 @@ menu_interactive_pick() {
         menu_enable_wrap
         [[ -n "$saved_stty" ]] && stty "$saved_stty" 2>/dev/null || stty echo 2>/dev/null
     }
-    trap cleanup_menu EXIT
+    # Chain onto any EXIT trap already set rather than replacing it. An earlier
+    # menu item may have one: the Template Library's tpl_cleanup shreds its
+    # private build key. Replacing it, then clearing it with `trap - EXIT`,
+    # left that key in /tmp whenever Custom Plugins ran in the same pass.
+    # `trap -p EXIT` prints "trap -- '<command>' EXIT"; stripping the ends
+    # leaves the command still shell-quoted, which the eval undoes.
+    local prev_exit_trap prev_exit_cmd=""
+    prev_exit_trap=$(trap -p EXIT)
+    if [[ -n "$prev_exit_trap" ]]; then
+        prev_exit_trap=${prev_exit_trap#trap -- }
+        eval "prev_exit_cmd=${prev_exit_trap% EXIT}"
+    fi
+    # Puts back the EXIT trap the picker found, or none if there was none.
+    menu_restore_exit_trap() {
+        if [[ -n "$prev_exit_cmd" ]]; then
+            trap -- "$prev_exit_cmd" EXIT
+        else
+            trap - EXIT
+        fi
+    }
+    trap -- "cleanup_menu${prev_exit_cmd:+; ${prev_exit_cmd}}" EXIT
     # Only raise a flag here — drawing from inside the handler could interleave
     # with a draw already in progress. menu_read_key turns this into a REDRAW.
     trap 'MENU_RESIZED=1' WINCH
@@ -13240,7 +13272,7 @@ menu_interactive_pick() {
                     break
                 fi
                 cleanup_menu
-                trap - EXIT
+                menu_restore_exit_trap
                 trap - WINCH
                 clear
                 echo "Cancelled."
@@ -13253,7 +13285,7 @@ menu_interactive_pick() {
 
     # Restore terminal before returning control to the caller
     cleanup_menu
-    trap - EXIT
+    menu_restore_exit_trap
     trap - WINCH
     clear
 

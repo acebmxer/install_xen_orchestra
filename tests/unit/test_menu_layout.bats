@@ -86,6 +86,50 @@ setup() {
     done
 }
 
+# The picker sets its own EXIT trap to restore the terminal. It used to
+# replace whatever EXIT trap was already set, so an earlier menu item's
+# cleanup (the template build's, which shreds its private build key) never
+# ran. Each case runs in its own bash so the EXIT trap really fires.
+_run_picker_then_exit() {
+    local key="$1"
+    bash -c '
+        _XO_SOURCE_ONLY=1 source "$1"
+        set +e
+        TEST_KEY="$2"
+        menu_gather_info() { :; }
+        draw_menu() { :; }
+        clear() { :; }
+        menu_read_key() {
+            case "$TEST_KEY" in
+                DIE) exit 3 ;;
+                *) MENU_KEY="$TEST_KEY" ;;
+            esac
+        }
+        trap "echo EARLIER_CLEANUP_RAN" EXIT
+        menu_interactive_pick
+        echo "PICKER_RETURNED"
+    ' _ "${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh" "$key" </dev/null
+}
+
+@test "the picker leaves an earlier EXIT trap in place when it returns" {
+    run _run_picker_then_exit ENTER
+    [[ "$output" == *"PICKER_RETURNED"* ]]
+    [[ "$output" == *"EARLIER_CLEANUP_RAN"* ]]
+}
+
+@test "quitting from the picker still runs an earlier EXIT trap" {
+    run _run_picker_then_exit QUIT
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Cancelled."* ]]
+    [[ "$output" == *"EARLIER_CLEANUP_RAN"* ]]
+}
+
+@test "dying inside the picker still runs an earlier EXIT trap" {
+    run _run_picker_then_exit DIE
+    [ "$status" -eq 3 ]
+    [[ "$output" == *"EARLIER_CLEANUP_RAN"* ]]
+}
+
 @test "run_menu resets a selection entry for every item" {
     # run_menu itself takes over the terminal, so just the reset block is
     # exercised here — that is where the array length used to be hardcoded.
