@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-19
+
 ### Added
 
 - **`XO_PROXY_CHANNEL`: choose the update channel for an XO Proxy.** A proxy
@@ -29,6 +31,14 @@ This installer builds Xen Orchestra from source and tracks the official
   `stable` offers older versions (0.33.1 to 0.31.10) which `upgrade` installs.
 
 ### Fixed
+
+- **`xo-server-host-power-manager`: a rule could not be saved with only one
+  trigger set up.** XO's settings form sends a rule's CPU or memory section
+  only if it was opened, but the plugin's settings required both, so a rule
+  that used only the memory trigger (or only CPU) was rejected unless the
+  unused section was opened too. Each trigger is now optional, and one left
+  out is treated as off (`none`), the same as choosing `none` in its Metric
+  dropdown. The plugin's version is now 0.2.1.
 
 - **XO Proxy install: three faults found on a real deploy.** (1) The proxy's
   IP was never captured: Vates' deploy script prints
@@ -2492,7 +2502,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.8.0...v0.9.0
