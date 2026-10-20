@@ -4,6 +4,11 @@ name: Sync plugins in
 # triggered by xo-plugins' own "notify install_xen_orchestra" workflow.
 # Commits only if the pull actually produced a diff, so a round-trip sync
 # (this repo -> xo-plugins -> back here) doesn't create an empty commit.
+#
+# Only dev is pulled. A change reaches xo-plugins' main by merging its dev
+# into main, and that change already arrived here on dev. Committing it to
+# main here as well put a bot commit on main that dev never had, leaving dev
+# "behind" main. main here only changes by merging a dev -> main pull request.
 
 on:
   repository_dispatch:
@@ -15,6 +20,7 @@ permissions:
 jobs:
   pull-plugin:
     name: Pull ${{ github.event.client_payload.plugin }} (${{ github.event.client_payload.branch }})
+    if: github.event.client_payload.branch == 'dev'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
