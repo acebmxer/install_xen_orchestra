@@ -2225,6 +2225,18 @@ EOF
 }
 
 # Create systemd service
+# Print the --max-old-space-size value (MB) on the ExecStart line of the
+# given xo-server unit file, or nothing if it has none or doesn't exist.
+# Shared by adjust_xo_memory (shows and edits it) and create_systemd_service
+# (keeps it when the unit is rewritten).
+xo_service_heap_limit() {
+    local service_file="$1" exec_line
+    exec_line=$(grep -E '^ExecStart=' "$service_file" 2>/dev/null | head -n1) || exec_line=""
+    if [[ "$exec_line" =~ --max-old-space-size=([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
 create_systemd_service() {
     log_info "Creating systemd service..."
 
@@ -2233,6 +2245,16 @@ create_systemd_service() {
     local EXEC_USER="${SERVICE_USER:-root}"
     local XO_SERVER_PATH="${INSTALL_DIR}/packages/xo-server/dist/cli.mjs"
     local DEBUG_ENV=""
+
+    # Keep a heap size set with --adjust-memory: it lives on the ExecStart
+    # line this function rewrites, and losing it silently brings back the
+    # out-of-memory crash it was set to fix.
+    local HEAP_FLAG="" heap_mb
+    heap_mb=$(xo_service_heap_limit /etc/systemd/system/xo-server.service)
+    if [[ -n "$heap_mb" ]]; then
+        HEAP_FLAG=" --max-old-space-size=${heap_mb}"
+        log_info "Keeping the ${heap_mb} MB heap size set with --adjust-memory"
+    fi
 
     if [[ "$DEBUG_MODE" == "true" ]]; then
         DEBUG_ENV="DEBUG=xo:main"
@@ -2273,7 +2295,7 @@ Environment="NODE_ENV=production"
 WorkingDirectory=${INSTALL_DIR}/packages/xo-server
 ExecStartPre=/bin/mkdir -p /run/xo-server/mounts
 ExecStartPre=/bin/chmod 755 /run/xo-server/mounts
-ExecStart=${NODE_PATH} ${XO_SERVER_PATH}
+ExecStart=${NODE_PATH}${HEAP_FLAG} ${XO_SERVER_PATH}
 Restart=always
 RestartSec=10
 SyslogIdentifier=xo-server
@@ -8263,11 +8285,8 @@ adjust_xo_memory() {
     fi
 
     # Detect the current --max-old-space-size value from the service file (if any)
-    local current_exec current_limit=""
-    current_exec=$(grep -E '^ExecStart=' "$service_file" 2>/dev/null | head -n1) || current_exec=""
-    if [[ "$current_exec" =~ --max-old-space-size=([0-9]+) ]]; then
-        current_limit="${BASH_REMATCH[1]}"
-    fi
+    local current_limit
+    current_limit=$(xo_service_heap_limit "$service_file")
 
     # Resolve the node binary path (needed below to query node's default heap)
     local node_path

@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-86-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-470%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-474%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -210,6 +210,8 @@ alone does **not** fix this — the systemd service must also pass
 This option detects the system RAM, suggests a heap size (total RAM minus
 ~512 MB reserved for the OS), backs up `/etc/systemd/system/xo-server.service`,
 rewrites the `ExecStart` line, then reloads systemd and restarts `xo-server`.
+The heap size is kept when `--update`, `--rebuild`, `--reconfigure` or
+`--restore` rewrite that file.
 
 ## Quick Start
 

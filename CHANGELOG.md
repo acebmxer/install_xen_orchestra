@@ -12,6 +12,11 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The `--adjust-memory` heap size survives updates.** `--update`,
+  `--rebuild`, `--reconfigure` and `--restore` rewrite the xo-server service
+  file, which dropped the heap size and brought back the out-of-memory crash
+  it was set to fix. The value is now read from the file and written back.
+  An install that already lost it needs `--adjust-memory` run once more.
 - **Following the certificate renewal advice no longer leaves XO without
   HTTPS.** The expiry warning, `--status` and the sample config say to
   delete the files in `SSL_CERT_DIR` and run `--reconfigure`, but
