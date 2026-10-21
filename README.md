@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-86-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-448%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-476%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -210,6 +210,8 @@ alone does **not** fix this — the systemd service must also pass
 This option detects the system RAM, suggests a heap size (total RAM minus
 ~512 MB reserved for the OS), backs up `/etc/systemd/system/xo-server.service`,
 rewrites the `ExecStart` line, then reloads systemd and restarts `xo-server`.
+The heap size is kept when `--update`, `--rebuild`, `--reconfigure` or
+`--restore` rewrite that file.
 
 ## Quick Start
 
@@ -318,7 +320,7 @@ Key settings:
 | `HTTPS_PORT` | 443 | HTTPS port |
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days |
-| `GIT_BRANCH` | master | Git branch or tag |
+| `GIT_BRANCH` | master | Git branch (tags are not supported) |
 | `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
 | `SERVICE_USER` | root | Service user — root by default; any username runs XO non-root |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |

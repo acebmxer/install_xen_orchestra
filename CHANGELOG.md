@@ -10,6 +10,66 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-21
+
+### Fixed
+
+- **The self-signed certificate is made on machines with a long host name.**
+  openssl refuses a certificate name (CN) longer than 64 characters, so on a
+  machine whose full host name was longer (common on cloud VMs) no
+  certificate was made and the install stopped there. The full name now goes
+  in the certificate's alternative names, which is what browsers check, and
+  the short host name is used as the CN.
+- **The `--adjust-memory` heap size survives updates.** `--update`,
+  `--rebuild`, `--reconfigure` and `--restore` rewrite the xo-server service
+  file, which dropped the heap size and brought back the out-of-memory crash
+  it was set to fix. The value is now read from the file and written back.
+  An install that already lost it needs `--adjust-memory` run once more.
+- **Following the certificate renewal advice no longer leaves XO without
+  HTTPS.** The expiry warning, `--status` and the sample config say to
+  delete the files in `SSL_CERT_DIR` and run `--reconfigure`, but
+  `--reconfigure` never issued a certificate, so xo-server was left pointing
+  at files that no longer existed. `--reconfigure` now issues a new
+  self-signed certificate when `SSL_CERT_DIR` has none, which also covers
+  changing `SSL_CERT_DIR` to an empty folder. An existing certificate,
+  including one you supplied, is never replaced.
+- **Running the script once with sudo no longer breaks self-update.** The
+  script checked for updates (`git fetch`/`pull` in its own folder) before
+  refusing root, so a sudo run left root-owned files in `.git` and every
+  later normal run reported "Could not check for script updates (network
+  unavailable?)". Root is now refused before the update check. An install
+  already affected needs `sudo chown -R "$USER": .git` once, run in the
+  script's folder.
+- **`--restore` and `--list-backups` work when `SERVICE_USER` is not root.**
+  Backups of such an install can be read only by root, and the checks ran as
+  the user running the script, so every backup was listed as
+  `[INCOMPLETE/CORRUPT]` without its commit and the restore was refused. The
+  checks now go through sudo. Installs with the default `SERVICE_USER=root`
+  were not affected.
+- **`--uninstall`'s "purge Redis data" no longer stops Redis from starting.**
+  It deleted `/var/lib/redis` itself, which Debian's Redis can't start
+  without, so a later reinstall stopped at "Redis/Valkey is not running". It
+  now empties the data directory instead, and stops the service actually in
+  use first (Valkey was never stopped, so it could write its data back) and
+  starts it again afterwards. If the service can't be stopped, nothing is
+  deleted.
+- **`--uninstall` stops and disables xo-server.** The check for the service
+  never matched, so the uninstall removed the unit file and the install
+  directory while xo-server kept running and holding ports 80/443, and left
+  a dangling link in `multi-user.target.wants`.
+- **`--rebuild` no longer deletes XO when it can't clone it again.** It
+  removed the install first and cloned afterwards, so a failed clone left XO
+  deleted and stopped. It now clones next to the install and swaps only once
+  the clone has worked; if it fails, the old install is kept and started
+  again. On an install cloned from a tag, the clone always failed (it asked
+  for a branch called `HEAD`).
+- **`GIT_BRANCH` must be a branch; a tag is refused.** The docs said a tag
+  works, but `--update` could never update one (it stopped with "Could not
+  fetch remote commit"). Install, `--update` and `--rebuild` now check
+  `GIT_BRANCH` against GitHub before doing anything and stop with a clear
+  message for a tag or a branch that doesn't exist. `stable` was dropped
+  from the sample config: Xen Orchestra has no branch by that name.
+
 ## [0.9.4] - 2026-10-20
 
 ### Security
@@ -2551,7 +2611,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...v0.9.2

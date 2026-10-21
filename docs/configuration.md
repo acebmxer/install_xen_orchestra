@@ -14,7 +14,7 @@ Key settings:
 | `HTTPS_PORT` | 443 | HTTPS port |
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days (see below) |
-| `GIT_BRANCH` | master | Git branch or tag |
+| `GIT_BRANCH` | master | Git branch (tags are not supported) |
 | `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
 | `SERVICE_USER` | root | Service user (see below) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain (see below) |

@@ -6,9 +6,22 @@ setup() {
     load_script
 
     BACKUP_TEST_DIR=$(mktemp -d)
+
+    # The backup checks go through sudo (a backup can be readable only by
+    # root), so mock_helpers' `sudo() { true; }`, which answers yes to every
+    # test, would hide a missing file. Run the command instead, as this same
+    # user, dropping a leading "-u <user>".
+    # shellcheck disable=SC2317
+    sudo() {
+        if [[ "$1" == "-u" ]]; then shift 2; fi
+        "$@"
+    }
+    export -f sudo
 }
 
 teardown() {
+    # The "only sudo can read it" tests lock a backup with chmod 000.
+    chmod -R u+rwx "$BACKUP_TEST_DIR" 2>/dev/null || true
     rm -rf "$BACKUP_TEST_DIR"
 }
 
@@ -117,4 +130,47 @@ teardown() {
     [[ "$output" == *"xo-backup-20260101_000000"* ]]
     [[ "$output" == *"xo-backup-20260102_000000"* ]]
     [[ "$output" == *"INCOMPLETE/CORRUPT"* ]]
+}
+
+# A backup of a non-root SERVICE_USER's install is root-owned with mode 750,
+# so the user running the script can't look inside it; only sudo can. Model
+# that with a backup locked to mode 000 and a sudo that unlocks it for the
+# one command it runs.
+locked_backup() {
+    LOCKED="$BACKUP_TEST_DIR/xo-backup-20260103_000000"
+    mkdir -p "$LOCKED"
+    touch "$LOCKED/package.json"
+    git -C "$LOCKED" init -q
+    git -C "$LOCKED" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+    chmod 000 "$LOCKED"
+    # shellcheck disable=SC2317
+    sudo() {
+        if [[ "$1" == "-u" ]]; then shift 2; fi
+        local rc=0
+        chmod 755 "$LOCKED"
+        "$@" || rc=$?
+        chmod 000 "$LOCKED"
+        return "$rc"
+    }
+    export -f sudo
+}
+
+@test "a complete backup that only sudo can read passes" {
+    locked_backup
+    # Positive control: the invoking user really can't see inside it.
+    [ ! -f "$LOCKED/package.json" ]
+
+    run verify_backup_integrity "$LOCKED"
+    [ "$status" -eq 0 ]
+}
+
+@test "--list-backups shows a backup only sudo can read as complete, with its commit" {
+    locked_backup
+    BACKUP_DIR="$BACKUP_TEST_DIR"
+    LIST_BACKUPS_ONLY=true
+
+    run restore_xo
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"xo-backup-20260103_000000"*"commit: "* ]]
+    [[ "$output" != *"INCOMPLETE/CORRUPT"* ]]
 }

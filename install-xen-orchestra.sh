@@ -1628,6 +1628,56 @@ flush_tokens_standalone() {
     log_success "Token flush complete."
 }
 
+# Print the name of whichever redis-compatible service this distro installed,
+# or nothing if there is none:
+#   Debian/Ubuntu -> redis-server    RHEL/CentOS -> redis
+#   Fedora / newer RHEL -> valkey (drop-in replacement for redis)
+# `systemctl cat` succeeds only when the unit file actually exists, which is a
+# more reliable test than grepping `list-unit-files` output.
+detect_redis_service() {
+    local candidate
+    for candidate in redis-server redis valkey valkey-server; do
+        if systemctl cat "${candidate}.service" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Delete everything Redis/Valkey has stored, for --uninstall's "purge Redis
+# data". The server is stopped first (it would write its data back on its next
+# save) and started again afterwards. Only the contents of each data directory
+# go: the directories themselves stay, because Debian's redis unit doesn't
+# recreate /var/lib/redis and the server can't start without it.
+#   $@  data directories (missing ones are skipped)
+purge_redis_data() {
+    local redis_svc
+    redis_svc=$(detect_redis_service)
+
+    if [[ -n "$redis_svc" ]]; then
+        if ! run_cmd sudo systemctl stop "$redis_svc" 2>/dev/null; then
+            log_warning "Could not stop ${redis_svc}; Redis data was NOT purged."
+            return 0
+        fi
+    else
+        log_warning "No redis/valkey systemd unit found; purging data files only."
+    fi
+
+    local dir
+    for dir in "$@"; do
+        if sudo test -d "$dir"; then
+            run_cmd sudo find "$dir" -mindepth 1 -delete || \
+                log_warning "Could not remove everything in ${dir}"
+        fi
+    done
+
+    if [[ -n "$redis_svc" ]]; then
+        run_cmd sudo systemctl start "$redis_svc" 2>/dev/null || \
+            log_warning "${redis_svc} did not start again; check: sudo systemctl status ${redis_svc}"
+    fi
+}
+
 # Start and enable Redis
 setup_redis() {
     log_info "Setting up Redis..."
@@ -1638,19 +1688,8 @@ setup_redis() {
     # before we probe for it.
     run_cmd sudo systemctl daemon-reload 2>/dev/null || true
 
-    # Detect whichever redis-compatible service this distro installed:
-    #   Debian/Ubuntu -> redis-server    RHEL/CentOS -> redis
-    #   Fedora / newer RHEL -> valkey (drop-in replacement for redis)
-    # `systemctl cat` succeeds only when the unit file actually exists, which is a
-    # more reliable test than grepping `list-unit-files` output.
-    local redis_svc=""
-    local candidate
-    for candidate in redis-server redis valkey valkey-server; do
-        if systemctl cat "${candidate}.service" >/dev/null 2>&1; then
-            redis_svc="$candidate"
-            break
-        fi
-    done
+    local redis_svc
+    redis_svc=$(detect_redis_service)
 
     if [[ -n "$redis_svc" ]]; then
         log_info "Enabling and starting ${redis_svc}.service"
@@ -1994,8 +2033,19 @@ generate_ssl_certificate() {
         return 0
     fi
 
-    local CERT_CN
-    CERT_CN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "xen-orchestra")
+    local CERT_FQDN CERT_CN CERT_SAN
+    CERT_FQDN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)
+    CERT_FQDN="${CERT_FQDN:-xen-orchestra}"
+    # A certificate's CN holds at most 64 characters, and openssl refuses a
+    # longer one outright, so no certificate gets made. A longer name (cloud
+    # VMs often have one) goes in the subjectAltName only -- which is what
+    # browsers check -- and the CN takes the short host name.
+    CERT_CN="$CERT_FQDN"
+    CERT_SAN="DNS:${CERT_FQDN}"
+    if (( ${#CERT_FQDN} > 64 )); then
+        CERT_CN="${CERT_FQDN%%.*}"
+        CERT_SAN="DNS:${CERT_FQDN},DNS:${CERT_CN}"
+    fi
 
     # 825 days is the longest lifetime the CA/Browser Forum ever allowed for a
     # public certificate, and the ceiling most internal policies inherited. The
@@ -2018,7 +2068,7 @@ generate_ssl_certificate() {
         -keyout "${SSL_CERT_DIR}/${SSL_KEY_FILE}" \
         -out "${SSL_CERT_DIR}/${SSL_CERT_FILE}" \
         -subj "/CN=${CERT_CN}" \
-        -addext "subjectAltName=DNS:${CERT_CN}"
+        -addext "subjectAltName=${CERT_SAN}"
 
     # Set permissions
     run_cmd sudo chmod 600 "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
@@ -2186,6 +2236,18 @@ EOF
 }
 
 # Create systemd service
+# Print the --max-old-space-size value (MB) on the ExecStart line of the
+# given xo-server unit file, or nothing if it has none or doesn't exist.
+# Shared by adjust_xo_memory (shows and edits it) and create_systemd_service
+# (keeps it when the unit is rewritten).
+xo_service_heap_limit() {
+    local service_file="$1" exec_line
+    exec_line=$(grep -E '^ExecStart=' "$service_file" 2>/dev/null | head -n1) || exec_line=""
+    if [[ "$exec_line" =~ --max-old-space-size=([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
 create_systemd_service() {
     log_info "Creating systemd service..."
 
@@ -2194,6 +2256,16 @@ create_systemd_service() {
     local EXEC_USER="${SERVICE_USER:-root}"
     local XO_SERVER_PATH="${INSTALL_DIR}/packages/xo-server/dist/cli.mjs"
     local DEBUG_ENV=""
+
+    # Keep a heap size set with --adjust-memory: it lives on the ExecStart
+    # line this function rewrites, and losing it silently brings back the
+    # out-of-memory crash it was set to fix.
+    local HEAP_FLAG="" heap_mb
+    heap_mb=$(xo_service_heap_limit /etc/systemd/system/xo-server.service)
+    if [[ -n "$heap_mb" ]]; then
+        HEAP_FLAG=" --max-old-space-size=${heap_mb}"
+        log_info "Keeping the ${heap_mb} MB heap size set with --adjust-memory"
+    fi
 
     if [[ "$DEBUG_MODE" == "true" ]]; then
         DEBUG_ENV="DEBUG=xo:main"
@@ -2234,7 +2306,7 @@ Environment="NODE_ENV=production"
 WorkingDirectory=${INSTALL_DIR}/packages/xo-server
 ExecStartPre=/bin/mkdir -p /run/xo-server/mounts
 ExecStartPre=/bin/chmod 755 /run/xo-server/mounts
-ExecStart=${NODE_PATH} ${XO_SERVER_PATH}
+ExecStart=${NODE_PATH}${HEAP_FLAG} ${XO_SERVER_PATH}
 Restart=always
 RestartSec=10
 SyslogIdentifier=xo-server
@@ -2508,6 +2580,38 @@ get_installed_commit() {
 # Get remote commit
 get_remote_commit() {
     git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/"$GIT_BRANCH" 2>/dev/null | cut -f1
+}
+
+# Refuse a GIT_BRANCH that is not a branch on the Xen Orchestra repo, before
+# anything is installed, stopped or deleted. Only branches are supported: a
+# tag clones as a detached HEAD, which --update cannot follow and --rebuild
+# cannot re-clone. Exits on a tag, a missing branch, or no answer from GitHub.
+#   $1  branch name (defaults to $GIT_BRANCH)
+require_remote_branch() {
+    local branch="${1:-$GIT_BRANCH}"
+    local repo="https://github.com/vatesfr/xen-orchestra"
+    local rc=0
+
+    git ls-remote --exit-code --heads "$repo" "refs/heads/${branch}" >/dev/null 2>&1 || rc=$?
+    (( rc == 0 )) && return 0
+
+    # --exit-code returns 2 when the remote answered but nothing matched;
+    # anything else means GitHub could not be asked at all.
+    if (( rc != 2 )); then
+        log_error "Could not reach ${repo} to check GIT_BRANCH=${branch} (network unavailable?)"
+        exit 1
+    fi
+
+    rc=0
+    git ls-remote --exit-code --tags "$repo" "refs/tags/${branch}" >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )); then
+        log_error "GIT_BRANCH=${branch} is a tag. Only branches are supported."
+        log_error "Set GIT_BRANCH to a branch (for example master) in xo-config.cfg."
+    else
+        log_error "GIT_BRANCH=${branch}: no such branch on ${repo}."
+        log_error "Set GIT_BRANCH to a branch (for example master) in xo-config.cfg."
+    fi
+    exit 1
 }
 
 # Snapshot the XO VM itself via XO's REST API, so a bad update/rebuild can be
@@ -2798,7 +2902,12 @@ create_backup() {
 verify_backup_integrity() {
     local backup_path="$1"
 
-    if [[ ! -d "$backup_path" ]]; then
+    # Every test below goes through sudo. create_backup() copies with
+    # `sudo cp -r`, so a backup of a non-root SERVICE_USER's install is
+    # root-owned with that install's 750 mode, and this script refuses to run
+    # as root (check_not_root): a plain test, run as the invoking user, can't
+    # look inside it and would call every such backup incomplete.
+    if ! sudo test -d "$backup_path"; then
         log_error "  ${backup_path} is not a directory."
         return 1
     fi
@@ -2806,11 +2915,8 @@ verify_backup_integrity() {
     # package.json at the root is the one file every XO checkout has,
     # regardless of branch, commit, or how deep the monorepo's packages
     # directory tree goes -- so its absence means the copy never completed,
-    # or this directory never held an XO checkout at all. This runs as
-    # whatever restore_xo itself is running as (root, per check_not_root
-    # elsewhere), which can always read a path it's about to sudo rm -rf --
-    # so a plain existence test is enough, no sudo -u re-exec needed here.
-    if [[ ! -f "${backup_path}/package.json" ]]; then
+    # or this directory never held an XO checkout at all.
+    if ! sudo test -f "${backup_path}/package.json"; then
         log_error "  ${backup_path}/package.json is missing."
         return 1
     fi
@@ -2820,11 +2926,10 @@ verify_backup_integrity() {
     # truncated object store, which every other file in the tree can look
     # perfectly fine next to.
     #
-    # git itself does care about ownership here (its "dubious ownership"
-    # safety check), so this one read -- unlike the existence test above --
-    # does run as the backup's own owner, matching how the backup listing
-    # loop above already reads a backup's commit.
-    if [[ -d "${backup_path}/.git" ]]; then
+    # git itself cares about ownership here (its "dubious ownership" safety
+    # check), so this read runs as the backup's own owner, matching how the
+    # backup listing in restore_xo reads a backup's commit.
+    if sudo test -d "${backup_path}/.git"; then
         local owner
         owner=$(stat -c '%U' "$backup_path" 2>/dev/null) || owner="root"
         if ! sudo -u "$owner" git -C "$backup_path" rev-parse HEAD &>/dev/null; then
@@ -2867,7 +2972,7 @@ restore_xo() {
         BACKUP_NAME=$(basename "$BACKUP")
         # Read commit hash from backup's git repo, running as the directory owner
         local BACKUP_COMMIT=""
-        if [[ -d "$BACKUP/.git" ]]; then
+        if sudo test -d "$BACKUP/.git"; then
             local BACKUP_OWNER
             BACKUP_OWNER=$(stat -c '%U' "$BACKUP" 2>/dev/null)
             BACKUP_COMMIT=$(sudo -u "$BACKUP_OWNER" git -C "$BACKUP" rev-parse HEAD 2>/dev/null | cut -c1-12 || true)
@@ -3383,6 +3488,10 @@ update_xo() {
         exit 1
     fi
 
+    # A tag or misspelt branch otherwise surfaces only as "Could not fetch
+    # remote commit" below.
+    require_remote_branch
+
     local INSTALLED_COMMIT REMOTE_COMMIT
     # Keep failures non-fatal here so the explicit empty-value checks below emit a
     # clean message instead of letting a transient git/network error trip `set -e`.
@@ -3541,9 +3650,17 @@ rebuild_xo() {
         exit 1
     fi
 
-    # Detect the currently checked-out branch
+    # Detect the currently checked-out branch. A detached HEAD (an install
+    # cloned from a tag by an older version of this script) has no branch
+    # to re-clone, so fall back to GIT_BRANCH.
     local CURRENT_BRANCH
     CURRENT_BRANCH=$(install_dir_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$GIT_BRANCH")
+    if [[ -z "$CURRENT_BRANCH" || "$CURRENT_BRANCH" == "HEAD" ]]; then
+        CURRENT_BRANCH="$GIT_BRANCH"
+    fi
+
+    # Refuse before anything is stopped or removed.
+    require_remote_branch "$CURRENT_BRANCH"
 
     local CURRENT_COMMIT
     CURRENT_COMMIT=$(get_installed_commit)
@@ -3559,7 +3676,7 @@ rebuild_xo() {
     echo ""
     log_warning "This will:"
     log_warning "  1. Back up the current installation to ${BACKUP_DIR}"
-    log_warning "  2. Remove ${INSTALL_DIR} and do a fresh clone from branch '${CURRENT_BRANCH}'"
+    log_warning "  2. Do a fresh clone from branch '${CURRENT_BRANCH}' and replace ${INSTALL_DIR} with it"
     log_warning "  3. Perform a clean rebuild"
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
@@ -3581,14 +3698,26 @@ rebuild_xo() {
     # Backup current installation (node_modules excluded, same as update)
     create_backup
 
-    # Wipe current installation directory
-    log_info "Removing current installation directory..."
-    run_cmd sudo rm -rf "$INSTALL_DIR"
-
-    # Fresh clone of the same branch
+    # Fresh clone of the same branch, next to the current install so the
+    # final swap is a rename on the same filesystem. The current install is
+    # removed only once the clone has succeeded, so a failed clone (network,
+    # GitHub) leaves XO in place and starts it again.
+    local NEW_DIR="${INSTALL_DIR%/}.rebuild-new"
+    run_cmd sudo rm -rf "$NEW_DIR"
     log_info "Cloning Xen Orchestra (branch: ${CURRENT_BRANCH})..."
     run_cmd sudo mkdir -p "$(dirname "$INSTALL_DIR")"
-    run_cmd sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
+    if ! run_cmd sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$NEW_DIR"; then
+        run_cmd sudo rm -rf "$NEW_DIR"
+        log_error "Clone failed. The current installation was left in place."
+        log_info "Starting xo-server service..."
+        run_cmd sudo systemctl start xo-server || true
+        exit 1
+    fi
+
+    # Swap the fresh clone in for the current installation
+    log_info "Removing current installation directory..."
+    run_cmd sudo rm -rf "$INSTALL_DIR"
+    run_cmd sudo mv "$NEW_DIR" "$INSTALL_DIR"
 
     # Ensure service user exists before any chown operations
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
@@ -3660,6 +3789,7 @@ reconfigure_xo() {
     log_warning "  - /etc/xo-server/config.toml"
     log_warning "  - /etc/systemd/system/xo-server.service"
     log_warning "  - /etc/sudoers.d/xo-server-* (if non-root service user)"
+    log_warning "  - a new self-signed certificate in ${SSL_CERT_DIR} (only if it has none)"
     echo ""
     log_info "Current configuration from xo-config.cfg:"
     echo "  - HTTP Port:        ${HTTP_PORT}"
@@ -3736,6 +3866,12 @@ reconfigure_xo() {
     # overwrites the unit this is read from).
     local PREV_SERVICE_USER
     PREV_SERVICE_USER=$(get_previous_service_user)
+
+    # Issue a self-signed certificate if SSL_CERT_DIR has none (deleted to
+    # renew an expiring one, or SSL_CERT_DIR changed to a new folder), so the
+    # config.toml written next never points at missing files. An existing
+    # certificate is never replaced.
+    generate_ssl_certificate
 
     # Regenerate configuration
     configure_xo
@@ -3921,6 +4057,7 @@ install_xo() {
     detect_os
     install_dependencies
     check_git
+    require_remote_branch
     install_nodejs
     install_yarn
     create_service_user
@@ -8060,8 +8197,9 @@ cleanup_xo() {
         return 0
     fi
 
-    # 1. Stop and disable the systemd service
-    if systemctl list-unit-files xo-server.service &>/dev/null 2>&1 | grep -q xo-server; then
+    # 1. Stop and disable the systemd service. `systemctl cat` succeeds only
+    # when the unit exists (same test setup_redis uses).
+    if systemctl cat xo-server.service >/dev/null 2>&1; then
         log_info "Stopping xo-server service..."
         run_cmd sudo systemctl stop xo-server 2>/dev/null || true
         run_cmd sudo systemctl disable xo-server 2>/dev/null || true
@@ -8124,9 +8262,7 @@ cleanup_xo() {
     echo ""
     if confirm_or_skip "Also purge Redis data? (WARNING: removes all Redis databases on this host)"; then
         log_info "Purging Redis data..."
-        run_cmd sudo systemctl stop redis-server 2>/dev/null || \
-            run_cmd sudo systemctl stop redis 2>/dev/null || true
-        run_cmd sudo rm -rf /var/lib/redis /var/lib/valkey 2>/dev/null || true
+        purge_redis_data /var/lib/redis /var/lib/valkey
     fi
 
     log_success "Xen Orchestra has been uninstalled."
@@ -8160,11 +8296,8 @@ adjust_xo_memory() {
     fi
 
     # Detect the current --max-old-space-size value from the service file (if any)
-    local current_exec current_limit=""
-    current_exec=$(grep -E '^ExecStart=' "$service_file" 2>/dev/null | head -n1) || current_exec=""
-    if [[ "$current_exec" =~ --max-old-space-size=([0-9]+) ]]; then
-        current_limit="${BASH_REMATCH[1]}"
-    fi
+    local current_limit
+    current_limit=$(xo_service_heap_limit "$service_file")
 
     # Resolve the node binary path (needed below to query node's default heap)
     local node_path
@@ -13548,8 +13681,14 @@ main() {
         exit 1
     fi
 
+    # Refuse root before self-update: self_update_script runs git fetch/pull
+    # in this checkout, and doing that as root leaves root-owned files in
+    # .git (FETCH_HEAD) that make every later normal run's fetch fail, so
+    # self-update silently stops working. Every operation refuses root
+    # anyway; this only moves the refusal ahead of the first git command.
     # Self-update before doing anything (skip for --help to avoid delays)
     if [[ "$OPERATION" != "--help" ]]; then
+        check_not_root
         self_update_script
     fi
 
