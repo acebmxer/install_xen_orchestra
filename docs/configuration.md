@@ -178,7 +178,7 @@ automatically. Do this **while both key halves are still intact**.
 
 | Variable | Description |
 |----------|-------------|
-| `XO_DEBUG=1` | Enable debug mode (`set -x`) |
+| `XO_DEBUG=1` | Enable debug mode (`set -x`). Lines that handle passwords and tokens are left out of the trace, but read it before posting it anywhere. |
 | `XO_NO_SELF_UPDATE=1` | Skip automatic script self-update |
 | `XO_DEPLOY_IMAGE_VERSION` | `--deploy`: Debian major version for the guest (default `13`) |
 | `XO_DEPLOY_IMAGE_RELEASE` | `--deploy`: Debian codename for the guest (default `trixie`) |

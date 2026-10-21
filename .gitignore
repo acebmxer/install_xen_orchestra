@@ -2,6 +2,9 @@ CLAUDE.md
 .claude/
 xo-config.cfg
 
+# Local working notes (plans) -- kept on this machine, not on GitHub.
+docs/issues-72-94-plan.md
+
 # SSH keypairs saved by older versions of --deploy (named after the guest
 # hostname). Current versions never write these -- the deployment key is
 # destroyed when the deploy finishes -- but the pattern stays so a leftover

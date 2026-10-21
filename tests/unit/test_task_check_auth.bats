@@ -15,12 +15,13 @@ setup() {
     SEEN_TOKEN_FILE=$(mktemp)
     export SEEN_TOKEN_FILE
     # Answers the task query with 200 and an empty task list, and records
-    # the authenticationToken cookie it was sent.
+    # the authenticationToken cookie it was sent. The cookie arrives in the
+    # curl config given with -K (see xo_cookie_config), not on the command line.
     # shellcheck disable=SC2317
     curl() {
         local out="" prev=""
         for a in "$@"; do
-            [[ "$a" == authenticationToken=* ]] && echo "$a" >> "$SEEN_TOKEN_FILE"
+            [[ "$prev" == "-K" ]] && sed -n 's/^cookie = "\(authenticationToken=[^"]*\)"$/\1/p' "$a" >> "$SEEN_TOKEN_FILE"
             [[ "$prev" == "--output" ]] && out="$a"
             prev="$a"
         done

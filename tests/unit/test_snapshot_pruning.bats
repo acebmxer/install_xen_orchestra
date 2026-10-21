@@ -220,8 +220,12 @@ _snap_json() {
     SEEN_TOKEN_FILE=$(mktemp)
     # shellcheck disable=SC2317
     curl() {
+        # The cookie arrives in the curl config given with -K (see
+        # xo_cookie_config), not on the command line.
+        local prev=""
         for a in "$@"; do
-            [[ "$a" == authenticationToken=* ]] && echo "$a" >> "$SEEN_TOKEN_FILE"
+            [[ "$prev" == "-K" ]] && sed -n 's/^cookie = "\(authenticationToken=[^"]*\)"$/\1/p' "$a" >> "$SEEN_TOKEN_FILE"
+            prev="$a"
         done
         for a in "$@"; do [[ "$a" == "-G" ]] && { echo "[]"; return 0; }; done
         echo "200"
@@ -252,8 +256,12 @@ _snap_json() {
     SEEN_TOKEN_FILE=$(mktemp)
     # shellcheck disable=SC2317
     curl() {
+        # The cookie arrives in the curl config given with -K (see
+        # xo_cookie_config), not on the command line.
+        local prev=""
         for a in "$@"; do
-            [[ "$a" == authenticationToken=* ]] && echo "$a" >> "$SEEN_TOKEN_FILE"
+            [[ "$prev" == "-K" ]] && sed -n 's/^cookie = "\(authenticationToken=[^"]*\)"$/\1/p' "$a" >> "$SEEN_TOKEN_FILE"
+            prev="$a"
         done
         for a in "$@"; do [[ "$a" == "-G" ]] && { echo "[]"; return 0; }; done
         echo "200"

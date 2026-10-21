@@ -12,6 +12,23 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Security
 
+- **Passwords and tokens kept out of `ps`, the debug trace and the log file.**
+  Any other user on the machine running the script could read these while
+  they were in use:
+  - the XO API token, which every REST call put on curl's command line, and
+    the template builder put inside xo-cli's `--url`;
+  - the XO password, which `--proxy` passed as an argument to its xo-cli login
+    helper;
+  - the token given to `xo-cli register --token`, which `--proxy` now writes
+    straight into xo-cli's settings file (mode 0600) instead.
+
+  `XO_DEBUG=1` claimed to mask secrets but printed them all, from the config
+  file onward. The trace now leaves out the parts that handle a password or
+  token and warns you to read it before sharing. `--proxy` no longer writes
+  the proxy's full token to `--log-file` when registration fails; the manual
+  command is shown on screen only. Still visible for about a second:
+  `xo-cli proxy.register`, which accepts the proxy's token on its command
+  line only.
 - **Templates no longer keep the build's temporary SSH key.** The build key
   cloud-init installs for the template's default user (and root) is now
   removed before the template is sealed; previously every built template

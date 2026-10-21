@@ -35,13 +35,22 @@ Batch 5 - menu, helpers, docs, CI (final PR)
   #90  --deploy: SSH key comment with ": " breaks cloud-init
   #93  docs that don't match the code (four items)
   #94  plugin sync skips new-file-only changes; CI needs jq installed
+       (also add curl and nodejs to ci.yml's apt line: the #92 tests skip
+       without them, and ubuntu-latest only happens to have both)
 
 Status (an issue is listed here once its fix is on dev; each one goes into
 the dev -> main PR notes as a "Fixes #N" line, which closes it on merge)
   #87  fixed - build key removed from authorized_keys in all three prep
        scripts; picker keeps earlier EXIT traps. Not yet tested on a real build.
+  #92  fixed - token via curl -K pipe and private xo-cli config, password to
+       the xo-cli login by env, XO_DEBUG off in secret-handling functions,
+       proxy token kept out of --log-file. Left as is (decided): xo-cli
+       proxy.register still takes the proxy token as an argument. Also fixed
+       the #87 test's `! grep` lines, which bats never fails on.
+       Not yet tested on a live --proxy run or a live template build.
 
 Fixes lines for the next PR:
   Fixes #87
+  Fixes #92
 
 Delete this file once all of the above has landed on main.

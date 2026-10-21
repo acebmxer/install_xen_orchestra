@@ -1,11 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-# Enable debug mode if XO_DEBUG environment variable is set
-# Note: sensitive variables (passwords, tokens) are masked in debug output
+# Enable debug mode if XO_DEBUG environment variable is set.
+#
+# xtrace prints every command with its values expanded, secrets included, so
+# each function that reads or sends a password or token turns it off for its
+# own duration (`local -; set +x`): load_config from the point it sources
+# xo-config.cfg, the API calls, the --proxy and --deploy flows. Everything
+# else is traced in full, which is why the warning below asks for a
+# read-through.
 if [[ "${XO_DEBUG:-0}" == "1" ]]; then
+    echo "XO_DEBUG=1: tracing every command. Lines that handle passwords and tokens are left out, but read the output before posting it anywhere." >&2
     set -x
-    # Mask sensitive variables from debug trace output
     export PS4='+ '
 fi
 
@@ -107,6 +113,56 @@ log_warning() {
 
 log_error() {
     _log "ERROR" "$1"
+}
+
+# Print a curl config line carrying XO's authenticationToken cookie.
+#
+# Takes the NAME of the variable holding the token, never the token: a
+# function's arguments are shown by xtrace. Used as `curl -K <(xo_cookie_config
+# xo_token) ...` so the token reaches curl through a pipe instead of its
+# command line, which any local user can read in ps or /proc/<pid>/cmdline
+# while curl runs. A process substitution rather than `-K -` because some
+# callers already feed the request body on stdin (--data-binary @-).
+#
+# Inside double quotes curl's config parser treats backslash as an escape, so
+# backslashes are doubled before quotes are escaped.
+xo_cookie_config() {
+    { set +x; } 2>/dev/null
+    local value="${!1}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf 'cookie = "authenticationToken=%s"\n' "$value"
+}
+
+# Write xo-cli's settings file (<config home>/xo-cli/config.json) with the
+# given XO URL and the token held in the variable named by $3.
+#
+# This is what `xo-cli register --token <token> <url>` writes -- server,
+# token, allowUnauthorized, and a clientId if there is none -- but without the
+# token on xo-cli's command line, which is the only place xo-cli takes it.
+# xo-cli reads this file from $XDG_CONFIG_HOME (default ~/.config). Existing
+# keys are kept. The file is written 0600: it holds an admin-level token.
+# node is there whenever xo-cli is, which is a node program.
+xo_cli_write_config() {
+    local -
+    set +x
+    local config_home="$1" url="$2" token_var="$3" rc=0
+    XO_CLI_CFG_HOME="$config_home" XO_CLI_CFG_URL="$url" XO_CLI_CFG_TOKEN="${!token_var}" \
+        node -e '
+const fs = require("fs"), path = require("path");
+const dir = path.join(process.env.XO_CLI_CFG_HOME, "xo-cli");
+const file = path.join(dir, "config.json");
+let cfg = {};
+try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) {}
+if (cfg.clientId === undefined) cfg.clientId = Math.random().toString(36).slice(2);
+cfg.allowUnauthorized = true;
+cfg.server = process.env.XO_CLI_CFG_URL;
+cfg.token = process.env.XO_CLI_CFG_TOKEN;
+fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+fs.writeFileSync(file, JSON.stringify(cfg), { mode: 0o600 });
+fs.chmodSync(file, 0o600);
+' || rc=$?
+    return "$rc"
 }
 
 # Acquire an exclusive lock on XO_LOCKFILE using flock.
@@ -416,7 +472,11 @@ load_config() {
         exit 1
     fi
 
-    # Source the configuration
+    # Source the configuration. It holds passwords and tokens, which XO_DEBUG's
+    # xtrace would print line by line, so tracing stays off from here to the
+    # end of this function (see the note at the top of this file).
+    local -
+    set +x
     source "$CONFIG_FILE"
 
     # Set defaults if not specified
@@ -2479,6 +2539,10 @@ get_remote_commit() {
 # dmidecode's product UUID, which the same guidance warns can disagree with
 # it over byte-order.
 snapshot_xo_vm() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     local label="$1"  # e.g. "pre-update" or "pre-rebuild"
 
     local virt_type
@@ -2529,7 +2593,7 @@ snapshot_xo_vm() {
         [[ "$proto" == "https" ]] && curl_opts+=(-k)
 
         http_code=$(curl "${curl_opts[@]}" -X POST \
-            -b "authenticationToken=${xo_token}" \
+            -K <(xo_cookie_config xo_token) \
             -H "Content-Type: application/json" \
             -d "{\"name_label\": \"${snap_name}\"}" \
             "${base_url}/rest/v0/vms/${vm_uuid}/actions/snapshot?sync=true" \
@@ -2579,7 +2643,7 @@ prune_xo_vm_snapshots() {
 
     local list_resp
     list_resp=$(curl -sk --max-time 30 \
-        -b "authenticationToken=${xo_token}" \
+        -K <(xo_cookie_config xo_token) \
         -G --data-urlencode "filter=\$snapshot_of:${vm_uuid}" \
         --data-urlencode "fields=id,name_label,snapshot_time" \
         "${base_url}/rest/v0/vm-snapshots" \
@@ -2636,7 +2700,7 @@ prune_xo_vm_snapshots() {
         local del_code
         del_code=$(curl -sk --max-time 30 --output /dev/null --write-out "%{http_code}" \
             -X DELETE \
-            -b "authenticationToken=${xo_token}" \
+            -K <(xo_cookie_config xo_token) \
             "${base_url}/rest/v0/vm-snapshots/${snap_id}" \
             2>/dev/null) || del_code=""
 
@@ -2951,6 +3015,10 @@ restore_xo() {
 # If xo-server's start time can't be determined, the filter is a no-op
 # and all pending tasks are counted (fail-safe to original behavior).
 check_active_xo_tasks() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     log_info "Checking for active Xen Orchestra tasks before updating..."
     printf '\n'
 
@@ -3039,7 +3107,7 @@ check_active_xo_tasks() {
             if [[ "$auth_method" == "token" ]]; then
                 # Token auth — passed via cookie header
                 http_code=$(curl "${curl_opts[@]}" \
-                    -b "authenticationToken=${xo_token}" \
+                    -K <(xo_cookie_config xo_token) \
                     "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
                     2>/dev/null) || true
             else
@@ -3861,6 +3929,10 @@ install_xo() {
 
 # Install XO Proxy on a Xen pool master
 install_xo_proxy() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     log_info "Starting XO Proxy installation..."
     echo ""
 
@@ -4070,8 +4142,9 @@ install_xo_proxy() {
 
 set timeout 30
 set username [lindex $argv 0]
-set password [lindex $argv 1]
-set url      [lindex $argv 2]
+set url      [lindex $argv 1]
+# From the environment, not argv: see the caller.
+set password $env(XO_CLI_REG_PASSWORD)
 
 spawn xo-cli register --au $url $username
 
@@ -4097,12 +4170,15 @@ XO_CLI_EXPECT_END
     chmod +x "$XO_CLI_SCRIPT"
 
     # A configured API token is used instead of the username and password.
-    # It works for accounts with MFA, which the password login cannot. xo-cli
-    # only accepts the token as an argument, so it is briefly visible in ps --
-    # the same exposure as the token-in-URL calls elsewhere in this script.
+    # It works for accounts with MFA, which the password login cannot.
+    # `xo-cli register --token` takes the token only as an argument, visible
+    # to every local user in ps, and all it does is write xo-cli's settings
+    # file -- so that file is written directly instead (xo_cli_write_config).
+    # Like `register --token`, this does not contact XO; a bad token shows up
+    # at proxy.register below.
     if [[ -n "${XO_API_TOKEN:-}" ]]; then
         log_info "Using XO_API_TOKEN from the config to register xo-cli."
-        if xo-cli register --au --token "$XO_API_TOKEN" "$XO_REGISTER_URL"; then
+        if xo_cli_write_config "${XDG_CONFIG_HOME:-$HOME/.config}" "$XO_REGISTER_URL" XO_API_TOKEN; then
             log_success "xo-cli registered with Xen Orchestra"
         else
             log_warning "Failed to register xo-cli with XO_API_TOKEN"
@@ -4111,7 +4187,10 @@ XO_CLI_EXPECT_END
             trap - EXIT
             exit 1
         fi
-    elif "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_PASSWORD" "$XO_REGISTER_URL"; then
+    # The password goes to the expect script through its environment, which
+    # other local users cannot read, not as an argument, which they can (ps,
+    # /proc/<pid>/cmdline) for as long as the login takes.
+    elif XO_CLI_REG_PASSWORD="$XO_PASSWORD" "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_REGISTER_URL"; then
         log_success "xo-cli registered with Xen Orchestra"
     else
         log_warning "Failed to register xo-cli automatically"
@@ -4132,8 +4211,10 @@ XO_CLI_EXPECT_END
         log_success "XO Proxy registered successfully!"
     else
         log_error "Failed to register XO Proxy"
-        log_info "You can register manually with:"
-        log_info "xo-cli proxy.register authenticationToken=\"$AUTH_TOKEN\" address=\"$ACTUAL_PROXY_IP:443\" vmUuid=\"$PROXY_UUID\""
+        # The command carries the proxy's full token, so it goes to the
+        # terminal only: log_info would also write it to --log-file.
+        log_info "You can register manually with the command below (not written to the log file):"
+        echo "xo-cli proxy.register authenticationToken=\"$AUTH_TOKEN\" address=\"$ACTUAL_PROXY_IP:443\" vmUuid=\"$PROXY_UUID\""
         exit 1
     fi
 
@@ -9966,19 +10047,36 @@ tpl_cleanup_failed_build() {
 
 # Run an xo-cli command against the configured XO, printing its output.
 tpl_xo_cli() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     local base
     base=$(tpl_api_base_url)
 
-    # The token goes INSIDE the url, as xo-cli's own --help states: "The URL
-    # must include credentials: https://token@xo.company.net/". There is no
-    # standalone --token for a command invocation -- passing one is read as a
-    # positional argument and fails with "invalid arg: <the token>", which
-    # looks like the token is malformed rather than misplaced.
-    local auth_url="${base/:\/\//://${XO_API_TOKEN}@}"
+    # The token goes in through a private xo-cli settings file, not the
+    # command line. xo-cli takes it only two ways: inside --url
+    # ("https://token@xo.company.net/", per its --help) or from the file
+    # `xo-cli register` writes. A URL argument is readable by every local user
+    # in ps for as long as xo-cli runs. So each call gets its own 0700
+    # XDG_CONFIG_HOME holding that file, removed afterwards -- which also
+    # leaves alone whatever the operator has registered xo-cli against.
+    # (There is no standalone --token for a command invocation: one is read
+    # as a positional argument and fails with "invalid arg: <the token>".)
+    local cfg_home rc=0
+    cfg_home=$(mktemp -d --tmpdir xo-cli-cfg-XXXXXX) || return 1
+    chmod 700 "$cfg_home"
+    if ! xo_cli_write_config "$cfg_home" "$base" XO_API_TOKEN; then
+        rm -rf "$cfg_home"
+        echo "could not write a temporary xo-cli configuration"
+        return 1
+    fi
 
     # --au (--allowUnauthorized) for the same reason curl gets -k: the common
     # target is an XO with a self-signed certificate.
-    xo-cli --au --url "$auth_url" "$@" 2>&1
+    XDG_CONFIG_HOME="$cfg_home" xo-cli --au "$@" 2>&1 || rc=$?
+    rm -rf "$cfg_home"
+    return "$rc"
 }
 
 # POST a REST path with a JSON body and print the response.
@@ -10418,7 +10516,7 @@ tpl_api_import_image() {
         deploy_curl_upload_with_progress "$upload_file" "$up_size" http_code \
             -k -L --post301 --post302 --post303 -X POST \
             --speed-limit 1024 --speed-time 120 \
-            -b "authenticationToken=${XO_API_TOKEN}" \
+            -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
             --data-binary @- \
             --output "$resp_file" --write-out '%{http_code}' \
@@ -10441,7 +10539,7 @@ tpl_api_import_image() {
         deploy_curl_stream_with_progress "$url" "$stream_size" http_code \
             -s -k -L --post301 --post302 --post303 -X POST \
             --speed-limit 1024 --speed-time 120 \
-            -b "authenticationToken=${XO_API_TOKEN}" \
+            -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
             --data-binary @- \
             --output "$resp_file" --write-out '%{http_code}' \
@@ -11508,15 +11606,18 @@ tpl_api_request() {
         # Every other curl in this script already does this; these calls were
         # the exception.
         local args=(-s --max-time 60 -k -L --post301 --post302 --post303
-            --output "$resp_file" --write-out '%{http_code}'
-            -b "authenticationToken=${XO_API_TOKEN}")
+            --output "$resp_file" --write-out '%{http_code}')
         [[ "$method" != "GET" ]] && args+=(-X "$method")
         if [[ -n "$body" ]]; then
             args+=(-H 'Content-Type: application/json' --data-binary "$body")
         fi
 
+        # The token goes in on the curl line itself, not in args: a process
+        # substitution's pipe is only guaranteed open for the command it is
+        # written on. See xo_cookie_config.
         rc=0
-        http_code=$(curl "${args[@]}" "${base}/rest/v0/${path#/}" 2>/dev/null) || rc=$?
+        http_code=$(curl "${args[@]}" -K <(xo_cookie_config XO_API_TOKEN) \
+            "${base}/rest/v0/${path#/}" 2>/dev/null) || rc=$?
 
         TPL_API_LAST_CODE="$http_code"
         TPL_API_LAST_CURL_RC="$rc"
@@ -11546,6 +11647,10 @@ tpl_api_request() {
 # -- worth logging, because the REST API requires an admin account and a token
 # from a non-admin user fails later in ways that do not mention permissions.
 tpl_api_check_auth() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     if [[ -z "${XO_API_TOKEN:-}" ]]; then
         TPL_API_UNAVAILABLE_REASON="no XO_API_TOKEN (or XO_TASK_CHECK_TOKEN) in ${CONFIG_FILE##*/}"
         return 1
