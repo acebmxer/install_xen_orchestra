@@ -205,3 +205,36 @@ test('tick: a second tick while the first is still reading stats does not press 
   assert.deepEqual(presses, ['h3'])
   assert.equal(state.busy, false)
 })
+
+test('tick: a failed power-off waits for the cooldown before trying again', async () => {
+  const host3 = { type: 'host', id: 'h3', name_label: 'host3', $poolId: 'pool1', enabled: true, power_state: 'Running' }
+  const objects = {
+    h1: { type: 'host', id: 'h1', $poolId: 'pool1', enabled: true, power_state: 'Running', memory: { size: 64 * GB, usage: 8 * GB } },
+    h3: { ...host3, memory: { size: 64 * GB, usage: 8 * GB } },
+  }
+  let shutdowns = 0
+  const xo = {
+    getObject: id => objects[id],
+    getObjects: () => objects,
+    getXapi: () => ({
+      shutdownHost: async () => {
+        shutdowns++
+        throw new Error('VM_REQUIRES_SR')
+      },
+    }),
+  }
+  const rule = baseRule({
+    targetHostId: 'h3',
+    powerProvider: 'native',
+    memory: { metric: 'percentFree', powerOnBelow: 15, powerOffAbove: 40 },
+  })
+  const state = new RuleState()
+  state.offEligibleSinceMs = Date.now() - COOLDOWN_MS - 1
+
+  await tick({ xo, rule, state, powerProviders: new Map() })
+  await tick({ xo, rule, state, powerProviders: new Map() })
+  await tick({ xo, rule, state, powerProviders: new Map() })
+
+  assert.equal(shutdowns, 1)
+  assert.ok(state.lastActionAt > 0, 'the failed attempt starts the cooldown')
+})

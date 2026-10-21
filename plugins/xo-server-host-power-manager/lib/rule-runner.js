@@ -166,9 +166,13 @@ async function tick({ xo, rule, state, powerProviders }) {
       } else {
         await powerOff({ xo, rule, host })
       }
-      state.lastActionAt = now
     } catch (error) {
       log.error(`rule "${rule.label || rule.targetHostId}": ${result.action} failed`, { error })
+    } finally {
+      // A failed attempt counts as an action too: without this, a power-off
+      // whose evacuation fails (a VM that can't be placed) disabled the
+      // host, moved some VMs and gave up again on every poll.
+      state.lastActionAt = now
     }
   } finally {
     state.busy = false

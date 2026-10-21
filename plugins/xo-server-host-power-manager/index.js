@@ -26,6 +26,12 @@ const {
 const { getRunningHosts } = require('./lib/metrics')
 const log = require('./lib/log')
 
+// Lower limits for the two timing settings. A poll interval of 0 or less
+// turned into a ~1 ms loop, and a cooldown of 0 lets a failing power-off
+// retry on every poll and a power-off follow straight after a power-on.
+const MIN_POLL_INTERVAL_SECONDS = 10
+const MIN_COOLDOWN_MINUTES = 1
+
 const cpuMetricSchema = {
   type: 'object',
   title: 'CPU trigger',
@@ -123,13 +129,15 @@ exports.configurationSchema = {
             type: 'number',
             title: 'Poll interval (seconds)',
             default: 60,
+            minimum: MIN_POLL_INTERVAL_SECONDS,
           },
           cooldownMinutes: {
             type: 'number',
             title: 'Cooldown (minutes)',
             default: 15,
+            minimum: MIN_COOLDOWN_MINUTES,
             description:
-              'Minimum time between two power actions on this host, and how long CPU and memory must both stay comfortable before powering it off. Power-on is not delayed by this — only throttled by it.',
+              'Minimum time between two power actions on this host (a failed one counts too), and how long CPU and memory must both stay comfortable before powering it off. Power-on is not delayed by this — only throttled by it.',
           },
         },
         required: ['targetHostId', 'powerProvider'],
@@ -162,6 +170,40 @@ function normalizeRule(rule) {
     ...rule,
     cpu: rule.cpu || { metric: 'none' },
     memory: rule.memory || { metric: 'none' },
+  }
+}
+
+// Settings that would make rules fight each other or flap are refused, so
+// XO shows the error on save and keeps the previous settings running.
+// xo-server already enforces the schema's `minimum`s before configure() is
+// called; they are checked here too so a rule can never run with them.
+function validateRules(rules) {
+  const seenHostIds = new Set()
+  for (const rule of rules) {
+    const label = rule.label || rule.targetHostId
+    if (seenHostIds.has(rule.targetHostId)) {
+      throw new Error(
+        `more than one rule manages host ${rule.targetHostId}: rules for the same host would undo each other's power actions — keep one rule per host`
+      )
+    }
+    seenHostIds.add(rule.targetHostId)
+
+    if (cpuTriggerActive(rule) && rule.cpu.powerOffBelow >= rule.cpu.powerOnAbove) {
+      throw new Error(
+        `rule "${label}", CPU trigger: "Power off when at/below" (${rule.cpu.powerOffBelow}) must be lower than "Power on when at/above" (${rule.cpu.powerOnAbove}), or the host is powered on and off in turn`
+      )
+    }
+    if (memoryTriggerActive(rule) && rule.memory.powerOffAbove <= rule.memory.powerOnBelow) {
+      throw new Error(
+        `rule "${label}", memory trigger: "Power off when at/above" (${rule.memory.powerOffAbove}) must be higher than "Power on when at/below" (${rule.memory.powerOnBelow}), or the host is powered on and off in turn`
+      )
+    }
+    if (!(rule.pollIntervalSeconds >= MIN_POLL_INTERVAL_SECONDS)) {
+      throw new Error(`rule "${label}": Poll interval must be at least ${MIN_POLL_INTERVAL_SECONDS} seconds`)
+    }
+    if (!(rule.cooldownMinutes >= MIN_COOLDOWN_MINUTES)) {
+      throw new Error(`rule "${label}": Cooldown must be at least ${MIN_COOLDOWN_MINUTES} minute`)
+    }
   }
 }
 
@@ -205,8 +247,12 @@ exports.default = function ({ xo }) {
     // itself here, or the plugin goes inert (rules cleared, never
     // rescheduled) until xo-server is restarted.
     configure(configuration, { loaded } = {}) {
+      // Checked before anything is torn down: a refused save leaves the
+      // rules already running untouched.
+      const nextRules = ((configuration && configuration.rules) || []).map(normalizeRule)
+      validateRules(nextRules)
       clearTimers()
-      rules = ((configuration && configuration.rules) || []).map(normalizeRule)
+      rules = nextRules
       // Rules that no longer exist keep no state around.
       const currentIds = new Set(rules.map(rule => rule.targetHostId))
       for (const id of ruleStates.keys()) {

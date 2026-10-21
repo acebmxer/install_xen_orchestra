@@ -12,6 +12,20 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`xo-server-host-power-manager`: settings that make the plugin misbehave
+  are now refused on save.** Two rules for the same host left a background
+  timer running that no later save or unload could stop, and the two rules
+  could undo each other's power actions. Thresholds where power-off is not
+  past power-on (CPU power-off must be lower, memory power-off higher)
+  powered the host on and off in turn, and a poll interval of 0 or less
+  checked about once a millisecond. XO now shows an error naming the rule
+  and keeps the previous settings; the poll interval must be at least 10
+  seconds and the cooldown at least 1 minute. Settings saved earlier that
+  break one of these rules stop the plugin at the next xo-server start until
+  they are corrected under Settings > Plugins. Also, a power-off that failed
+  (a VM that could not be moved off the host) was retried on every poll,
+  moving VMs back and forth each time; a failed attempt now waits for the
+  cooldown like a successful one.
 - **`xo-server-host-power-manager`: the "Average CPU utilization %" metric
   now works.** Every poll failed reading the hosts' CPU stats ("no such
   object undefined"), so a rule using it never acted, and its memory trigger
