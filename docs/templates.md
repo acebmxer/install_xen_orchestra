@@ -16,7 +16,9 @@ distribution's own published cloud image:
 ./install-xen-orchestra.sh --build-templates
 ```
 
-It is also the **VM Template Library** entry in the interactive menu.
+It is also the **VM Template Library** entry in the interactive menu. The
+templates are chosen in an interactive picker, so it needs a terminal:
+`--non-interactive` is refused, and `--dry-run` stops before anything is built.
 
 Run it from your workstation — Debian, Ubuntu, Fedora, Arch, CachyOS, openSUSE
 or anything with `apt`, `dnf`, `pacman`, `zypper` or `apk`. It talks to XO's API

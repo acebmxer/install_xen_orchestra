@@ -8643,7 +8643,8 @@ show_help() {
     echo "  --version              Show this script's version and branch, then exit"
     echo "  --help                 Show this help message"
     echo ""
-    echo "Automation Flags (can be combined with any operation):"
+    echo "Automation Flags (can be combined with any operation; --deploy and"
+    echo "--build-templates refuse --non-interactive and stop at once under --dry-run):"
     echo "  --non-interactive      Bypass all interactive prompts; use config defaults"
     echo "  --yes                  Alias for --non-interactive"
     echo "  --backup-file NAME     With --restore: select specific backup by directory name"
@@ -12100,6 +12101,15 @@ build_vm_templates() {
     echo "  touched; the work happens on the pool."
     echo ""
 
+    # The build steps talk to the pool and to XO directly (dom0_xe, curl,
+    # xo-cli), not through run_cmd, so nothing below honours DRY_RUN. Stop
+    # here, as --deploy does, rather than build for real.
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warning "[DRY-RUN] --build-templates creates VMs and templates on the pool and"
+        log_warning "[DRY-RUN] cannot be meaningfully simulated. No changes were made."
+        return 0
+    fi
+
     # Deliberately not deploy_check_local_deps: that insists on an ISO writer
     # and the openssh client suite, which the API path needs neither of -- it
     # hands the cloud-init document to XO and never opens an SSH connection.
@@ -13693,7 +13703,17 @@ main() {
     fi
 
     if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
-        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --deploy, --adjust-memory, --flush-tokens, --uninstall, --custom-plugins)"
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --flush-tokens, --uninstall, --status, --custom-plugins)"
+        exit 1
+    fi
+
+    # --build-templates chooses what to build in a full-screen picker. With
+    # no terminal that picker reads EOF as Enter and quits with nothing
+    # selected, which looked like a successful run that did nothing. There is
+    # no other way to name the templates, so it is refused like --deploy.
+    if [[ "$NON_INTERACTIVE" == "true" ]] && [[ "$OPERATION" == "--build-templates" ]]; then
+        log_error "--build-templates cannot be combined with --non-interactive."
+        log_error "The templates to build are chosen in an interactive picker."
         exit 1
     fi
 

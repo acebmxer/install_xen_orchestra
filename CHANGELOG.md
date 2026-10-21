@@ -10,6 +10,18 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--build-templates` no longer builds for real under `--dry-run`, and
+  refuses `--non-interactive`.** `--dry-run` went on to create VMs and
+  templates on the pool; it now stops before anything is checked or built,
+  as `--deploy` does. With `--non-interactive` the template picker opened
+  anyway, read the missing keyboard as Enter and quit with "No templates
+  selected"; it is now refused with a message, since the templates can only
+  be chosen in the picker. The list of operations in the "`--non-interactive`
+  requires an explicit operation" error now includes `--status` and no
+  longer offers `--deploy`, which refuses `--non-interactive`.
+
 ## [0.9.5] - 2026-10-21
 
 ### Fixed
