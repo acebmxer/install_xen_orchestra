@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-21
+
 ### Fixed
 
 - **`xo-server-host-power-manager` no longer presses the NanoKVM power
@@ -22,7 +24,8 @@ This installer builds Xen Orchestra from source and tracks the official
   show Running before trying again, for up to the new per-rule **Boot wait
   (minutes)** setting (default 10). A host XO shows as Unknown is left
   alone, and a host disabled for maintenance is no longer shut down. The
-  Test button's logged result now says why an action is held back.
+  Test button's logged result now says why an action is held back. The
+  plugin's version is now 0.2.2.
 - **`xo-server-host-power-manager`: settings that make the plugin misbehave
   are now refused on save.** Two rules for the same host left a background
   timer running that no later save or unload could stop, and the two rules
@@ -2690,7 +2693,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...v0.9.4
