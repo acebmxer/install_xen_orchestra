@@ -10,6 +10,44 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-21
+
+### Fixed
+
+- **`xo-server-host-power-manager` no longer presses the NanoKVM power
+  button on a host that may already be on.** XO shows a host as Halted while
+  it boots or reboots, and the NanoKVM button toggles power, so a slow boot,
+  or a reboot during patching while memory was tight, could get the button
+  pressed and the host switched off mid-boot. The plugin now reads the
+  NanoKVM's power LED first and presses only when it says off (not when it
+  is on or can't be read), and after a power-on it waits for the host to
+  show Running before trying again, for up to the new per-rule **Boot wait
+  (minutes)** setting (default 10). A host XO shows as Unknown is left
+  alone, and a host disabled for maintenance is no longer shut down. The
+  Test button's logged result now says why an action is held back. The
+  plugin's version is now 0.2.2.
+- **`xo-server-host-power-manager`: settings that make the plugin misbehave
+  are now refused on save.** Two rules for the same host left a background
+  timer running that no later save or unload could stop, and the two rules
+  could undo each other's power actions. Thresholds where power-off is not
+  past power-on (CPU power-off must be lower, memory power-off higher)
+  powered the host on and off in turn, and a poll interval of 0 or less
+  checked about once a millisecond. XO now shows an error naming the rule
+  and keeps the previous settings; the poll interval must be at least 10
+  seconds and the cooldown at least 1 minute. Settings saved earlier that
+  break one of these rules stop the plugin at the next xo-server start until
+  they are corrected under Settings > Plugins. Also, a power-off that failed
+  (a VM that could not be moved off the host) was retried on every poll,
+  moving VMs back and forth each time; a failed attempt now waits for the
+  cooldown like a successful one.
+- **`xo-server-host-power-manager`: the "Average CPU utilization %" metric
+  now works.** Every poll failed reading the hosts' CPU stats ("no such
+  object undefined"), so a rule using it never acted, and its memory trigger
+  never acted either. Rules using memory only or the vCPU:pCPU ratio were
+  not affected. Also, a stats reading slower than the poll interval could
+  let two polls act at once and press a NanoKVM power button twice (on, then
+  straight back off); a poll now waits for the previous one to finish.
+
 ## [0.9.6] - 2026-10-21
 
 ### Fixed
@@ -2655,7 +2693,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...v0.9.4

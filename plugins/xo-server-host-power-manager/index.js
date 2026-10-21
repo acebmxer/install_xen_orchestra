@@ -16,6 +16,7 @@ const {
   RuleState,
   tick,
   decide,
+  blockedReason,
   computeCpuValue,
   computeMemoryValue,
   cpuTriggerActive,
@@ -25,6 +26,17 @@ const {
 } = require('./lib/rule-runner')
 const { getRunningHosts } = require('./lib/metrics')
 const log = require('./lib/log')
+
+// Lower limits for the two timing settings. A poll interval of 0 or less
+// turned into a ~1 ms loop, and a cooldown of 0 lets a failing power-off
+// retry on every poll and a power-off follow straight after a power-on.
+const MIN_POLL_INTERVAL_SECONDS = 10
+const MIN_COOLDOWN_MINUTES = 1
+// After a power-on, no further power-on until the host shows Running or
+// this long has passed (rules saved before the setting existed get the
+// default).
+const DEFAULT_BOOT_WAIT_MINUTES = 10
+const MIN_BOOT_WAIT_MINUTES = 1
 
 const cpuMetricSchema = {
   type: 'object',
@@ -123,13 +135,23 @@ exports.configurationSchema = {
             type: 'number',
             title: 'Poll interval (seconds)',
             default: 60,
+            minimum: MIN_POLL_INTERVAL_SECONDS,
           },
           cooldownMinutes: {
             type: 'number',
             title: 'Cooldown (minutes)',
             default: 15,
+            minimum: MIN_COOLDOWN_MINUTES,
             description:
-              'Minimum time between two power actions on this host, and how long CPU and memory must both stay comfortable before powering it off. Power-on is not delayed by this — only throttled by it.',
+              'Minimum time between two power actions on this host (a failed one counts too), and how long CPU and memory must both stay comfortable before powering it off. Power-on is not delayed by this — only throttled by it.',
+          },
+          bootWaitMinutes: {
+            type: 'number',
+            title: 'Boot wait (minutes)',
+            default: DEFAULT_BOOT_WAIT_MINUTES,
+            minimum: MIN_BOOT_WAIT_MINUTES,
+            description:
+              'After a power-on, how long to wait for the host to show Running in XO before another power-on may be tried. Set it longer than the host takes to boot: XO shows a booting host as Halted, and a second NanoKVM press would switch it off.',
           },
         },
         required: ['targetHostId', 'powerProvider'],
@@ -162,6 +184,44 @@ function normalizeRule(rule) {
     ...rule,
     cpu: rule.cpu || { metric: 'none' },
     memory: rule.memory || { metric: 'none' },
+    bootWaitMinutes: rule.bootWaitMinutes ?? DEFAULT_BOOT_WAIT_MINUTES,
+  }
+}
+
+// Settings that would make rules fight each other or flap are refused, so
+// XO shows the error on save and keeps the previous settings running.
+// xo-server already enforces the schema's `minimum`s before configure() is
+// called; they are checked here too so a rule can never run with them.
+function validateRules(rules) {
+  const seenHostIds = new Set()
+  for (const rule of rules) {
+    const label = rule.label || rule.targetHostId
+    if (seenHostIds.has(rule.targetHostId)) {
+      throw new Error(
+        `more than one rule manages host ${rule.targetHostId}: rules for the same host would undo each other's power actions — keep one rule per host`
+      )
+    }
+    seenHostIds.add(rule.targetHostId)
+
+    if (cpuTriggerActive(rule) && rule.cpu.powerOffBelow >= rule.cpu.powerOnAbove) {
+      throw new Error(
+        `rule "${label}", CPU trigger: "Power off when at/below" (${rule.cpu.powerOffBelow}) must be lower than "Power on when at/above" (${rule.cpu.powerOnAbove}), or the host is powered on and off in turn`
+      )
+    }
+    if (memoryTriggerActive(rule) && rule.memory.powerOffAbove <= rule.memory.powerOnBelow) {
+      throw new Error(
+        `rule "${label}", memory trigger: "Power off when at/above" (${rule.memory.powerOffAbove}) must be higher than "Power on when at/below" (${rule.memory.powerOnBelow}), or the host is powered on and off in turn`
+      )
+    }
+    if (!(rule.pollIntervalSeconds >= MIN_POLL_INTERVAL_SECONDS)) {
+      throw new Error(`rule "${label}": Poll interval must be at least ${MIN_POLL_INTERVAL_SECONDS} seconds`)
+    }
+    if (!(rule.cooldownMinutes >= MIN_COOLDOWN_MINUTES)) {
+      throw new Error(`rule "${label}": Cooldown must be at least ${MIN_COOLDOWN_MINUTES} minute`)
+    }
+    if (!(rule.bootWaitMinutes >= MIN_BOOT_WAIT_MINUTES)) {
+      throw new Error(`rule "${label}": Boot wait must be at least ${MIN_BOOT_WAIT_MINUTES} minute`)
+    }
   }
 }
 
@@ -205,8 +265,12 @@ exports.default = function ({ xo }) {
     // itself here, or the plugin goes inert (rules cleared, never
     // rescheduled) until xo-server is restarted.
     configure(configuration, { loaded } = {}) {
+      // Checked before anything is torn down: a refused save leaves the
+      // rules already running untouched.
+      const nextRules = ((configuration && configuration.rules) || []).map(normalizeRule)
+      validateRules(nextRules)
       clearTimers()
-      rules = ((configuration && configuration.rules) || []).map(normalizeRule)
+      rules = nextRules
       // Rules that no longer exist keep no state around.
       const currentIds = new Set(rules.map(rule => rule.targetHostId))
       for (const id of ruleStates.keys()) {
@@ -253,17 +317,21 @@ exports.default = function ({ xo }) {
       const memoryValue = computeMemoryValue(rule, hosts)
 
       const state = ruleStates.get(targetHostId) || new RuleState()
+      const now = Date.now()
       const result = decide({
         rule,
         cpuValue,
         memoryValue,
         hostIsRunning: host.power_state === 'Running',
         offEligibleSinceMs: state.offEligibleSinceMs,
-        now: Date.now(),
+        now,
       })
+      const heldBackBecause =
+        result.action === 'none' ? null : blockedReason({ action: result.action, host, rule, state, now })
 
       const testResult = {
         hostPowerState: host.power_state,
+        hostEnabled: host.enabled,
         runningHostCount: hosts.length,
         cpuTriggerActive: cpuTriggerActive(rule),
         cpuTriggerIncomplete: cpuTriggerIncomplete(rule),
@@ -273,7 +341,8 @@ exports.default = function ({ xo }) {
         memoryTriggerIncomplete: memoryTriggerIncomplete(rule),
         memoryMetric: rule.memory.metric,
         memoryValue,
-        wouldDo: result.action,
+        wouldDo: heldBackBecause === null ? result.action : 'none',
+        heldBackBecause,
       }
       // XO's own "Test plugin" button discards whatever this method
       // returns and shows a static "appears to be working" message on

@@ -85,9 +85,9 @@ exports.default = function ({ xo }) {
       return devicesByHostId.has(hostId)
     },
 
-    // Presses the power button. NanoKVM can't distinguish "the host is off"
-    // from "the host is on" itself — this is used for power-on, where the
-    // caller already knows the host is off.
+    // Presses the power button. NanoKVM's button toggles power, so this is
+    // only safe on a host that is off: xo-server-host-power-manager reads
+    // getPowerState() first and presses only when the power LED says off.
     async powerOn(hostId) {
       const entry = devicesByHostId.get(hostId)
       if (entry === undefined) {
@@ -96,9 +96,10 @@ exports.default = function ({ xo }) {
       await entry.client.pressPower()
     },
 
-    // Best-effort local signal only (reads the NanoKVM's own GPIO power LED
-    // pin) — callers should treat XAPI/XO host state as authoritative and
-    // use this only while a host is booting and not yet reachable there.
+    // Reads the NanoKVM's own GPIO power LED pin: 'on', 'off', or 'unknown'
+    // when the device can't be reached. xo-server-host-power-manager checks
+    // it before every press, since XO shows a booting or rebooting host as
+    // Halted.
     async getPowerState(hostId) {
       const entry = devicesByHostId.get(hostId)
       if (entry === undefined) {

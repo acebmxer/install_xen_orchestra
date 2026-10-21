@@ -78,13 +78,36 @@ test('getVcpuRatio returns 0 when the given hosts have no physical cores', () =>
 test('getAverageCpuPercent averages all core samples, then averages across hosts', async () => {
   const hosts = [{ id: 'h1' }, { id: 'h2' }]
   const xo = {
-    getXapiHostStats: async host =>
-      host.id === 'h1'
+    getXapiHostStats: async hostId =>
+      hostId === 'h1'
         ? { stats: { cpus: { 0: [10, 20], 1: [30, 40] } } } // avg 25
         : { stats: { cpus: { 0: [50, 50] } } }, // avg 50
   }
 
   assert.equal(await getAverageCpuPercent(xo, hosts), 37.5)
+})
+
+// Same lookup xo-server's getXapiHostStats() does: xen-api's getObject()
+// resolves an id string, but given an object it reads `$id`, which XO host
+// objects don't have, and throws.
+function xapiLikeGetObject(idOrObject) {
+  const id = typeof idOrObject === 'string' ? idOrObject : idOrObject.$id
+  if (id !== 'h1') {
+    throw new Error(`no such object ${id}`)
+  }
+  return { uuid: id }
+}
+
+test('getAverageCpuPercent passes the host id, not the XO host object, to getXapiHostStats', async () => {
+  const hosts = [{ type: 'host', id: 'h1', uuid: 'h1', _xapiId: 'h1', _xapiRef: 'OpaqueRef:1' }]
+  const xo = {
+    getXapiHostStats: async hostId => {
+      xapiLikeGetObject(hostId)
+      return { stats: { cpus: { 0: [40, 60] } } }
+    },
+  }
+
+  assert.equal(await getAverageCpuPercent(xo, hosts), 50)
 })
 
 test('getAverageCpuPercent returns 0 when there are no hosts', async () => {
@@ -94,7 +117,7 @@ test('getAverageCpuPercent returns 0 when there are no hosts', async () => {
 test('getAverageCpuPercent skips hosts with no core samples rather than treating them as 0', async () => {
   const hosts = [{ id: 'h1' }, { id: 'h2' }]
   const xo = {
-    getXapiHostStats: async host => (host.id === 'h1' ? { stats: { cpus: {} } } : { stats: { cpus: { 0: [80] } } }),
+    getXapiHostStats: async hostId => (hostId === 'h1' ? { stats: { cpus: {} } } : { stats: { cpus: { 0: [80] } } }),
   }
 
   assert.equal(await getAverageCpuPercent(xo, hosts), 80)

@@ -47,8 +47,10 @@ jobs:
       - name: Push each changed plugin
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # --global: plugin-push.sh commits inside its own temporary clone
+          # of xo-plugins, which never sees this checkout's local config.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           before="${{ github.event.before }}"
           if [ "$before" = "0000000000000000000000000000000000000000" ]; then

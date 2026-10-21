@@ -35,13 +35,21 @@ extra host:
 | Power-on provider | `native` (iLO/DRAC/WoL) or `nanokvm` |
 | CPU trigger | Metric (`Not used`, average % **or** vCPU:pCPU ratio) + power-on/power-off thresholds |
 | Memory trigger | Metric (`Not used`, pool-wide free % or GB, **or** lowest free % or GB on any one running host) + power-on/power-off thresholds |
-| Poll interval | How often to re-check, in seconds (default 60) |
-| Cooldown | Minutes; see **Behavior** below |
+| Poll interval | How often to re-check, in seconds (default 60, at least 10) |
+| Cooldown | Minutes (default 15, at least 1); see **Behavior** below |
+| Boot wait | Minutes (default 10, at least 1): after a power-on, how long to wait for the host to show Running before another power-on may be tried; set it longer than the host takes to boot |
 
 Both triggers are optional and default to `Not used` on a new rule — pick a
 Metric other than `Not used` and fill in its two thresholds to turn a trigger
 on. Use CPU only, memory only, or both; at least one must be configured or
 the rule will never power the host on.
+
+Saving is refused, with an error naming the rule, when two rules manage the
+same host (they would undo each other's power actions), or when a trigger's
+power-off threshold is not past its power-on threshold (CPU: power off must
+be lower than power on; memory: power off must be higher than power on),
+which would power the host on and off in turn. The settings already running
+stay in effect until a save succeeds.
 
 Saving changes here takes effect immediately — no `xo-server` restart
 needed. Each rule's polling restarts fresh on save, so a lowered Cooldown or
@@ -77,13 +85,27 @@ every attempt.
   deliberately asymmetric — scale up fast, scale down slow — so a brief dip
   in load doesn't cause the host to flap on and off.
 - Cooldown also applies as a minimum gap between any two actions on the same
-  host, regardless of direction.
+  host, regardless of direction, and whether or not the action succeeded.
 - If only one trigger is configured (see **Configure** above), that trigger
   alone decides both power-on and power-off — the unset one is ignored
   entirely.
-- If a power-off is blocked by the pool's HA failover plan, the rule leaves
-  the host running and retries on the next poll — it never forces the
-  evacuation or bypasses HA.
+- If a power-off fails (blocked by the pool's HA failover plan, or a VM that
+  can't be moved off the host), the rule leaves the host running and tries
+  again once the cooldown has passed — it never forces the evacuation or
+  bypasses HA.
+- **Nothing is done to a host XO can't vouch for.** A host XO shows as
+  `Unknown` is neither powered on nor shut down. A host that is disabled
+  (maintenance mode) while running is not shut down. After a power-on, no
+  further power-on is tried until the host shows Running or the Boot wait
+  has passed, since XO shows a booting or rebooting host as Halted.
+- **NanoKVM power-on checks the power LED first.** The NanoKVM power button
+  toggles power, so pressing it on a host that is already on would switch it
+  off. The button is pressed only when the NanoKVM reports the power LED
+  off; when the LED is on, or can't be read (NanoKVM unreachable), nothing
+  is pressed and the log says why.
+- Each time a rule holds back an action for one of these reasons, the reason
+  is logged once (not on every poll), and the **Test** result includes it
+  as `heldBackBecause`.
 
 ## Test button
 
@@ -94,8 +116,9 @@ would be taken, so you can sanity-check thresholds before relying on them.
 XO's own "Test plugin" dialog only ever shows a static "appears to be
 working" message — it discards the actual result. To see what a Test click
 actually computed (current CPU/memory values, whether each trigger is
-active, and `wouldDo`), check `sudo journalctl -u xo-server` right after
-clicking it; the result is logged there.
+active, `wouldDo`, and `heldBackBecause` when an action is being held
+back), check `sudo journalctl -u xo-server` right after clicking it; the
+result is logged there.
 
 ## Requires
 

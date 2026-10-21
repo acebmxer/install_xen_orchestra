@@ -1,5 +1,10 @@
 FROM quay.io/centos/centos:stream10
+# EPEL straight from Fedora's own server, not a random mirror from the
+# metalink: a mirror with a broken certificate (mirrors.wcupa.edu) failed
+# image builds at random. Only the [epel] section is changed.
 RUN dnf install -y epel-release \
+    && sed -i -e '/^\[epel\]/,/^\[/{s|^#baseurl=https://download.example/pub/|baseurl=https://dl.fedoraproject.org/pub/|;s|^metalink=|#metalink=|}' \
+       /etc/yum.repos.d/epel.repo \
     && dnf install -y sudo git bash bats ShellCheck ca-certificates \
     openssl xorriso openssh-clients diffutils python3-pyyaml \
     && dnf clean all \

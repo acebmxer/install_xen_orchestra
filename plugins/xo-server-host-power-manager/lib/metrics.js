@@ -35,6 +35,12 @@ exports.getRunningHosts = getRunningHosts
 // confirmed against a real host's /rest/v0/hosts/<id>/stats response, which
 // also confirmed each point is already a 0-100 percentage (values were seen
 // up to ~14 on an idle-ish host), not a 0-1 fraction that needs scaling.
+//
+// getXapiHostStats() takes the host's id, not the XO host object: it looks
+// the host up with xen-api's getObject(), which reads `$id` from an object
+// argument, and XO host objects have none, so passing the object throws
+// "no such object undefined". xo-server's own host.stats API passes an id
+// too.
 async function getAverageCpuPercent(xo, hosts) {
   if (hosts.length === 0) {
     return 0
@@ -42,7 +48,7 @@ async function getAverageCpuPercent(xo, hosts) {
 
   const perHostAverages = await Promise.all(
     hosts.map(async host => {
-      const { stats } = await xo.getXapiHostStats(host, 'seconds')
+      const { stats } = await xo.getXapiHostStats(host.id, 'seconds')
       const cores = stats.cpus ? Object.values(stats.cpus) : []
       if (cores.length === 0) {
         return undefined

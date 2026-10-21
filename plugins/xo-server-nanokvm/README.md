@@ -57,9 +57,10 @@ clicking Test; it's logged there.
 
 ## What it can't do
 
-NanoKVM only knows how to press a button — it can't tell "host is off" from
-"host is on". Power-on works because the caller already knows the host is
-off. This plugin does not attempt to power a host *off*: XO's own
+NanoKVM's power button toggles power: the same press switches a host on or
+off. Before pressing it for a power-on, xo-server-host-power-manager reads
+the power LED through this plugin and presses only when it reports off.
+This plugin does not attempt to power a host *off*: XO's own
 `Host.shutdown` already asks the OS to shut down cleanly (which physically
 powers off standard hardware) and evacuates running VMs first — see
 xo-server-host-power-manager, which uses that for every host regardless of

@@ -104,16 +104,49 @@ function computeMemoryValue(rule, hosts) {
 exports.computeMemoryValue = computeMemoryValue
 
 // One rule's live state between ticks: is a power action already in flight,
-// when did it last run, and (for power-off) since when have both resources
-// been comfortable.
+// when did it last run, (for power-off) since when have both resources
+// been comfortable, when the host was last powered on (for the boot wait),
+// and the last reason an action was held back (so it is logged once, not
+// on every poll).
 class RuleState {
   constructor() {
     this.lastActionAt = 0
     this.offEligibleSinceMs = null
     this.busy = false
+    this.poweredOnAt = null
+    this.lastBlockedReason = null
   }
 }
 exports.RuleState = RuleState
+
+// Why an action decide() asked for must not happen right now, or null.
+// Kept pure, like decide(), so the Test button reports the same answer.
+//
+// - XO reports `Unknown` when a host's metrics are missing: it may well be
+//   running, so neither a power-on press nor a shutdown is safe.
+// - A disabled, running host is in maintenance (patching, a rolling pool
+//   update): the operator took it out on purpose, so it is not shut down.
+//   Power-on is not checked against `enabled`: a host this plugin shut down
+//   stays disabled while it is off.
+// - XO keeps showing `Halted` while a host boots, and a NanoKVM press
+//   toggles power, so after a power-on no further power-on is tried until
+//   the host has shown Running or the rule's boot wait has passed.
+function blockedReason({ action, host, rule, state, now }) {
+  if (host.power_state !== 'Running' && host.power_state !== 'Halted') {
+    return `host power state is "${host.power_state}"`
+  }
+  if (action === 'power-off' && host.enabled === false) {
+    return 'host is disabled (maintenance mode)'
+  }
+  if (action === 'power-on' && state.poweredOnAt !== null) {
+    const bootWaitMs = rule.bootWaitMinutes * 60 * 1000
+    if (now - state.poweredOnAt < bootWaitMs) {
+      return `waiting up to ${rule.bootWaitMinutes} min (boot wait) for the host to show Running after the last power-on`
+    }
+  }
+  return null
+}
+exports.blockedReason = blockedReason
 
 async function tick({ xo, rule, state, powerProviders }) {
   if (state.busy) {
@@ -129,48 +162,83 @@ async function tick({ xo, rule, state, powerProviders }) {
   }
 
   const now = Date.now()
+  if (host.power_state === 'Running') {
+    // Booted: the boot wait after the last power-on is over.
+    state.poweredOnAt = null
+  }
   const cooldownMs = rule.cooldownMinutes * 60 * 1000
   if (now - state.lastActionAt < cooldownMs) {
     return
   }
 
-  const hosts = getRunningHosts(xo, host.$poolId)
-  const [cpuValue, memoryValue] = await Promise.all([
-    computeCpuValue(xo, rule, hosts),
-    Promise.resolve(computeMemoryValue(rule, hosts)),
-  ])
-
-  const hostIsRunning = host.power_state === 'Running'
-  const result = decide({
-    rule,
-    cpuValue,
-    memoryValue,
-    hostIsRunning,
-    offEligibleSinceMs: state.offEligibleSinceMs,
-    now,
-  })
-  state.offEligibleSinceMs = result.offEligibleSinceMs
-
-  if (result.action === 'none') {
-    return
-  }
-
+  // Marked busy before the first await: the stats call can take longer than
+  // the poll interval, and a second tick starting meanwhile would reach the
+  // same decision and press the power button again (on, then off).
   state.busy = true
   try {
-    if (result.action === 'power-on') {
-      await powerOn({ xo, rule, host, powerProviders })
-    } else {
-      await powerOff({ xo, rule, host })
+    const hosts = getRunningHosts(xo, host.$poolId)
+    const [cpuValue, memoryValue] = await Promise.all([
+      computeCpuValue(xo, rule, hosts),
+      Promise.resolve(computeMemoryValue(rule, hosts)),
+    ])
+
+    const hostIsRunning = host.power_state === 'Running'
+    const result = decide({
+      rule,
+      cpuValue,
+      memoryValue,
+      hostIsRunning,
+      offEligibleSinceMs: state.offEligibleSinceMs,
+      now,
+    })
+    state.offEligibleSinceMs = result.offEligibleSinceMs
+
+    if (result.action === 'none') {
+      state.lastBlockedReason = null
+      return
     }
-    state.lastActionAt = now
-  } catch (error) {
-    log.error(`rule "${rule.label || rule.targetHostId}": ${result.action} failed`, { error })
+
+    const label = rule.label || rule.targetHostId
+    const reason = blockedReason({ action: result.action, host, rule, state, now })
+    if (reason !== null) {
+      if (reason !== state.lastBlockedReason) {
+        log.info(`rule "${label}": ${result.action} held back: ${reason}`)
+      }
+      state.lastBlockedReason = reason
+      return
+    }
+    state.lastBlockedReason = null
+
+    let attempted = true
+    try {
+      if (result.action === 'power-on') {
+        attempted = await powerOn({ xo, rule, host, powerProviders })
+      } else {
+        await powerOff({ xo, rule, host })
+      }
+    } catch (error) {
+      log.error(`rule "${label}": ${result.action} failed`, { error })
+    } finally {
+      // A failed attempt counts as an action too: without this, a power-off
+      // whose evacuation fails (a VM that can't be placed) disabled the
+      // host, moved some VMs and gave up again on every poll. A press
+      // skipped because the NanoKVM's power LED was on or unreadable did
+      // nothing, so it is not counted.
+      if (attempted) {
+        state.lastActionAt = now
+        if (result.action === 'power-on') {
+          state.poweredOnAt = now
+        }
+      }
+    }
   } finally {
     state.busy = false
   }
 }
 exports.tick = tick
 
+// Returns false when the NanoKVM press was skipped (nothing was done), true
+// otherwise; throws when the power-on itself failed.
 async function powerOn({ xo, rule, host, powerProviders }) {
   if (rule.powerProvider === 'nanokvm') {
     const provider = powerProviders.get('nanokvm')
@@ -180,9 +248,27 @@ async function powerOn({ xo, rule, host, powerProviders }) {
     if (!provider.supportsHost(host.id)) {
       throw new Error(`xo-server-nanokvm has no device configured for host ${host.id}`)
     }
+    // The power button toggles: pressed on a host that is already on
+    // (booting, rebooting, or shown Halted by XO for any other reason) it
+    // powers it off or starts a shutdown. So the NanoKVM's power LED must
+    // say "off" before pressing; "on" or unreadable means no press.
+    const ledState =
+      typeof provider.getPowerState === 'function' ? await provider.getPowerState(host.id) : 'unsupported'
+    if (ledState === 'on') {
+      log.info(`not pressing the NanoKVM power button for host ${host.name_label} (${host.id}): its power LED is on`)
+      return false
+    }
+    if (ledState !== 'off') {
+      log.warn(
+        ledState === 'unsupported'
+          ? `not pressing the NanoKVM power button for host ${host.name_label} (${host.id}): this xo-server-nanokvm cannot read the power LED — update it`
+          : `not pressing the NanoKVM power button for host ${host.name_label} (${host.id}): its power LED could not be read (NanoKVM unreachable?)`
+      )
+      return false
+    }
     log.info(`powering on host ${host.name_label} (${host.id}) via NanoKVM`)
     await provider.powerOn(host.id)
-    return
+    return true
   }
 
   if (!host.powerOnMode) {
@@ -192,6 +278,7 @@ async function powerOn({ xo, rule, host, powerProviders }) {
   }
   log.info(`powering on host ${host.name_label} (${host.id}) via ${host.powerOnMode}`)
   await xo.getXapi(host.id).powerOnHost(host.id)
+  return true
 }
 
 // shutdownHost() (default options: no force, no bypassEvacuate) already
