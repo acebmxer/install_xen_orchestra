@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-21
+
 ### Fixed
 
 - **The template picker's "already on this pool" label now appears.** It
@@ -21,7 +23,6 @@ This installer builds Xen Orchestra from source and tracks the official
   pool master's password first. The end-of-run summary also counted a
   template that was skipped because it already existed as built; skipped
   templates are now listed separately.
-
 - **Template builds through the XO API stay on one pool.** When XO manages
   several pools, the build could take the pool from one and the default
   storage from another, and the network, base template and guest-tools ISO
@@ -30,7 +31,6 @@ This installer builds Xen Orchestra from source and tracks the official
   one once XO held more than 500 templates. With more than one pool the
   build now asks which pool to build on (a single pool is used without
   asking, as before) and takes everything from that pool.
-
 - **Template builds through the XO API now verify the image checksum.** The
   API build path (the default whenever an API token is set) downloaded,
   converted and uploaded each image without checking it against the
@@ -44,7 +44,6 @@ This installer builds Xen Orchestra from source and tracks the official
 
   The image transfer's progress bar no longer prints "dd.err: No such file
   or directory" when it starts.
-
 - **`--build-templates` no longer builds for real under `--dry-run`, and
   refuses `--non-interactive`.** `--dry-run` went on to create VMs and
   templates on the pool; it now stops before anything is checked or built,
@@ -2656,7 +2655,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...v0.9.3
