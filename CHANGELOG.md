@@ -12,6 +12,15 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Template builds through the XO API stay on one pool.** When XO manages
+  several pools, the build could take the pool from one and the default
+  storage from another, and the network, base template and guest-tools ISO
+  from whichever pool XO listed first. It also skipped a template as
+  "already exists" when only another pool had one, and missed an existing
+  one once XO held more than 500 templates. With more than one pool the
+  build now asks which pool to build on (a single pool is used without
+  asking, as before) and takes everything from that pool.
+
 - **Template builds through the XO API now verify the image checksum.** The
   API build path (the default whenever an API token is set) downloaded,
   converted and uploaded each image without checking it against the

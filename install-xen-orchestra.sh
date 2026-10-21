@@ -10534,12 +10534,42 @@ tpl_json_id_matching() {
     return 0
 }
 
+# The objects in a REST collection whose <field> is exactly <value>, printed
+# as they came (one pretty-printed object after another), so the result can
+# be handed to tpl_json_field / tpl_json_field_where like any response.
+#
+# This is how lookups are kept to one pool: XO lists every pool's objects
+# together, so the build asks for `$pool` alongside what it needs and keeps
+# only the chosen pool's objects before matching on anything else.
+tpl_json_objects_where() {
+    local json="$1" field="$2" value="$3"
+    printf '%s' "$json" | awk -v f="\"${field}\"" -v v="\"${value}\"" '
+        # Braces escaped for busybox awk, as in tpl_json_field_where.
+        /^[[:space:]]*\{/ { buf = ""; hit = 0; inobj = 1 }
+        inobj {
+            buf = buf $0 "\n"
+            p = index($0, f ":")
+            if (p == 0) p = index($0, f " :")
+            if (p > 0) {
+                rest = substr($0, p + length(f))
+                if (match(rest, /"[^"]*"/) && substr(rest, RSTART, RLENGTH) == v) hit = 1
+            }
+        }
+        /^[[:space:]]*\}/ { if (inobj && hit) printf "%s", buf; inobj = 0 }
+    '
+}
+
 # Resolve the SR and network through the API, in place of tpl_resolve_storage
 # and tpl_resolve_network's `xe` calls.
 #
 # The same choice is made as the SSH path makes: the pool's default SR, and the
 # management network. Both are what a VM created in XO's own New VM form would
 # get, so a template built either way lands in the same place.
+#
+# Everything is taken from one pool. XO lists every pool it manages in one
+# response, and reading the first "id" and the first "default_SR" separately
+# could pair one pool with another pool's SR; the PIFs and templates were not
+# filtered by pool at all. With several pools the operator picks one.
 tpl_api_resolve_targets() {
     local pools default_sr pool_id
     if ! pools=$(tpl_api_get "pools?fields=id,default_SR,name_label"); then
@@ -10547,15 +10577,30 @@ tpl_api_resolve_targets() {
         return 1
     fi
 
-    pool_id=$(tpl_json_field "$pools" "id")
-    default_sr=$(tpl_json_field "$pools" "default_SR")
+    local -a pool_opts=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && pool_opts+=("$line")
+    done < <(printf '%s' "$pools" | awk '
+        /^[[:space:]]*\{/ { id = ""; name = "" }
+        match($0, /"id"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            s = substr($0, RSTART, RLENGTH); sub(/^"id"[[:space:]]*:[[:space:]]*"/, "", s); sub(/"$/, "", s); id = s
+        }
+        match($0, /"name_label"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            s = substr($0, RSTART, RLENGTH); sub(/^"name_label"[[:space:]]*:[[:space:]]*"/, "", s); sub(/"$/, "", s); name = s
+        }
+        /^[[:space:]]*\}/ { if (id != "") print id "|" (name != "" ? name : id) }
+    ')
 
-    if [[ -z "$pool_id" ]]; then
+    if [[ ${#pool_opts[@]} -eq 0 ]]; then
         log_error "XO returned no pools. Is a host connected to this XO?"
         return 1
     fi
+    deploy_choose "Which pool should the templates be built on?" "${pool_opts[@]}"
+    pool_id="$DEPLOY_CHOICE"
     TPL_API_POOL_ID="$pool_id"
 
+    default_sr=$(tpl_json_field "$(tpl_json_objects_where "$pools" id "$pool_id")" "default_SR")
     if [[ -z "$default_sr" ]]; then
         log_error "This pool has no default SR set. Set one in XO, or use"
         log_error "TEMPLATE_BUILD_METHOD=ssh to pick storage on the pool master."
@@ -10584,10 +10629,11 @@ tpl_api_resolve_targets() {
     # PIF and the answer read off its $network. A pool has one management PIF
     # per host, all on the same network, so any of them gives the same answer.
     local pifs net_id
-    if ! pifs=$(tpl_api_get "pifs?fields=management,\$network&limit=200"); then
+    if ! pifs=$(tpl_api_get "pifs?fields=management,\$network,\$pool&limit=2000"); then
         log_error "Could not list PIFs from XO."
         return 1
     fi
+    pifs=$(tpl_json_objects_where "$pifs" '$pool' "$pool_id")
     net_id=$(tpl_json_field_where "$pifs" management true '$network')
 
     if [[ -z "$net_id" ]]; then
@@ -10596,10 +10642,11 @@ tpl_api_resolve_targets() {
         # the SSH path falls back too, and an unrouted network is worse than a
         # guess at a routed one.
         local nets
-        if ! nets=$(tpl_api_get "networks?fields=id,name_label,PIFs&limit=200"); then
+        if ! nets=$(tpl_api_get "networks?fields=id,name_label,PIFs,\$pool&limit=2000"); then
             log_error "Could not list networks from XO."
             return 1
         fi
+        nets=$(tpl_json_objects_where "$nets" '$pool' "$pool_id")
         net_id=$(printf '%s' "$nets" | awk '
             /^[[:space:]]*\{/ { id = ""; haspif = 0 }
             /"id"[[:space:]]*:/ && id == "" {
@@ -10926,14 +10973,19 @@ tpl_api_create_build_vm() {
     # here -- SRs, networks, pools -- reports id and uuid identically, which is
     # why this is the only lookup that has to ask for both.
     local tpls base_tpl count
-    tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label&filter=$(tpl_urlencode 'name_label:"Other install media"')&limit=50" 2>/dev/null) || tpls=""
+    #
+    # Kept to the build pool: every pool ships its own "Other install media",
+    # and create_vm on this pool cannot use another pool's.
+    tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label,\$pool&filter=$(tpl_urlencode 'name_label:"Other install media"')&limit=200" 2>/dev/null) || tpls=""
+    tpls=$(tpl_json_objects_where "$tpls" '$pool' "$TPL_API_POOL_ID")
     base_tpl=$(tpl_json_field_where "$tpls" name_label 'Other install media' uuid)
 
     if [[ -z "$base_tpl" ]]; then
-        if ! tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label&limit=1000"); then
+        if ! tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label,\$pool&limit=5000"); then
             log_error "Could not list VM templates from XO."
             return 1
         fi
+        tpls=$(tpl_json_objects_where "$tpls" '$pool' "$TPL_API_POOL_ID")
         base_tpl=$(tpl_json_field_where "$tpls" name_label 'Other install media' uuid)
     fi
     if [[ -z "$base_tpl" ]]; then
@@ -11093,7 +11145,9 @@ tpl_api_attach_tools_iso() {
     # tools from a superseded ISO, which is the sort of thing that works often
     # enough to go unnoticed.
     local isos iso_id
-    if isos=$(tpl_api_get "vdis?fields=id,name_label&limit=2000"); then
+    # Only this pool's copy can be inserted into this pool's VM.
+    if isos=$(tpl_api_get "vdis?fields=id,name_label,\$pool&limit=2000"); then
+        isos=$(tpl_json_objects_where "$isos" '$pool' "$TPL_API_POOL_ID")
         iso_id=$(tpl_json_id_where "$isos" name_label "$TPL_TOOLS_ISO_NAME")
     fi
     if [[ -n "$iso_id" ]] && tpl_xo_cli vm.insertCd id="$TPL_VM_UUID" cd_id="$iso_id" force=true >/dev/null; then
@@ -11305,8 +11359,13 @@ tpl_api_cleanup_failed_build() {
 
 tpl_template_exists_dispatch() {
     if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        # Asked by name (XO's filter is a substring match, so the exact
+        # match is still made here) and kept to the build pool: a same-named
+        # template on another pool is not this pool's, and listing every
+        # template with a limit missed one once a pool held more than that.
         local resp
-        resp=$(tpl_api_get "vm-templates?fields=name_label&limit=500" 2>/dev/null) || return 1
+        resp=$(tpl_api_get "vm-templates?fields=name_label,\$pool&filter=$(tpl_urlencode "name_label:\"$1\"")&limit=200" 2>/dev/null) || return 1
+        resp=$(tpl_json_objects_where "$resp" '$pool' "$TPL_API_POOL_ID")
         printf '%s' "$resp" | grep -qF "\"$1\""
     else
         tpl_template_exists "$1"

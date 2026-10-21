@@ -275,7 +275,10 @@ its checksum format alongside it.
    description, and flags the VM as a template.
 
 Storage and network are not prompted for. The build uses the pool's default SR
-(or the emptiest one, if no default is set) and the management network.
+(or the emptiest one, if no default is set) and the management network. When
+the build goes through the XO API and XO manages more than one pool, it asks
+which pool to build on, and takes the storage, network and base template from
+that pool only.
 
 ## Requirements
 
