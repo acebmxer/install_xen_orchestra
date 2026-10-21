@@ -12,6 +12,14 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Security
 
+- **The pool master's host key is checked properly before the root password
+  is sent.** `--deploy` showed or compared only the ED25519 fingerprint but
+  then trusted every key in the scan, so a different key type answering on
+  that address was accepted without being checked. Only the checked key is
+  trusted now. `--proxy` checked nothing: whatever answered on that address
+  on first contact received the password. It now shows the fingerprint for
+  confirmation, honours `XO_DEPLOY_POOL_FINGERPRINT`, and holds both its own
+  ssh connections and the proxy helper's to the checked key.
 - **Passwords and tokens kept out of `ps`, the debug trace and the log file.**
   Any other user on the machine running the script could read these while
   they were in use:

@@ -15,6 +15,8 @@
 # environment is not. The caller sets these instead:
 #   XO_HELPER_HOST_PASSWORD   SSH password for the pool master
 #   XO_HELPER_XO_PASSWORD     Xen Orchestra web UI password
+# and, optionally (not a secret, kept here beside the others):
+#   XO_HELPER_KNOWN_HOSTS     known_hosts file with the checked pool master key
 #
 # Outputs lines of the form:
 #   CAPTURED_VALUES:
@@ -39,8 +41,22 @@ set actual_proxy_ip ""
 
 log_user 1
 
-# Connect to pool master
-spawn ssh -o StrictHostKeyChecking=accept-new $username@$pool_master
+# Connect to pool master.
+#
+# XO_HELPER_KNOWN_HOSTS, when set, is the run-scoped known_hosts holding the
+# pool master key install-xen-orchestra.sh checked before sending the
+# password (deploy_verify_host_key). The connection is held to that key alone.
+# Without it (the key was already in the operator's own known_hosts, which ssh
+# enforces), accept-new as before.
+set known_hosts ""
+if {[info exists env(XO_HELPER_KNOWN_HOSTS)]} {
+    set known_hosts $env(XO_HELPER_KNOWN_HOSTS)
+}
+if {$known_hosts ne "" && [file exists $known_hosts] && [file size $known_hosts] > 0} {
+    spawn ssh -o UserKnownHostsFile=$known_hosts -o StrictHostKeyChecking=yes $username@$pool_master
+} else {
+    spawn ssh -o StrictHostKeyChecking=accept-new $username@$pool_master
+}
 
 # Handle password prompt
 expect {

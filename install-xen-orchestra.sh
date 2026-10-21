@@ -3969,6 +3969,21 @@ install_xo_proxy() {
         exit 1
     fi
 
+    # Check the pool master's host key before the password is sent.
+    #
+    # The password goes to whatever answers on that address, so the host key
+    # is checked first, the same way --deploy does it: shown for confirmation,
+    # or compared with XO_DEPLOY_POOL_FINGERPRINT. The checked key is pinned in
+    # a run-scoped known_hosts that both ssh calls and the expect helper use.
+    # deploy_verify_host_key and deploy_pin_pool_host_key work in
+    # DEPLOY_WORKDIR, which --proxy has no other use for.
+    DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-proxy-work-XXXXXX)
+    chmod 700 "$DEPLOY_WORKDIR"
+    DEPLOY_POOL_KNOWN_HOSTS=""
+    trap 'rm -rf "$DEPLOY_WORKDIR"' EXIT
+    deploy_verify_host_key
+    pool_master_hostkey_opts
+
     # Test SSH connection
     #
     # `sshpass -e` reading $SSHPASS, never `sshpass -p "$password"`: an argument
@@ -3982,14 +3997,15 @@ install_xo_proxy() {
     # prompt is a change they did not ask for, and the connection works without
     # it. ssh asks for the password itself, so its prompt must not be
     # redirected away here.
+
     log_info "Testing SSH connection to $HOST_USERNAME@$POOL_MASTER_IP..."
     local ssh_ok=0
     if command -v sshpass >/dev/null 2>&1; then
-        SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null || ssh_ok=$?
+        SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${POOL_HOSTKEY_OPTS[@]}" -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null || ssh_ok=$?
     else
         log_info "sshpass is not installed, so ssh will ask for that password once more."
         log_info "  (installing sshpass would avoid the second prompt; nothing else changes)"
-        ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" >/dev/null || ssh_ok=$?
+        ssh "${POOL_HOSTKEY_OPTS[@]}" -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" >/dev/null || ssh_ok=$?
     fi
     if (( ssh_ok != 0 )); then
         log_error "Failed to connect to Pool Master. Please check your credentials."
@@ -4055,7 +4071,7 @@ install_xo_proxy() {
     # Matches deploy_cleanup/tpl_cleanup elsewhere: an EXIT trap so a failure
     # between here and the explicit rm below (a signal, a parsing error under
     # set -euo pipefail) doesn't leave a copy of the helper script in /tmp.
-    trap 'rm -f "$TEMP_SCRIPT"' EXIT
+    trap 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"' EXIT
 
     # Run the expect script
     log_info "Starting XO Proxy installer on Pool Master..."
@@ -4066,7 +4082,12 @@ install_xo_proxy() {
     # readable by any other local user (ps, /proc/<pid>/cmdline) for as long
     # as it runs, while its environment is not. Matches the SSHPASS/-e
     # pattern used for the sshpass calls elsewhere in this script.
+    #
+    # XO_HELPER_KNOWN_HOSTS: the pinned pool master key from above, so the
+    # helper's own ssh is held to it too. Empty when the key was already in
+    # the operator's known_hosts, which ssh enforces by itself.
     OUTPUT=$(XO_HELPER_HOST_PASSWORD="$HOST_PASSWORD" XO_HELPER_XO_PASSWORD="$XO_PASSWORD" \
+        XO_HELPER_KNOWN_HOSTS="$DEPLOY_POOL_KNOWN_HOSTS" \
         "$TEMP_SCRIPT" "$POOL_MASTER_IP" "$HOST_USERNAME" "$PROXY_IP" "$NTP_SERVER" "$XO_USERNAME" 2>&1 | tee /dev/tty)
 
     # Extract values from output (look after CAPTURED_VALUES marker)
@@ -4074,8 +4095,11 @@ install_xo_proxy() {
     PROXY_UUID=$(echo "$OUTPUT" | grep "^PROXY_UUID=" | tail -1 | cut -d'=' -f2)
     AUTH_TOKEN=$(echo "$OUTPUT" | grep "^AUTH_TOKEN=" | tail -1 | cut -d'=' -f2)
 
-    # Clean up temp script
+    # Clean up temp script and the pinned host key; nothing below uses ssh.
     rm -f "$TEMP_SCRIPT"
+    rm -rf "$DEPLOY_WORKDIR"
+    DEPLOY_WORKDIR=""
+    DEPLOY_POOL_KNOWN_HOSTS=""
     trap - EXIT
 
     # Use user-specified IP if not captured
@@ -4344,6 +4368,8 @@ DEPLOY_SSH_OPTS=()
 # checked. Empty until then, which is what keeps dom0_exec usable under `set -u`
 # on the paths that run before the check.
 DEPLOY_POOL_KNOWN_HOSTS=""
+# Set by pool_master_hostkey_opts.
+POOL_HOSTKEY_OPTS=()
 
 # Suppressing `set -x` around anything that touches the pool password.
 #
@@ -4426,6 +4452,35 @@ is_safe_url() {
 # package to install. Set by deploy_connect_pool_master.
 DEPLOY_AUTH_MODE="prompt"
 
+# The ssh options that bind a connection to the pool master's checked key,
+# left in POOL_HOSTKEY_OPTS. Used by dom0_exec (--deploy, the template
+# builder's SSH path) and by --proxy's ssh calls; the expect helper gets the
+# same file through XO_HELPER_KNOWN_HOSTS.
+#
+# Fingerprinting a key and then connecting under `accept-new` against the
+# default known_hosts verifies one transaction and trusts another: nothing
+# stops a different key -- or the same host's RSA key, when the ED25519 one
+# was what was shown -- being accepted at connect time. Pinning the checked
+# key into a run-scoped file and demanding StrictHostKeyChecking=yes is what
+# makes the check bind to the session that carries the host password. This
+# is the same pattern deploy_wait_for_guest already uses for the guest.
+#
+# Before the check has run (DEPLOY_POOL_KNOWN_HOSTS empty) there is nothing to
+# pin against, so `accept-new` stands -- but every caller runs
+# deploy_verify_host_key before the first connection that carries the
+# password. It also stands when the key was already in the operator's own
+# known_hosts, where ssh enforces it anyway.
+pool_master_hostkey_opts() {
+    if [[ -n "$DEPLOY_POOL_KNOWN_HOSTS" && -s "$DEPLOY_POOL_KNOWN_HOSTS" ]]; then
+        POOL_HOSTKEY_OPTS=(
+            -o UserKnownHostsFile="$DEPLOY_POOL_KNOWN_HOSTS"
+            -o StrictHostKeyChecking=yes
+        )
+    else
+        POOL_HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new)
+    fi
+}
+
 dom0_exec() {
     # sshpass reads the password from the environment, which xtrace would print.
     local -
@@ -4439,28 +4494,8 @@ dom0_exec() {
         -o ConnectTimeout=15
     )
 
-    # Bind the connection to the key deploy_verify_host_key actually checked.
-    #
-    # Fingerprinting a key and then connecting under `accept-new` against the
-    # default known_hosts verifies one transaction and trusts another: nothing
-    # stops a different key -- or the same host's RSA key, when the ED25519 one
-    # was what was shown -- being accepted at connect time. Pinning the scanned
-    # key into a run-scoped file and demanding StrictHostKeyChecking=yes is what
-    # makes the check bind to the session that carries the host password. This
-    # is the same pattern deploy_wait_for_guest already uses for the guest.
-    #
-    # Before the check has run (DEPLOY_POOL_KNOWN_HOSTS empty) there is nothing
-    # to pin against, so `accept-new` stands -- but deploy_connect_pool_master
-    # calls deploy_verify_host_key before the first dom0_exec, so no call that
-    # carries the password takes this branch.
-    if [[ -n "$DEPLOY_POOL_KNOWN_HOSTS" && -s "$DEPLOY_POOL_KNOWN_HOSTS" ]]; then
-        common+=(
-            -o UserKnownHostsFile="$DEPLOY_POOL_KNOWN_HOSTS"
-            -o StrictHostKeyChecking=yes
-        )
-    else
-        common+=(-o StrictHostKeyChecking=accept-new)
-    fi
+    pool_master_hostkey_opts
+    common+=("${POOL_HOSTKEY_OPTS[@]}")
     if [[ "$DEPLOY_AUTH_MODE" == "sshpass" ]]; then
         SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${common[@]}" \
             "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@" || rc=$?
@@ -6048,20 +6083,43 @@ deploy_check_local_deps() {
 # Set XO_DEPLOY_POOL_FINGERPRINT to the expected SHA256 fingerprint to check it
 # without a prompt -- the only form of this that works under --non-interactive.
 
-# Pin the scanned host key so dom0_exec is bound to the key that was verified.
+# Pin the checked host key so every later connection is bound to it.
 #
-# Every line of the scan is pinned, not just the ED25519 one whose fingerprint
-# was displayed: the host legitimately offers several types and ssh picks one at
-# negotiation time. Pinning the whole scan means whichever it picks came from
-# the host we checked, while a key that was not in the scan -- an attacker's RSA
-# key offered in place of the ED25519 one we showed the operator -- is rejected
-# outright rather than accepted under `accept-new`.
+# Only the scan line(s) whose fingerprint is the one that was checked -- shown
+# to the operator, or compared with XO_DEPLOY_POOL_FINGERPRINT -- are pinned.
+# Pinning the whole scan trusted every other key type that came back in it
+# without anyone checking it: an RSA key answering beside the real ED25519 one
+# passed the check and was then accepted at connect time. With only the
+# checked key pinned, ssh negotiates that key type, and a host offering any
+# other key fails with "REMOTE HOST IDENTIFICATION HAS CHANGED".
+#
+# Arguments: the scan file, the checked fingerprint (SHA256:...). Exits if no
+# line matches: continuing would fall back to accepting whatever is offered.
 deploy_pin_pool_host_key() {
-    local scan="$1"
+    local scan="$1" checked_fp="$2"
     local pinned="${DEPLOY_WORKDIR}/pool_known_hosts"
+    local one="${DEPLOY_WORKDIR}/pool_hostkey_line"
+    local line fp
 
-    cp "$scan" "$pinned" 2>/dev/null || return 0
-    chmod 600 "$pinned" 2>/dev/null || true
+    if ! { : > "$pinned" && chmod 600 "$pinned"; } 2>/dev/null; then
+        log_error "Could not write ${pinned}; refusing to send the host password."
+        exit 1
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        printf '%s\n' "$line" > "$one"
+        fp=$(ssh-keygen -lf "$one" 2>/dev/null | awk '{print $2}')
+        if [[ -n "$fp" && "$fp" == "$checked_fp" ]]; then
+            printf '%s\n' "$line" >> "$pinned"
+        fi
+    done < "$scan"
+    rm -f "$one"
+
+    if [[ ! -s "$pinned" ]]; then
+        log_error "Could not pin the checked host key of ${POOL_MASTER_IP}; refusing to"
+        log_error "send the host password."
+        exit 1
+    fi
     DEPLOY_POOL_KNOWN_HOSTS="$pinned"
 }
 
@@ -6116,7 +6174,7 @@ deploy_verify_host_key() {
 
     if [[ -n "$expected" ]]; then
         if [[ "$fp" == "$expected" ]]; then
-            deploy_pin_pool_host_key "$scan"
+            deploy_pin_pool_host_key "$scan" "$fp"
             log_success "Pool master host key matches XO_DEPLOY_POOL_FINGERPRINT."
             return 0
         fi
@@ -6141,7 +6199,7 @@ deploy_verify_host_key() {
         # Still pinned: nobody confirmed this key, but binding the run to the one
         # key we saw is strictly better than letting every later connection take
         # whatever is offered.
-        deploy_pin_pool_host_key "$scan"
+        deploy_pin_pool_host_key "$scan" "$fp"
         log_warning "Non-interactive: accepting this key without confirmation."
         log_warning "Set XO_DEPLOY_POOL_FINGERPRINT to have it verified instead."
         return 0
@@ -6151,7 +6209,7 @@ deploy_verify_host_key() {
         exit 1
     fi
 
-    deploy_pin_pool_host_key "$scan"
+    deploy_pin_pool_host_key "$scan" "$fp"
 }
 
 # Collect pool master connection details and open the shared SSH connection.

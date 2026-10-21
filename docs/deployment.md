@@ -232,7 +232,10 @@ confirm it against `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the
 host's console. Once the key is known, `ssh` enforces it and no prompt appears.
 For unattended runs, set `XO_DEPLOY_POOL_FINGERPRINT` to the expected SHA256
 fingerprint and the deploy verifies it instead of prompting, aborting before
-the password is sent if it does not match.
+the password is sent if it does not match. Either way, only the key whose
+fingerprint was checked is trusted for the rest of the run; a host offering any
+other key is refused. `--proxy` does the same check before it sends the
+password.
 
 To deploy a different Debian release, set `XO_DEPLOY_IMAGE_VERSION` and
 `XO_DEPLOY_IMAGE_RELEASE`, or point `XO_DEPLOY_IMAGE_URL` at any raw cloud

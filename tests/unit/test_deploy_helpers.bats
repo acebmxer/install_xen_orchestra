@@ -1075,6 +1075,139 @@ _seed_keys() {
     [[ "$output" != *"accept-new"* ]]
 }
 
+# A scan that returns the host's real ED25519 key plus another key type: the
+# ED25519 fingerprint is what gets checked, so only that line may be pinned.
+# Pinning the whole scan trusted the unchecked key too.
+_two_key_scan() {
+    ssh-keygen -q -t ed25519 -N "" -f "${TMPDIR_TEST}/real_ed25519" >/dev/null
+    ssh-keygen -q -t rsa -b 2048 -N "" -f "${TMPDIR_TEST}/other_rsa" >/dev/null
+    {
+        echo "192.0.2.10 $(cut -d' ' -f1-2 "${TMPDIR_TEST}/real_ed25519.pub")"
+        echo "192.0.2.10 $(cut -d' ' -f1-2 "${TMPDIR_TEST}/other_rsa.pub")"
+    } > "${TMPDIR_TEST}/scan_out"
+    ED25519_FP=$(ssh-keygen -lf "${TMPDIR_TEST}/real_ed25519.pub" | awk '{print $2}')
+}
+
+@test "only the checked host key is pinned, not every key in the scan" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not installed"
+    _two_key_scan
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub"
+    printf '#!/bin/sh\ncat "%s"\n' "${TMPDIR_TEST}/scan_out" > "${stub}/ssh-keyscan"
+    chmod +x "${stub}/ssh-keyscan"
+
+    POOL_MASTER_IP="192.0.2.10"
+    NON_INTERACTIVE=true
+    XO_DEPLOY_POOL_FINGERPRINT="$ED25519_FP"
+    # Not already known: the check would otherwise return before scanning.
+    HOME="$TMPDIR_TEST"
+
+    PATH="${stub}:${PATH}" run deploy_verify_host_key
+    [ "$status" -eq 0 ]
+    [ "$(wc -l < "${TMPDIR_TEST}/pool_known_hosts")" -eq 1 ]
+    grep -q "ssh-ed25519" "${TMPDIR_TEST}/pool_known_hosts"
+    run grep -q "ssh-rsa" "${TMPDIR_TEST}/pool_known_hosts"
+    [ "$status" -eq 1 ]
+}
+
+@test "the confirmed key is the one pinned when no fingerprint is configured" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not installed"
+    _two_key_scan
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub"
+    printf '#!/bin/sh\ncat "%s"\n' "${TMPDIR_TEST}/scan_out" > "${stub}/ssh-keyscan"
+    chmod +x "${stub}/ssh-keyscan"
+
+    POOL_MASTER_IP="192.0.2.10"
+    NON_INTERACTIVE=true
+    unset XO_DEPLOY_POOL_FINGERPRINT
+    HOME="$TMPDIR_TEST"
+
+    PATH="${stub}:${PATH}" run deploy_verify_host_key
+    [ "$status" -eq 0 ]
+    # The fingerprint shown is the ED25519 one, and that is all that is pinned.
+    [[ "$output" == *"$ED25519_FP"* ]]
+    [ "$(wc -l < "${TMPDIR_TEST}/pool_known_hosts")" -eq 1 ]
+    grep -q "ssh-ed25519" "${TMPDIR_TEST}/pool_known_hosts"
+}
+
+# --proxy sent the pool master's root password over a connection that took
+# whatever key answered (accept-new), with no fingerprint shown and
+# XO_DEPLOY_POOL_FINGERPRINT ignored. Runs the real install_xo_proxy up to the
+# helper with ssh, sshpass and expect stubbed.
+_run_proxy_until_helper() {
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub" "${TMPDIR_TEST}/helper"
+    printf '#!/bin/sh\ncat "%s"\n' "${TMPDIR_TEST}/scan_out" > "${stub}/ssh-keyscan"
+    printf '#!/bin/sh\necho "$*" >> "%s/sshpass_args"\nexit 0\n' "$TMPDIR_TEST" > "${stub}/sshpass"
+    printf '#!/bin/sh\nexit 0\n' > "${stub}/ssh"
+    printf '#!/bin/sh\nexit 0\n' > "${stub}/expect"
+    cat > "${TMPDIR_TEST}/helper/xo-proxy-helper.exp" <<EOF
+#!/bin/sh
+echo "\${XO_HELPER_KNOWN_HOSTS}" > "${TMPDIR_TEST}/helper_known_hosts_var"
+cp "\${XO_HELPER_KNOWN_HOSTS}" "${TMPDIR_TEST}/helper_known_hosts" 2>/dev/null
+echo CAPTURED_VALUES:
+EOF
+    chmod +x "${stub}"/* "${TMPDIR_TEST}/helper/xo-proxy-helper.exp"
+
+    run bash -c '
+        _XO_SOURCE_ONLY=1 source "$1"
+        set +e
+        PATH="$2/bin:$PATH"
+        HOME="$2"
+        SCRIPT_DIR="$2/helper"
+        NON_INTERACTIVE=true
+        detect_package_manager() { :; }
+        unset XO_API_TOKEN
+        XO_DEPLOY_POOL_FINGERPRINT="$3"
+        printf "%s\n" 192.0.2.10 root host-pw dhcp "" admin@x xo-pw | install_xo_proxy
+    ' _ "${BATS_TEST_DIRNAME}/../../install-xen-orchestra.sh" "$TMPDIR_TEST" "$1"
+}
+
+@test "--proxy refuses to send the password when the host key does not match" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not installed"
+    _two_key_scan
+    _run_proxy_until_helper "SHA256:definitely-not-the-real-key"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not match XO_DEPLOY_POOL_FINGERPRINT"* ]]
+    [ ! -e "${TMPDIR_TEST}/sshpass_args" ]
+}
+
+@test "--proxy holds its ssh calls and the helper to the checked key" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not installed"
+    _two_key_scan
+    _run_proxy_until_helper "$ED25519_FP"
+
+    [[ "$output" == *"matches XO_DEPLOY_POOL_FINGERPRINT"* ]]
+    grep -q "StrictHostKeyChecking=yes" "${TMPDIR_TEST}/sshpass_args"
+    grep -q "UserKnownHostsFile=" "${TMPDIR_TEST}/sshpass_args"
+    run grep -q "accept-new" "${TMPDIR_TEST}/sshpass_args"
+    [ "$status" -eq 1 ]
+    # The helper got the same pinned file, holding only the checked key.
+    [ -s "${TMPDIR_TEST}/helper_known_hosts_var" ]
+    [ "$(wc -l < "${TMPDIR_TEST}/helper_known_hosts")" -eq 1 ]
+    grep -q "ssh-ed25519" "${TMPDIR_TEST}/helper_known_hosts"
+    # And the run-scoped directory holding it is gone afterwards.
+    [ ! -e "$(cat "${TMPDIR_TEST}/helper_known_hosts_var")" ]
+}
+
+@test "the proxy helper connects with the pinned known_hosts when given one" {
+    command -v expect >/dev/null || skip "expect not installed"
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub"
+    printf '#!/bin/sh\necho "$*" > "%s/ssh_args"\n' "$TMPDIR_TEST" > "${stub}/ssh"
+    chmod +x "${stub}/ssh"
+    echo "192.0.2.10 ssh-ed25519 AAAAFAKE" > "${TMPDIR_TEST}/pinned"
+
+    PATH="${stub}:${PATH}" XO_HELPER_HOST_PASSWORD=x XO_HELPER_XO_PASSWORD=y \
+        XO_HELPER_KNOWN_HOSTS="${TMPDIR_TEST}/pinned" \
+        timeout 20 expect "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp" \
+        192.0.2.10 root dhcp "" admin@x >/dev/null 2>&1 || true
+
+    grep -q "UserKnownHostsFile=${TMPDIR_TEST}/pinned" "${TMPDIR_TEST}/ssh_args"
+    grep -q "StrictHostKeyChecking=yes" "${TMPDIR_TEST}/ssh_args"
+}
+
 # The hash is a credential. The script masks secrets under XO_DEBUG=1
 # everywhere else; these two functions were missing the guard.
 @test "the admin password hash is not printed by xtrace" {
@@ -1497,7 +1630,8 @@ _sha_b() { printf 'b%.0s' $(seq 128); }
     # read as a hang. Matched loosely because `declare -f` renormalises spacing.
     local fallback
     fallback=$(grep -A1 'sshpass would avoid the second prompt' <<< "$body" | tail -1)
-    [[ "$fallback" == *"ssh -o StrictHostKeyChecking"* ]]
+    # The pool master's checked host key comes in through POOL_HOSTKEY_OPTS.
+    [[ "$fallback" == *'ssh "${POOL_HOSTKEY_OPTS[@]}"'* ]]
     [[ "$fallback" != *"sshpass"* ]]
     [[ "$fallback" != *"&> /dev/null"* ]]
     [[ "$fallback" != *"&>/dev/null"* ]]

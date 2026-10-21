@@ -184,7 +184,7 @@ automatically. Do this **while both key halves are still intact**.
 | `XO_DEPLOY_IMAGE_RELEASE` | `--deploy`: Debian codename for the guest (default `trixie`) |
 | `XO_DEPLOY_IMAGE_URL` | `--deploy`: full URL of a raw cloud image, overriding the two above |
 | `XO_DEPLOY_IMAGE_SHA512` | `--deploy`: expected SHA-512 digest of the cloud image (128 hex characters). See the notes below. |
-| `XO_DEPLOY_POOL_FINGERPRINT` | `--deploy`: expected SHA256 host-key fingerprint of the pool master (e.g. `SHA256:abc…`). See the notes below. |
+| `XO_DEPLOY_POOL_FINGERPRINT` | `--deploy` and `--proxy`: expected SHA256 host-key fingerprint of the pool master (e.g. `SHA256:abc…`). See the notes below. |
 | `XO_DEPLOY_ADMIN_PASSWORD` | `--deploy --non-interactive`: password for the VM's admin account. Required — the deploy refuses to run without it. Minimum 12 characters. |
 | `XO_DEPLOY_ADMIN_SSH_PWAUTH` | `--deploy --non-interactive`: set to `true` to allow SSH logins with that password (default `false`, key/console only). |
 | `XO_DEPLOY_ADMIN_SSH_KEY` | `--deploy --non-interactive`: path to, or text of, a public key to install on the admin account. See the notes below. |
@@ -196,8 +196,9 @@ Notes on the `--deploy` variables:
   outright since it cannot be hashed. Without it, the origin's published
   `SHA512SUMS` is used when available.
 - **`XO_DEPLOY_POOL_FINGERPRINT`**: Verified instead of prompting on first
-  connection; the deploy aborts before the host password is sent if it does
-  not match.
+  connection; `--deploy` and `--proxy` abort before the host password is sent
+  if it does not match. Only the key with this fingerprint is trusted for the
+  rest of the run.
 - **`XO_DEPLOY_ADMIN_SSH_KEY`**: Without it the VM ends up console-only, since
   the deployment key is destroyed at the end of the run.
 

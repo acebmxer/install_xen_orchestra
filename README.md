@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-86-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-442%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-447%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -92,7 +92,9 @@ own documented method exactly:
   account uses MFA, or you want no login prompts, set `XO_API_TOKEN` in
   `xo-config.cfg` first; the script then registers `xo-cli` with the token
   against `XO_URL` (or this machine if it is unset) and does not ask for the
-  XO username and password.
+  XO username and password. Before sending the pool master's password it shows
+  the host key fingerprint to confirm, as `--deploy` does
+  (`XO_DEPLOY_POOL_FINGERPRINT` checks it without asking).
 
 ### After `--proxy`: register the proxy and choose its update channel
 
