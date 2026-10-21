@@ -95,6 +95,20 @@ teardown() {
     [ "$rc" -ne 0 ]
 }
 
+@test "the stream helper prints no error when the progress poll runs before dd starts" {
+    # Seen live: "dd.err: No such file or directory" over the progress bar.
+    # The poll read dd's progress file before the background pipeline had
+    # created it; a slow mkfifo (only run with --digest) makes that certain.
+    mkfifo() { sleep 1; command mkfifo "$@"; }
+    local code="" digest="" rc=0
+    deploy_curl_stream_with_progress --digest 512 digest \
+        "$RAW_URL" "" code -s -T - "file://$S/received" 2> "$S/err" || rc=$?
+    [ "$rc" -eq 0 ]
+    [ "$digest" = "$GOOD_RAW" ]
+    run grep -c 'No such file' "$S/err"
+    [ "$output" = "0" ]
+}
+
 @test "the stream helper works as before without --digest" {
     local code="" rc=0
     deploy_curl_stream_with_progress "$RAW_URL" "" code \

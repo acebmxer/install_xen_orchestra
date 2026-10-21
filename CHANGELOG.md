@@ -42,6 +42,9 @@ This installer builds Xen Orchestra from source and tracks the official
   only when the image really was checked (not after the SSH path's
   streaming fallback, or when the origin publishes no checksum).
 
+  The image transfer's progress bar no longer prints "dd.err: No such file
+  or directory" when it starts.
+
 - **`--build-templates` no longer builds for real under `--dry-run`, and
   refuses `--non-interactive`.** `--dry-run` went on to create VMs and
   templates on the pool; it now stops before anything is checked or built,

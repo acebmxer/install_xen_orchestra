@@ -5160,6 +5160,10 @@ deploy_curl_upload_with_progress() {
     d=$(mktemp -d) || return 1
     fifo="$d/pipe"
     if ! mkfifo "$fifo" 2>/dev/null; then rm -rf "$d"; return 1; fi
+    # Created here, not by dd's 2> in the background job: the poll below can
+    # run first, and its `< dd.err` then printed "No such file or directory"
+    # over the progress bar.
+    : > "$d/dd.err"
 
     # Writer. Blocks until curl opens the read end, which is why it is
     # backgrounded before curl rather than after.
@@ -5239,6 +5243,10 @@ deploy_curl_stream_with_progress() {
     local d rc=0 pipepid sent
 
     d=$(mktemp -d) || return 1
+    # Created before the background job, as in
+    # deploy_curl_upload_with_progress: the poll can run before dd's 2>
+    # creates it, which printed "No such file or directory" over the bar.
+    : > "$d/dd.err"
 
     DEPLOY_PROGRESS_FILLED=0
     DEPLOY_PROGRESS_PCT=-1
