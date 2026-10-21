@@ -175,6 +175,38 @@ EOF
     [ "$status" -eq 1 ]
 }
 
+@test "XO_DEBUG's trace leaves out the passwords typed into --proxy" {
+    # install_xo_proxy turns tracing off for itself; two lines used to turn it
+    # back on straight after each password prompt, so the sshpass call and
+    # the helper's environment were traced with the passwords in them. Runs
+    # the real function as far as the helper, with ssh/sshpass/expect stubbed.
+    mkdir -p "${TMPDIR_TEST}/bin" "${TMPDIR_TEST}/helper"
+    printf '#!/bin/bash\nexit 0\n' > "${TMPDIR_TEST}/bin/sshpass"
+    printf '#!/bin/bash\nexit 0\n' > "${TMPDIR_TEST}/bin/ssh"
+    printf '#!/bin/bash\nexit 0\n' > "${TMPDIR_TEST}/bin/expect"
+    printf '#!/bin/bash\necho CAPTURED_VALUES:\nexit 0\n' > "${TMPDIR_TEST}/helper/xo-proxy-helper.exp"
+    chmod +x "${TMPDIR_TEST}"/bin/* "${TMPDIR_TEST}/helper/xo-proxy-helper.exp"
+
+    run bash -c '
+        _XO_SOURCE_ONLY=1 source "$1"
+        set +e
+        PATH="$2/bin:$PATH"
+        SCRIPT_DIR="$2/helper"
+        detect_package_manager() { :; }
+        unset XO_API_TOKEN
+        XO_DEBUG=1
+        set -x
+        printf "%s\n" 10.0.0.1 root host-secret-pw dhcp "" admin@x xo-secret-pw \
+            | install_xo_proxy > /dev/null 2> "$2/trace"
+        set +x
+        grep -c . "$2/trace"
+    ' _ "$SCRIPT" "$TMPDIR_TEST"
+
+    [ -s "${TMPDIR_TEST}/trace" ]
+    run grep -E "host-secret-pw|xo-secret-pw" "${TMPDIR_TEST}/trace"
+    [ "$status" -eq 1 ]
+}
+
 @test "a function that pauses the trace turns it back on when it returns" {
     run bash -c '
         _XO_SOURCE_ONLY=1 source "$1"

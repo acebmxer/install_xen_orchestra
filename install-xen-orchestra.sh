@@ -3962,14 +3962,12 @@ install_xo_proxy() {
     read -p "Host username [root]: " HOST_USERNAME
     HOST_USERNAME=${HOST_USERNAME:-root}
 
-    { set +x; } 2>/dev/null
     read -sp "Host password: " HOST_PASSWORD
     echo ""
     if [[ -z "$HOST_PASSWORD" ]]; then
         log_error "Host password is required"
         exit 1
     fi
-    [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
 
     # Test SSH connection
     #
@@ -4033,14 +4031,12 @@ install_xo_proxy() {
             exit 1
         fi
 
-        { set +x; } 2>/dev/null
         read -sp "Xen Orchestra login password: " XO_PASSWORD
         echo ""
         if [[ -z "$XO_PASSWORD" ]]; then
             log_error "Xen Orchestra password is required"
             exit 1
         fi
-        [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
     fi
 
     # Copy the companion expect script to a temp file for execution
