@@ -3756,6 +3756,7 @@ reconfigure_xo() {
     log_warning "  - /etc/xo-server/config.toml"
     log_warning "  - /etc/systemd/system/xo-server.service"
     log_warning "  - /etc/sudoers.d/xo-server-* (if non-root service user)"
+    log_warning "  - a new self-signed certificate in ${SSL_CERT_DIR} (only if it has none)"
     echo ""
     log_info "Current configuration from xo-config.cfg:"
     echo "  - HTTP Port:        ${HTTP_PORT}"
@@ -3832,6 +3833,12 @@ reconfigure_xo() {
     # overwrites the unit this is read from).
     local PREV_SERVICE_USER
     PREV_SERVICE_USER=$(get_previous_service_user)
+
+    # Issue a self-signed certificate if SSL_CERT_DIR has none (deleted to
+    # renew an expiring one, or SSL_CERT_DIR changed to a new folder), so the
+    # config.toml written next never points at missing files. An existing
+    # certificate is never replaced.
+    generate_ssl_certificate
 
     # Regenerate configuration
     configure_xo

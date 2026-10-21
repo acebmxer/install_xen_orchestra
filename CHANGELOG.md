@@ -12,6 +12,14 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Following the certificate renewal advice no longer leaves XO without
+  HTTPS.** The expiry warning, `--status` and the sample config say to
+  delete the files in `SSL_CERT_DIR` and run `--reconfigure`, but
+  `--reconfigure` never issued a certificate, so xo-server was left pointing
+  at files that no longer existed. `--reconfigure` now issues a new
+  self-signed certificate when `SSL_CERT_DIR` has none, which also covers
+  changing `SSL_CERT_DIR` to an empty folder. An existing certificate,
+  including one you supplied, is never replaced.
 - **Running the script once with sudo no longer breaks self-update.** The
   script checked for updates (`git fetch`/`pull` in its own folder) before
   refusing root, so a sudo run left root-owned files in `.git` and every
