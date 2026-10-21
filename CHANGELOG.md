@@ -12,6 +12,13 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`--uninstall`'s "purge Redis data" no longer stops Redis from starting.**
+  It deleted `/var/lib/redis` itself, which Debian's Redis can't start
+  without, so a later reinstall stopped at "Redis/Valkey is not running". It
+  now empties the data directory instead, and stops the service actually in
+  use first (Valkey was never stopped, so it could write its data back) and
+  starts it again afterwards. If the service can't be stopped, nothing is
+  deleted.
 - **`--uninstall` stops and disables xo-server.** The check for the service
   never matched, so the uninstall removed the unit file and the install
   directory while xo-server kept running and holding ports 80/443, and left

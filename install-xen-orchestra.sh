@@ -1628,6 +1628,56 @@ flush_tokens_standalone() {
     log_success "Token flush complete."
 }
 
+# Print the name of whichever redis-compatible service this distro installed,
+# or nothing if there is none:
+#   Debian/Ubuntu -> redis-server    RHEL/CentOS -> redis
+#   Fedora / newer RHEL -> valkey (drop-in replacement for redis)
+# `systemctl cat` succeeds only when the unit file actually exists, which is a
+# more reliable test than grepping `list-unit-files` output.
+detect_redis_service() {
+    local candidate
+    for candidate in redis-server redis valkey valkey-server; do
+        if systemctl cat "${candidate}.service" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Delete everything Redis/Valkey has stored, for --uninstall's "purge Redis
+# data". The server is stopped first (it would write its data back on its next
+# save) and started again afterwards. Only the contents of each data directory
+# go: the directories themselves stay, because Debian's redis unit doesn't
+# recreate /var/lib/redis and the server can't start without it.
+#   $@  data directories (missing ones are skipped)
+purge_redis_data() {
+    local redis_svc
+    redis_svc=$(detect_redis_service)
+
+    if [[ -n "$redis_svc" ]]; then
+        if ! run_cmd sudo systemctl stop "$redis_svc" 2>/dev/null; then
+            log_warning "Could not stop ${redis_svc}; Redis data was NOT purged."
+            return 0
+        fi
+    else
+        log_warning "No redis/valkey systemd unit found; purging data files only."
+    fi
+
+    local dir
+    for dir in "$@"; do
+        if sudo test -d "$dir"; then
+            run_cmd sudo find "$dir" -mindepth 1 -delete || \
+                log_warning "Could not remove everything in ${dir}"
+        fi
+    done
+
+    if [[ -n "$redis_svc" ]]; then
+        run_cmd sudo systemctl start "$redis_svc" 2>/dev/null || \
+            log_warning "${redis_svc} did not start again; check: sudo systemctl status ${redis_svc}"
+    fi
+}
+
 # Start and enable Redis
 setup_redis() {
     log_info "Setting up Redis..."
@@ -1638,19 +1688,8 @@ setup_redis() {
     # before we probe for it.
     run_cmd sudo systemctl daemon-reload 2>/dev/null || true
 
-    # Detect whichever redis-compatible service this distro installed:
-    #   Debian/Ubuntu -> redis-server    RHEL/CentOS -> redis
-    #   Fedora / newer RHEL -> valkey (drop-in replacement for redis)
-    # `systemctl cat` succeeds only when the unit file actually exists, which is a
-    # more reliable test than grepping `list-unit-files` output.
-    local redis_svc=""
-    local candidate
-    for candidate in redis-server redis valkey valkey-server; do
-        if systemctl cat "${candidate}.service" >/dev/null 2>&1; then
-            redis_svc="$candidate"
-            break
-        fi
-    done
+    local redis_svc
+    redis_svc=$(detect_redis_service)
 
     if [[ -n "$redis_svc" ]]; then
         log_info "Enabling and starting ${redis_svc}.service"
@@ -8182,9 +8221,7 @@ cleanup_xo() {
     echo ""
     if confirm_or_skip "Also purge Redis data? (WARNING: removes all Redis databases on this host)"; then
         log_info "Purging Redis data..."
-        run_cmd sudo systemctl stop redis-server 2>/dev/null || \
-            run_cmd sudo systemctl stop redis 2>/dev/null || true
-        run_cmd sudo rm -rf /var/lib/redis /var/lib/valkey 2>/dev/null || true
+        purge_redis_data /var/lib/redis /var/lib/valkey
     fi
 
     log_success "Xen Orchestra has been uninstalled."
