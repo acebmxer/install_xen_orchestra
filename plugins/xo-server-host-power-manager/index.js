@@ -16,6 +16,7 @@ const {
   RuleState,
   tick,
   decide,
+  blockedReason,
   computeCpuValue,
   computeMemoryValue,
   cpuTriggerActive,
@@ -31,6 +32,11 @@ const log = require('./lib/log')
 // retry on every poll and a power-off follow straight after a power-on.
 const MIN_POLL_INTERVAL_SECONDS = 10
 const MIN_COOLDOWN_MINUTES = 1
+// After a power-on, no further power-on until the host shows Running or
+// this long has passed (rules saved before the setting existed get the
+// default).
+const DEFAULT_BOOT_WAIT_MINUTES = 10
+const MIN_BOOT_WAIT_MINUTES = 1
 
 const cpuMetricSchema = {
   type: 'object',
@@ -139,6 +145,14 @@ exports.configurationSchema = {
             description:
               'Minimum time between two power actions on this host (a failed one counts too), and how long CPU and memory must both stay comfortable before powering it off. Power-on is not delayed by this — only throttled by it.',
           },
+          bootWaitMinutes: {
+            type: 'number',
+            title: 'Boot wait (minutes)',
+            default: DEFAULT_BOOT_WAIT_MINUTES,
+            minimum: MIN_BOOT_WAIT_MINUTES,
+            description:
+              'After a power-on, how long to wait for the host to show Running in XO before another power-on may be tried. Set it longer than the host takes to boot: XO shows a booting host as Halted, and a second NanoKVM press would switch it off.',
+          },
         },
         required: ['targetHostId', 'powerProvider'],
       },
@@ -170,6 +184,7 @@ function normalizeRule(rule) {
     ...rule,
     cpu: rule.cpu || { metric: 'none' },
     memory: rule.memory || { metric: 'none' },
+    bootWaitMinutes: rule.bootWaitMinutes ?? DEFAULT_BOOT_WAIT_MINUTES,
   }
 }
 
@@ -203,6 +218,9 @@ function validateRules(rules) {
     }
     if (!(rule.cooldownMinutes >= MIN_COOLDOWN_MINUTES)) {
       throw new Error(`rule "${label}": Cooldown must be at least ${MIN_COOLDOWN_MINUTES} minute`)
+    }
+    if (!(rule.bootWaitMinutes >= MIN_BOOT_WAIT_MINUTES)) {
+      throw new Error(`rule "${label}": Boot wait must be at least ${MIN_BOOT_WAIT_MINUTES} minute`)
     }
   }
 }
@@ -299,17 +317,21 @@ exports.default = function ({ xo }) {
       const memoryValue = computeMemoryValue(rule, hosts)
 
       const state = ruleStates.get(targetHostId) || new RuleState()
+      const now = Date.now()
       const result = decide({
         rule,
         cpuValue,
         memoryValue,
         hostIsRunning: host.power_state === 'Running',
         offEligibleSinceMs: state.offEligibleSinceMs,
-        now: Date.now(),
+        now,
       })
+      const heldBackBecause =
+        result.action === 'none' ? null : blockedReason({ action: result.action, host, rule, state, now })
 
       const testResult = {
         hostPowerState: host.power_state,
+        hostEnabled: host.enabled,
         runningHostCount: hosts.length,
         cpuTriggerActive: cpuTriggerActive(rule),
         cpuTriggerIncomplete: cpuTriggerIncomplete(rule),
@@ -319,7 +341,8 @@ exports.default = function ({ xo }) {
         memoryTriggerIncomplete: memoryTriggerIncomplete(rule),
         memoryMetric: rule.memory.metric,
         memoryValue,
-        wouldDo: result.action,
+        wouldDo: heldBackBecause === null ? result.action : 'none',
+        heldBackBecause,
       }
       // XO's own "Test plugin" button discards whatever this method
       // returns and shows a static "appears to be working" message on

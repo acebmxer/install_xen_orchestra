@@ -107,4 +107,33 @@ test('the settings form carries the same minimums, so XO rejects them on save', 
   const ruleSchema = plugin.configurationSchema.properties.rules.items.properties
   assert.equal(ruleSchema.pollIntervalSeconds.minimum, 10)
   assert.equal(ruleSchema.cooldownMinutes.minimum, 1)
+  assert.equal(ruleSchema.bootWaitMinutes.minimum, 1)
+  assert.equal(ruleSchema.bootWaitMinutes.default, 10)
+})
+
+test('configure refuses a boot wait under 1 minute, and a rule saved without one gets 10', () => {
+  const instance = plugin.default({ xo: {} })
+  for (const bootWaitMinutes of [0, -1]) {
+    assert.throws(() => instance.configure({ rules: [rule({ bootWaitMinutes })] }), /Boot wait must be at least 1 minute/)
+  }
+  instance.configure({ rules: [rule()] })
+})
+
+test('the Test button reports an action held back, and why', async () => {
+  const objects = {
+    h1: { type: 'host', id: 'h1', $poolId: 'pool1', enabled: true, power_state: 'Running', memory: { size: 64, usage: 60 } },
+    h3: { type: 'host', id: 'h3', $poolId: 'pool1', enabled: false, power_state: 'Unknown' },
+  }
+  const xo = { getObject: id => objects[id], getObjects: () => objects }
+  const instance = plugin.default({ xo })
+  instance.configure({ rules: [rule()] })
+
+  const result = await instance.test({ targetHostId: 'h3' })
+  assert.equal(result.wouldDo, 'none')
+  assert.match(result.heldBackBecause, /power state is "Unknown"/)
+
+  objects.h3.power_state = 'Halted'
+  const halted = await instance.test({ targetHostId: 'h3' })
+  assert.equal(halted.wouldDo, 'power-on')
+  assert.equal(halted.heldBackBecause, null)
 })

@@ -12,6 +12,17 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`xo-server-host-power-manager` no longer presses the NanoKVM power
+  button on a host that may already be on.** XO shows a host as Halted while
+  it boots or reboots, and the NanoKVM button toggles power, so a slow boot,
+  or a reboot during patching while memory was tight, could get the button
+  pressed and the host switched off mid-boot. The plugin now reads the
+  NanoKVM's power LED first and presses only when it says off (not when it
+  is on or can't be read), and after a power-on it waits for the host to
+  show Running before trying again, for up to the new per-rule **Boot wait
+  (minutes)** setting (default 10). A host XO shows as Unknown is left
+  alone, and a host disabled for maintenance is no longer shut down. The
+  Test button's logged result now says why an action is held back.
 - **`xo-server-host-power-manager`: settings that make the plugin misbehave
   are now refused on save.** Two rules for the same host left a background
   timer running that no later save or unload could stop, and the two rules

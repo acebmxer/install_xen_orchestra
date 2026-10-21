@@ -13,6 +13,7 @@ const {
   computeMemoryValue,
   RuleState,
   tick,
+  blockedReason,
 } = require('../lib/rule-runner')
 
 const GB = 1024 * 1024 * 1024
@@ -159,7 +160,7 @@ test('decide: a trigger left "Not used" never requests power-on and never blocks
 // A pool with one running host (h1, tight on memory) and the managed host
 // (h3, off). getXapiHostStats takes `statsDelayMs` to answer, standing in
 // for a stats call slower than the poll interval.
-function tickFixture({ statsDelayMs = 0, h3 = {} } = {}) {
+function tickFixture({ statsDelayMs = 0, h3 = {}, led = 'off' } = {}) {
   const objects = {
     h1: {
       type: 'host',
@@ -180,7 +181,7 @@ function tickFixture({ statsDelayMs = 0, h3 = {} } = {}) {
   }
   const nanokvm = {
     supportsHost: () => true,
-    getPowerState: async () => 'off',
+    getPowerState: async () => led,
     powerOn: async hostId => {
       presses.push(hostId)
     },
@@ -237,4 +238,98 @@ test('tick: a failed power-off waits for the cooldown before trying again', asyn
 
   assert.equal(shutdowns, 1)
   assert.ok(state.lastActionAt > 0, 'the failed attempt starts the cooldown')
+})
+
+test('tick: no NanoKVM press while the power LED says on or cannot be read', async () => {
+  for (const led of ['on', 'unknown']) {
+    const { xo, rule, presses, powerProviders } = tickFixture({ led })
+    const state = new RuleState()
+
+    await tick({ xo, rule, state, powerProviders })
+
+    assert.deepEqual(presses, [], `LED "${led}" must not be pressed`)
+    assert.equal(state.lastActionAt, 0, 'a skipped press is not counted as an action')
+  }
+
+  // Positive control: same pool, LED off -> pressed.
+  const { xo, rule, presses, powerProviders } = tickFixture({ led: 'off' })
+  await tick({ xo, rule, state: new RuleState(), powerProviders })
+  assert.deepEqual(presses, ['h3'])
+})
+
+test('tick: a host XO shows as Unknown is neither powered on nor shut down', async () => {
+  const { xo, rule, presses, powerProviders } = tickFixture({ h3: { power_state: 'Unknown' } })
+  await tick({ xo, rule, state: new RuleState(), powerProviders })
+  assert.deepEqual(presses, [])
+})
+
+test('tick: a disabled (maintenance) running host is not shut down', async () => {
+  const objects = {
+    h1: { type: 'host', id: 'h1', $poolId: 'pool1', enabled: true, power_state: 'Running', memory: { size: 64 * GB, usage: 8 * GB } },
+    h3: { type: 'host', id: 'h3', name_label: 'host3', $poolId: 'pool1', enabled: false, power_state: 'Running' },
+  }
+  let shutdowns = 0
+  const xo = {
+    getObject: id => objects[id],
+    getObjects: () => objects,
+    getXapi: () => ({
+      shutdownHost: async () => {
+        shutdowns++
+      },
+    }),
+  }
+  const rule = baseRule({
+    targetHostId: 'h3',
+    powerProvider: 'native',
+    memory: { metric: 'percentFree', powerOnBelow: 15, powerOffAbove: 40 },
+  })
+  const state = new RuleState()
+  state.offEligibleSinceMs = Date.now() - COOLDOWN_MS - 1
+
+  await tick({ xo, rule, state, powerProviders: new Map() })
+  assert.equal(shutdowns, 0)
+
+  // Positive control: the same host, enabled again, is shut down.
+  objects.h3.enabled = true
+  await tick({ xo, rule, state, powerProviders: new Map() })
+  assert.equal(shutdowns, 1)
+})
+
+test('tick: after a power-on, no second press until the boot wait has passed', async () => {
+  const { xo, rule, presses, powerProviders } = tickFixture()
+  rule.bootWaitMinutes = 30 // longer than the fixture's 10-minute cooldown
+  const state = new RuleState()
+
+  await tick({ xo, rule, state, powerProviders })
+  assert.deepEqual(presses, ['h3'])
+
+  // Cooldown over, host still shown Halted, LED not reporting on (e.g. the
+  // LED header isn't wired): the boot wait still holds the second press.
+  state.lastActionAt -= COOLDOWN_MS + 1
+  state.poweredOnAt -= COOLDOWN_MS + 1
+  await tick({ xo, rule, state, powerProviders })
+  assert.deepEqual(presses, ['h3'])
+
+  // Boot wait over -> the host never came up, so it is pressed again.
+  state.poweredOnAt -= 30 * 60 * 1000
+  await tick({ xo, rule, state, powerProviders })
+  assert.deepEqual(presses, ['h3', 'h3'])
+})
+
+test('blockedReason: the boot wait holds a power-on until it has passed, never a power-off', () => {
+  const rule = baseRule({ bootWaitMinutes: 10 })
+  const state = new RuleState()
+  state.poweredOnAt = 1000
+  const halted = { power_state: 'Halted', enabled: false }
+  assert.match(blockedReason({ action: 'power-on', host: halted, rule, state, now: 2000 }), /boot wait/)
+  assert.equal(blockedReason({ action: 'power-on', host: halted, rule, state, now: 1000 + 10 * 60 * 1000 }), null)
+  assert.equal(blockedReason({ action: 'power-off', host: { power_state: 'Running', enabled: true }, rule, state, now: 2000 }), null)
+})
+
+test('tick: a host seen Running ends the boot wait', async () => {
+  const { xo, rule, powerProviders } = tickFixture({ h3: { power_state: 'Running', enabled: true } })
+  const state = new RuleState()
+  state.poweredOnAt = Date.now()
+  await tick({ xo, rule, state, powerProviders })
+  assert.equal(state.poweredOnAt, null)
 })
