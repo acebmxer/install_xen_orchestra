@@ -115,6 +115,21 @@ log_error() {
     _log "ERROR" "$1"
 }
 
+# Print the value of the variable named by $1, escaped for a double-quoted
+# curl config value (curl -K). Inside double quotes curl's config parser treats
+# backslash as an escape (\n, \t, \\, \"), so backslashes are doubled before
+# quotes are escaped; escaping only the quotes turned "pa\ss\nword" into
+# "pass", a newline and "word". Takes the variable's NAME so the secret is not
+# an argument xtrace would print. Every curl config line built from a secret
+# goes through this; do not add a second escaper.
+curl_config_quote() {
+    { set +x; } 2>/dev/null
+    local value="${!1}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
+}
+
 # Print a curl config line carrying XO's authenticationToken cookie.
 #
 # Takes the NAME of the variable holding the token, never the token: a
@@ -123,15 +138,9 @@ log_error() {
 # command line, which any local user can read in ps or /proc/<pid>/cmdline
 # while curl runs. A process substitution rather than `-K -` because some
 # callers already feed the request body on stdin (--data-binary @-).
-#
-# Inside double quotes curl's config parser treats backslash as an escape, so
-# backslashes are doubled before quotes are escaped.
 xo_cookie_config() {
     { set +x; } 2>/dev/null
-    local value="${!1}"
-    value=${value//\\/\\\\}
-    value=${value//\"/\\\"}
-    printf 'cookie = "authenticationToken=%s"\n' "$value"
+    printf 'cookie = "authenticationToken=%s"\n' "$(curl_config_quote "$1")"
 }
 
 # Write xo-cli's settings file (<config home>/xo-cli/config.json) with the
@@ -3111,10 +3120,11 @@ check_active_xo_tasks() {
                     "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
                     2>/dev/null) || true
             else
-                # Basic auth — pipe credentials via curl's -K stdin to keep password out of argv
+                # Basic auth — pipe credentials via curl's -K stdin to keep password out of argv.
+                # Escaped by curl_config_quote: backslashes too, not just quotes.
                 local esc_user esc_pass
-                esc_user=$(printf '%s' "$xo_user" | sed 's/"/\\"/g')
-                esc_pass=$(printf '%s' "$xo_pass" | sed 's/"/\\"/g')
+                esc_user=$(curl_config_quote xo_user)
+                esc_pass=$(curl_config_quote xo_pass)
 
                 http_code=$(printf 'user = "%s:%s"\n' "$esc_user" "$esc_pass" | \
                     curl "${curl_opts[@]}" -K - \

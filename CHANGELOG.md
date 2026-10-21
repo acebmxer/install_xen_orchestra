@@ -48,6 +48,15 @@ This installer builds Xen Orchestra from source and tracks the official
   as the Template Library: the plugin picker replaced the build's cleanup on
   exit instead of running after it.
 
+### Fixed
+
+- **The running-task check works with a password containing a backslash.**
+  With `XO_TASK_CHECK_USER`/`XO_TASK_CHECK_PASS` (or the password typed at
+  the prompt), a backslash in the password was altered on the way to XO
+  (`\n` became a newline), the login failed with 401, and under
+  `--non-interactive` the check was skipped, so an update could go ahead
+  while tasks were running.
+
 ## [0.9.3] - 2026-10-19
 
 ### Added
