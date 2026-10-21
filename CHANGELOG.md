@@ -12,6 +12,12 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`--restore` and `--list-backups` work when `SERVICE_USER` is not root.**
+  Backups of such an install can be read only by root, and the checks ran as
+  the user running the script, so every backup was listed as
+  `[INCOMPLETE/CORRUPT]` without its commit and the restore was refused. The
+  checks now go through sudo. Installs with the default `SERVICE_USER=root`
+  were not affected.
 - **`--uninstall`'s "purge Redis data" no longer stops Redis from starting.**
   It deleted `/var/lib/redis` itself, which Debian's Redis can't start
   without, so a later reinstall stopped at "Redis/Valkey is not running". It

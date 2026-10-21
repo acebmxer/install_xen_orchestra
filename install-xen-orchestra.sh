@@ -2869,7 +2869,12 @@ create_backup() {
 verify_backup_integrity() {
     local backup_path="$1"
 
-    if [[ ! -d "$backup_path" ]]; then
+    # Every test below goes through sudo. create_backup() copies with
+    # `sudo cp -r`, so a backup of a non-root SERVICE_USER's install is
+    # root-owned with that install's 750 mode, and this script refuses to run
+    # as root (check_not_root): a plain test, run as the invoking user, can't
+    # look inside it and would call every such backup incomplete.
+    if ! sudo test -d "$backup_path"; then
         log_error "  ${backup_path} is not a directory."
         return 1
     fi
@@ -2877,11 +2882,8 @@ verify_backup_integrity() {
     # package.json at the root is the one file every XO checkout has,
     # regardless of branch, commit, or how deep the monorepo's packages
     # directory tree goes -- so its absence means the copy never completed,
-    # or this directory never held an XO checkout at all. This runs as
-    # whatever restore_xo itself is running as (root, per check_not_root
-    # elsewhere), which can always read a path it's about to sudo rm -rf --
-    # so a plain existence test is enough, no sudo -u re-exec needed here.
-    if [[ ! -f "${backup_path}/package.json" ]]; then
+    # or this directory never held an XO checkout at all.
+    if ! sudo test -f "${backup_path}/package.json"; then
         log_error "  ${backup_path}/package.json is missing."
         return 1
     fi
@@ -2891,11 +2893,10 @@ verify_backup_integrity() {
     # truncated object store, which every other file in the tree can look
     # perfectly fine next to.
     #
-    # git itself does care about ownership here (its "dubious ownership"
-    # safety check), so this one read -- unlike the existence test above --
-    # does run as the backup's own owner, matching how the backup listing
-    # loop above already reads a backup's commit.
-    if [[ -d "${backup_path}/.git" ]]; then
+    # git itself cares about ownership here (its "dubious ownership" safety
+    # check), so this read runs as the backup's own owner, matching how the
+    # backup listing in restore_xo reads a backup's commit.
+    if sudo test -d "${backup_path}/.git"; then
         local owner
         owner=$(stat -c '%U' "$backup_path" 2>/dev/null) || owner="root"
         if ! sudo -u "$owner" git -C "$backup_path" rev-parse HEAD &>/dev/null; then
@@ -2938,7 +2939,7 @@ restore_xo() {
         BACKUP_NAME=$(basename "$BACKUP")
         # Read commit hash from backup's git repo, running as the directory owner
         local BACKUP_COMMIT=""
-        if [[ -d "$BACKUP/.git" ]]; then
+        if sudo test -d "$BACKUP/.git"; then
             local BACKUP_OWNER
             BACKUP_OWNER=$(stat -c '%U' "$BACKUP" 2>/dev/null)
             BACKUP_COMMIT=$(sudo -u "$BACKUP_OWNER" git -C "$BACKUP" rev-parse HEAD 2>/dev/null | cut -c1-12 || true)
