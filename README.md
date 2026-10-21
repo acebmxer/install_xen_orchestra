@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-86-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-503%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-513%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-10-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -290,8 +290,12 @@ template uses:
   ↑↓ Navigate   SPACE Select/Deselect   ENTER Confirm   Q Back
 ```
 
-A row that is already built on the pool says `already on this pool` beneath it,
-so a re-run is not a guess about what a build would do.
+When the build goes through the XO API (an `XO_API_TOKEN` is set and
+`TEMPLATE_BUILD_METHOD` is not `ssh`), a row that is already built on the pool
+says `already on this pool` beneath it, so a re-run is not a guess about what a
+build would do; if XO manages several pools, it asks which pool first. The SSH
+build shows no label, since it would need the pool master's password before the
+list opens. Either way, a template that already exists is skipped, not rebuilt.
 
 Pick the templates you want and it does the rest — verifying the image against
 the origin's published checksum, installing the XCP-ng guest tools, scrubbing

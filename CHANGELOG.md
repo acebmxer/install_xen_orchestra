@@ -12,6 +12,16 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The template picker's "already on this pool" label now appears.** It
+  checked the pool before the script had connected to it, so the check
+  always failed silently and no row was ever labelled. When the build goes
+  through the XO API, the pool's templates are now fetched once before the
+  picker opens (asking which pool first if XO manages several, and building
+  on that same pool); the SSH build shows no label, as it would need the
+  pool master's password first. The end-of-run summary also counted a
+  template that was skipped because it already existed as built; skipped
+  templates are now listed separately.
+
 - **Template builds through the XO API stay on one pool.** When XO manages
   several pools, the build could take the pool from one and the default
   storage from another, and the network, base template and guest-tools ISO

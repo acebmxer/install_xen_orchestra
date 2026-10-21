@@ -10559,24 +10559,12 @@ tpl_json_objects_where() {
     '
 }
 
-# Resolve the SR and network through the API, in place of tpl_resolve_storage
-# and tpl_resolve_network's `xe` calls.
-#
-# The same choice is made as the SSH path makes: the pool's default SR, and the
-# management network. Both are what a VM created in XO's own New VM form would
-# get, so a template built either way lands in the same place.
-#
-# Everything is taken from one pool. XO lists every pool it manages in one
-# response, and reading the first "id" and the first "default_SR" separately
-# could pair one pool with another pool's SR; the PIFs and templates were not
-# filtered by pool at all. With several pools the operator picks one.
-tpl_api_resolve_targets() {
-    local pools default_sr pool_id
-    if ! pools=$(tpl_api_get "pools?fields=id,default_SR,name_label"); then
-        log_error "Could not list pools from XO."
-        return 1
-    fi
-
+# Choose the one pool an API build works on, from a `pools?fields=id,
+# name_label,...` response. Sets TPL_API_POOL_ID. With several pools the
+# operator is asked; with one it is used without asking.
+TPL_API_POOL_ID=""
+tpl_api_choose_pool() {
+    local pools="$1"
     local -a pool_opts=()
     local line
     while IFS= read -r line; do
@@ -10596,9 +10584,39 @@ tpl_api_resolve_targets() {
         log_error "XO returned no pools. Is a host connected to this XO?"
         return 1
     fi
+    # Already chosen this run (before the template picker, for its labels):
+    # keep it, so the operator is asked once and labels and build agree.
+    if [[ -n "$TPL_API_POOL_ID" ]]; then
+        local opt
+        for opt in "${pool_opts[@]}"; do
+            [[ "${opt%%|*}" == "$TPL_API_POOL_ID" ]] && return 0
+        done
+    fi
     deploy_choose "Which pool should the templates be built on?" "${pool_opts[@]}"
-    pool_id="$DEPLOY_CHOICE"
-    TPL_API_POOL_ID="$pool_id"
+    TPL_API_POOL_ID="$DEPLOY_CHOICE"
+    return 0
+}
+
+# Resolve the SR and network through the API, in place of tpl_resolve_storage
+# and tpl_resolve_network's `xe` calls.
+#
+# The same choice is made as the SSH path makes: the pool's default SR, and the
+# management network. Both are what a VM created in XO's own New VM form would
+# get, so a template built either way lands in the same place.
+#
+# Everything is taken from one pool. XO lists every pool it manages in one
+# response, and reading the first "id" and the first "default_SR" separately
+# could pair one pool with another pool's SR; the PIFs and templates were not
+# filtered by pool at all. With several pools the operator picks one.
+tpl_api_resolve_targets() {
+    local pools default_sr pool_id
+    if ! pools=$(tpl_api_get "pools?fields=id,default_SR,name_label"); then
+        log_error "Could not list pools from XO."
+        return 1
+    fi
+
+    tpl_api_choose_pool "$pools" || return 1
+    pool_id="$TPL_API_POOL_ID"
 
     default_sr=$(tpl_json_field "$(tpl_json_objects_where "$pools" id "$pool_id")" "default_SR")
     if [[ -z "$default_sr" ]]; then
@@ -11438,6 +11456,9 @@ tpl_cleanup_failed_build_dispatch() {
 }
 
 # Build one template: one image, one firmware mode, start to finish.
+# Returns 0 when the template was built or already existed (TPL_SKIPPED says
+# which), 1 when the build failed.
+TPL_SKIPPED=false
 tpl_build_one() {
     local row="$1"
     local key display user
@@ -11476,9 +11497,11 @@ tpl_build_one() {
     # prevent on the download. An operator who cannot tell a working build from
     # a stuck one kills it, and killing it halfway through leaves a build VM
     # and a multi-gigabyte disk behind.
+    TPL_SKIPPED=false
     log_info "  checking whether this template already exists..."
     if tpl_template_exists_dispatch "$name"; then
         log_info "  a template named '${name}' already exists; skipping."
+        TPL_SKIPPED=true
         return 0
     fi
 
@@ -11581,6 +11604,46 @@ tpl_build_one() {
 
 # --- Selection --------------------------------------------------------------
 
+# What the picker's "already on this pool" label is read from.
+#
+# API path only, and only when it needs no prompt beyond the pool choice: a
+# token is set and TEMPLATE_BUILD_METHOD is not ssh. Asked once, before the
+# picker opens, because the picker redraws on every key and cannot make a
+# round trip per row. The SSH path would need the pool master's password
+# before the picker even opened, so it shows no label (TPL_EXISTING_KNOWN
+# stays false) and the build still skips what exists. The pool chosen here
+# is kept for the build (tpl_api_choose_pool), so labels and build agree.
+TPL_EXISTING_NAMES=""
+TPL_EXISTING_KNOWN=false
+tpl_api_prefetch_existing() {
+    TPL_EXISTING_NAMES=""
+    TPL_EXISTING_KNOWN=false
+    [[ "${TEMPLATE_BUILD_METHOD:-auto}" == "ssh" ]] && return 0
+    [[ -n "${XO_API_TOKEN:-}" ]] || return 0
+
+    log_info "Checking Xen Orchestra for templates that are already built..."
+    if ! tpl_api_check_auth; then
+        # Reported properly once the build method is chosen; here it only
+        # means the picker shows no labels.
+        return 0
+    fi
+    local pools resp
+    pools=$(tpl_api_get "pools?fields=id,default_SR,name_label" 2>/dev/null) || return 0
+    tpl_api_choose_pool "$pools" || return 0
+    resp=$(tpl_api_get "vm-templates?fields=name_label,\$pool&limit=10000" 2>/dev/null) || return 0
+    resp=$(tpl_json_objects_where "$resp" '$pool' "$TPL_API_POOL_ID")
+    TPL_EXISTING_NAMES=$(printf '%s' "$resp" \
+        | sed -n 's/.*"name_label"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    TPL_EXISTING_KNOWN=true
+    return 0
+}
+
+# Whether the picker should label a template name as already built.
+tpl_existing_label() {
+    [[ "$TPL_EXISTING_KNOWN" == "true" ]] || return 1
+    grep -qxF -- "$1" <<< "$TPL_EXISTING_NAMES"
+}
+
 # The template library submenu.
 #
 # Driven by the same keys as the main menu — arrows to move, space to select,
@@ -11668,8 +11731,10 @@ tpl_prompt_selection() {
                 "$pointer" "$mark" "$label" "$M_DIM" "$user" "$M_RESET"
 
             # Say plainly which of these already exist, so a re-run is not a
-            # guess about what a build would actually do.
-            if tpl_template_exists "$(tpl_template_name "$display")"; then
+            # guess about what a build would actually do. Read from the list
+            # tpl_api_prefetch_existing fetched: there is no pool connection
+            # yet, so a per-row check here could never answer.
+            if tpl_existing_label "$(tpl_template_name "$display")"; then
                 printf '       %salready on this pool%s\n' "$M_DIM" "$M_RESET"
             fi
         done
@@ -12278,6 +12343,9 @@ build_vm_templates() {
     # The SSH path's dependencies are checked once that path is chosen.
     tpl_check_local_deps
 
+    TPL_API_POOL_ID=""
+    tpl_api_prefetch_existing
+
     tpl_prompt_selection
     if [[ ${#TPL_SELECTED[@]} -eq 0 ]]; then
         log_info "No templates selected."
@@ -12323,10 +12391,16 @@ build_vm_templates() {
     (( ${#TPL_SELECTED[@]} > 1 )) && prompt="Build these ${#TPL_SELECTED[@]} templates?"
     confirm_or_skip "$prompt" || { log_info "Cancelled."; return 0; }
 
-    local built=0 failed=0
+    local built=0 failed=0 skipped=0
     for row in "${TPL_SELECTED[@]}"; do
         if tpl_build_one "$row"; then
-            built=$((built + 1))
+            # A template that already existed returns success too, but was
+            # not built: counted apart so the summary does not claim it.
+            if [[ "$TPL_SKIPPED" == "true" ]]; then
+                skipped=$((skipped + 1))
+            else
+                built=$((built + 1))
+            fi
         else
             failed=$((failed + 1))
             log_error "  build failed; continuing with the rest."
@@ -12335,10 +12409,12 @@ build_vm_templates() {
 
     echo ""
     echo "=============================================="
+    local skip_note=""
+    (( skipped > 0 )) && skip_note=", ${skipped} skipped (already on the pool)"
     if (( failed == 0 )); then
-        log_success "Done. ${built} template(s) ready."
+        log_success "Done. ${built} template(s) built${skip_note}."
     else
-        log_warning "Done. ${built} succeeded, ${failed} failed."
+        log_warning "Done. ${built} succeeded, ${failed} failed${skip_note}."
     fi
     echo "=============================================="
     echo ""
