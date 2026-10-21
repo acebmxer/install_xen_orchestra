@@ -2510,6 +2510,38 @@ get_remote_commit() {
     git ls-remote https://github.com/vatesfr/xen-orchestra refs/heads/"$GIT_BRANCH" 2>/dev/null | cut -f1
 }
 
+# Refuse a GIT_BRANCH that is not a branch on the Xen Orchestra repo, before
+# anything is installed, stopped or deleted. Only branches are supported: a
+# tag clones as a detached HEAD, which --update cannot follow and --rebuild
+# cannot re-clone. Exits on a tag, a missing branch, or no answer from GitHub.
+#   $1  branch name (defaults to $GIT_BRANCH)
+require_remote_branch() {
+    local branch="${1:-$GIT_BRANCH}"
+    local repo="https://github.com/vatesfr/xen-orchestra"
+    local rc=0
+
+    git ls-remote --exit-code --heads "$repo" "refs/heads/${branch}" >/dev/null 2>&1 || rc=$?
+    (( rc == 0 )) && return 0
+
+    # --exit-code returns 2 when the remote answered but nothing matched;
+    # anything else means GitHub could not be asked at all.
+    if (( rc != 2 )); then
+        log_error "Could not reach ${repo} to check GIT_BRANCH=${branch} (network unavailable?)"
+        exit 1
+    fi
+
+    rc=0
+    git ls-remote --exit-code --tags "$repo" "refs/tags/${branch}" >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )); then
+        log_error "GIT_BRANCH=${branch} is a tag. Only branches are supported."
+        log_error "Set GIT_BRANCH to a branch (for example master) in xo-config.cfg."
+    else
+        log_error "GIT_BRANCH=${branch}: no such branch on ${repo}."
+        log_error "Set GIT_BRANCH to a branch (for example master) in xo-config.cfg."
+    fi
+    exit 1
+}
+
 # Snapshot the XO VM itself via XO's REST API, so a bad update/rebuild can be
 # rolled back from a normal VM snapshot in the UI -- the same recovery path
 # as any other VM, and unlike create_backup() below, one that also covers
@@ -3383,6 +3415,10 @@ update_xo() {
         exit 1
     fi
 
+    # A tag or misspelt branch otherwise surfaces only as "Could not fetch
+    # remote commit" below.
+    require_remote_branch
+
     local INSTALLED_COMMIT REMOTE_COMMIT
     # Keep failures non-fatal here so the explicit empty-value checks below emit a
     # clean message instead of letting a transient git/network error trip `set -e`.
@@ -3541,9 +3577,17 @@ rebuild_xo() {
         exit 1
     fi
 
-    # Detect the currently checked-out branch
+    # Detect the currently checked-out branch. A detached HEAD (an install
+    # cloned from a tag by an older version of this script) has no branch
+    # to re-clone, so fall back to GIT_BRANCH.
     local CURRENT_BRANCH
     CURRENT_BRANCH=$(install_dir_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$GIT_BRANCH")
+    if [[ -z "$CURRENT_BRANCH" || "$CURRENT_BRANCH" == "HEAD" ]]; then
+        CURRENT_BRANCH="$GIT_BRANCH"
+    fi
+
+    # Refuse before anything is stopped or removed.
+    require_remote_branch "$CURRENT_BRANCH"
 
     local CURRENT_COMMIT
     CURRENT_COMMIT=$(get_installed_commit)
@@ -3559,7 +3603,7 @@ rebuild_xo() {
     echo ""
     log_warning "This will:"
     log_warning "  1. Back up the current installation to ${BACKUP_DIR}"
-    log_warning "  2. Remove ${INSTALL_DIR} and do a fresh clone from branch '${CURRENT_BRANCH}'"
+    log_warning "  2. Do a fresh clone from branch '${CURRENT_BRANCH}' and replace ${INSTALL_DIR} with it"
     log_warning "  3. Perform a clean rebuild"
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
@@ -3581,14 +3625,26 @@ rebuild_xo() {
     # Backup current installation (node_modules excluded, same as update)
     create_backup
 
-    # Wipe current installation directory
-    log_info "Removing current installation directory..."
-    run_cmd sudo rm -rf "$INSTALL_DIR"
-
-    # Fresh clone of the same branch
+    # Fresh clone of the same branch, next to the current install so the
+    # final swap is a rename on the same filesystem. The current install is
+    # removed only once the clone has succeeded, so a failed clone (network,
+    # GitHub) leaves XO in place and starts it again.
+    local NEW_DIR="${INSTALL_DIR%/}.rebuild-new"
+    run_cmd sudo rm -rf "$NEW_DIR"
     log_info "Cloning Xen Orchestra (branch: ${CURRENT_BRANCH})..."
     run_cmd sudo mkdir -p "$(dirname "$INSTALL_DIR")"
-    run_cmd sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$INSTALL_DIR"
+    if ! run_cmd sudo git clone -b "$CURRENT_BRANCH" https://github.com/vatesfr/xen-orchestra "$NEW_DIR"; then
+        run_cmd sudo rm -rf "$NEW_DIR"
+        log_error "Clone failed. The current installation was left in place."
+        log_info "Starting xo-server service..."
+        run_cmd sudo systemctl start xo-server || true
+        exit 1
+    fi
+
+    # Swap the fresh clone in for the current installation
+    log_info "Removing current installation directory..."
+    run_cmd sudo rm -rf "$INSTALL_DIR"
+    run_cmd sudo mv "$NEW_DIR" "$INSTALL_DIR"
 
     # Ensure service user exists before any chown operations
     if [[ -n "$SERVICE_USER" ]] && [[ "$SERVICE_USER" != "root" ]]; then
@@ -3921,6 +3977,7 @@ install_xo() {
     detect_os
     install_dependencies
     check_git
+    require_remote_branch
     install_nodejs
     install_yarn
     create_service_user

@@ -10,6 +10,21 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--rebuild` no longer deletes XO when it can't clone it again.** It
+  removed the install first and cloned afterwards, so a failed clone left XO
+  deleted and stopped. It now clones next to the install and swaps only once
+  the clone has worked; if it fails, the old install is kept and started
+  again. On an install cloned from a tag, the clone always failed (it asked
+  for a branch called `HEAD`).
+- **`GIT_BRANCH` must be a branch; a tag is refused.** The docs said a tag
+  works, but `--update` could never update one (it stopped with "Could not
+  fetch remote commit"). Install, `--update` and `--rebuild` now check
+  `GIT_BRANCH` against GitHub before doing anything and stop with a clear
+  message for a tag or a branch that doesn't exist. `stable` was dropped
+  from the sample config: Xen Orchestra has no branch by that name.
+
 ## [0.9.4] - 2026-10-20
 
 ### Security
