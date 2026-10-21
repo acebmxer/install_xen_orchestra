@@ -13644,8 +13644,14 @@ main() {
         exit 1
     fi
 
+    # Refuse root before self-update: self_update_script runs git fetch/pull
+    # in this checkout, and doing that as root leaves root-owned files in
+    # .git (FETCH_HEAD) that make every later normal run's fetch fail, so
+    # self-update silently stops working. Every operation refuses root
+    # anyway; this only moves the refusal ahead of the first git command.
     # Self-update before doing anything (skip for --help to avoid delays)
     if [[ "$OPERATION" != "--help" ]]; then
+        check_not_root
         self_update_script
     fi
 

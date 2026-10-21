@@ -12,6 +12,13 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Running the script once with sudo no longer breaks self-update.** The
+  script checked for updates (`git fetch`/`pull` in its own folder) before
+  refusing root, so a sudo run left root-owned files in `.git` and every
+  later normal run reported "Could not check for script updates (network
+  unavailable?)". Root is now refused before the update check. An install
+  already affected needs `sudo chown -R "$USER": .git` once, run in the
+  script's folder.
 - **`--restore` and `--list-backups` work when `SERVICE_USER` is not root.**
   Backups of such an install can be read only by root, and the checks ran as
   the user running the script, so every backup was listed as
