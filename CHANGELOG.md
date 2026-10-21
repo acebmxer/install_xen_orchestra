@@ -12,6 +12,12 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The self-signed certificate is made on machines with a long host name.**
+  openssl refuses a certificate name (CN) longer than 64 characters, so on a
+  machine whose full host name was longer (common on cloud VMs) no
+  certificate was made and the install stopped there. The full name now goes
+  in the certificate's alternative names, which is what browsers check, and
+  the short host name is used as the CN.
 - **The `--adjust-memory` heap size survives updates.** `--update`,
   `--rebuild`, `--reconfigure` and `--restore` rewrite the xo-server service
   file, which dropped the heap size and brought back the out-of-memory crash

@@ -2033,8 +2033,19 @@ generate_ssl_certificate() {
         return 0
     fi
 
-    local CERT_CN
-    CERT_CN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "xen-orchestra")
+    local CERT_FQDN CERT_CN CERT_SAN
+    CERT_FQDN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)
+    CERT_FQDN="${CERT_FQDN:-xen-orchestra}"
+    # A certificate's CN holds at most 64 characters, and openssl refuses a
+    # longer one outright, so no certificate gets made. A longer name (cloud
+    # VMs often have one) goes in the subjectAltName only -- which is what
+    # browsers check -- and the CN takes the short host name.
+    CERT_CN="$CERT_FQDN"
+    CERT_SAN="DNS:${CERT_FQDN}"
+    if (( ${#CERT_FQDN} > 64 )); then
+        CERT_CN="${CERT_FQDN%%.*}"
+        CERT_SAN="DNS:${CERT_FQDN},DNS:${CERT_CN}"
+    fi
 
     # 825 days is the longest lifetime the CA/Browser Forum ever allowed for a
     # public certificate, and the ceiling most internal policies inherited. The
@@ -2057,7 +2068,7 @@ generate_ssl_certificate() {
         -keyout "${SSL_CERT_DIR}/${SSL_KEY_FILE}" \
         -out "${SSL_CERT_DIR}/${SSL_CERT_FILE}" \
         -subj "/CN=${CERT_CN}" \
-        -addext "subjectAltName=DNS:${CERT_CN}"
+        -addext "subjectAltName=${CERT_SAN}"
 
     # Set permissions
     run_cmd sudo chmod 600 "${SSL_CERT_DIR}/${SSL_KEY_FILE}"
