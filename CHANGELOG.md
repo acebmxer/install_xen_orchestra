@@ -10,6 +10,16 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **`xo-server-host-power-manager`: the "Average CPU utilization %" metric
+  now works.** Every poll failed reading the hosts' CPU stats ("no such
+  object undefined"), so a rule using it never acted, and its memory trigger
+  never acted either. Rules using memory only or the vCPU:pCPU ratio were
+  not affected. Also, a stats reading slower than the poll interval could
+  let two polls act at once and press a NanoKVM power button twice (on, then
+  straight back off); a poll now waits for the previous one to finish.
+
 ## [0.9.6] - 2026-10-21
 
 ### Fixed

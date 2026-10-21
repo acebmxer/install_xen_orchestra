@@ -134,37 +134,42 @@ async function tick({ xo, rule, state, powerProviders }) {
     return
   }
 
-  const hosts = getRunningHosts(xo, host.$poolId)
-  const [cpuValue, memoryValue] = await Promise.all([
-    computeCpuValue(xo, rule, hosts),
-    Promise.resolve(computeMemoryValue(rule, hosts)),
-  ])
-
-  const hostIsRunning = host.power_state === 'Running'
-  const result = decide({
-    rule,
-    cpuValue,
-    memoryValue,
-    hostIsRunning,
-    offEligibleSinceMs: state.offEligibleSinceMs,
-    now,
-  })
-  state.offEligibleSinceMs = result.offEligibleSinceMs
-
-  if (result.action === 'none') {
-    return
-  }
-
+  // Marked busy before the first await: the stats call can take longer than
+  // the poll interval, and a second tick starting meanwhile would reach the
+  // same decision and press the power button again (on, then off).
   state.busy = true
   try {
-    if (result.action === 'power-on') {
-      await powerOn({ xo, rule, host, powerProviders })
-    } else {
-      await powerOff({ xo, rule, host })
+    const hosts = getRunningHosts(xo, host.$poolId)
+    const [cpuValue, memoryValue] = await Promise.all([
+      computeCpuValue(xo, rule, hosts),
+      Promise.resolve(computeMemoryValue(rule, hosts)),
+    ])
+
+    const hostIsRunning = host.power_state === 'Running'
+    const result = decide({
+      rule,
+      cpuValue,
+      memoryValue,
+      hostIsRunning,
+      offEligibleSinceMs: state.offEligibleSinceMs,
+      now,
+    })
+    state.offEligibleSinceMs = result.offEligibleSinceMs
+
+    if (result.action === 'none') {
+      return
     }
-    state.lastActionAt = now
-  } catch (error) {
-    log.error(`rule "${rule.label || rule.targetHostId}": ${result.action} failed`, { error })
+
+    try {
+      if (result.action === 'power-on') {
+        await powerOn({ xo, rule, host, powerProviders })
+      } else {
+        await powerOff({ xo, rule, host })
+      }
+      state.lastActionAt = now
+    } catch (error) {
+      log.error(`rule "${rule.label || rule.targetHostId}": ${result.action} failed`, { error })
+    }
   } finally {
     state.busy = false
   }

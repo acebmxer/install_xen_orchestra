@@ -11,6 +11,8 @@ const {
   decide,
   computeCpuValue,
   computeMemoryValue,
+  RuleState,
+  tick,
 } = require('../lib/rule-runner')
 
 const GB = 1024 * 1024 * 1024
@@ -152,4 +154,54 @@ test('decide: a trigger left "Not used" never requests power-on and never blocks
     now: COOLDOWN_MS,
   })
   assert.equal(off.action, 'power-off')
+})
+
+// A pool with one running host (h1, tight on memory) and the managed host
+// (h3, off). getXapiHostStats takes `statsDelayMs` to answer, standing in
+// for a stats call slower than the poll interval.
+function tickFixture({ statsDelayMs = 0, h3 = {} } = {}) {
+  const objects = {
+    h1: {
+      type: 'host',
+      id: 'h1',
+      $poolId: 'pool1',
+      enabled: true,
+      power_state: 'Running',
+      memory: { size: 64 * GB, usage: 60 * GB },
+    },
+    h3: { type: 'host', id: 'h3', name_label: 'host3', $poolId: 'pool1', enabled: false, power_state: 'Halted', ...h3 },
+  }
+  const presses = []
+  const xo = {
+    getObject: id => objects[id],
+    getObjects: () => objects,
+    getXapiHostStats: hostId =>
+      new Promise(resolve => setTimeout(() => resolve({ stats: { cpus: { 0: [hostId === 'h1' ? 10 : 0] } } }), statsDelayMs)),
+  }
+  const nanokvm = {
+    supportsHost: () => true,
+    getPowerState: async () => 'off',
+    powerOn: async hostId => {
+      presses.push(hostId)
+    },
+  }
+  const rule = baseRule({
+    targetHostId: 'h3',
+    powerProvider: 'nanokvm',
+    cpu: { metric: 'percent', powerOnAbove: 80, powerOffBelow: 20 },
+    memory: { metric: 'percentFree', powerOnBelow: 15, powerOffAbove: 40 },
+  })
+  return { xo, rule, presses, powerProviders: new Map([['nanokvm', nanokvm]]) }
+}
+
+test('tick: a second tick while the first is still reading stats does not press the button again', async () => {
+  const { xo, rule, presses, powerProviders } = tickFixture({ statsDelayMs: 50 })
+  const state = new RuleState()
+
+  const first = tick({ xo, rule, state, powerProviders })
+  const second = tick({ xo, rule, state, powerProviders })
+  await Promise.all([first, second])
+
+  assert.deepEqual(presses, ['h3'])
+  assert.equal(state.busy, false)
 })
