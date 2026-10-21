@@ -10,6 +10,55 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-20
+
+### Security
+
+- **The pool master's host key is checked properly before the root password
+  is sent.** `--deploy` showed or compared only the ED25519 fingerprint but
+  then trusted every key in the scan, so a different key type answering on
+  that address was accepted without being checked. Only the checked key is
+  trusted now. `--proxy` checked nothing: whatever answered on that address
+  on first contact received the password. It now shows the fingerprint for
+  confirmation, honours `XO_DEPLOY_POOL_FINGERPRINT`, and holds both its own
+  ssh connections and the proxy helper's to the checked key.
+- **Passwords and tokens kept out of `ps`, the debug trace and the log file.**
+  Any other user on the machine running the script could read these while
+  they were in use:
+  - the XO API token, which every REST call put on curl's command line, and
+    the template builder put inside xo-cli's `--url`;
+  - the XO password, which `--proxy` passed as an argument to its xo-cli login
+    helper;
+  - the token given to `xo-cli register --token`, which `--proxy` now writes
+    straight into xo-cli's settings file (mode 0600) instead.
+
+  `XO_DEBUG=1` claimed to mask secrets but printed them all, from the config
+  file onward. The trace now leaves out the parts that handle a password or
+  token and warns you to read it before sharing. `--proxy` no longer writes
+  the proxy's full token to `--log-file` when registration fails; the manual
+  command is shown on screen only. Still visible for about a second:
+  `xo-cli proxy.register`, which accepts the proxy's token on its command
+  line only.
+- **Templates no longer keep the build's temporary SSH key.** The build key
+  cloud-init installs for the template's default user (and root) is now
+  removed before the template is sealed; previously every built template
+  carried that entry in `authorized_keys`. Templates built with an earlier
+  version still have it: delete the line ending `xo template build
+  (temporary)` from `~/.ssh/authorized_keys` in VMs made from them, or rebuild
+  the template. The private half is also no longer left in
+  `/tmp/xo-templates-*/` when Custom Plugins is ticked in the same menu pass
+  as the Template Library: the plugin picker replaced the build's cleanup on
+  exit instead of running after it.
+
+### Fixed
+
+- **The running-task check works with a password containing a backslash.**
+  With `XO_TASK_CHECK_USER`/`XO_TASK_CHECK_PASS` (or the password typed at
+  the prompt), a backslash in the password was altered on the way to XO
+  (`\n` became a newline), the login failed with 401, and under
+  `--non-interactive` the check was skipped, so an update could go ahead
+  while tasks were running.
+
 ## [0.9.3] - 2026-10-19
 
 ### Added
@@ -2502,7 +2551,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.0...v0.9.1

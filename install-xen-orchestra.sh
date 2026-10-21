@@ -1,11 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-# Enable debug mode if XO_DEBUG environment variable is set
-# Note: sensitive variables (passwords, tokens) are masked in debug output
+# Enable debug mode if XO_DEBUG environment variable is set.
+#
+# xtrace prints every command with its values expanded, secrets included, so
+# each function that reads or sends a password or token turns it off for its
+# own duration (`local -; set +x`): load_config from the point it sources
+# xo-config.cfg, the API calls, the --proxy and --deploy flows. Everything
+# else is traced in full, which is why the warning below asks for a
+# read-through.
 if [[ "${XO_DEBUG:-0}" == "1" ]]; then
+    echo "XO_DEBUG=1: tracing every command. Lines that handle passwords and tokens are left out, but read the output before posting it anywhere." >&2
     set -x
-    # Mask sensitive variables from debug trace output
     export PS4='+ '
 fi
 
@@ -107,6 +113,65 @@ log_warning() {
 
 log_error() {
     _log "ERROR" "$1"
+}
+
+# Print the value of the variable named by $1, escaped for a double-quoted
+# curl config value (curl -K). Inside double quotes curl's config parser treats
+# backslash as an escape (\n, \t, \\, \"), so backslashes are doubled before
+# quotes are escaped; escaping only the quotes turned "pa\ss\nword" into
+# "pass", a newline and "word". Takes the variable's NAME so the secret is not
+# an argument xtrace would print. Every curl config line built from a secret
+# goes through this; do not add a second escaper.
+curl_config_quote() {
+    { set +x; } 2>/dev/null
+    local value="${!1}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
+}
+
+# Print a curl config line carrying XO's authenticationToken cookie.
+#
+# Takes the NAME of the variable holding the token, never the token: a
+# function's arguments are shown by xtrace. Used as `curl -K <(xo_cookie_config
+# xo_token) ...` so the token reaches curl through a pipe instead of its
+# command line, which any local user can read in ps or /proc/<pid>/cmdline
+# while curl runs. A process substitution rather than `-K -` because some
+# callers already feed the request body on stdin (--data-binary @-).
+xo_cookie_config() {
+    { set +x; } 2>/dev/null
+    printf 'cookie = "authenticationToken=%s"\n' "$(curl_config_quote "$1")"
+}
+
+# Write xo-cli's settings file (<config home>/xo-cli/config.json) with the
+# given XO URL and the token held in the variable named by $3.
+#
+# This is what `xo-cli register --token <token> <url>` writes -- server,
+# token, allowUnauthorized, and a clientId if there is none -- but without the
+# token on xo-cli's command line, which is the only place xo-cli takes it.
+# xo-cli reads this file from $XDG_CONFIG_HOME (default ~/.config). Existing
+# keys are kept. The file is written 0600: it holds an admin-level token.
+# node is there whenever xo-cli is, which is a node program.
+xo_cli_write_config() {
+    local -
+    set +x
+    local config_home="$1" url="$2" token_var="$3" rc=0
+    XO_CLI_CFG_HOME="$config_home" XO_CLI_CFG_URL="$url" XO_CLI_CFG_TOKEN="${!token_var}" \
+        node -e '
+const fs = require("fs"), path = require("path");
+const dir = path.join(process.env.XO_CLI_CFG_HOME, "xo-cli");
+const file = path.join(dir, "config.json");
+let cfg = {};
+try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) {}
+if (cfg.clientId === undefined) cfg.clientId = Math.random().toString(36).slice(2);
+cfg.allowUnauthorized = true;
+cfg.server = process.env.XO_CLI_CFG_URL;
+cfg.token = process.env.XO_CLI_CFG_TOKEN;
+fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+fs.writeFileSync(file, JSON.stringify(cfg), { mode: 0o600 });
+fs.chmodSync(file, 0o600);
+' || rc=$?
+    return "$rc"
 }
 
 # Acquire an exclusive lock on XO_LOCKFILE using flock.
@@ -416,7 +481,11 @@ load_config() {
         exit 1
     fi
 
-    # Source the configuration
+    # Source the configuration. It holds passwords and tokens, which XO_DEBUG's
+    # xtrace would print line by line, so tracing stays off from here to the
+    # end of this function (see the note at the top of this file).
+    local -
+    set +x
     source "$CONFIG_FILE"
 
     # Set defaults if not specified
@@ -2479,6 +2548,10 @@ get_remote_commit() {
 # dmidecode's product UUID, which the same guidance warns can disagree with
 # it over byte-order.
 snapshot_xo_vm() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     local label="$1"  # e.g. "pre-update" or "pre-rebuild"
 
     local virt_type
@@ -2529,7 +2602,7 @@ snapshot_xo_vm() {
         [[ "$proto" == "https" ]] && curl_opts+=(-k)
 
         http_code=$(curl "${curl_opts[@]}" -X POST \
-            -b "authenticationToken=${xo_token}" \
+            -K <(xo_cookie_config xo_token) \
             -H "Content-Type: application/json" \
             -d "{\"name_label\": \"${snap_name}\"}" \
             "${base_url}/rest/v0/vms/${vm_uuid}/actions/snapshot?sync=true" \
@@ -2579,7 +2652,7 @@ prune_xo_vm_snapshots() {
 
     local list_resp
     list_resp=$(curl -sk --max-time 30 \
-        -b "authenticationToken=${xo_token}" \
+        -K <(xo_cookie_config xo_token) \
         -G --data-urlencode "filter=\$snapshot_of:${vm_uuid}" \
         --data-urlencode "fields=id,name_label,snapshot_time" \
         "${base_url}/rest/v0/vm-snapshots" \
@@ -2636,7 +2709,7 @@ prune_xo_vm_snapshots() {
         local del_code
         del_code=$(curl -sk --max-time 30 --output /dev/null --write-out "%{http_code}" \
             -X DELETE \
-            -b "authenticationToken=${xo_token}" \
+            -K <(xo_cookie_config xo_token) \
             "${base_url}/rest/v0/vm-snapshots/${snap_id}" \
             2>/dev/null) || del_code=""
 
@@ -2951,6 +3024,10 @@ restore_xo() {
 # If xo-server's start time can't be determined, the filter is a no-op
 # and all pending tasks are counted (fail-safe to original behavior).
 check_active_xo_tasks() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     log_info "Checking for active Xen Orchestra tasks before updating..."
     printf '\n'
 
@@ -3039,14 +3116,15 @@ check_active_xo_tasks() {
             if [[ "$auth_method" == "token" ]]; then
                 # Token auth — passed via cookie header
                 http_code=$(curl "${curl_opts[@]}" \
-                    -b "authenticationToken=${xo_token}" \
+                    -K <(xo_cookie_config xo_token) \
                     "${base_url}/rest/v0/tasks?filter=status%3Apending&fields=*" \
                     2>/dev/null) || true
             else
-                # Basic auth — pipe credentials via curl's -K stdin to keep password out of argv
+                # Basic auth — pipe credentials via curl's -K stdin to keep password out of argv.
+                # Escaped by curl_config_quote: backslashes too, not just quotes.
                 local esc_user esc_pass
-                esc_user=$(printf '%s' "$xo_user" | sed 's/"/\\"/g')
-                esc_pass=$(printf '%s' "$xo_pass" | sed 's/"/\\"/g')
+                esc_user=$(curl_config_quote xo_user)
+                esc_pass=$(curl_config_quote xo_pass)
 
                 http_code=$(printf 'user = "%s:%s"\n' "$esc_user" "$esc_pass" | \
                     curl "${curl_opts[@]}" -K - \
@@ -3861,6 +3939,10 @@ install_xo() {
 
 # Install XO Proxy on a Xen pool master
 install_xo_proxy() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     log_info "Starting XO Proxy installation..."
     echo ""
 
@@ -3890,14 +3972,27 @@ install_xo_proxy() {
     read -p "Host username [root]: " HOST_USERNAME
     HOST_USERNAME=${HOST_USERNAME:-root}
 
-    { set +x; } 2>/dev/null
     read -sp "Host password: " HOST_PASSWORD
     echo ""
     if [[ -z "$HOST_PASSWORD" ]]; then
         log_error "Host password is required"
         exit 1
     fi
-    [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
+
+    # Check the pool master's host key before the password is sent.
+    #
+    # The password goes to whatever answers on that address, so the host key
+    # is checked first, the same way --deploy does it: shown for confirmation,
+    # or compared with XO_DEPLOY_POOL_FINGERPRINT. The checked key is pinned in
+    # a run-scoped known_hosts that both ssh calls and the expect helper use.
+    # deploy_verify_host_key and deploy_pin_pool_host_key work in
+    # DEPLOY_WORKDIR, which --proxy has no other use for.
+    DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-proxy-work-XXXXXX)
+    chmod 700 "$DEPLOY_WORKDIR"
+    DEPLOY_POOL_KNOWN_HOSTS=""
+    trap 'rm -rf "$DEPLOY_WORKDIR"' EXIT
+    deploy_verify_host_key
+    pool_master_hostkey_opts
 
     # Test SSH connection
     #
@@ -3912,14 +4007,15 @@ install_xo_proxy() {
     # prompt is a change they did not ask for, and the connection works without
     # it. ssh asks for the password itself, so its prompt must not be
     # redirected away here.
+
     log_info "Testing SSH connection to $HOST_USERNAME@$POOL_MASTER_IP..."
     local ssh_ok=0
     if command -v sshpass >/dev/null 2>&1; then
-        SSHPASS="$HOST_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null || ssh_ok=$?
+        SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${POOL_HOSTKEY_OPTS[@]}" -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" &>/dev/null || ssh_ok=$?
     else
         log_info "sshpass is not installed, so ssh will ask for that password once more."
         log_info "  (installing sshpass would avoid the second prompt; nothing else changes)"
-        ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" >/dev/null || ssh_ok=$?
+        ssh "${POOL_HOSTKEY_OPTS[@]}" -o ConnectTimeout=10 "$HOST_USERNAME@$POOL_MASTER_IP" "echo 'Connection successful'" >/dev/null || ssh_ok=$?
     fi
     if (( ssh_ok != 0 )); then
         log_error "Failed to connect to Pool Master. Please check your credentials."
@@ -3961,14 +4057,12 @@ install_xo_proxy() {
             exit 1
         fi
 
-        { set +x; } 2>/dev/null
         read -sp "Xen Orchestra login password: " XO_PASSWORD
         echo ""
         if [[ -z "$XO_PASSWORD" ]]; then
             log_error "Xen Orchestra password is required"
             exit 1
         fi
-        [[ "${XO_DEBUG:-0}" == "1" ]] && set -x
     fi
 
     # Copy the companion expect script to a temp file for execution
@@ -3987,7 +4081,7 @@ install_xo_proxy() {
     # Matches deploy_cleanup/tpl_cleanup elsewhere: an EXIT trap so a failure
     # between here and the explicit rm below (a signal, a parsing error under
     # set -euo pipefail) doesn't leave a copy of the helper script in /tmp.
-    trap 'rm -f "$TEMP_SCRIPT"' EXIT
+    trap 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"' EXIT
 
     # Run the expect script
     log_info "Starting XO Proxy installer on Pool Master..."
@@ -3998,7 +4092,12 @@ install_xo_proxy() {
     # readable by any other local user (ps, /proc/<pid>/cmdline) for as long
     # as it runs, while its environment is not. Matches the SSHPASS/-e
     # pattern used for the sshpass calls elsewhere in this script.
+    #
+    # XO_HELPER_KNOWN_HOSTS: the pinned pool master key from above, so the
+    # helper's own ssh is held to it too. Empty when the key was already in
+    # the operator's known_hosts, which ssh enforces by itself.
     OUTPUT=$(XO_HELPER_HOST_PASSWORD="$HOST_PASSWORD" XO_HELPER_XO_PASSWORD="$XO_PASSWORD" \
+        XO_HELPER_KNOWN_HOSTS="$DEPLOY_POOL_KNOWN_HOSTS" \
         "$TEMP_SCRIPT" "$POOL_MASTER_IP" "$HOST_USERNAME" "$PROXY_IP" "$NTP_SERVER" "$XO_USERNAME" 2>&1 | tee /dev/tty)
 
     # Extract values from output (look after CAPTURED_VALUES marker)
@@ -4006,8 +4105,11 @@ install_xo_proxy() {
     PROXY_UUID=$(echo "$OUTPUT" | grep "^PROXY_UUID=" | tail -1 | cut -d'=' -f2)
     AUTH_TOKEN=$(echo "$OUTPUT" | grep "^AUTH_TOKEN=" | tail -1 | cut -d'=' -f2)
 
-    # Clean up temp script
+    # Clean up temp script and the pinned host key; nothing below uses ssh.
     rm -f "$TEMP_SCRIPT"
+    rm -rf "$DEPLOY_WORKDIR"
+    DEPLOY_WORKDIR=""
+    DEPLOY_POOL_KNOWN_HOSTS=""
     trap - EXIT
 
     # Use user-specified IP if not captured
@@ -4070,8 +4172,9 @@ install_xo_proxy() {
 
 set timeout 30
 set username [lindex $argv 0]
-set password [lindex $argv 1]
-set url      [lindex $argv 2]
+set url      [lindex $argv 1]
+# From the environment, not argv: see the caller.
+set password $env(XO_CLI_REG_PASSWORD)
 
 spawn xo-cli register --au $url $username
 
@@ -4097,12 +4200,15 @@ XO_CLI_EXPECT_END
     chmod +x "$XO_CLI_SCRIPT"
 
     # A configured API token is used instead of the username and password.
-    # It works for accounts with MFA, which the password login cannot. xo-cli
-    # only accepts the token as an argument, so it is briefly visible in ps --
-    # the same exposure as the token-in-URL calls elsewhere in this script.
+    # It works for accounts with MFA, which the password login cannot.
+    # `xo-cli register --token` takes the token only as an argument, visible
+    # to every local user in ps, and all it does is write xo-cli's settings
+    # file -- so that file is written directly instead (xo_cli_write_config).
+    # Like `register --token`, this does not contact XO; a bad token shows up
+    # at proxy.register below.
     if [[ -n "${XO_API_TOKEN:-}" ]]; then
         log_info "Using XO_API_TOKEN from the config to register xo-cli."
-        if xo-cli register --au --token "$XO_API_TOKEN" "$XO_REGISTER_URL"; then
+        if xo_cli_write_config "${XDG_CONFIG_HOME:-$HOME/.config}" "$XO_REGISTER_URL" XO_API_TOKEN; then
             log_success "xo-cli registered with Xen Orchestra"
         else
             log_warning "Failed to register xo-cli with XO_API_TOKEN"
@@ -4111,7 +4217,10 @@ XO_CLI_EXPECT_END
             trap - EXIT
             exit 1
         fi
-    elif "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_PASSWORD" "$XO_REGISTER_URL"; then
+    # The password goes to the expect script through its environment, which
+    # other local users cannot read, not as an argument, which they can (ps,
+    # /proc/<pid>/cmdline) for as long as the login takes.
+    elif XO_CLI_REG_PASSWORD="$XO_PASSWORD" "$XO_CLI_SCRIPT" "$XO_USERNAME" "$XO_REGISTER_URL"; then
         log_success "xo-cli registered with Xen Orchestra"
     else
         log_warning "Failed to register xo-cli automatically"
@@ -4132,8 +4241,10 @@ XO_CLI_EXPECT_END
         log_success "XO Proxy registered successfully!"
     else
         log_error "Failed to register XO Proxy"
-        log_info "You can register manually with:"
-        log_info "xo-cli proxy.register authenticationToken=\"$AUTH_TOKEN\" address=\"$ACTUAL_PROXY_IP:443\" vmUuid=\"$PROXY_UUID\""
+        # The command carries the proxy's full token, so it goes to the
+        # terminal only: log_info would also write it to --log-file.
+        log_info "You can register manually with the command below (not written to the log file):"
+        echo "xo-cli proxy.register authenticationToken=\"$AUTH_TOKEN\" address=\"$ACTUAL_PROXY_IP:443\" vmUuid=\"$PROXY_UUID\""
         exit 1
     fi
 
@@ -4267,6 +4378,8 @@ DEPLOY_SSH_OPTS=()
 # checked. Empty until then, which is what keeps dom0_exec usable under `set -u`
 # on the paths that run before the check.
 DEPLOY_POOL_KNOWN_HOSTS=""
+# Set by pool_master_hostkey_opts.
+POOL_HOSTKEY_OPTS=()
 
 # Suppressing `set -x` around anything that touches the pool password.
 #
@@ -4349,6 +4462,35 @@ is_safe_url() {
 # package to install. Set by deploy_connect_pool_master.
 DEPLOY_AUTH_MODE="prompt"
 
+# The ssh options that bind a connection to the pool master's checked key,
+# left in POOL_HOSTKEY_OPTS. Used by dom0_exec (--deploy, the template
+# builder's SSH path) and by --proxy's ssh calls; the expect helper gets the
+# same file through XO_HELPER_KNOWN_HOSTS.
+#
+# Fingerprinting a key and then connecting under `accept-new` against the
+# default known_hosts verifies one transaction and trusts another: nothing
+# stops a different key -- or the same host's RSA key, when the ED25519 one
+# was what was shown -- being accepted at connect time. Pinning the checked
+# key into a run-scoped file and demanding StrictHostKeyChecking=yes is what
+# makes the check bind to the session that carries the host password. This
+# is the same pattern deploy_wait_for_guest already uses for the guest.
+#
+# Before the check has run (DEPLOY_POOL_KNOWN_HOSTS empty) there is nothing to
+# pin against, so `accept-new` stands -- but every caller runs
+# deploy_verify_host_key before the first connection that carries the
+# password. It also stands when the key was already in the operator's own
+# known_hosts, where ssh enforces it anyway.
+pool_master_hostkey_opts() {
+    if [[ -n "$DEPLOY_POOL_KNOWN_HOSTS" && -s "$DEPLOY_POOL_KNOWN_HOSTS" ]]; then
+        POOL_HOSTKEY_OPTS=(
+            -o UserKnownHostsFile="$DEPLOY_POOL_KNOWN_HOSTS"
+            -o StrictHostKeyChecking=yes
+        )
+    else
+        POOL_HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new)
+    fi
+}
+
 dom0_exec() {
     # sshpass reads the password from the environment, which xtrace would print.
     local -
@@ -4362,28 +4504,8 @@ dom0_exec() {
         -o ConnectTimeout=15
     )
 
-    # Bind the connection to the key deploy_verify_host_key actually checked.
-    #
-    # Fingerprinting a key and then connecting under `accept-new` against the
-    # default known_hosts verifies one transaction and trusts another: nothing
-    # stops a different key -- or the same host's RSA key, when the ED25519 one
-    # was what was shown -- being accepted at connect time. Pinning the scanned
-    # key into a run-scoped file and demanding StrictHostKeyChecking=yes is what
-    # makes the check bind to the session that carries the host password. This
-    # is the same pattern deploy_wait_for_guest already uses for the guest.
-    #
-    # Before the check has run (DEPLOY_POOL_KNOWN_HOSTS empty) there is nothing
-    # to pin against, so `accept-new` stands -- but deploy_connect_pool_master
-    # calls deploy_verify_host_key before the first dom0_exec, so no call that
-    # carries the password takes this branch.
-    if [[ -n "$DEPLOY_POOL_KNOWN_HOSTS" && -s "$DEPLOY_POOL_KNOWN_HOSTS" ]]; then
-        common+=(
-            -o UserKnownHostsFile="$DEPLOY_POOL_KNOWN_HOSTS"
-            -o StrictHostKeyChecking=yes
-        )
-    else
-        common+=(-o StrictHostKeyChecking=accept-new)
-    fi
+    pool_master_hostkey_opts
+    common+=("${POOL_HOSTKEY_OPTS[@]}")
     if [[ "$DEPLOY_AUTH_MODE" == "sshpass" ]]; then
         SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${common[@]}" \
             "${HOST_USERNAME}@${POOL_MASTER_IP}" "$@" || rc=$?
@@ -5971,20 +6093,43 @@ deploy_check_local_deps() {
 # Set XO_DEPLOY_POOL_FINGERPRINT to the expected SHA256 fingerprint to check it
 # without a prompt -- the only form of this that works under --non-interactive.
 
-# Pin the scanned host key so dom0_exec is bound to the key that was verified.
+# Pin the checked host key so every later connection is bound to it.
 #
-# Every line of the scan is pinned, not just the ED25519 one whose fingerprint
-# was displayed: the host legitimately offers several types and ssh picks one at
-# negotiation time. Pinning the whole scan means whichever it picks came from
-# the host we checked, while a key that was not in the scan -- an attacker's RSA
-# key offered in place of the ED25519 one we showed the operator -- is rejected
-# outright rather than accepted under `accept-new`.
+# Only the scan line(s) whose fingerprint is the one that was checked -- shown
+# to the operator, or compared with XO_DEPLOY_POOL_FINGERPRINT -- are pinned.
+# Pinning the whole scan trusted every other key type that came back in it
+# without anyone checking it: an RSA key answering beside the real ED25519 one
+# passed the check and was then accepted at connect time. With only the
+# checked key pinned, ssh negotiates that key type, and a host offering any
+# other key fails with "REMOTE HOST IDENTIFICATION HAS CHANGED".
+#
+# Arguments: the scan file, the checked fingerprint (SHA256:...). Exits if no
+# line matches: continuing would fall back to accepting whatever is offered.
 deploy_pin_pool_host_key() {
-    local scan="$1"
+    local scan="$1" checked_fp="$2"
     local pinned="${DEPLOY_WORKDIR}/pool_known_hosts"
+    local one="${DEPLOY_WORKDIR}/pool_hostkey_line"
+    local line fp
 
-    cp "$scan" "$pinned" 2>/dev/null || return 0
-    chmod 600 "$pinned" 2>/dev/null || true
+    if ! { : > "$pinned" && chmod 600 "$pinned"; } 2>/dev/null; then
+        log_error "Could not write ${pinned}; refusing to send the host password."
+        exit 1
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        printf '%s\n' "$line" > "$one"
+        fp=$(ssh-keygen -lf "$one" 2>/dev/null | awk '{print $2}')
+        if [[ -n "$fp" && "$fp" == "$checked_fp" ]]; then
+            printf '%s\n' "$line" >> "$pinned"
+        fi
+    done < "$scan"
+    rm -f "$one"
+
+    if [[ ! -s "$pinned" ]]; then
+        log_error "Could not pin the checked host key of ${POOL_MASTER_IP}; refusing to"
+        log_error "send the host password."
+        exit 1
+    fi
     DEPLOY_POOL_KNOWN_HOSTS="$pinned"
 }
 
@@ -6039,7 +6184,7 @@ deploy_verify_host_key() {
 
     if [[ -n "$expected" ]]; then
         if [[ "$fp" == "$expected" ]]; then
-            deploy_pin_pool_host_key "$scan"
+            deploy_pin_pool_host_key "$scan" "$fp"
             log_success "Pool master host key matches XO_DEPLOY_POOL_FINGERPRINT."
             return 0
         fi
@@ -6064,7 +6209,7 @@ deploy_verify_host_key() {
         # Still pinned: nobody confirmed this key, but binding the run to the one
         # key we saw is strictly better than letting every later connection take
         # whatever is offered.
-        deploy_pin_pool_host_key "$scan"
+        deploy_pin_pool_host_key "$scan" "$fp"
         log_warning "Non-interactive: accepting this key without confirmation."
         log_warning "Set XO_DEPLOY_POOL_FINGERPRINT to have it verified instead."
         return 0
@@ -6074,7 +6219,7 @@ deploy_verify_host_key() {
         exit 1
     fi
 
-    deploy_pin_pool_host_key "$scan"
+    deploy_pin_pool_host_key "$scan" "$fp"
 }
 
 # Collect pool master connection details and open the shared SSH connection.
@@ -8898,6 +9043,10 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build's temporary key was installed by cloud-init for the default user
+# (and for root, behind a "log in as" prefix). Remove it so the template does
+# not carry an entry for a key generated on the build machine.
+sed -i '/xo template build (temporary)/d' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null || true
 # The build gave this VM the hostname "xo-template-build" from the prep drive.
 # Clear it so the template ships no hostname: each clone then takes its own
 # from cloud-init or DHCP instead of inheriting the build VM's name.
@@ -9042,6 +9191,10 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build's temporary key was installed by cloud-init for the default user
+# (and for root, behind a "log in as" prefix). Remove it so the template does
+# not carry an entry for a key generated on the build machine.
+sed -i '/xo template build (temporary)/d' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null || true
 # The build gave this VM the hostname "xo-template-build" from the prep drive.
 # Clear it so the template ships no hostname: each clone then takes its own
 # from cloud-init or DHCP instead of inheriting the build VM's name.
@@ -9235,6 +9388,10 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 truncate -s 0 /etc/machine-id
 truncate -s 0 /var/lib/dbus/machine-id 2>/dev/null || true
 find /etc/ssh -type f -name 'ssh_host_*' -delete
+# The build's temporary key was installed by cloud-init for the default user
+# (and for root, behind a "log in as" prefix). Remove it so the template does
+# not carry an entry for a key generated on the build machine.
+sed -i '/xo template build (temporary)/d' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null || true
 # The build gave this VM the hostname "xo-template-build" from the prep drive.
 # Clear it so the template ships no hostname: each clone then takes its own
 # from cloud-init or DHCP instead of inheriting the build VM's name.
@@ -9954,19 +10111,36 @@ tpl_cleanup_failed_build() {
 
 # Run an xo-cli command against the configured XO, printing its output.
 tpl_xo_cli() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     local base
     base=$(tpl_api_base_url)
 
-    # The token goes INSIDE the url, as xo-cli's own --help states: "The URL
-    # must include credentials: https://token@xo.company.net/". There is no
-    # standalone --token for a command invocation -- passing one is read as a
-    # positional argument and fails with "invalid arg: <the token>", which
-    # looks like the token is malformed rather than misplaced.
-    local auth_url="${base/:\/\//://${XO_API_TOKEN}@}"
+    # The token goes in through a private xo-cli settings file, not the
+    # command line. xo-cli takes it only two ways: inside --url
+    # ("https://token@xo.company.net/", per its --help) or from the file
+    # `xo-cli register` writes. A URL argument is readable by every local user
+    # in ps for as long as xo-cli runs. So each call gets its own 0700
+    # XDG_CONFIG_HOME holding that file, removed afterwards -- which also
+    # leaves alone whatever the operator has registered xo-cli against.
+    # (There is no standalone --token for a command invocation: one is read
+    # as a positional argument and fails with "invalid arg: <the token>".)
+    local cfg_home rc=0
+    cfg_home=$(mktemp -d --tmpdir xo-cli-cfg-XXXXXX) || return 1
+    chmod 700 "$cfg_home"
+    if ! xo_cli_write_config "$cfg_home" "$base" XO_API_TOKEN; then
+        rm -rf "$cfg_home"
+        echo "could not write a temporary xo-cli configuration"
+        return 1
+    fi
 
     # --au (--allowUnauthorized) for the same reason curl gets -k: the common
     # target is an XO with a self-signed certificate.
-    xo-cli --au --url "$auth_url" "$@" 2>&1
+    XDG_CONFIG_HOME="$cfg_home" xo-cli --au "$@" 2>&1 || rc=$?
+    rm -rf "$cfg_home"
+    return "$rc"
 }
 
 # POST a REST path with a JSON body and print the response.
@@ -10406,7 +10580,7 @@ tpl_api_import_image() {
         deploy_curl_upload_with_progress "$upload_file" "$up_size" http_code \
             -k -L --post301 --post302 --post303 -X POST \
             --speed-limit 1024 --speed-time 120 \
-            -b "authenticationToken=${XO_API_TOKEN}" \
+            -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
             --data-binary @- \
             --output "$resp_file" --write-out '%{http_code}' \
@@ -10429,7 +10603,7 @@ tpl_api_import_image() {
         deploy_curl_stream_with_progress "$url" "$stream_size" http_code \
             -s -k -L --post301 --post302 --post303 -X POST \
             --speed-limit 1024 --speed-time 120 \
-            -b "authenticationToken=${XO_API_TOKEN}" \
+            -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
             --data-binary @- \
             --output "$resp_file" --write-out '%{http_code}' \
@@ -11496,15 +11670,18 @@ tpl_api_request() {
         # Every other curl in this script already does this; these calls were
         # the exception.
         local args=(-s --max-time 60 -k -L --post301 --post302 --post303
-            --output "$resp_file" --write-out '%{http_code}'
-            -b "authenticationToken=${XO_API_TOKEN}")
+            --output "$resp_file" --write-out '%{http_code}')
         [[ "$method" != "GET" ]] && args+=(-X "$method")
         if [[ -n "$body" ]]; then
             args+=(-H 'Content-Type: application/json' --data-binary "$body")
         fi
 
+        # The token goes in on the curl line itself, not in args: a process
+        # substitution's pipe is only guaranteed open for the command it is
+        # written on. See xo_cookie_config.
         rc=0
-        http_code=$(curl "${args[@]}" "${base}/rest/v0/${path#/}" 2>/dev/null) || rc=$?
+        http_code=$(curl "${args[@]}" -K <(xo_cookie_config XO_API_TOKEN) \
+            "${base}/rest/v0/${path#/}" 2>/dev/null) || rc=$?
 
         TPL_API_LAST_CODE="$http_code"
         TPL_API_LAST_CURL_RC="$rc"
@@ -11534,6 +11711,10 @@ tpl_api_request() {
 # -- worth logging, because the REST API requires an admin account and a token
 # from a non-admin user fails later in ways that do not mention permissions.
 tpl_api_check_auth() {
+    # Handles the XO API token or password: no XO_DEBUG trace inside, see the
+    # note at the top of this file.
+    local -
+    set +x
     if [[ -z "${XO_API_TOKEN:-}" ]]; then
         TPL_API_UNAVAILABLE_REASON="no XO_API_TOKEN (or XO_TASK_CHECK_TOKEN) in ${CONFIG_FILE##*/}"
         return 1
@@ -13118,7 +13299,27 @@ menu_interactive_pick() {
         menu_enable_wrap
         [[ -n "$saved_stty" ]] && stty "$saved_stty" 2>/dev/null || stty echo 2>/dev/null
     }
-    trap cleanup_menu EXIT
+    # Chain onto any EXIT trap already set rather than replacing it. An earlier
+    # menu item may have one: the Template Library's tpl_cleanup shreds its
+    # private build key. Replacing it, then clearing it with `trap - EXIT`,
+    # left that key in /tmp whenever Custom Plugins ran in the same pass.
+    # `trap -p EXIT` prints "trap -- '<command>' EXIT"; stripping the ends
+    # leaves the command still shell-quoted, which the eval undoes.
+    local prev_exit_trap prev_exit_cmd=""
+    prev_exit_trap=$(trap -p EXIT)
+    if [[ -n "$prev_exit_trap" ]]; then
+        prev_exit_trap=${prev_exit_trap#trap -- }
+        eval "prev_exit_cmd=${prev_exit_trap% EXIT}"
+    fi
+    # Puts back the EXIT trap the picker found, or none if there was none.
+    menu_restore_exit_trap() {
+        if [[ -n "$prev_exit_cmd" ]]; then
+            trap -- "$prev_exit_cmd" EXIT
+        else
+            trap - EXIT
+        fi
+    }
+    trap -- "cleanup_menu${prev_exit_cmd:+; ${prev_exit_cmd}}" EXIT
     # Only raise a flag here — drawing from inside the handler could interleave
     # with a draw already in progress. menu_read_key turns this into a REDRAW.
     trap 'MENU_RESIZED=1' WINCH
@@ -13240,7 +13441,7 @@ menu_interactive_pick() {
                     break
                 fi
                 cleanup_menu
-                trap - EXIT
+                menu_restore_exit_trap
                 trap - WINCH
                 clear
                 echo "Cancelled."
@@ -13253,7 +13454,7 @@ menu_interactive_pick() {
 
     # Restore terminal before returning control to the caller
     cleanup_menu
-    trap - EXIT
+    menu_restore_exit_trap
     trap - WINCH
     clear
 

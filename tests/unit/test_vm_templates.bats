@@ -234,6 +234,48 @@ teardown() {
     done
 }
 
+@test "every prep script removes the build key from authorized_keys before sealing" {
+    # cloud-init installs the build's public key for the default user (and,
+    # with a "please log in as" prefix, for root). Without removing it, every
+    # template ships an entry for a key this script generated. Run each
+    # script's removal against stand-in home directories and check the build
+    # key's lines are gone while the operator's own key stays.
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not installed"
+    DEPLOY_WORKDIR="$TMPDIR_TEST"
+    local pubkey
+    pubkey=$(tpl_build_ssh_key)
+    [ -n "$pubkey" ]
+
+    local fn line
+    for fn in tpl_prep_debian tpl_prep_rhel tpl_prep_fedora; do
+        local root="${TMPDIR_TEST}/${fn}"
+        mkdir -p "${root}/root/.ssh" "${root}/home/someuser/.ssh"
+        printf 'ssh-ed25519 AAAAown operator@laptop\n%s\n' "$pubkey" \
+            > "${root}/home/someuser/.ssh/authorized_keys"
+        printf 'no-port-forwarding,command="echo login as someuser" %s\n' "$pubkey" \
+            > "${root}/root/.ssh/authorized_keys"
+
+        line=$("$fn" someuser | grep 'authorized_keys' | grep -v '^\s*#')
+        [ -n "$line" ]
+        line=${line//\/root\//${root}\/root\/}
+        line=${line//\/home\//${root}\/home\/}
+        bash -c "$line"
+
+        # `run` + status, not `! grep`: bats does not fail a test on a
+        # negated command that is not its last line.
+        run grep -qF "xo template build (temporary)" "${root}/home/someuser/.ssh/authorized_keys"
+        [ "$status" -eq 1 ]
+        run grep -qF "xo template build (temporary)" "${root}/root/.ssh/authorized_keys"
+        [ "$status" -eq 1 ]
+        grep -qF "operator@laptop" "${root}/home/someuser/.ssh/authorized_keys"
+
+        # And it runs before the VM powers off, not after.
+        "$fn" someuser > "${TMPDIR_TEST}/prep.sh"
+        [ "$(grep -n 'authorized_keys' "${TMPDIR_TEST}/prep.sh" | grep -v ':\s*#' | cut -d: -f1)" \
+            -lt "$(grep -n '^shutdown -h now' "${TMPDIR_TEST}/prep.sh" | cut -d: -f1)" ]
+    done
+}
+
 @test "the prep script installs guest tools from the ISO before falling back to apt" {
     # Debian 13 has no xe-guest-utilities package, and a failed apt install
     # does not stop cloud-init — so an ISO-last ordering produces a template
@@ -2569,15 +2611,46 @@ print("ok")
     ! tpl_is_xo_id ""
 }
 
-@test "xo-cli is given the token in the URL, not as a flag" {
-    # xo-cli has no standalone --token for a command invocation: its --help
-    # says "The URL must include credentials". Passing one is read as a
-    # positional argument and fails with "invalid arg: <the token>", which
-    # reads as a malformed token rather than a misplaced one.
-    local body
-    body=$(declare -f tpl_xo_cli)
-    [[ "$body" == *'${XO_API_TOKEN}@'* ]]
-    [[ "$body" != *"--token"* ]]
+@test "xo-cli gets the token from a private settings file, not its command line" {
+    # xo-cli has no standalone --token for a command invocation: one is read
+    # as a positional argument and fails with "invalid arg: <the token>". It
+    # used to get the token inside --url, where every local user could read
+    # it in ps. Now a per-call XDG_CONFIG_HOME holds xo-cli's own settings
+    # file, readable only by this user and removed afterwards.
+    command -v node >/dev/null || skip "node not installed"
+    local bin="${TMPDIR_TEST}/bin"
+    mkdir -p "$bin"
+    cat > "${bin}/xo-cli" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$@" > "$STUB_DIR/argv"
+cp "$XDG_CONFIG_HOME/xo-cli/config.json" "$STUB_DIR/config.json"
+stat -c '%a' "$XDG_CONFIG_HOME" "$XDG_CONFIG_HOME/xo-cli/config.json" > "$STUB_DIR/modes"
+echo "$XDG_CONFIG_HOME" > "$STUB_DIR/home"
+echo "stub output"
+STUB
+    chmod +x "${bin}/xo-cli"
+    export STUB_DIR="$TMPDIR_TEST"
+    PATH="${bin}:$PATH"
+    XO_API_TOKEN='tok-en"with\back'
+    XO_URL="https://xo.example.test"
+
+    run tpl_xo_cli vm.ejectCd id=abc
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"stub output"* ]]
+
+    run grep -qF "tok-en" "${TMPDIR_TEST}/argv"
+    [ "$status" -eq 1 ]
+    run grep -qx -e "--token" -e "--url" "${TMPDIR_TEST}/argv"
+    [ "$status" -eq 1 ]
+    grep -qx "vm.ejectCd" "${TMPDIR_TEST}/argv"
+
+    run node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1]));
+        console.log(c.token===process.argv[2] && c.server.startsWith("https://xo.example.test") && c.allowUnauthorized===true)' \
+        "${TMPDIR_TEST}/config.json" "$XO_API_TOKEN"
+    [ "$output" = "true" ]
+    [ "$(sed -n 1p "${TMPDIR_TEST}/modes")" = "700" ]
+    [ "$(sed -n 2p "${TMPDIR_TEST}/modes")" = "600" ]
+    [ ! -e "$(cat "${TMPDIR_TEST}/home")" ]
 }
 
 @test "the API path picks the management network, not whichever XO lists first" {
