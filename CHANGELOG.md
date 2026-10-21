@@ -12,6 +12,10 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`--uninstall` stops and disables xo-server.** The check for the service
+  never matched, so the uninstall removed the unit file and the install
+  directory while xo-server kept running and holding ports 80/443, and left
+  a dangling link in `multi-user.target.wants`.
 - **`--rebuild` no longer deletes XO when it can't clone it again.** It
   removed the install first and cloned afterwards, so a failed clone left XO
   deleted and stopped. It now clones next to the install and swaps only once

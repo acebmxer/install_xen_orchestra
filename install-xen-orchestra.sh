@@ -8117,8 +8117,9 @@ cleanup_xo() {
         return 0
     fi
 
-    # 1. Stop and disable the systemd service
-    if systemctl list-unit-files xo-server.service &>/dev/null 2>&1 | grep -q xo-server; then
+    # 1. Stop and disable the systemd service. `systemctl cat` succeeds only
+    # when the unit exists (same test setup_redis uses).
+    if systemctl cat xo-server.service >/dev/null 2>&1; then
         log_info "Stopping xo-server service..."
         run_cmd sudo systemctl stop xo-server 2>/dev/null || true
         run_cmd sudo systemctl disable xo-server 2>/dev/null || true
