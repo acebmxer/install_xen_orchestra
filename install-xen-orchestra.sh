@@ -5160,6 +5160,10 @@ deploy_curl_upload_with_progress() {
     d=$(mktemp -d) || return 1
     fifo="$d/pipe"
     if ! mkfifo "$fifo" 2>/dev/null; then rm -rf "$d"; return 1; fi
+    # Created here, not by dd's 2> in the background job: the poll below can
+    # run first, and its `< dd.err` then printed "No such file or directory"
+    # over the progress bar.
+    : > "$d/dd.err"
 
     # Writer. Blocks until curl opens the read end, which is why it is
     # backgrounded before curl rather than after.
@@ -5223,26 +5227,57 @@ deploy_curl_upload_with_progress() {
 #
 # A total is optional. Without one deploy_draw_progress_n falls back to a
 # running byte count, which is still better than several minutes of silence.
+#
+# Optional leading `--digest BITS VAR`: also hash the bytes as they pass
+# (shaBITSsum, read from a fifo that tee feeds) and put the hex digest in VAR,
+# empty if it could not be computed. The API build path uses this to check a
+# raw image it never writes to disk. The fetch keeps its own exit status
+# through the tee (pipefail in that stage), so PIPESTATUS[0] still means the
+# download.
 deploy_curl_stream_with_progress() {
+    local bits="" digestvar=""
+    if [[ "${1:-}" == "--digest" ]]; then
+        bits="$2" digestvar="$3"; shift 3
+    fi
     local url="$1" total="$2" outvar="$3"; shift 3
     local d rc=0 pipepid sent
 
     d=$(mktemp -d) || return 1
+    # Created before the background job, as in
+    # deploy_curl_upload_with_progress: the poll can run before dd's 2>
+    # creates it, which printed "No such file or directory" over the bar.
+    : > "$d/dd.err"
 
     DEPLOY_PROGRESS_FILLED=0
     DEPLOY_PROGRESS_PCT=-1
     DEPLOY_PROGRESS_BYTES=-1
+
+    local -a fetch=(curl -fL --no-progress-meter --max-time 0 \
+        --speed-limit 1024 --speed-time 120 "$url")
 
     # PIPESTATUS is captured inside the subshell because the foreground shell
     # goes on to poll: by the time it could look, the pipeline is long gone.
     # Both stages matter -- a mirror that 404s and an XO that refuses the body
     # are different failures and either one must fail the build.
     {
-        curl -fL --no-progress-meter --max-time 0 \
-            --speed-limit 1024 --speed-time 120 "$url" \
+        local hashpid=""
+        if [[ -n "$bits" ]]; then
+            mkfifo "$d/digest.fifo"
+            "sha${bits}sum" < "$d/digest.fifo" 2>/dev/null \
+                | awk '{print $1}' > "$d/digest" &
+            hashpid=$!
+        fi
+        {
+            if [[ -n "$bits" ]]; then
+                ( set -o pipefail; "${fetch[@]}" | tee "$d/digest.fifo" )
+            else
+                "${fetch[@]}"
+            fi
+        } \
         | dd bs=1M status=progress 2>"$d/dd.err" \
         | curl "$@" > "$d/code" 2>/dev/null
         printf '%s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[2]}" > "$d/rc"
+        [[ -n "$hashpid" ]] && wait "$hashpid"
     } &
     pipepid=$!
 
@@ -5267,6 +5302,7 @@ deploy_curl_stream_with_progress() {
     printf '\n' >&2
 
     printf -v "$outvar" '%s' "$(cat "$d/code" 2>/dev/null)"
+    [[ -n "$digestvar" ]] && printf -v "$digestvar" '%s' "$(cat "$d/digest" 2>/dev/null)"
     rm -rf "$d"
     return "$rc"
 }
@@ -5336,16 +5372,33 @@ deploy_ensure_qemu_img() {
     return 1
 }
 
+# Check a downloaded image against the digest its origin publishes.
+#
+# Arguments: the image URL, then what to check, then where:
+#   dom0    (default) the second argument is a file on the pool master; the
+#           sums file is fetched and the file hashed there, over SSH
+#   local   the second argument is a file on this machine (the API build
+#           path, which downloads here); fetched and hashed here
+#   digest  the second argument is the image's digest, already computed
+#           while it streamed past (the API path's raw upload); the sums
+#           file is fetched here
+#
+# Returns 1 only for a mismatch or a pin that cannot be honoured. An origin
+# with no sums entry, or a digest that could not be computed, warns and
+# returns 0, so DEPLOY_IMAGE_VERIFIED says whether the image really was
+# checked: callers print "checksum verified" only when it is true.
+DEPLOY_IMAGE_VERIFIED=false
 deploy_verify_image_checksum() {
-    local url="$1" tmp="$2"
+    local url="$1" tmp="$2" where="${3:-dom0}"
     local pinned="${XO_DEPLOY_IMAGE_SHA512:-}"
     local want=""
+    DEPLOY_IMAGE_VERIFIED=false
 
     # The pin is SHA-512 by name, so it overrides whatever the origin would
     # otherwise have been read in.
     local sums_file sums_bits
     read -r sums_file sums_bits <<< "$(deploy_checksum_source "$url")"
-    [[ -n "$pinned" ]] && sums_bits=512
+    sums_bits=$(deploy_image_digest_bits "$url")
 
     if [[ -n "$pinned" ]]; then
         want="$pinned"
@@ -5357,7 +5410,11 @@ deploy_verify_image_checksum() {
         local dir="${url%/*}"
 
         local sums
-        sums=$(dom0_exec "curl -fsSL --max-time 120 '${dir}/${sums_file}' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+        if [[ "$where" == "dom0" ]]; then
+            sums=$(dom0_exec "curl -fsSL --max-time 120 '${dir}/${sums_file}' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+        else
+            sums=$(curl -fsSL --max-time 120 "${dir}/${sums_file}" 2>/dev/null | tr -d '\r' || true)
+        fi
         if [[ -n "$sums" ]]; then
             # Lines are "<digest>  <name>"; coreutils marks binary mode with a
             # leading '*' on the name. Ubuntu's SHA256SUMS uses that '*' form
@@ -5398,15 +5455,19 @@ deploy_verify_image_checksum() {
     fi
 
     local got
-    got=$(dom0_exec "sha${sums_bits}sum '${tmp}' 2>/dev/null | awk '{print \$1}'" | tr -d '\r')
+    case "$where" in
+        dom0)   got=$(dom0_exec "sha${sums_bits}sum '${tmp}' 2>/dev/null | awk '{print \$1}'" | tr -d '\r') ;;
+        local)  got=$("sha${sums_bits}sum" "$tmp" 2>/dev/null | awk '{print $1}') ;;
+        digest) got="$tmp" ;;
+    esac
     if [[ ! "$got" =~ ^[a-fA-F0-9]{$hex_len}$ ]]; then
         # A pin is a demand for proof, so failing to produce one is fatal.
         if [[ -n "$pinned" ]]; then
-            log_error "Could not compute the image's SHA-512 on the pool master, and"
+            log_error "Could not compute the image's SHA-512, and"
             log_error "XO_DEPLOY_IMAGE_SHA512 is set. Refusing to import it unverified."
             return 1
         fi
-        log_warning "  could not compute the image's checksum on the pool master; skipping."
+        log_warning "  could not compute the image's checksum; skipping."
         return 0
     fi
 
@@ -5419,8 +5480,20 @@ deploy_verify_image_checksum() {
         return 1
     fi
 
+    DEPLOY_IMAGE_VERIFIED=true
     log_success "  image checksum verified"
     return 0
+}
+
+# The SHA width (256 or 512) an image is checked with: the origin's sums file
+# decides it, except that the XO_DEPLOY_IMAGE_SHA512 pin is SHA-512 by name.
+# Shared by deploy_verify_image_checksum and the API path's streamed upload,
+# which has to pick the algorithm before the bytes go past.
+deploy_image_digest_bits() {
+    local sums_file sums_bits
+    read -r sums_file sums_bits <<< "$(deploy_checksum_source "$1")"
+    [[ -n "${XO_DEPLOY_IMAGE_SHA512:-}" ]] && sums_bits=512
+    printf '%s' "$sums_bits"
 }
 
 # Staging wins on every count that matters. The download lands in a file, so it
@@ -5436,6 +5509,9 @@ deploy_verify_image_checksum() {
 # without the few gigabytes of scratch space staging needs.
 deploy_import_vdi_from_url() {
     local vdi="$1" url="$2"
+    # Set by deploy_verify_image_checksum on the staged path only; the
+    # streaming fallback below cannot check anything, so it stays false.
+    DEPLOY_IMAGE_VERIFIED=false
 
     # `|| rc=$?` rather than a bare call: under `set -e` a function returning
     # non-zero on its own line takes the script down with it, so the fallback
@@ -8643,7 +8719,8 @@ show_help() {
     echo "  --version              Show this script's version and branch, then exit"
     echo "  --help                 Show this help message"
     echo ""
-    echo "Automation Flags (can be combined with any operation):"
+    echo "Automation Flags (can be combined with any operation; --deploy and"
+    echo "--build-templates refuse --non-interactive and stop at once under --dry-run):"
     echo "  --non-interactive      Bypass all interactive prompts; use config defaults"
     echo "  --yes                  Alias for --non-interactive"
     echo "  --backup-file NAME     With --restore: select specific backup by directory name"
@@ -10005,7 +10082,7 @@ tpl_create_build_vm() {
         log_error "    ssh ${HOST_USERNAME}@${POOL_MASTER_IP} grep -i vhd-tool /var/log/xensource.log"
         return 1
     fi
-    log_success "  image imported and checksum verified"
+    tpl_log_image_imported
 
     # The prep drive.
     TPL_CIDATA_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${name} cidata' virtual-size=16MiB type=user" | tr -d '\r')
@@ -10465,12 +10542,80 @@ tpl_json_id_matching() {
     return 0
 }
 
+# The objects in a REST collection whose <field> is exactly <value>, printed
+# as they came (one pretty-printed object after another), so the result can
+# be handed to tpl_json_field / tpl_json_field_where like any response.
+#
+# This is how lookups are kept to one pool: XO lists every pool's objects
+# together, so the build asks for `$pool` alongside what it needs and keeps
+# only the chosen pool's objects before matching on anything else.
+tpl_json_objects_where() {
+    local json="$1" field="$2" value="$3"
+    printf '%s' "$json" | awk -v f="\"${field}\"" -v v="\"${value}\"" '
+        # Braces escaped for busybox awk, as in tpl_json_field_where.
+        /^[[:space:]]*\{/ { buf = ""; hit = 0; inobj = 1 }
+        inobj {
+            buf = buf $0 "\n"
+            p = index($0, f ":")
+            if (p == 0) p = index($0, f " :")
+            if (p > 0) {
+                rest = substr($0, p + length(f))
+                if (match(rest, /"[^"]*"/) && substr(rest, RSTART, RLENGTH) == v) hit = 1
+            }
+        }
+        /^[[:space:]]*\}/ { if (inobj && hit) printf "%s", buf; inobj = 0 }
+    '
+}
+
+# Choose the one pool an API build works on, from a `pools?fields=id,
+# name_label,...` response. Sets TPL_API_POOL_ID. With several pools the
+# operator is asked; with one it is used without asking.
+TPL_API_POOL_ID=""
+tpl_api_choose_pool() {
+    local pools="$1"
+    local -a pool_opts=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && pool_opts+=("$line")
+    done < <(printf '%s' "$pools" | awk '
+        /^[[:space:]]*\{/ { id = ""; name = "" }
+        match($0, /"id"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            s = substr($0, RSTART, RLENGTH); sub(/^"id"[[:space:]]*:[[:space:]]*"/, "", s); sub(/"$/, "", s); id = s
+        }
+        match($0, /"name_label"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            s = substr($0, RSTART, RLENGTH); sub(/^"name_label"[[:space:]]*:[[:space:]]*"/, "", s); sub(/"$/, "", s); name = s
+        }
+        /^[[:space:]]*\}/ { if (id != "") print id "|" (name != "" ? name : id) }
+    ')
+
+    if [[ ${#pool_opts[@]} -eq 0 ]]; then
+        log_error "XO returned no pools. Is a host connected to this XO?"
+        return 1
+    fi
+    # Already chosen this run (before the template picker, for its labels):
+    # keep it, so the operator is asked once and labels and build agree.
+    if [[ -n "$TPL_API_POOL_ID" ]]; then
+        local opt
+        for opt in "${pool_opts[@]}"; do
+            [[ "${opt%%|*}" == "$TPL_API_POOL_ID" ]] && return 0
+        done
+    fi
+    deploy_choose "Which pool should the templates be built on?" "${pool_opts[@]}"
+    TPL_API_POOL_ID="$DEPLOY_CHOICE"
+    return 0
+}
+
 # Resolve the SR and network through the API, in place of tpl_resolve_storage
 # and tpl_resolve_network's `xe` calls.
 #
 # The same choice is made as the SSH path makes: the pool's default SR, and the
 # management network. Both are what a VM created in XO's own New VM form would
 # get, so a template built either way lands in the same place.
+#
+# Everything is taken from one pool. XO lists every pool it manages in one
+# response, and reading the first "id" and the first "default_SR" separately
+# could pair one pool with another pool's SR; the PIFs and templates were not
+# filtered by pool at all. With several pools the operator picks one.
 tpl_api_resolve_targets() {
     local pools default_sr pool_id
     if ! pools=$(tpl_api_get "pools?fields=id,default_SR,name_label"); then
@@ -10478,15 +10623,10 @@ tpl_api_resolve_targets() {
         return 1
     fi
 
-    pool_id=$(tpl_json_field "$pools" "id")
-    default_sr=$(tpl_json_field "$pools" "default_SR")
+    tpl_api_choose_pool "$pools" || return 1
+    pool_id="$TPL_API_POOL_ID"
 
-    if [[ -z "$pool_id" ]]; then
-        log_error "XO returned no pools. Is a host connected to this XO?"
-        return 1
-    fi
-    TPL_API_POOL_ID="$pool_id"
-
+    default_sr=$(tpl_json_field "$(tpl_json_objects_where "$pools" id "$pool_id")" "default_SR")
     if [[ -z "$default_sr" ]]; then
         log_error "This pool has no default SR set. Set one in XO, or use"
         log_error "TEMPLATE_BUILD_METHOD=ssh to pick storage on the pool master."
@@ -10515,10 +10655,11 @@ tpl_api_resolve_targets() {
     # PIF and the answer read off its $network. A pool has one management PIF
     # per host, all on the same network, so any of them gives the same answer.
     local pifs net_id
-    if ! pifs=$(tpl_api_get "pifs?fields=management,\$network&limit=200"); then
+    if ! pifs=$(tpl_api_get "pifs?fields=management,\$network,\$pool&limit=2000"); then
         log_error "Could not list PIFs from XO."
         return 1
     fi
+    pifs=$(tpl_json_objects_where "$pifs" '$pool' "$pool_id")
     net_id=$(tpl_json_field_where "$pifs" management true '$network')
 
     if [[ -z "$net_id" ]]; then
@@ -10527,10 +10668,11 @@ tpl_api_resolve_targets() {
         # the SSH path falls back too, and an unrouted network is worse than a
         # guess at a routed one.
         local nets
-        if ! nets=$(tpl_api_get "networks?fields=id,name_label,PIFs&limit=200"); then
+        if ! nets=$(tpl_api_get "networks?fields=id,name_label,PIFs,\$pool&limit=2000"); then
             log_error "Could not list networks from XO."
             return 1
         fi
+        nets=$(tpl_json_objects_where "$nets" '$pool' "$pool_id")
         net_id=$(printf '%s' "$nets" | awk '
             /^[[:space:]]*\{/ { id = ""; haspif = 0 }
             /"id"[[:space:]]*:/ && id == "" {
@@ -10566,6 +10708,17 @@ tpl_api_resolve_targets() {
     return 0
 }
 
+# The success line after an image import, on either build path. It says
+# "checksum verified" only when deploy_verify_image_checksum really matched a
+# digest; otherwise the warning it printed explains why not.
+tpl_log_image_imported() {
+    if [[ "$DEPLOY_IMAGE_VERIFIED" == "true" ]]; then
+        log_success "  image imported and checksum verified"
+    else
+        log_success "  image imported (checksum not verified; see the warning above)"
+    fi
+}
+
 # Import a cloud image into a new VDI on the default SR.
 #
 # The image is streamed from its mirror straight into XO's import endpoint, so
@@ -10598,7 +10751,8 @@ tpl_api_import_image() {
     # converted here before the upload -- the same conversion the SSH path
     # does on the pool master, done locally because that is where the bytes
     # are on this path.
-    local local_file="" upload_file="" converted=""
+    local local_file="" upload_file="" converted="" stream_digest=""
+    DEPLOY_IMAGE_VERIFIED=false
     case "$url" in
         *.raw)
             # Raw streams straight through: nothing to convert, and staging a
@@ -10650,6 +10804,13 @@ tpl_api_import_image() {
                     --retry 5 --retry-delay 3 --retry-all-errors \
                     --speed-limit 1024 --speed-time 120 --max-time 3600 "$url"; then
                 log_error "  could not download ${url}"
+                rm -f "$local_file"
+                return 1
+            fi
+
+            # Checked as downloaded, before the conversion: the origin
+            # publishes a digest of the file it publishes, as on the SSH path.
+            if ! deploy_verify_image_checksum "$url" "$local_file" local; then
                 rm -f "$local_file"
                 return 1
             fi
@@ -10733,7 +10894,12 @@ tpl_api_import_image() {
             | grep -i '^content-length:' | tail -1 | awk '{print $2}')
         [[ "$stream_size" =~ ^[0-9]+$ ]] || stream_size=""
 
-        deploy_curl_stream_with_progress "$url" "$stream_size" http_code \
+        # Nothing lands on disk here, so the image is hashed as it streams
+        # past and checked once XO has the disk; a mismatch fails the build
+        # and tpl_api_cleanup_failed_build deletes the disk.
+        deploy_curl_stream_with_progress \
+            --digest "$(deploy_image_digest_bits "$url")" stream_digest \
+            "$url" "$stream_size" http_code \
             -s -k -L --post301 --post302 --post303 -X POST \
             --speed-limit 1024 --speed-time 120 \
             -K <(xo_cookie_config XO_API_TOKEN) \
@@ -10758,6 +10924,17 @@ tpl_api_import_image() {
         [[ -n "$resp" ]] && log_error "  it said: ${resp}"
         return 1
     fi
+
+    # The streamed (raw) upload: compare the digest taken on the way past.
+    # The converted path already verified its download above.
+    if [[ -z "$upload_file" ]]; then
+        if ! deploy_verify_image_checksum "$url" "$stream_digest" digest; then
+            log_error "  the image XO received is not the published one; removing it."
+            return 1
+        fi
+    fi
+
+    tpl_log_image_imported
     return 0
 }
 
@@ -10822,14 +10999,19 @@ tpl_api_create_build_vm() {
     # here -- SRs, networks, pools -- reports id and uuid identically, which is
     # why this is the only lookup that has to ask for both.
     local tpls base_tpl count
-    tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label&filter=$(tpl_urlencode 'name_label:"Other install media"')&limit=50" 2>/dev/null) || tpls=""
+    #
+    # Kept to the build pool: every pool ships its own "Other install media",
+    # and create_vm on this pool cannot use another pool's.
+    tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label,\$pool&filter=$(tpl_urlencode 'name_label:"Other install media"')&limit=200" 2>/dev/null) || tpls=""
+    tpls=$(tpl_json_objects_where "$tpls" '$pool' "$TPL_API_POOL_ID")
     base_tpl=$(tpl_json_field_where "$tpls" name_label 'Other install media' uuid)
 
     if [[ -z "$base_tpl" ]]; then
-        if ! tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label&limit=1000"); then
+        if ! tpls=$(tpl_api_get "vm-templates?fields=id,uuid,name_label,\$pool&limit=5000"); then
             log_error "Could not list VM templates from XO."
             return 1
         fi
+        tpls=$(tpl_json_objects_where "$tpls" '$pool' "$TPL_API_POOL_ID")
         base_tpl=$(tpl_json_field_where "$tpls" name_label 'Other install media' uuid)
     fi
     if [[ -z "$base_tpl" ]]; then
@@ -10989,7 +11171,9 @@ tpl_api_attach_tools_iso() {
     # tools from a superseded ISO, which is the sort of thing that works often
     # enough to go unnoticed.
     local isos iso_id
-    if isos=$(tpl_api_get "vdis?fields=id,name_label&limit=2000"); then
+    # Only this pool's copy can be inserted into this pool's VM.
+    if isos=$(tpl_api_get "vdis?fields=id,name_label,\$pool&limit=2000"); then
+        isos=$(tpl_json_objects_where "$isos" '$pool' "$TPL_API_POOL_ID")
         iso_id=$(tpl_json_id_where "$isos" name_label "$TPL_TOOLS_ISO_NAME")
     fi
     if [[ -n "$iso_id" ]] && tpl_xo_cli vm.insertCd id="$TPL_VM_UUID" cd_id="$iso_id" force=true >/dev/null; then
@@ -11201,8 +11385,13 @@ tpl_api_cleanup_failed_build() {
 
 tpl_template_exists_dispatch() {
     if [[ "$TPL_BUILD_METHOD" == "api" ]]; then
+        # Asked by name (XO's filter is a substring match, so the exact
+        # match is still made here) and kept to the build pool: a same-named
+        # template on another pool is not this pool's, and listing every
+        # template with a limit missed one once a pool held more than that.
         local resp
-        resp=$(tpl_api_get "vm-templates?fields=name_label&limit=500" 2>/dev/null) || return 1
+        resp=$(tpl_api_get "vm-templates?fields=name_label,\$pool&filter=$(tpl_urlencode "name_label:\"$1\"")&limit=200" 2>/dev/null) || return 1
+        resp=$(tpl_json_objects_where "$resp" '$pool' "$TPL_API_POOL_ID")
         printf '%s' "$resp" | grep -qF "\"$1\""
     else
         tpl_template_exists "$1"
@@ -11275,6 +11464,9 @@ tpl_cleanup_failed_build_dispatch() {
 }
 
 # Build one template: one image, one firmware mode, start to finish.
+# Returns 0 when the template was built or already existed (TPL_SKIPPED says
+# which), 1 when the build failed.
+TPL_SKIPPED=false
 tpl_build_one() {
     local row="$1"
     local key display user
@@ -11313,9 +11505,11 @@ tpl_build_one() {
     # prevent on the download. An operator who cannot tell a working build from
     # a stuck one kills it, and killing it halfway through leaves a build VM
     # and a multi-gigabyte disk behind.
+    TPL_SKIPPED=false
     log_info "  checking whether this template already exists..."
     if tpl_template_exists_dispatch "$name"; then
         log_info "  a template named '${name}' already exists; skipping."
+        TPL_SKIPPED=true
         return 0
     fi
 
@@ -11418,6 +11612,46 @@ tpl_build_one() {
 
 # --- Selection --------------------------------------------------------------
 
+# What the picker's "already on this pool" label is read from.
+#
+# API path only, and only when it needs no prompt beyond the pool choice: a
+# token is set and TEMPLATE_BUILD_METHOD is not ssh. Asked once, before the
+# picker opens, because the picker redraws on every key and cannot make a
+# round trip per row. The SSH path would need the pool master's password
+# before the picker even opened, so it shows no label (TPL_EXISTING_KNOWN
+# stays false) and the build still skips what exists. The pool chosen here
+# is kept for the build (tpl_api_choose_pool), so labels and build agree.
+TPL_EXISTING_NAMES=""
+TPL_EXISTING_KNOWN=false
+tpl_api_prefetch_existing() {
+    TPL_EXISTING_NAMES=""
+    TPL_EXISTING_KNOWN=false
+    [[ "${TEMPLATE_BUILD_METHOD:-auto}" == "ssh" ]] && return 0
+    [[ -n "${XO_API_TOKEN:-}" ]] || return 0
+
+    log_info "Checking Xen Orchestra for templates that are already built..."
+    if ! tpl_api_check_auth; then
+        # Reported properly once the build method is chosen; here it only
+        # means the picker shows no labels.
+        return 0
+    fi
+    local pools resp
+    pools=$(tpl_api_get "pools?fields=id,default_SR,name_label" 2>/dev/null) || return 0
+    tpl_api_choose_pool "$pools" || return 0
+    resp=$(tpl_api_get "vm-templates?fields=name_label,\$pool&limit=10000" 2>/dev/null) || return 0
+    resp=$(tpl_json_objects_where "$resp" '$pool' "$TPL_API_POOL_ID")
+    TPL_EXISTING_NAMES=$(printf '%s' "$resp" \
+        | sed -n 's/.*"name_label"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    TPL_EXISTING_KNOWN=true
+    return 0
+}
+
+# Whether the picker should label a template name as already built.
+tpl_existing_label() {
+    [[ "$TPL_EXISTING_KNOWN" == "true" ]] || return 1
+    grep -qxF -- "$1" <<< "$TPL_EXISTING_NAMES"
+}
+
 # The template library submenu.
 #
 # Driven by the same keys as the main menu — arrows to move, space to select,
@@ -11505,8 +11739,10 @@ tpl_prompt_selection() {
                 "$pointer" "$mark" "$label" "$M_DIM" "$user" "$M_RESET"
 
             # Say plainly which of these already exist, so a re-run is not a
-            # guess about what a build would actually do.
-            if tpl_template_exists "$(tpl_template_name "$display")"; then
+            # guess about what a build would actually do. Read from the list
+            # tpl_api_prefetch_existing fetched: there is no pool connection
+            # yet, so a per-row check here could never answer.
+            if tpl_existing_label "$(tpl_template_name "$display")"; then
                 printf '       %salready on this pool%s\n' "$M_DIM" "$M_RESET"
             fi
         done
@@ -12100,11 +12336,23 @@ build_vm_templates() {
     echo "  touched; the work happens on the pool."
     echo ""
 
+    # The build steps talk to the pool and to XO directly (dom0_xe, curl,
+    # xo-cli), not through run_cmd, so nothing below honours DRY_RUN. Stop
+    # here, as --deploy does, rather than build for real.
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warning "[DRY-RUN] --build-templates creates VMs and templates on the pool and"
+        log_warning "[DRY-RUN] cannot be meaningfully simulated. No changes were made."
+        return 0
+    fi
+
     # Deliberately not deploy_check_local_deps: that insists on an ISO writer
     # and the openssh client suite, which the API path needs neither of -- it
     # hands the cloud-init document to XO and never opens an SSH connection.
     # The SSH path's dependencies are checked once that path is chosen.
     tpl_check_local_deps
+
+    TPL_API_POOL_ID=""
+    tpl_api_prefetch_existing
 
     tpl_prompt_selection
     if [[ ${#TPL_SELECTED[@]} -eq 0 ]]; then
@@ -12151,10 +12399,16 @@ build_vm_templates() {
     (( ${#TPL_SELECTED[@]} > 1 )) && prompt="Build these ${#TPL_SELECTED[@]} templates?"
     confirm_or_skip "$prompt" || { log_info "Cancelled."; return 0; }
 
-    local built=0 failed=0
+    local built=0 failed=0 skipped=0
     for row in "${TPL_SELECTED[@]}"; do
         if tpl_build_one "$row"; then
-            built=$((built + 1))
+            # A template that already existed returns success too, but was
+            # not built: counted apart so the summary does not claim it.
+            if [[ "$TPL_SKIPPED" == "true" ]]; then
+                skipped=$((skipped + 1))
+            else
+                built=$((built + 1))
+            fi
         else
             failed=$((failed + 1))
             log_error "  build failed; continuing with the rest."
@@ -12163,10 +12417,12 @@ build_vm_templates() {
 
     echo ""
     echo "=============================================="
+    local skip_note=""
+    (( skipped > 0 )) && skip_note=", ${skipped} skipped (already on the pool)"
     if (( failed == 0 )); then
-        log_success "Done. ${built} template(s) ready."
+        log_success "Done. ${built} template(s) built${skip_note}."
     else
-        log_warning "Done. ${built} succeeded, ${failed} failed."
+        log_warning "Done. ${built} succeeded, ${failed} failed${skip_note}."
     fi
     echo "=============================================="
     echo ""
@@ -13693,7 +13949,17 @@ main() {
     fi
 
     if [[ "$NON_INTERACTIVE" == "true" ]] && [[ -z "$OPERATION" ]]; then
-        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --deploy, --adjust-memory, --flush-tokens, --uninstall, --custom-plugins)"
+        log_error "--non-interactive requires an explicit operation flag (--install, --update, --restore, --rebuild, --reconfigure, --proxy, --adjust-memory, --flush-tokens, --uninstall, --status, --custom-plugins)"
+        exit 1
+    fi
+
+    # --build-templates chooses what to build in a full-screen picker. With
+    # no terminal that picker reads EOF as Enter and quits with nothing
+    # selected, which looked like a successful run that did nothing. There is
+    # no other way to name the templates, so it is refused like --deploy.
+    if [[ "$NON_INTERACTIVE" == "true" ]] && [[ "$OPERATION" == "--build-templates" ]]; then
+        log_error "--build-templates cannot be combined with --non-interactive."
+        log_error "The templates to build are chosen in an interactive picker."
         exit 1
     fi
 

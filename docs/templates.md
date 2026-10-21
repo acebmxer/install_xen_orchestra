@@ -16,7 +16,9 @@ distribution's own published cloud image:
 ./install-xen-orchestra.sh --build-templates
 ```
 
-It is also the **VM Template Library** entry in the interactive menu.
+It is also the **VM Template Library** entry in the interactive menu. The
+templates are chosen in an interactive picker, so it needs a terminal:
+`--non-interactive` is refused, and `--dry-run` stops before anything is built.
 
 Run it from your workstation — Debian, Ubuntu, Fedora, Arch, CachyOS, openSUSE
 or anything with `apt`, `dnf`, `pacman`, `zypper` or `apk`. It talks to XO's API
@@ -255,7 +257,10 @@ its checksum format alongside it.
    several gigabytes never cross your workstation's link. An image that is not
    raw — Ubuntu's `.img` files are qcow2 — is then converted to raw with
    `qemu-img`, after the checksum has been verified against the file as
-   published.
+   published. On the API path the image is downloaded to the machine running
+   the script instead and verified there before it is converted and uploaded;
+   a raw image (Debian) is streamed straight to XO and hashed on the way, and
+   a mismatch fails the build and deletes the disk it was written to.
 3. **Imports it into the disk** over XAPI's HTTP endpoint, then confirms the
    disk actually holds a partition table before going further.
 4. **Boots the VM once.** A cloud-init drive installs the guest tools, adds
@@ -270,14 +275,17 @@ its checksum format alongside it.
    description, and flags the VM as a template.
 
 Storage and network are not prompted for. The build uses the pool's default SR
-(or the emptiest one, if no default is set) and the management network.
+(or the emptiest one, if no default is set) and the management network. When
+the build goes through the XO API and XO manages more than one pool, it asks
+which pool to build on, and takes the storage, network and base template from
+that pool only.
 
 ## Requirements
 
 - The pool master must have outbound internet access, and enough space in
   `/var/tmp` to stage the image — roughly 3.3 GB for the Debian templates. If
   it is short, the build streams the image straight into the disk instead,
-  which cannot resume a broken transfer.
+  which cannot resume a broken transfer or verify the checksum.
 
   **Every template except the two Debian ones needs more on the SSH path, and
   cannot fall back to streaming.** Their images are qcow2 and have to be

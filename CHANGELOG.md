@@ -10,6 +10,50 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-21
+
+### Fixed
+
+- **The template picker's "already on this pool" label now appears.** It
+  checked the pool before the script had connected to it, so the check
+  always failed silently and no row was ever labelled. When the build goes
+  through the XO API, the pool's templates are now fetched once before the
+  picker opens (asking which pool first if XO manages several, and building
+  on that same pool); the SSH build shows no label, as it would need the
+  pool master's password first. The end-of-run summary also counted a
+  template that was skipped because it already existed as built; skipped
+  templates are now listed separately.
+- **Template builds through the XO API stay on one pool.** When XO manages
+  several pools, the build could take the pool from one and the default
+  storage from another, and the network, base template and guest-tools ISO
+  from whichever pool XO listed first. It also skipped a template as
+  "already exists" when only another pool had one, and missed an existing
+  one once XO held more than 500 templates. With more than one pool the
+  build now asks which pool to build on (a single pool is used without
+  asking, as before) and takes everything from that pool.
+- **Template builds through the XO API now verify the image checksum.** The
+  API build path (the default whenever an API token is set) downloaded,
+  converted and uploaded each image without checking it against the
+  checksum its origin publishes, although the docs and the build output said
+  it did. qcow2 images are now verified after download and before
+  conversion; Debian's raw images, which are streamed straight to XO, are
+  hashed as they pass, and a mismatch fails the build and deletes the
+  imported disk. On both paths the "checksum verified" line is now printed
+  only when the image really was checked (not after the SSH path's
+  streaming fallback, or when the origin publishes no checksum).
+
+  The image transfer's progress bar no longer prints "dd.err: No such file
+  or directory" when it starts.
+- **`--build-templates` no longer builds for real under `--dry-run`, and
+  refuses `--non-interactive`.** `--dry-run` went on to create VMs and
+  templates on the pool; it now stops before anything is checked or built,
+  as `--deploy` does. With `--non-interactive` the template picker opened
+  anyway, read the missing keyboard as Enter and quit with "No templates
+  selected"; it is now refused with a message, since the templates can only
+  be chosen in the picker. The list of operations in the "`--non-interactive`
+  requires an explicit operation" error now includes `--status` and no
+  longer offers `--deploy`, which refuses `--non-interactive`.
+
 ## [0.9.5] - 2026-10-21
 
 ### Fixed
@@ -2611,7 +2655,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.2...v0.9.3

@@ -825,7 +825,7 @@ teardown() {
     local imp chk ok
     imp=$(grep -n 'deploy_import_vdi_from_url' <<< "$body" | head -1 | cut -d: -f1)
     chk=$(grep -n 'tpl_disk_has_partition_table' <<< "$body" | head -1 | cut -d: -f1)
-    ok=$(grep -n 'image imported and checksum verified' <<< "$body" | head -1 | cut -d: -f1)
+    ok=$(grep -n 'tpl_log_image_imported' <<< "$body" | head -1 | cut -d: -f1)
     [ "$imp" -lt "$chk" ]
     [ "$chk" -lt "$ok" ]
 }
@@ -1597,7 +1597,9 @@ SHA256 (${base}) = 659024f5219a57e0be136c2902f624ee4405e307bc6d8fc72c7fabdf8267e
     # switch the pin to a 256-bit comparison.
     local body
     body=$(declare -f deploy_verify_image_checksum)
-    [[ "$body" == *'[[ -n "$pinned" ]] && sums_bits=512'* ]]
+    [[ "$body" == *'sums_bits=$(deploy_image_digest_bits "$url")'* ]]
+    XO_DEPLOY_IMAGE_SHA512=abc
+    [ "$(deploy_image_digest_bits 'https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img')" = "512" ]
 }
 
 # --- image conversion -------------------------------------------------------
