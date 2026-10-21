@@ -12,6 +12,17 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Template builds through the XO API now verify the image checksum.** The
+  API build path (the default whenever an API token is set) downloaded,
+  converted and uploaded each image without checking it against the
+  checksum its origin publishes, although the docs and the build output said
+  it did. qcow2 images are now verified after download and before
+  conversion; Debian's raw images, which are streamed straight to XO, are
+  hashed as they pass, and a mismatch fails the build and deletes the
+  imported disk. On both paths the "checksum verified" line is now printed
+  only when the image really was checked (not after the SSH path's
+  streaming fallback, or when the origin publishes no checksum).
+
 - **`--build-templates` no longer builds for real under `--dry-run`, and
   refuses `--non-interactive`.** `--dry-run` went on to create VMs and
   templates on the pool; it now stops before anything is checked or built,

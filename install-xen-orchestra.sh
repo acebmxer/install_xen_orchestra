@@ -5223,7 +5223,18 @@ deploy_curl_upload_with_progress() {
 #
 # A total is optional. Without one deploy_draw_progress_n falls back to a
 # running byte count, which is still better than several minutes of silence.
+#
+# Optional leading `--digest BITS VAR`: also hash the bytes as they pass
+# (shaBITSsum, read from a fifo that tee feeds) and put the hex digest in VAR,
+# empty if it could not be computed. The API build path uses this to check a
+# raw image it never writes to disk. The fetch keeps its own exit status
+# through the tee (pipefail in that stage), so PIPESTATUS[0] still means the
+# download.
 deploy_curl_stream_with_progress() {
+    local bits="" digestvar=""
+    if [[ "${1:-}" == "--digest" ]]; then
+        bits="$2" digestvar="$3"; shift 3
+    fi
     local url="$1" total="$2" outvar="$3"; shift 3
     local d rc=0 pipepid sent
 
@@ -5233,16 +5244,32 @@ deploy_curl_stream_with_progress() {
     DEPLOY_PROGRESS_PCT=-1
     DEPLOY_PROGRESS_BYTES=-1
 
+    local -a fetch=(curl -fL --no-progress-meter --max-time 0 \
+        --speed-limit 1024 --speed-time 120 "$url")
+
     # PIPESTATUS is captured inside the subshell because the foreground shell
     # goes on to poll: by the time it could look, the pipeline is long gone.
     # Both stages matter -- a mirror that 404s and an XO that refuses the body
     # are different failures and either one must fail the build.
     {
-        curl -fL --no-progress-meter --max-time 0 \
-            --speed-limit 1024 --speed-time 120 "$url" \
+        local hashpid=""
+        if [[ -n "$bits" ]]; then
+            mkfifo "$d/digest.fifo"
+            "sha${bits}sum" < "$d/digest.fifo" 2>/dev/null \
+                | awk '{print $1}' > "$d/digest" &
+            hashpid=$!
+        fi
+        {
+            if [[ -n "$bits" ]]; then
+                ( set -o pipefail; "${fetch[@]}" | tee "$d/digest.fifo" )
+            else
+                "${fetch[@]}"
+            fi
+        } \
         | dd bs=1M status=progress 2>"$d/dd.err" \
         | curl "$@" > "$d/code" 2>/dev/null
         printf '%s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[2]}" > "$d/rc"
+        [[ -n "$hashpid" ]] && wait "$hashpid"
     } &
     pipepid=$!
 
@@ -5267,6 +5294,7 @@ deploy_curl_stream_with_progress() {
     printf '\n' >&2
 
     printf -v "$outvar" '%s' "$(cat "$d/code" 2>/dev/null)"
+    [[ -n "$digestvar" ]] && printf -v "$digestvar" '%s' "$(cat "$d/digest" 2>/dev/null)"
     rm -rf "$d"
     return "$rc"
 }
@@ -5336,16 +5364,33 @@ deploy_ensure_qemu_img() {
     return 1
 }
 
+# Check a downloaded image against the digest its origin publishes.
+#
+# Arguments: the image URL, then what to check, then where:
+#   dom0    (default) the second argument is a file on the pool master; the
+#           sums file is fetched and the file hashed there, over SSH
+#   local   the second argument is a file on this machine (the API build
+#           path, which downloads here); fetched and hashed here
+#   digest  the second argument is the image's digest, already computed
+#           while it streamed past (the API path's raw upload); the sums
+#           file is fetched here
+#
+# Returns 1 only for a mismatch or a pin that cannot be honoured. An origin
+# with no sums entry, or a digest that could not be computed, warns and
+# returns 0, so DEPLOY_IMAGE_VERIFIED says whether the image really was
+# checked: callers print "checksum verified" only when it is true.
+DEPLOY_IMAGE_VERIFIED=false
 deploy_verify_image_checksum() {
-    local url="$1" tmp="$2"
+    local url="$1" tmp="$2" where="${3:-dom0}"
     local pinned="${XO_DEPLOY_IMAGE_SHA512:-}"
     local want=""
+    DEPLOY_IMAGE_VERIFIED=false
 
     # The pin is SHA-512 by name, so it overrides whatever the origin would
     # otherwise have been read in.
     local sums_file sums_bits
     read -r sums_file sums_bits <<< "$(deploy_checksum_source "$url")"
-    [[ -n "$pinned" ]] && sums_bits=512
+    sums_bits=$(deploy_image_digest_bits "$url")
 
     if [[ -n "$pinned" ]]; then
         want="$pinned"
@@ -5357,7 +5402,11 @@ deploy_verify_image_checksum() {
         local dir="${url%/*}"
 
         local sums
-        sums=$(dom0_exec "curl -fsSL --max-time 120 '${dir}/${sums_file}' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+        if [[ "$where" == "dom0" ]]; then
+            sums=$(dom0_exec "curl -fsSL --max-time 120 '${dir}/${sums_file}' 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+        else
+            sums=$(curl -fsSL --max-time 120 "${dir}/${sums_file}" 2>/dev/null | tr -d '\r' || true)
+        fi
         if [[ -n "$sums" ]]; then
             # Lines are "<digest>  <name>"; coreutils marks binary mode with a
             # leading '*' on the name. Ubuntu's SHA256SUMS uses that '*' form
@@ -5398,15 +5447,19 @@ deploy_verify_image_checksum() {
     fi
 
     local got
-    got=$(dom0_exec "sha${sums_bits}sum '${tmp}' 2>/dev/null | awk '{print \$1}'" | tr -d '\r')
+    case "$where" in
+        dom0)   got=$(dom0_exec "sha${sums_bits}sum '${tmp}' 2>/dev/null | awk '{print \$1}'" | tr -d '\r') ;;
+        local)  got=$("sha${sums_bits}sum" "$tmp" 2>/dev/null | awk '{print $1}') ;;
+        digest) got="$tmp" ;;
+    esac
     if [[ ! "$got" =~ ^[a-fA-F0-9]{$hex_len}$ ]]; then
         # A pin is a demand for proof, so failing to produce one is fatal.
         if [[ -n "$pinned" ]]; then
-            log_error "Could not compute the image's SHA-512 on the pool master, and"
+            log_error "Could not compute the image's SHA-512, and"
             log_error "XO_DEPLOY_IMAGE_SHA512 is set. Refusing to import it unverified."
             return 1
         fi
-        log_warning "  could not compute the image's checksum on the pool master; skipping."
+        log_warning "  could not compute the image's checksum; skipping."
         return 0
     fi
 
@@ -5419,8 +5472,20 @@ deploy_verify_image_checksum() {
         return 1
     fi
 
+    DEPLOY_IMAGE_VERIFIED=true
     log_success "  image checksum verified"
     return 0
+}
+
+# The SHA width (256 or 512) an image is checked with: the origin's sums file
+# decides it, except that the XO_DEPLOY_IMAGE_SHA512 pin is SHA-512 by name.
+# Shared by deploy_verify_image_checksum and the API path's streamed upload,
+# which has to pick the algorithm before the bytes go past.
+deploy_image_digest_bits() {
+    local sums_file sums_bits
+    read -r sums_file sums_bits <<< "$(deploy_checksum_source "$1")"
+    [[ -n "${XO_DEPLOY_IMAGE_SHA512:-}" ]] && sums_bits=512
+    printf '%s' "$sums_bits"
 }
 
 # Staging wins on every count that matters. The download lands in a file, so it
@@ -5436,6 +5501,9 @@ deploy_verify_image_checksum() {
 # without the few gigabytes of scratch space staging needs.
 deploy_import_vdi_from_url() {
     local vdi="$1" url="$2"
+    # Set by deploy_verify_image_checksum on the staged path only; the
+    # streaming fallback below cannot check anything, so it stays false.
+    DEPLOY_IMAGE_VERIFIED=false
 
     # `|| rc=$?` rather than a bare call: under `set -e` a function returning
     # non-zero on its own line takes the script down with it, so the fallback
@@ -10006,7 +10074,7 @@ tpl_create_build_vm() {
         log_error "    ssh ${HOST_USERNAME}@${POOL_MASTER_IP} grep -i vhd-tool /var/log/xensource.log"
         return 1
     fi
-    log_success "  image imported and checksum verified"
+    tpl_log_image_imported
 
     # The prep drive.
     TPL_CIDATA_VDI=$(dom0_xe "vdi-create sr-uuid=${DEPLOY_SR_UUID} name-label='${name} cidata' virtual-size=16MiB type=user" | tr -d '\r')
@@ -10567,6 +10635,17 @@ tpl_api_resolve_targets() {
     return 0
 }
 
+# The success line after an image import, on either build path. It says
+# "checksum verified" only when deploy_verify_image_checksum really matched a
+# digest; otherwise the warning it printed explains why not.
+tpl_log_image_imported() {
+    if [[ "$DEPLOY_IMAGE_VERIFIED" == "true" ]]; then
+        log_success "  image imported and checksum verified"
+    else
+        log_success "  image imported (checksum not verified; see the warning above)"
+    fi
+}
+
 # Import a cloud image into a new VDI on the default SR.
 #
 # The image is streamed from its mirror straight into XO's import endpoint, so
@@ -10599,7 +10678,8 @@ tpl_api_import_image() {
     # converted here before the upload -- the same conversion the SSH path
     # does on the pool master, done locally because that is where the bytes
     # are on this path.
-    local local_file="" upload_file="" converted=""
+    local local_file="" upload_file="" converted="" stream_digest=""
+    DEPLOY_IMAGE_VERIFIED=false
     case "$url" in
         *.raw)
             # Raw streams straight through: nothing to convert, and staging a
@@ -10651,6 +10731,13 @@ tpl_api_import_image() {
                     --retry 5 --retry-delay 3 --retry-all-errors \
                     --speed-limit 1024 --speed-time 120 --max-time 3600 "$url"; then
                 log_error "  could not download ${url}"
+                rm -f "$local_file"
+                return 1
+            fi
+
+            # Checked as downloaded, before the conversion: the origin
+            # publishes a digest of the file it publishes, as on the SSH path.
+            if ! deploy_verify_image_checksum "$url" "$local_file" local; then
                 rm -f "$local_file"
                 return 1
             fi
@@ -10734,7 +10821,12 @@ tpl_api_import_image() {
             | grep -i '^content-length:' | tail -1 | awk '{print $2}')
         [[ "$stream_size" =~ ^[0-9]+$ ]] || stream_size=""
 
-        deploy_curl_stream_with_progress "$url" "$stream_size" http_code \
+        # Nothing lands on disk here, so the image is hashed as it streams
+        # past and checked once XO has the disk; a mismatch fails the build
+        # and tpl_api_cleanup_failed_build deletes the disk.
+        deploy_curl_stream_with_progress \
+            --digest "$(deploy_image_digest_bits "$url")" stream_digest \
+            "$url" "$stream_size" http_code \
             -s -k -L --post301 --post302 --post303 -X POST \
             --speed-limit 1024 --speed-time 120 \
             -K <(xo_cookie_config XO_API_TOKEN) \
@@ -10759,6 +10851,17 @@ tpl_api_import_image() {
         [[ -n "$resp" ]] && log_error "  it said: ${resp}"
         return 1
     fi
+
+    # The streamed (raw) upload: compare the digest taken on the way past.
+    # The converted path already verified its download above.
+    if [[ -z "$upload_file" ]]; then
+        if ! deploy_verify_image_checksum "$url" "$stream_digest" digest; then
+            log_error "  the image XO received is not the published one; removing it."
+            return 1
+        fi
+    fi
+
+    tpl_log_image_imported
     return 0
 }
 
