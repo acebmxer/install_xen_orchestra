@@ -12,6 +12,11 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`--proxy` no longer sits for 10 minutes when the pool master accepts
+  your SSH key.** The proxy helper waited only for a password prompt, so
+  a key or agent login, which never shows one, ran out its 600-second
+  timeout before the proxy installer started. It now goes ahead as soon as
+  the shell prompt appears.
 - **The menu's Edit xo-config.cfg and Rename Sample items no longer drop
   the other ticked items.** The "reload the script?" question used to come
   first, and either answer lost the rest: "No" exited and "Yes" restarted

@@ -1208,6 +1208,59 @@ EOF
     grep -q "StrictHostKeyChecking=yes" "${TMPDIR_TEST}/ssh_args"
 }
 
+# A stand-in for ssh to the pool master: asks for a password only when
+# FAKE_SSH_PASSWORD=1 (a key login asks nothing), then acts as a root shell,
+# logging every line the helper sends until "exit".
+_write_fake_pool_ssh() {
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub"
+    cat > "${stub}/ssh" <<'EOF'
+#!/bin/bash
+if [ "${FAKE_SSH_PASSWORD:-0}" = 1 ]; then
+    printf "root@192.0.2.10's password: "
+    IFS= read -r l
+    echo "PASSWORD:$l" >> "$FAKE_SSH_LOG"
+    echo
+fi
+printf '[root@xcp-ng ~]# '
+while IFS= read -r line; do
+    echo "LINE:$line" >> "$FAKE_SSH_LOG"
+    [ "$line" = exit ] && exit 0
+    printf '[root@xcp-ng ~]# '
+done
+EOF
+    chmod +x "${stub}/ssh"
+}
+
+_run_proxy_helper() {
+    PATH="${TMPDIR_TEST}/bin:${PATH}" XO_HELPER_HOST_PASSWORD=host-pw XO_HELPER_XO_PASSWORD=y \
+        FAKE_SSH_LOG="${TMPDIR_TEST}/session.log" \
+        timeout 30 expect "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp" \
+        192.0.2.10 root dhcp "" admin@x >/dev/null 2>&1 || true
+}
+
+@test "the proxy helper does not wait out its timeout when SSH asks no password" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    local start=$SECONDS
+    FAKE_SSH_PASSWORD=0 _run_proxy_helper
+    # The old helper waited for "password:" for 600 s (cut off at 30 here)
+    # and sent nothing.
+    [ $((SECONDS - start)) -lt 15 ]
+    [ "$(head -1 "${TMPDIR_TEST}/session.log")" = \
+      "LINE:wget -qO /tmp/xo-proxy-deploy.sh https://xoa.io/proxy/deploy && bash /tmp/xo-proxy-deploy.sh; rm -f /tmp/xo-proxy-deploy.sh" ]
+    run grep -q '^PASSWORD:' "${TMPDIR_TEST}/session.log"
+    [ "$status" -eq 1 ]
+}
+
+@test "the proxy helper still sends the password when SSH asks for one" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    FAKE_SSH_PASSWORD=1 _run_proxy_helper
+    [ "$(sed -n 1p "${TMPDIR_TEST}/session.log")" = "PASSWORD:host-pw" ]
+    [[ "$(sed -n 2p "${TMPDIR_TEST}/session.log")" == "LINE:wget -qO /tmp/xo-proxy-deploy.sh "* ]]
+}
+
 # The hash is a credential. The script masks secrets under XO_DEBUG=1
 # everywhere else; these two functions were missing the guard.
 @test "the admin password hash is not printed by xtrace" {

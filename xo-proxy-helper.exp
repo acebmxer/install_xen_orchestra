@@ -58,10 +58,20 @@ if {$known_hosts ne "" && [file exists $known_hosts] && [file size $known_hosts]
     spawn ssh -o StrictHostKeyChecking=accept-new $username@$pool_master
 }
 
-# Handle password prompt
+# A shell prompt: "# " for root, "$ " for anyone else, at the end of what
+# has arrived so far.
+set shell_prompt {[#$] $}
+
+# Handle the password prompt -- or no prompt at all: with a key or an agent
+# the pool master goes straight to the shell, and waiting only for
+# "password:" sat out the whole 600 s timeout before carrying on.
+set at_prompt 0
 expect {
     "password:" {
         send "$password\r"
+    }
+    -re $shell_prompt {
+        set at_prompt 1
     }
 }
 
@@ -73,11 +83,13 @@ expect {
 # This is still Vates' own documented one-liner with no signature or
 # checksum to verify it against; running it unattended trusts xoa.io and the
 # network path to it, same as running it by hand would.
-expect {
-    -re ".*#" {
-        send "wget -qO /tmp/xo-proxy-deploy.sh https://xoa.io/proxy/deploy && bash /tmp/xo-proxy-deploy.sh; rm -f /tmp/xo-proxy-deploy.sh\r"
-    }
+#
+# A prompt already matched above has been consumed, so waiting for another
+# here would hang: send the command straight away in that case.
+if {!$at_prompt} {
+    expect -re $shell_prompt
 }
+send "wget -qO /tmp/xo-proxy-deploy.sh https://xoa.io/proxy/deploy && bash /tmp/xo-proxy-deploy.sh; rm -f /tmp/xo-proxy-deploy.sh\r"
 
 # Handle installer prompts
 expect {
