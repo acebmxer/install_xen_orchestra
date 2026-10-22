@@ -33,6 +33,46 @@ per host that has a NanoKVM attached:
 Devices can share the same username/password, or each use their own —
 both work, since every entry is independent.
 
+## HTTP or HTTPS
+
+Use an `https://` Base URL where you can. With `http://`:
+
+- the password is sent in a form anyone watching the network can decrypt.
+  NanoKVM's login encrypts it with a passphrase that is the same on every
+  device and published in NanoKVM's source, so it hides nothing;
+- the session cookie the device hands back travels in clear, and whoever
+  copies it can press the power button until it expires.
+
+With `https://`, xo-server (Node.js) checks the device's certificate. The
+one NanoKVM generates when you turn HTTPS on is self-signed and issued to
+`localhost` only, so it is refused even if you tell Node to trust it: the
+name never matches the Base URL. To use HTTPS:
+
+1. Turn HTTPS on in NanoKVM's web UI first. Doing it later regenerates the
+   certificate and overwrites yours.
+2. Replace `/etc/kvm/server.crt` and `/etc/kvm/server.key` on the device
+   with a certificate issued to the name (or IP address) in your Base URL,
+   then restart the device.
+3. If that certificate is not from a CA the XO server already trusts (for
+   example you made it self-signed), tell xo-server to trust it by pointing
+   `NODE_EXTRA_CA_CERTS` at a copy of it on the XO server, in a systemd
+   drop-in:
+
+   ```bash
+   sudo systemctl edit xo-server
+   ```
+
+   ```ini
+   [Service]
+   Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/nanokvm.pem
+   ```
+
+   then `sudo systemctl restart xo-server`.
+
+Use the Test button to check it. If HTTPS is not an option, keep the NanoKVM
+and the XO server on an isolated network that nothing else can reach, and use
+`http://` there.
+
 ## Account
 
 Create a dedicated account with the `user` role (**Settings > Account**),

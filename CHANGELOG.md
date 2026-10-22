@@ -12,6 +12,19 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Docs: four places that said something the script doesn't do.** API
+  tokens don't need a description to survive an update: the update only
+  deletes browser session tokens, which it recognises by their `client_id`,
+  and keeps every other token. `docs/deployment.md` no longer tells you to
+  log in with an `xo-deploy-<hostname>.key` file, which the deploy stopped
+  saving; you log in with your own key. It also says the image is first
+  downloaded to `/var/tmp` on the pool master (about 3.3 GB free needed)
+  and streamed straight into the disk only when there isn't room. The
+  NanoKVM plugin's README now explains that an `http://` Base URL lets
+  anyone on the network read the password and the session cookie, and how
+  to set up HTTPS, since the certificate NanoKVM makes for itself is only
+  valid for `localhost`.
+
 - **`--deploy` no longer breaks the new VM's setup when your SSH key's
   comment contains `: ` or ` #`.** The key went into the VM's cloud-init
   settings unquoted, so a comment like `me: work laptop` was read as

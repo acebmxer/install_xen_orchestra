@@ -3116,11 +3116,11 @@ restore_xo() {
 #
 # NOTE: the token must be a persistent API token created in XO's web
 # UI (open your user menu → Tokens; the exact menu location varies by XO
-# version) or via the REST API with a "description" field in the request body.
+# version) or via the REST API.
 # The token is sent to the REST API via the authenticationToken cookie.
-# During updates flush_redis_tokens() preserves tokens that have a non-empty
-# description and deletes tokens without one (browser sessions). A token
-# created without a description will be wiped on the next update.
+# During updates flush_redis_tokens() deletes only tokens that carry a
+# client_id (browser sessions), so an API token survives with or without a
+# description.
 #
 # Orphan filter: tasks whose start time predates xo-server's process start
 # are treated as stale DB records (e.g. left over after restoring an XO
@@ -4678,7 +4678,9 @@ dom0_xe() {
 # payload, let alone a 3 GiB image.
 #
 # Running it on the pool master means the image never crosses the operator's
-# link and never lands on dom0's filesystem either.
+# link. This streaming PUT is the fallback, though: by default the image is
+# first staged in /var/tmp on dom0 and PUT from that file (see
+# deploy_import_vdi_staged and deploy_import_vdi_from_url).
 #
 # All of this is verified by tests/probe-xapi-deploy.sh against a real host.
 # ---------------------------------------------------------------------------

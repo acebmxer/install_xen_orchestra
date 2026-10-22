@@ -36,21 +36,23 @@ the safest approach.
 Tokens are more secure than storing a password — they can be revoked
 independently and expire after 30 days by default.
 
-> [!IMPORTANT]
-> **Tokens must have a description or they will be deleted during updates.**
+> [!NOTE]
+> **Which tokens survive an update.**
 >
 > During an update the installer flushes stale session tokens from Redis to
 > prevent schema-mismatch 401 errors after XO restarts. It tells session
-> tokens apart from API tokens by checking for a non-empty `description` field
-> in the token's stored JSON:
+> tokens apart from API tokens by the `client_id` field in the token's stored
+> JSON, which XO sets only for browser logins:
 >
-> - Tokens **with** a description → treated as API/integration tokens → **kept**
-> - Tokens **without** a description → treated as browser session tokens → **deleted**
+> - Tokens **with** a `client_id` → browser session tokens → **deleted**
+>   (users log in again)
+> - Tokens **without** a `client_id` → API tokens, created as below → **kept**
 >
-> This applies to `XO_TASK_CHECK_TOKEN` and to **any other API tokens** used
-> by third-party tools (monitoring agents, Terraform, scripts, etc.) that
-> connect to this XO server. Always create tokens with a meaningful
-> description.
+> The description is not used, so an API token is kept whether it has one or
+> not. This applies to `XO_TASK_CHECK_TOKEN` / `XO_API_TOKEN` and to **any
+> other API tokens** used by third-party tools (monitoring agents, Terraform,
+> scripts, etc.) that connect to this XO server. A meaningful description is
+> still worth giving, so you can tell the tokens apart on the Tokens page.
 
 **Option 1 — XO web UI (always prompts for a description):**
 

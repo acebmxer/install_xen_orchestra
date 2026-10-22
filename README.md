@@ -482,8 +482,8 @@ is aborted to prevent data loss or corruption.
 Only **admin-level** XO accounts can access the REST API. Authentication comes
 from an auth token, from stored credentials, or from an interactive prompt, in
 that order — see
-[docs/authentication.md](docs/authentication.md) for how to set one up, and why
-API tokens need a description.
+[docs/authentication.md](docs/authentication.md) for how to set one up, and
+which tokens an update keeps.
 
 ## Scheduled Updates (cron)
 
