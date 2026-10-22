@@ -13215,7 +13215,8 @@ menu_rename_config() {
         echo
         if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
             log_info "Skipping rename."
-            return 0
+            # Nothing changed, so no reload is offered for it.
+            return 1
         fi
     fi
     if [[ ! -f "$SAMPLE_CONFIG" ]]; then
@@ -13230,12 +13231,14 @@ menu_rename_config() {
 menu_edit_config() {
     echo ""
 
-    # Ensure config exists
+    # Ensure config exists. Creating it from the sample is itself a change.
+    local created=false
     if [[ ! -f "$CONFIG_FILE" ]]; then
         if [[ -f "$SAMPLE_CONFIG" ]]; then
             log_info "xo-config.cfg not found. Creating from sample..."
             cp "$SAMPLE_CONFIG" "$CONFIG_FILE"
             log_success "Created xo-config.cfg from sample."
+            created=true
         else
             log_error "Neither xo-config.cfg nor sample-xo-config.cfg found!"
             return 1
@@ -13245,12 +13248,12 @@ menu_edit_config() {
     # Read preferred editor from config
     local editor="${PREFERRED_EDITOR:-nano}"
 
-    # Source config to get PREFERRED_EDITOR if not already loaded
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local cfg_editor
-        cfg_editor=$(grep -E '^PREFERRED_EDITOR=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2) || true
-        [[ -n "$cfg_editor" ]] && editor="$cfg_editor"
-    fi
+    # Read PREFERRED_EDITOR from the file as it is now. deploy_config_value
+    # strips quotes and a trailing comment, so PREFERRED_EDITOR="vim" works
+    # the same as PREFERRED_EDITOR=vim.
+    local cfg_editor
+    cfg_editor=$(deploy_config_value "$CONFIG_FILE" PREFERRED_EDITOR)
+    [[ -n "$cfg_editor" ]] && editor="$cfg_editor"
 
     # Validate editor choice
     if [[ "$editor" != "nano" ]] && [[ "$editor" != "vim" ]]; then
@@ -13294,7 +13297,15 @@ menu_edit_config() {
     fi
 
     log_info "Opening ${CONFIG_FILE} with ${editor}..."
+    local sum_before sum_after
+    sum_before=$(cksum < "$CONFIG_FILE")
     "$editor" "$CONFIG_FILE" < /dev/tty
+    sum_after=$(cksum < "$CONFIG_FILE")
+    if [[ "$created" != "true" && "$sum_before" == "$sum_after" ]]; then
+        # Closed without saving a change: nothing to reload for.
+        log_info "No changes made to xo-config.cfg."
+        return 1
+    fi
     log_success "Configuration editing complete."
 }
 
@@ -13518,7 +13529,8 @@ process_menu_selections() {
         return 0
     fi
 
-    # Preparatory operations first (rename, then edit)
+    # Preparatory operations first (rename, then edit). Each returns 0 only
+    # when it really changed xo-config.cfg.
     local config_changed=false
     if [[ ${MENU_SELECTED[2]} -eq 1 ]]; then
         menu_rename_config && config_changed=true
@@ -13528,8 +13540,22 @@ process_menu_selections() {
         menu_edit_config && config_changed=true
     fi
 
+    # Anything else ticked runs in this same pass, after the config change:
+    # the reload below used to come first, and either answer to it dropped
+    # the other ticked items. Re-read the config before they run, so they use
+    # the new settings (Deploy, Adjust Memory and Custom Plugins don't call
+    # load_config themselves, and the menu loaded the old file at start).
+    if [[ "$config_changed" == "true" ]] && menu_other_items_selected; then
+        log_info "Configuration changed. Reading the new xo-config.cfg before running the other selected items."
+        load_config
+    fi
+
+    process_menu_operations
+
     # If the config file was renamed or edited, offer to reload the script so
-    # the new settings take effect. Reloading re-runs load_config from scratch.
+    # the new settings take effect everywhere (the menu header included).
+    # Reloading re-runs load_config from scratch, which also drops any
+    # setting deleted from the file -- re-reading it above can't unset those.
     if [[ "$config_changed" == "true" ]]; then
         echo ""
         if prompt_yes_no "Configuration changed. Do you want to reload the script?"; then
@@ -13541,7 +13567,22 @@ process_menu_selections() {
             exit 0
         fi
     fi
+}
 
+# True when any menu item other than Rename Sample (2) and Edit xo-config.cfg
+# (8) is ticked.
+menu_other_items_selected() {
+    local i
+    for ((i = 0; i < MENU_TOTAL; i++)); do
+        [[ $i -eq 2 || $i -eq 8 ]] && continue
+        [[ ${MENU_SELECTED[$i]} -eq 1 ]] && return 0
+    done
+    return 1
+}
+
+# Run the ticked menu operations (everything except Rename Sample and Edit
+# xo-config.cfg, which process_menu_selections handles first).
+process_menu_operations() {
     # Install Xen Orchestra (full installation with all checks)
     if [[ ${MENU_SELECTED[0]} -eq 1 ]]; then
         install_xo
@@ -13884,6 +13925,20 @@ run_menu() {
     done
 }
 
+# A flag that takes a value (--backup-file NAME, --log-file PATH) must be
+# followed by one. Without this check a value flag at the end of the line
+# failed on the second shift with no message, and one followed by another
+# flag swallowed it (--log-file --update logged to a file named "--update"
+# and opened the menu instead of updating).
+require_flag_value() {
+    local flag="$1" value="$2"
+    if [[ -z "$value" || "$value" == --* ]]; then
+        log_error "$flag needs a value."
+        log_error "Run with --help for usage information."
+        exit 1
+    fi
+}
+
 # Main entry point
 main() {
     # Pre-parse global flags before dispatching to operations.
@@ -13898,15 +13953,17 @@ main() {
                 DRY_RUN=true
                 ;;
             --backup-file)
+                require_flag_value "$1" "${2-}"
                 shift
-                RESTORE_BACKUP_FILE="${1:-}"
+                RESTORE_BACKUP_FILE="$1"
                 ;;
             --list-backups)
                 LIST_BACKUPS_ONLY=true
                 ;;
             --log-file)
+                require_flag_value "$1" "${2-}"
                 shift
-                LOG_FILE="${1:-}"
+                LOG_FILE="$1"
                 ;;
             --json-logs)
                 JSON_LOGS=true

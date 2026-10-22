@@ -10,6 +10,22 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **The menu's Edit xo-config.cfg and Rename Sample items no longer drop
+  the other ticked items.** The "reload the script?" question used to come
+  first, and either answer lost the rest: "No" exited and "Yes" restarted
+  the menu with nothing ticked. The other items now run first, using the
+  new settings, and the reload is offered afterwards. Declining the
+  rename's overwrite, or closing the editor without saving a change, no
+  longer counts as a change, so no reload is offered for it. A quoted
+  `PREFERRED_EDITOR="vim"` (or one followed by a comment) is now honoured
+  instead of falling back to nano. `--backup-file` and `--log-file` with
+  no value now stop with an error; before, one at the end of the line
+  stopped with no message, and one followed by another flag took that
+  flag as its value (`--log-file --update` opened the menu instead of
+  updating).
+
 ## [0.9.7] - 2026-10-21
 
 ### Fixed
