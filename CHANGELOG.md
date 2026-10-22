@@ -12,6 +12,11 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`--deploy` no longer breaks the new VM's setup when your SSH key's
+  comment contains `: ` or ` #`.** The key went into the VM's cloud-init
+  settings unquoted, so a comment like `me: work laptop` was read as
+  something other than a key, and ` #` cut it short. Keys are now
+  quoted there, so any comment works.
 - **`--proxy` no longer sits for 10 minutes when the pool master accepts
   your SSH key.** The proxy helper waited only for a password prompt, so
   a key or agent login, which never shows one, ran out its 600-second

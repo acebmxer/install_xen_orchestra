@@ -6640,6 +6640,13 @@ deploy_load_pubkey() {
     printf '%s' "$line"
 }
 
+# Print VALUE as a YAML single-quoted string: wrapped in ' with any ' inside
+# doubled, YAML's only escape in that style. Safe for any single-line value.
+yaml_single_quote() {
+    local value="$1" sq="'"
+    printf "'%s'" "${value//$sq/$sq$sq}"
+}
+
 # Describe a public key for a prompt or the summary: "ed25519 SHA256:... (comment)".
 deploy_pubkey_label() {
     local line="$1" check="${DEPLOY_WORKDIR}/pubkey.label" out=""
@@ -7007,10 +7014,17 @@ deploy_build_config_drive() {
 
     # The operator's own key, when they gave one, goes in alongside it and is
     # what remains after the deploy key is revoked.
-    local pubkey_lines="      - ${DEPLOY_PUBKEY}"
+    #
+    # Each key is a single-quoted YAML string. deploy_load_pubkey accepts any
+    # comment, and a plain (unquoted) one turns into something else when the
+    # comment holds YAML syntax: "me: work laptop" made the list item a
+    # mapping instead of a key, and " #" starts a YAML comment that cuts the
+    # key short.
+    local pubkey_lines
+    pubkey_lines="      - $(yaml_single_quote "$DEPLOY_PUBKEY")"
     if [[ -n "${DEPLOY_USER_PUBKEY:-}" ]]; then
         pubkey_lines="${pubkey_lines}
-      - ${DEPLOY_USER_PUBKEY}"
+      - $(yaml_single_quote "$DEPLOY_USER_PUBKEY")"
     fi
 
     cat > "${dir}/meta-data" <<EOF

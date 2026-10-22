@@ -323,6 +323,38 @@ _deploy_drive_fixture() {
     [ "$status" -eq 0 ]
 }
 
+# deploy_load_pubkey accepts any comment. Unquoted, "me: work laptop" made
+# the list item a mapping, " #" cut the key short, and a ' in a quoted one
+# would end the string early.
+@test "a key comment with YAML syntax in it stays one intact key" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available"
+    python3 -c "import yaml" 2>/dev/null || skip "python3 yaml not available"
+    _deploy_drive_fixture
+    ssh-keygen -t ed25519 -N "" -C "me: work laptop #2 it's mine" \
+        -f "${TMPDIR_TEST}/odd" >/dev/null 2>&1
+    DEPLOY_USER_PUBKEY=$(deploy_load_pubkey "${TMPDIR_TEST}/odd.pub")
+
+    deploy_build_config_drive
+
+    run python3 -c '
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+keys = doc["users"][0]["ssh_authorized_keys"]
+assert all(isinstance(k, str) for k in keys), keys
+assert sys.argv[2] in keys, keys
+assert len(keys) == 2, keys
+print("OK")
+' "${DEPLOY_WORKDIR}/cidata/user-data" "$DEPLOY_USER_PUBKEY"
+    [ "$status" -eq 0 ]
+    [ "$output" = "OK" ]
+}
+
+@test "yaml_single_quote wraps the value and doubles any single quote" {
+    [ "$(yaml_single_quote "a: b")" = "'a: b'" ]
+    [ "$(yaml_single_quote "it's")" = "'it''s'" ]
+    [ "$(yaml_single_quote "")" = "''" ]
+}
+
 @test "the admin account still gets passwordless sudo for the install" {
     _deploy_drive_fixture
 
@@ -575,7 +607,7 @@ STUB
     local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
     grep -q "operator@laptop" "$user_data"
     grep -q "install-xen-orchestra deploy (temporary)" "$user_data"
-    [ "$(grep -c '^      - ssh-' "$user_data")" -eq 2 ]
+    [ "$(grep -c "^      - 'ssh-" "$user_data")" -eq 2 ]
 }
 
 @test "without a supplied key only the deployment key is installed" {
@@ -585,7 +617,7 @@ STUB
     deploy_build_config_drive
 
     local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
-    [ "$(grep -c '^      - ssh-' "$user_data")" -eq 1 ]
+    [ "$(grep -c "^      - 'ssh-" "$user_data")" -eq 1 ]
     grep -q "install-xen-orchestra deploy (temporary)" "$user_data"
 }
 
