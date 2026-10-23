@@ -3030,7 +3030,7 @@ restore_xo() {
         read -t 300 -r CHOICE || { log_error "Input timeout"; exit 1; }
         if [[ "$CHOICE" == "q" ]] || [[ "$CHOICE" == "Q" ]]; then
             log_info "Restore cancelled."
-            exit 0
+            return 0
         fi
     fi
 
@@ -3052,7 +3052,7 @@ restore_xo() {
     echo ""
     log_warning "You are about to restore: $SELECTED_NAME"
     log_warning "This will replace the current installation at $INSTALL_DIR"
-    confirm_or_skip "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; exit 0; }
+    confirm_or_skip "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
@@ -3517,7 +3517,10 @@ update_xo() {
         # config restore can still leave orphaned tokens behind — surface
         # them so the user knows to run --flush-tokens.
         check_orphaned_tokens
-        exit 0
+        # return, not exit: from the menu, other ticked items and the
+        # reload question still have to run after an update with nothing
+        # to do. Every caller ends right after this function.
+        return 0
     fi
 
     log_info "New version available. Proceeding with update..."
@@ -3680,7 +3683,7 @@ rebuild_xo() {
     log_warning "  3. Perform a clean rebuild"
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
-    confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; exit 0; }
+    confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; return 0; }
 
     # Snapshot while xo-server is still up -- it talks to the REST API on
     # localhost, so it must run before the service stops below or every
@@ -3819,7 +3822,7 @@ reconfigure_xo() {
     log_warning "Database and user data in /var/lib/xo-server will NOT be affected."
     log_warning "NFS/CIFS mounts and reverse proxy settings will continue to work."
     echo ""
-    confirm_or_skip "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; exit 0; }
+    confirm_or_skip "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."

@@ -49,6 +49,13 @@ This installer builds Xen Orchestra from source and tracks the official
   flag as its value (`--log-file --update` opened the menu instead of
   updating).
 
+  An item that ends early from the menu no longer ends the whole run.
+  Update with nothing new to install ("Already up to date"), and a
+  Rebuild, Reconfigure or Restore you cancel, used to quit the script on
+  the spot, so the items after it and the reload question after an edit
+  never came. The menu now goes on to the next ticked item, then offers
+  the reload.
+
 ## [0.9.7] - 2026-10-21
 
 ### Fixed
