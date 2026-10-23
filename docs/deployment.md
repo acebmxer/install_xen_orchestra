@@ -17,10 +17,17 @@ storage repository and network from what the pool actually has, then ask for
 the VM's size, admin account (with a required password), where to clone this
 repository inside the guest, and its static address. From there it:
 
-1. Creates the VM and streams a stock **Debian 13 cloud image** from
-   `cloud.debian.org` straight into its disk. The download runs *on the pool
-   master*, so the 3 GB never crosses your workstation's link and never lands
-   on dom0's root filesystem.
+1. Creates the VM and downloads a stock **Debian 13 cloud image** from
+   `cloud.debian.org` into its disk. The download runs *on the pool master*,
+   so the 3 GB never crosses your workstation's link. It is staged in
+   `/var/tmp` on the pool master first (`/var/tmp/xo-image-<disk uuid>.raw`),
+   which needs the image's size plus 256 MB free there, about 3.3 GB for the
+   default image: the staged copy can resume a broken download and is checked
+   for size and checksum before it is copied into the disk, then deleted. If
+   `/var/tmp` is too small, the image is streamed straight into the disk
+   instead, which needs no space on the pool master but cannot resume or
+   verify the download; with `XO_DEPLOY_IMAGE_SHA512` set (see below) the
+   deploy stops instead.
 2. Sets the VM's **boot firmware to UEFI**, after checking the imported disk
    really carries an EFI system partition — the stock Debian cloud images do.
    An image without one gets BIOS instead, because UEFI firmware with no
@@ -69,7 +76,8 @@ reopens; nothing has been created on the pool at that point.
 
 **Requirements**
 
-- The pool master must have outbound internet access.
+- The pool master must have outbound internet access, and room in `/var/tmp`
+  to stage the image (about 3.3 GB for the default one; see step 1 above).
 - A free **static IP** — this is required, not optional. A stock Debian cloud
   image has no `xe-guest-utilities`, so the host cannot report a DHCP lease
   back and the script would have no address to install over.
@@ -80,19 +88,17 @@ reopens; nothing has been created on the pool at that point.
   asked for the pool master password once, without it `ssh` asks a second time.
 
 **Afterwards** the VM contains an ordinary checkout of this repository, so
-updates work there exactly as anywhere else:
+updates work there exactly as anywhere else. Log in with the SSH key you gave
+the deploy (or with the password, if you allowed SSH password logins); the
+summary at the end of the run prints the exact `ssh` line:
 
 ```bash
-ssh -i xo-deploy-<hostname>.key <admin>@<ip>
+ssh <admin>@<ip>
 cd <clone dir> && ./install-xen-orchestra.sh --update
 ```
 
-The generated SSH private key is saved next to the script as
-`xo-deploy-<hostname>.key` (git-ignored). Keep it, or add your own key to the VM
-and delete it. Deploying a second VM with a hostname you have used before does
-not overwrite the first key — that file is the only way into that machine — so
-the new one is saved as `xo-deploy-<hostname>-2.key` and the summary tells you
-which key belongs to the VM just built.
+The deploy's own temporary key is not kept — see **SSH access uses your own
+key** below.
 
 The VM clones this repository from whatever `origin` your checkout uses, so a
 fork deploys itself. An SSH remote (`git@github.com:...`) is converted to the

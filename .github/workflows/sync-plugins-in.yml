@@ -28,28 +28,41 @@ jobs:
         with:
           ref: ${{ github.event.client_payload.branch }}
 
+      # The dispatch payload reaches the scripts through env:, never through
+      # ${{ }} inside run:, so whatever text it holds stays data and can't
+      # become part of the shell script.
       - name: Attach to the target branch
         # actions/checkout leaves HEAD detached. plugin-pull.sh refuses to run
         # unless `git rev-parse --abbrev-ref HEAD` reports "main" or "dev".
-        run: git checkout -B "${{ github.event.client_payload.branch }}"
+        env:
+          BRANCH: ${{ github.event.client_payload.branch }}
+        run: git checkout -B "$BRANCH"
 
       - name: Pull plugin from xo-plugins
-        run: scripts/plugin-pull.sh "${{ github.event.client_payload.plugin }}"
+        env:
+          PLUGIN: ${{ github.event.client_payload.plugin }}
+        run: scripts/plugin-pull.sh "$PLUGIN"
 
       - name: Commit and push if changed
+        env:
+          PLUGIN: ${{ github.event.client_payload.plugin }}
+          BRANCH: ${{ github.event.client_payload.branch }}
         run: |
           set -euo pipefail
-          plugin="${{ github.event.client_payload.plugin }}"
-          branch="${{ github.event.client_payload.branch }}"
+          plugin="$PLUGIN"
+          branch="$BRANCH"
 
-          if git diff --quiet -- "plugins/${plugin}"; then
+          # Stage first and compare the index: a plain `git diff` ignores
+          # untracked files, so a pull that only added a file looked like
+          # "no changes" and the new file was never committed.
+          git add -- "plugins/${plugin}"
+          if git diff --cached --quiet -- "plugins/${plugin}"; then
             echo "No changes after pulling ${plugin} -- nothing to commit."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "plugins/${plugin}"
           git commit -m "sync: pull ${plugin} from xo-plugins (${branch})"
 
           # Two dispatches for the same branch (e.g. two plugins updated at

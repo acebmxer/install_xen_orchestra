@@ -323,6 +323,38 @@ _deploy_drive_fixture() {
     [ "$status" -eq 0 ]
 }
 
+# deploy_load_pubkey accepts any comment. Unquoted, "me: work laptop" made
+# the list item a mapping, " #" cut the key short, and a ' in a quoted one
+# would end the string early.
+@test "a key comment with YAML syntax in it stays one intact key" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not available"
+    python3 -c "import yaml" 2>/dev/null || skip "python3 yaml not available"
+    _deploy_drive_fixture
+    ssh-keygen -t ed25519 -N "" -C "me: work laptop #2 it's mine" \
+        -f "${TMPDIR_TEST}/odd" >/dev/null 2>&1
+    DEPLOY_USER_PUBKEY=$(deploy_load_pubkey "${TMPDIR_TEST}/odd.pub")
+
+    deploy_build_config_drive
+
+    run python3 -c '
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+keys = doc["users"][0]["ssh_authorized_keys"]
+assert all(isinstance(k, str) for k in keys), keys
+assert sys.argv[2] in keys, keys
+assert len(keys) == 2, keys
+print("OK")
+' "${DEPLOY_WORKDIR}/cidata/user-data" "$DEPLOY_USER_PUBKEY"
+    [ "$status" -eq 0 ]
+    [ "$output" = "OK" ]
+}
+
+@test "yaml_single_quote wraps the value and doubles any single quote" {
+    [ "$(yaml_single_quote "a: b")" = "'a: b'" ]
+    [ "$(yaml_single_quote "it's")" = "'it''s'" ]
+    [ "$(yaml_single_quote "")" = "''" ]
+}
+
 @test "the admin account still gets passwordless sudo for the install" {
     _deploy_drive_fixture
 
@@ -575,7 +607,7 @@ STUB
     local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
     grep -q "operator@laptop" "$user_data"
     grep -q "install-xen-orchestra deploy (temporary)" "$user_data"
-    [ "$(grep -c '^      - ssh-' "$user_data")" -eq 2 ]
+    [ "$(grep -c "^      - 'ssh-" "$user_data")" -eq 2 ]
 }
 
 @test "without a supplied key only the deployment key is installed" {
@@ -585,7 +617,7 @@ STUB
     deploy_build_config_drive
 
     local user_data="${DEPLOY_WORKDIR}/cidata/user-data"
-    [ "$(grep -c '^      - ssh-' "$user_data")" -eq 1 ]
+    [ "$(grep -c "^      - 'ssh-" "$user_data")" -eq 1 ]
     grep -q "install-xen-orchestra deploy (temporary)" "$user_data"
 }
 
@@ -1206,6 +1238,108 @@ EOF
 
     grep -q "UserKnownHostsFile=${TMPDIR_TEST}/pinned" "${TMPDIR_TEST}/ssh_args"
     grep -q "StrictHostKeyChecking=yes" "${TMPDIR_TEST}/ssh_args"
+}
+
+# A stand-in for ssh to the pool master: asks for a password only when
+# FAKE_SSH_PASSWORD=1 (a key login asks nothing), then acts as a root shell,
+# logging every line the helper sends until "exit".
+_write_fake_pool_ssh() {
+    local stub="${TMPDIR_TEST}/bin"
+    mkdir -p "$stub"
+    cat > "${stub}/ssh" <<'EOF'
+#!/bin/bash
+if [ "${FAKE_SSH_PASSWORD:-0}" = 1 ]; then
+    printf "root@192.0.2.10's password: "
+    IFS= read -r l
+    echo "PASSWORD:$l" >> "$FAKE_SSH_LOG"
+    echo
+fi
+printf '[root@xcp-ng ~]# '
+while IFS= read -r line; do
+    echo "LINE:$line" >> "$FAKE_SSH_LOG"
+    [ "$line" = exit ] && exit 0
+    # With FAKE_INSTALLER=1, the wget line plays the proxy installer: quiet
+    # for FAKE_IMPORT_SECONDS (the appliance download), then its results.
+    if [ "${FAKE_INSTALLER:-0}" = 1 ] && [[ "$line" == wget* ]]; then
+        echo "Importing XO Proxy VM: this might take a while..."
+        sleep "${FAKE_IMPORT_SECONDS:-0}"
+        printf '\nYour XO Proxy Appliance IP address is:\n  192.0.2.129\n\n'
+        echo "XO Proxy Appliance UUID: e11c1c17-596c-7e82-cade-f6af0134cadb"
+        echo "XO Proxy authentication token: TokenAbc_123-xyz"
+    fi
+    printf '[root@xcp-ng ~]# '
+done
+EOF
+    chmod +x "${stub}/ssh"
+}
+
+_run_proxy_helper() {
+    PATH="${TMPDIR_TEST}/bin:${PATH}" XO_HELPER_HOST_PASSWORD=host-pw XO_HELPER_XO_PASSWORD=y \
+        FAKE_SSH_LOG="${TMPDIR_TEST}/session.log" \
+        timeout 30 expect "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp" \
+        192.0.2.10 root dhcp "" admin@x >/dev/null 2>&1 || true
+}
+
+@test "the proxy helper does not wait out its timeout when SSH asks no password" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    local start=$SECONDS
+    FAKE_SSH_PASSWORD=0 _run_proxy_helper
+    # The old helper waited for "password:" for 600 s (cut off at 30 here)
+    # and sent nothing.
+    [ $((SECONDS - start)) -lt 15 ]
+    [ "$(head -1 "${TMPDIR_TEST}/session.log")" = \
+      "LINE:wget -qO /tmp/xo-proxy-deploy.sh https://xoa.io/proxy/deploy && bash /tmp/xo-proxy-deploy.sh; rm -f /tmp/xo-proxy-deploy.sh" ]
+    run grep -q '^PASSWORD:' "${TMPDIR_TEST}/session.log"
+    [ "$status" -eq 1 ]
+}
+
+@test "the proxy helper still sends the password when SSH asks for one" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    FAKE_SSH_PASSWORD=1 _run_proxy_helper
+    [ "$(sed -n 1p "${TMPDIR_TEST}/session.log")" = "PASSWORD:host-pw" ]
+    [[ "$(sed -n 2p "${TMPDIR_TEST}/session.log")" == "LINE:wget -qO /tmp/xo-proxy-deploy.sh "* ]]
+}
+
+# The appliance download is silent and can outlast the login timeout (a
+# real run took 19 minutes against 600 s); the helper must keep reading
+# until the installer prints its results. XO_HELPER_INSTALL_TIMEOUT scales
+# the wait down so the test takes seconds.
+_run_proxy_helper_capture() {
+    PATH="${TMPDIR_TEST}/bin:${PATH}" XO_HELPER_HOST_PASSWORD=host-pw XO_HELPER_XO_PASSWORD=y \
+        FAKE_SSH_LOG="${TMPDIR_TEST}/session.log" FAKE_INSTALLER=1 \
+        timeout 30 expect "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp" \
+        192.0.2.10 root dhcp "" admin@x 2>&1 || true
+}
+
+@test "the proxy helper captures the results after a silent download" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    FAKE_SSH_PASSWORD=0 FAKE_IMPORT_SECONDS=3 XO_HELPER_INSTALL_TIMEOUT=10 \
+        run _run_proxy_helper_capture
+    [[ "$output" == *"PROXY_IP=192.0.2.129"* ]]
+    [[ "$output" == *"PROXY_UUID=e11c1c17-596c-7e82-cade-f6af0134cadb"* ]]
+    [[ "$output" == *"AUTH_TOKEN=TokenAbc_123-xyz"* ]]
+    [[ "$output" != *"Timeout waiting for installer"* ]]
+}
+
+@test "the proxy helper's install wait is its own setting, not the login timeout" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    # A download longer than the install wait still times out, so the
+    # setting is really what governs this wait.
+    FAKE_SSH_PASSWORD=0 FAKE_IMPORT_SECONDS=6 XO_HELPER_INSTALL_TIMEOUT=2 \
+        run _run_proxy_helper_capture
+    [[ "$output" == *"Timeout waiting for installer"* ]]
+    [[ "$output" == *"PROXY_UUID="$'\r'* || "$output" == *"PROXY_UUID="$'\n'* ]]
+}
+
+@test "the proxy helper allows an hour for the installer by default" {
+    # The 600 s login timeout is far too short for a slow appliance
+    # download; the installer phase gets its own, much longer, default.
+    grep -qx 'set install_timeout 3600' "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp"
+    grep -qx 'set timeout $install_timeout' "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp"
 }
 
 # The hash is a credential. The script masks secrets under XO_DEBUG=1

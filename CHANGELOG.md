@@ -10,6 +10,59 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-10-22
+
+### Fixed
+
+- **`--proxy` no longer loses the new proxy's address, UUID and token when
+  the appliance download is slow.** The proxy helper stopped reading the
+  installer after 10 minutes without output, and downloading and
+  importing the 1.2 GB appliance can take longer than that, so the values
+  were missed and you had to type them in. It now waits up to an hour
+  for the installer.
+- **Docs: four places that said something the script doesn't do.** API
+  tokens don't need a description to survive an update: the update only
+  deletes browser session tokens, which it recognises by their `client_id`,
+  and keeps every other token. `docs/deployment.md` no longer tells you to
+  log in with an `xo-deploy-<hostname>.key` file, which the deploy stopped
+  saving; you log in with your own key. It also says the image is first
+  downloaded to `/var/tmp` on the pool master (about 3.3 GB free needed)
+  and streamed straight into the disk only when there isn't room. The
+  NanoKVM plugin's README now explains that an `http://` Base URL lets
+  anyone on the network read the password and the session cookie, and how
+  to set up HTTPS, since the certificate NanoKVM makes for itself is only
+  valid for `localhost`.
+- **`--deploy` no longer breaks the new VM's setup when your SSH key's
+  comment contains `: ` or ` #`.** The key went into the VM's cloud-init
+  settings unquoted, so a comment like `me: work laptop` was read as
+  something other than a key, and ` #` cut it short. Keys are now
+  quoted there, so any comment works.
+- **`--proxy` no longer sits for 10 minutes when the pool master accepts
+  your SSH key.** The proxy helper waited only for a password prompt, so
+  a key or agent login, which never shows one, ran out its 600-second
+  timeout before the proxy installer started. It now goes ahead as soon as
+  the shell prompt appears.
+- **The menu's Edit xo-config.cfg and Rename Sample items no longer drop
+  the other ticked items.** The "reload the script?" question used to come
+  first, and either answer lost the rest: "No" exited and "Yes" restarted
+  the menu with nothing ticked. The other items now run first, using the
+  new settings, and the reload is offered afterwards. Declining the
+  rename's overwrite, or closing the editor without saving a change, no
+  longer counts as a change, so no reload is offered for it. A quoted
+  `PREFERRED_EDITOR="vim"` (or one followed by a comment) is now honoured
+  instead of falling back to nano. `--backup-file` and `--log-file` with
+  no value now stop with an error; before, one at the end of the line
+  stopped with no message, and one followed by another flag took that
+  flag as its value (`--log-file --update` opened the menu instead of
+  updating).
+
+  An item that ends early from the menu no longer ends the whole run.
+  Update with nothing new to install ("Already up to date"), and a
+  Rebuild, Reconfigure or Restore you cancel, used to quit the script on
+  the spot, so the items after it and the reload question after an edit
+  never came. The menu now goes on to the next ticked item, then offers
+  the reload.
+
 ## [0.9.7] - 2026-10-21
 
 ### Fixed
@@ -2693,7 +2746,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...v0.9.5

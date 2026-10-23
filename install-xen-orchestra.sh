@@ -3030,7 +3030,7 @@ restore_xo() {
         read -t 300 -r CHOICE || { log_error "Input timeout"; exit 1; }
         if [[ "$CHOICE" == "q" ]] || [[ "$CHOICE" == "Q" ]]; then
             log_info "Restore cancelled."
-            exit 0
+            return 0
         fi
     fi
 
@@ -3052,7 +3052,7 @@ restore_xo() {
     echo ""
     log_warning "You are about to restore: $SELECTED_NAME"
     log_warning "This will replace the current installation at $INSTALL_DIR"
-    confirm_or_skip "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; exit 0; }
+    confirm_or_skip "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
@@ -3116,11 +3116,11 @@ restore_xo() {
 #
 # NOTE: the token must be a persistent API token created in XO's web
 # UI (open your user menu → Tokens; the exact menu location varies by XO
-# version) or via the REST API with a "description" field in the request body.
+# version) or via the REST API.
 # The token is sent to the REST API via the authenticationToken cookie.
-# During updates flush_redis_tokens() preserves tokens that have a non-empty
-# description and deletes tokens without one (browser sessions). A token
-# created without a description will be wiped on the next update.
+# During updates flush_redis_tokens() deletes only tokens that carry a
+# client_id (browser sessions), so an API token survives with or without a
+# description.
 #
 # Orphan filter: tasks whose start time predates xo-server's process start
 # are treated as stale DB records (e.g. left over after restoring an XO
@@ -3517,7 +3517,10 @@ update_xo() {
         # config restore can still leave orphaned tokens behind — surface
         # them so the user knows to run --flush-tokens.
         check_orphaned_tokens
-        exit 0
+        # return, not exit: from the menu, other ticked items and the
+        # reload question still have to run after an update with nothing
+        # to do. Every caller ends right after this function.
+        return 0
     fi
 
     log_info "New version available. Proceeding with update..."
@@ -3680,7 +3683,7 @@ rebuild_xo() {
     log_warning "  3. Perform a clean rebuild"
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
-    confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; exit 0; }
+    confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; return 0; }
 
     # Snapshot while xo-server is still up -- it talks to the REST API on
     # localhost, so it must run before the service stops below or every
@@ -3819,7 +3822,7 @@ reconfigure_xo() {
     log_warning "Database and user data in /var/lib/xo-server will NOT be affected."
     log_warning "NFS/CIFS mounts and reverse proxy settings will continue to work."
     echo ""
-    confirm_or_skip "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; exit 0; }
+    confirm_or_skip "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
@@ -4678,7 +4681,9 @@ dom0_xe() {
 # payload, let alone a 3 GiB image.
 #
 # Running it on the pool master means the image never crosses the operator's
-# link and never lands on dom0's filesystem either.
+# link. This streaming PUT is the fallback, though: by default the image is
+# first staged in /var/tmp on dom0 and PUT from that file (see
+# deploy_import_vdi_staged and deploy_import_vdi_from_url).
 #
 # All of this is verified by tests/probe-xapi-deploy.sh against a real host.
 # ---------------------------------------------------------------------------
@@ -6640,6 +6645,13 @@ deploy_load_pubkey() {
     printf '%s' "$line"
 }
 
+# Print VALUE as a YAML single-quoted string: wrapped in ' with any ' inside
+# doubled, YAML's only escape in that style. Safe for any single-line value.
+yaml_single_quote() {
+    local value="$1" sq="'"
+    printf "'%s'" "${value//$sq/$sq$sq}"
+}
+
 # Describe a public key for a prompt or the summary: "ed25519 SHA256:... (comment)".
 deploy_pubkey_label() {
     local line="$1" check="${DEPLOY_WORKDIR}/pubkey.label" out=""
@@ -7007,10 +7019,17 @@ deploy_build_config_drive() {
 
     # The operator's own key, when they gave one, goes in alongside it and is
     # what remains after the deploy key is revoked.
-    local pubkey_lines="      - ${DEPLOY_PUBKEY}"
+    #
+    # Each key is a single-quoted YAML string. deploy_load_pubkey accepts any
+    # comment, and a plain (unquoted) one turns into something else when the
+    # comment holds YAML syntax: "me: work laptop" made the list item a
+    # mapping instead of a key, and " #" starts a YAML comment that cuts the
+    # key short.
+    local pubkey_lines
+    pubkey_lines="      - $(yaml_single_quote "$DEPLOY_PUBKEY")"
     if [[ -n "${DEPLOY_USER_PUBKEY:-}" ]]; then
         pubkey_lines="${pubkey_lines}
-      - ${DEPLOY_USER_PUBKEY}"
+      - $(yaml_single_quote "$DEPLOY_USER_PUBKEY")"
     fi
 
     cat > "${dir}/meta-data" <<EOF
@@ -13215,7 +13234,8 @@ menu_rename_config() {
         echo
         if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
             log_info "Skipping rename."
-            return 0
+            # Nothing changed, so no reload is offered for it.
+            return 1
         fi
     fi
     if [[ ! -f "$SAMPLE_CONFIG" ]]; then
@@ -13230,12 +13250,14 @@ menu_rename_config() {
 menu_edit_config() {
     echo ""
 
-    # Ensure config exists
+    # Ensure config exists. Creating it from the sample is itself a change.
+    local created=false
     if [[ ! -f "$CONFIG_FILE" ]]; then
         if [[ -f "$SAMPLE_CONFIG" ]]; then
             log_info "xo-config.cfg not found. Creating from sample..."
             cp "$SAMPLE_CONFIG" "$CONFIG_FILE"
             log_success "Created xo-config.cfg from sample."
+            created=true
         else
             log_error "Neither xo-config.cfg nor sample-xo-config.cfg found!"
             return 1
@@ -13245,12 +13267,12 @@ menu_edit_config() {
     # Read preferred editor from config
     local editor="${PREFERRED_EDITOR:-nano}"
 
-    # Source config to get PREFERRED_EDITOR if not already loaded
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local cfg_editor
-        cfg_editor=$(grep -E '^PREFERRED_EDITOR=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2) || true
-        [[ -n "$cfg_editor" ]] && editor="$cfg_editor"
-    fi
+    # Read PREFERRED_EDITOR from the file as it is now. deploy_config_value
+    # strips quotes and a trailing comment, so PREFERRED_EDITOR="vim" works
+    # the same as PREFERRED_EDITOR=vim.
+    local cfg_editor
+    cfg_editor=$(deploy_config_value "$CONFIG_FILE" PREFERRED_EDITOR)
+    [[ -n "$cfg_editor" ]] && editor="$cfg_editor"
 
     # Validate editor choice
     if [[ "$editor" != "nano" ]] && [[ "$editor" != "vim" ]]; then
@@ -13294,7 +13316,15 @@ menu_edit_config() {
     fi
 
     log_info "Opening ${CONFIG_FILE} with ${editor}..."
+    local sum_before sum_after
+    sum_before=$(cksum < "$CONFIG_FILE")
     "$editor" "$CONFIG_FILE" < /dev/tty
+    sum_after=$(cksum < "$CONFIG_FILE")
+    if [[ "$created" != "true" && "$sum_before" == "$sum_after" ]]; then
+        # Closed without saving a change: nothing to reload for.
+        log_info "No changes made to xo-config.cfg."
+        return 1
+    fi
     log_success "Configuration editing complete."
 }
 
@@ -13518,7 +13548,8 @@ process_menu_selections() {
         return 0
     fi
 
-    # Preparatory operations first (rename, then edit)
+    # Preparatory operations first (rename, then edit). Each returns 0 only
+    # when it really changed xo-config.cfg.
     local config_changed=false
     if [[ ${MENU_SELECTED[2]} -eq 1 ]]; then
         menu_rename_config && config_changed=true
@@ -13528,8 +13559,22 @@ process_menu_selections() {
         menu_edit_config && config_changed=true
     fi
 
+    # Anything else ticked runs in this same pass, after the config change:
+    # the reload below used to come first, and either answer to it dropped
+    # the other ticked items. Re-read the config before they run, so they use
+    # the new settings (Deploy, Adjust Memory and Custom Plugins don't call
+    # load_config themselves, and the menu loaded the old file at start).
+    if [[ "$config_changed" == "true" ]] && menu_other_items_selected; then
+        log_info "Configuration changed. Reading the new xo-config.cfg before running the other selected items."
+        load_config
+    fi
+
+    process_menu_operations
+
     # If the config file was renamed or edited, offer to reload the script so
-    # the new settings take effect. Reloading re-runs load_config from scratch.
+    # the new settings take effect everywhere (the menu header included).
+    # Reloading re-runs load_config from scratch, which also drops any
+    # setting deleted from the file -- re-reading it above can't unset those.
     if [[ "$config_changed" == "true" ]]; then
         echo ""
         if prompt_yes_no "Configuration changed. Do you want to reload the script?"; then
@@ -13541,7 +13586,22 @@ process_menu_selections() {
             exit 0
         fi
     fi
+}
 
+# True when any menu item other than Rename Sample (2) and Edit xo-config.cfg
+# (8) is ticked.
+menu_other_items_selected() {
+    local i
+    for ((i = 0; i < MENU_TOTAL; i++)); do
+        [[ $i -eq 2 || $i -eq 8 ]] && continue
+        [[ ${MENU_SELECTED[$i]} -eq 1 ]] && return 0
+    done
+    return 1
+}
+
+# Run the ticked menu operations (everything except Rename Sample and Edit
+# xo-config.cfg, which process_menu_selections handles first).
+process_menu_operations() {
     # Install Xen Orchestra (full installation with all checks)
     if [[ ${MENU_SELECTED[0]} -eq 1 ]]; then
         install_xo
@@ -13884,6 +13944,20 @@ run_menu() {
     done
 }
 
+# A flag that takes a value (--backup-file NAME, --log-file PATH) must be
+# followed by one. Without this check a value flag at the end of the line
+# failed on the second shift with no message, and one followed by another
+# flag swallowed it (--log-file --update logged to a file named "--update"
+# and opened the menu instead of updating).
+require_flag_value() {
+    local flag="$1" value="$2"
+    if [[ -z "$value" || "$value" == --* ]]; then
+        log_error "$flag needs a value."
+        log_error "Run with --help for usage information."
+        exit 1
+    fi
+}
+
 # Main entry point
 main() {
     # Pre-parse global flags before dispatching to operations.
@@ -13898,15 +13972,17 @@ main() {
                 DRY_RUN=true
                 ;;
             --backup-file)
+                require_flag_value "$1" "${2-}"
                 shift
-                RESTORE_BACKUP_FILE="${1:-}"
+                RESTORE_BACKUP_FILE="$1"
                 ;;
             --list-backups)
                 LIST_BACKUPS_ONLY=true
                 ;;
             --log-file)
+                require_flag_value "$1" "${2-}"
                 shift
-                LOG_FILE="${1:-}"
+                LOG_FILE="$1"
                 ;;
             --json-logs)
                 JSON_LOGS=true
