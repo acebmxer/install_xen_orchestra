@@ -91,6 +91,18 @@ if {!$at_prompt} {
 }
 send "wget -qO /tmp/xo-proxy-deploy.sh https://xoa.io/proxy/deploy && bash /tmp/xo-proxy-deploy.sh; rm -f /tmp/xo-proxy-deploy.sh\r"
 
+# The installer goes quiet while it downloads and imports the 1.2 GB
+# appliance, and on a slow link that takes longer than the 600 s above
+# (19 minutes has been seen). A timeout there stopped the helper reading
+# before the IP, UUID and token were printed, so none were captured. Allow
+# an hour of silence here; XO_HELPER_INSTALL_TIMEOUT (seconds) overrides it.
+set install_timeout 3600
+if {[info exists env(XO_HELPER_INSTALL_TIMEOUT)] &&
+    [string is digit -strict $env(XO_HELPER_INSTALL_TIMEOUT)]} {
+    set install_timeout $env(XO_HELPER_INSTALL_TIMEOUT)
+}
+set timeout $install_timeout
+
 # Handle installer prompts
 expect {
     -re "IP address\\? \\\[dhcp\\\]" {

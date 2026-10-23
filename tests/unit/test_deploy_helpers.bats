@@ -1258,6 +1258,15 @@ printf '[root@xcp-ng ~]# '
 while IFS= read -r line; do
     echo "LINE:$line" >> "$FAKE_SSH_LOG"
     [ "$line" = exit ] && exit 0
+    # With FAKE_INSTALLER=1, the wget line plays the proxy installer: quiet
+    # for FAKE_IMPORT_SECONDS (the appliance download), then its results.
+    if [ "${FAKE_INSTALLER:-0}" = 1 ] && [[ "$line" == wget* ]]; then
+        echo "Importing XO Proxy VM: this might take a while..."
+        sleep "${FAKE_IMPORT_SECONDS:-0}"
+        printf '\nYour XO Proxy Appliance IP address is:\n  192.0.2.129\n\n'
+        echo "XO Proxy Appliance UUID: e11c1c17-596c-7e82-cade-f6af0134cadb"
+        echo "XO Proxy authentication token: TokenAbc_123-xyz"
+    fi
     printf '[root@xcp-ng ~]# '
 done
 EOF
@@ -1291,6 +1300,46 @@ _run_proxy_helper() {
     FAKE_SSH_PASSWORD=1 _run_proxy_helper
     [ "$(sed -n 1p "${TMPDIR_TEST}/session.log")" = "PASSWORD:host-pw" ]
     [[ "$(sed -n 2p "${TMPDIR_TEST}/session.log")" == "LINE:wget -qO /tmp/xo-proxy-deploy.sh "* ]]
+}
+
+# The appliance download is silent and can outlast the login timeout (a
+# real run took 19 minutes against 600 s); the helper must keep reading
+# until the installer prints its results. XO_HELPER_INSTALL_TIMEOUT scales
+# the wait down so the test takes seconds.
+_run_proxy_helper_capture() {
+    PATH="${TMPDIR_TEST}/bin:${PATH}" XO_HELPER_HOST_PASSWORD=host-pw XO_HELPER_XO_PASSWORD=y \
+        FAKE_SSH_LOG="${TMPDIR_TEST}/session.log" FAKE_INSTALLER=1 \
+        timeout 30 expect "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp" \
+        192.0.2.10 root dhcp "" admin@x 2>&1 || true
+}
+
+@test "the proxy helper captures the results after a silent download" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    FAKE_SSH_PASSWORD=0 FAKE_IMPORT_SECONDS=3 XO_HELPER_INSTALL_TIMEOUT=10 \
+        run _run_proxy_helper_capture
+    [[ "$output" == *"PROXY_IP=192.0.2.129"* ]]
+    [[ "$output" == *"PROXY_UUID=e11c1c17-596c-7e82-cade-f6af0134cadb"* ]]
+    [[ "$output" == *"AUTH_TOKEN=TokenAbc_123-xyz"* ]]
+    [[ "$output" != *"Timeout waiting for installer"* ]]
+}
+
+@test "the proxy helper's install wait is its own setting, not the login timeout" {
+    command -v expect >/dev/null || skip "expect not installed"
+    _write_fake_pool_ssh
+    # A download longer than the install wait still times out, so the
+    # setting is really what governs this wait.
+    FAKE_SSH_PASSWORD=0 FAKE_IMPORT_SECONDS=6 XO_HELPER_INSTALL_TIMEOUT=2 \
+        run _run_proxy_helper_capture
+    [[ "$output" == *"Timeout waiting for installer"* ]]
+    [[ "$output" == *"PROXY_UUID="$'\r'* || "$output" == *"PROXY_UUID="$'\n'* ]]
+}
+
+@test "the proxy helper allows an hour for the installer by default" {
+    # The 600 s login timeout is far too short for a slow appliance
+    # download; the installer phase gets its own, much longer, default.
+    grep -qx 'set install_timeout 3600' "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp"
+    grep -qx 'set timeout $install_timeout' "${BATS_TEST_DIRNAME}/../../xo-proxy-helper.exp"
 }
 
 # The hash is a credential. The script masks secrets under XO_DEBUG=1

@@ -12,6 +12,13 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`--proxy` no longer loses the new proxy's address, UUID and token when
+  the appliance download is slow.** The proxy helper stopped reading the
+  installer after 10 minutes without output, and downloading and
+  importing the 1.2 GB appliance can take longer than that, so the values
+  were missed and you had to type them in. It now waits up to an hour
+  for the installer.
+
 - **Docs: four places that said something the script doesn't do.** API
   tokens don't need a description to survive an update: the update only
   deletes browser session tokens, which it recognises by their `client_id`,
