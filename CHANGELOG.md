@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-10-22
+
 ### Fixed
 
 - **`--proxy` no longer loses the new proxy's address, UUID and token when
@@ -18,7 +20,6 @@ This installer builds Xen Orchestra from source and tracks the official
   importing the 1.2 GB appliance can take longer than that, so the values
   were missed and you had to type them in. It now waits up to an hour
   for the installer.
-
 - **Docs: four places that said something the script doesn't do.** API
   tokens don't need a description to survive an update: the update only
   deletes browser session tokens, which it recognises by their `client_id`,
@@ -31,7 +32,6 @@ This installer builds Xen Orchestra from source and tracks the official
   anyone on the network read the password and the session cookie, and how
   to set up HTTPS, since the certificate NanoKVM makes for itself is only
   valid for `localhost`.
-
 - **`--deploy` no longer breaks the new VM's setup when your SSH key's
   comment contains `: ` or ` #`.** The key went into the VM's cloud-init
   settings unquoted, so a comment like `me: work laptop` was read as
@@ -2746,7 +2746,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.4...v0.9.5
