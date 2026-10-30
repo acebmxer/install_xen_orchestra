@@ -12,6 +12,14 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Building templates through the Xen Orchestra API no longer fills `/tmp`.**
+  qcow2 images were downloaded and converted in `/tmp`, which on Debian 13
+  is held in RAM and capped at half of it, so on a 6 GiB XO VM Ubuntu 26.04
+  failed with `No space left on device` while the disk had plenty of room.
+  The download and conversion now happen in `/var/tmp`, which is on disk,
+  and the free space there is checked before the download starts: if it is
+  short, the build stops and says how much is free, how much is needed, and
+  what to do. (#106)
 - **Building templates through the Xen Orchestra API no longer runs out of
   memory on large images.** The image was handed to curl in a way that
   makes it read the whole file into memory before sending any of it, and a

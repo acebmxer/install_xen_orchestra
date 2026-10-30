@@ -294,6 +294,12 @@ that pool only.
   pipe, so a pool master short on `/var/tmp` fails the build with a message
   saying so rather than importing something that will not boot.
 
+  **On the API path the same qcow2 images are downloaded and converted on your
+  workstation instead, in `/var/tmp`** (on disk, not the RAM-backed `/tmp`
+  that Debian 13 uses). Before downloading, the build checks there is room for
+  about five times the download, the same allowance as the SSH path, and stops
+  with the figures if there is not.
+
 - **`qemu-img`, to convert those qcow2 images to raw** (XO's import endpoint
   takes raw and VHD only). Where it is needed depends on the build method:
   - **API path** — on your workstation, since that is where the image is
