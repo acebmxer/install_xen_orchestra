@@ -10837,9 +10837,15 @@ tpl_api_import_image() {
             # qemu-img is silent and takes a minute or two on a 3.5 GiB
             # image, so the size is printed rather than leaving another
             # unexplained pause between two progress bars.
+            #
+            # The last "virtual-size", not the first: newer qemu-img lists the
+            # file's own size under "children" before the image's real one,
+            # so the first match is the 0.5 GiB qcow2 file, not its 10 GiB
+            # disk. Squashing the JSON onto one line lets the greedy match
+            # land on the last, as the SSH path does.
             local vsize
             vsize=$(qemu-img info --output=json "$local_file" 2>/dev/null \
-                | sed -n 's/.*"virtual-size":[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+                | tr -d ' \n' | sed -n 's/.*"virtual-size":\([0-9]*\).*/\1/p')
             if [[ "$vsize" =~ ^[0-9]+$ ]]; then
                 # One decimal place: bash does integer division, so a 3.5 GiB
                 # image printed as "0 GiB" and read as a failed size lookup
@@ -10849,8 +10855,13 @@ tpl_api_import_image() {
             else
                 log_info "    converting it to raw..."
             fi
-            if ! qemu-img convert -f qcow2 -O raw "$local_file" "$converted" 2>/dev/null; then
+            # qemu-img's own message is kept and shown on failure: "could not
+            # convert" alone does not say whether the disk filled or the
+            # download was bad.
+            local convert_err
+            if ! convert_err=$(qemu-img convert -f qcow2 -O raw "$local_file" "$converted" 2>&1); then
                 log_error "  could not convert the image to raw."
+                [[ -n "$convert_err" ]] && log_error "  qemu-img said: ${convert_err}"
                 rm -f "$local_file" "$converted"
                 return 1
             fi
@@ -10888,6 +10899,12 @@ tpl_api_import_image() {
         # The size is the file's own, which is what Content-Length has to be
         # anyway: a fifo has no length curl can discover, and XAPI refuses a
         # chunked body.
+        #
+        # -T -, never --data-binary @-: the latter reads the whole body into
+        # memory before sending, and a converted image is its full virtual
+        # size (10 GiB for AlmaLinux), so the kernel killed curl part-way.
+        # -T - streams. The empty Transfer-Encoding header stops curl adding
+        # "chunked" beside our Content-Length, as on the SSH path.
         local up_size
         up_size=$(stat -c %s "$upload_file" 2>/dev/null || echo 0)
         deploy_curl_upload_with_progress "$upload_file" "$up_size" http_code \
@@ -10895,7 +10912,7 @@ tpl_api_import_image() {
             --speed-limit 1024 --speed-time 120 \
             -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
-            --data-binary @- \
+            -T - -H 'Transfer-Encoding:' \
             --output "$resp_file" --write-out '%{http_code}' \
             "$target" || rc=$?
     else
@@ -10913,6 +10930,14 @@ tpl_api_import_image() {
             | grep -i '^content-length:' | tail -1 | awk '{print $2}')
         [[ "$stream_size" =~ ^[0-9]+$ ]] || stream_size=""
 
+        # Streamed with -T - when the origin gave a size, for the reason on
+        # the file upload above: --data-binary @- holds the whole image in
+        # memory first. XAPI needs a length, so a mirror that will not give
+        # one falls back to the buffering form, which does learn it.
+        local -a body_args=(--data-binary @-)
+        if [[ -n "$stream_size" ]]; then
+            body_args=(-T - -H "Content-Length: ${stream_size}" -H 'Transfer-Encoding:')
+        fi
         # Nothing lands on disk here, so the image is hashed as it streams
         # past and checked once XO has the disk; a mismatch fails the build
         # and tpl_api_cleanup_failed_build deletes the disk.
@@ -10923,7 +10948,7 @@ tpl_api_import_image() {
             --speed-limit 1024 --speed-time 120 \
             -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
-            --data-binary @- \
+            "${body_args[@]}" \
             --output "$resp_file" --write-out '%{http_code}' \
             "$target" || rc=$?
     fi

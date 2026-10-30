@@ -10,6 +10,21 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Fixed
+
+- **Building templates through the Xen Orchestra API no longer runs out of
+  memory on large images.** The image was handed to curl in a way that
+  makes it read the whole file into memory before sending any of it, and a
+  converted image is its full disk size (10 GiB for AlmaLinux). On the XO
+  VM the system killed curl part-way, which showed as `Killed` or as
+  `the image import failed (HTTP none)`. The image is now streamed, as the
+  SSH build method already did, and Debian's raw images are streamed the
+  same way whenever the mirror reports their size. The size shown before
+  the conversion is now the disk's real size rather than the downloaded
+  file's (it said 0.5 GiB for a 10 GiB disk), and a failed conversion now
+  shows qemu-img's own error message instead of only "could not convert
+  the image to raw." (#105)
+
 ## [0.9.8] - 2026-10-22
 
 ### Fixed

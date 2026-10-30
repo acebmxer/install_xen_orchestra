@@ -83,6 +83,11 @@ changes to [CHANGELOG.md](CHANGELOG.md) under the `[Unreleased]` heading.
 
 ## Opening a pull request
 
+Pull requests go to the `dev` branch; `main` only receives `dev` when a
+release is cut. Bug reports and feature requests use the
+[issue templates](https://github.com/acebmxer/install_xen_orchestra/issues/new/choose),
+and everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 GitHub pre-fills new PRs from
 [.github/pull_request_template.md](.github/pull_request_template.md) —
 fill it in rather than replacing it.

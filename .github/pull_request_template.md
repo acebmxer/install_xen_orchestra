@@ -21,6 +21,9 @@ here. If it deviates from upstream, say so explicitly and why.
 
 ## Checklist
 
+<!-- Tick only what you actually did. -->
+
+- [ ] This PR targets the `dev` branch, not `main`
 - [ ] `shellcheck -S warning install-xen-orchestra.sh` passes
 - [ ] `bash -n install-xen-orchestra.sh` passes
 - [ ] `bats tests/unit/` passes

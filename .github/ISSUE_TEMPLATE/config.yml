@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Xen Orchestra itself
+    url: https://github.com/vatesfr/xen-orchestra/issues
+    about: This repository is only the installer. Bugs in Xen Orchestra (the web UI, xo-server, backups) belong upstream with Vates.
+  - name: Security vulnerability
+    url: https://github.com/acebmxer/install_xen_orchestra/security
+    about: Report privately through the Security tab, not as a public issue.
