@@ -7,10 +7,10 @@
 [![Issues](https://img.shields.io/github/issues/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/issues)
 [![Stars](https://img.shields.io/github/stars/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/stargazers)
 [![Forks](https://img.shields.io/github/forks/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/forks)
-[![Unique cloners](https://img.shields.io/badge/unique%20cloners-106-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
+[![Unique cloners](https://img.shields.io/badge/unique%20cloners-173-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-537%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-545%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-14-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -543,6 +543,14 @@ If the build is broken, rebuild (takes a backup first):
 For OOM build failures, NodeSource GPG errors on offline hosts, git "dubious
 ownership", and SELinux denials on RHEL-family systems, see
 [docs/troubleshooting.md](docs/troubleshooting.md).
+
+## Contributing
+
+Pull requests go to the `dev` branch. Read [CONTRIBUTING.md](CONTRIBUTING.md)
+for the setup and conventions, use the issue templates for
+[bug reports and feature requests](https://github.com/acebmxer/install_xen_orchestra/issues/new/choose),
+report vulnerabilities privately as described in [SECURITY.md](SECURITY.md),
+and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

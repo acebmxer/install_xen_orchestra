@@ -2502,8 +2502,43 @@ print("ok")
     [[ "$body" == *"deploy_curl_upload_with_progress"* ]]
     # And it must feed curl from the counter, not hand it the file directly --
     # curl reading the file itself is what leaves nothing to measure.
-    [[ "$body" == *"--data-binary @-"* ]]
+    [[ "$body" == *"-T - -H 'Transfer-Encoding:'"* ]]
     [[ "$body" != *'--data-binary "@${upload_file}"'* ]]
+}
+
+@test "the API image upload streams instead of buffering in memory" {
+    # --data-binary @- reads the whole body into RAM first; a converted
+    # AlmaLinux image is 10 GiB and the kernel killed curl part-way. The file
+    # upload must use -T -, and the raw stream must too whenever a size is known.
+    local body
+    body=$(declare -f tpl_api_import_image)
+    local upload=${body#*deploy_curl_upload_with_progress \"\$upload_file\"}
+    upload=${upload%%else*}
+    [[ "$upload" == *"-T -"* ]]
+    [[ "$upload" != *"--data-binary"* ]]
+    [[ "$body" == *'body_args=(-T - -H "Content-Length: ${stream_size}" -H '"'"'Transfer-Encoding:'"'"')'* ]]
+}
+
+@test "the qcow2 size shown is the disk's, not the file's" {
+    # Newer qemu-img prints the file child's virtual-size first; that was
+    # shown as "0.5 GiB expanded" for a 10 GiB AlmaLinux disk.
+    local json='{
+    "children": [
+        {
+            "name": "file",
+            "info": {
+                "virtual-size": 197120,
+                "format": "file"
+            }
+        }
+    ],
+    "virtual-size": 10737418240,
+    "format": "qcow2"
+}'
+    local v
+    v=$(printf '%s\n' "$json" | tr -d ' \n' | sed -n 's/.*"virtual-size":\([0-9]*\).*/\1/p')
+    [ "$v" = "10737418240" ]
+    declare -f tpl_api_import_image | grep -qF "tr -d ' \n' | sed -n 's/.*\"virtual-size\":\([0-9]*\).*/\1/p'"
 }
 
 @test "the upload counter never signals dd" {

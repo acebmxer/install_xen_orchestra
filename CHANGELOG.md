@@ -10,6 +10,31 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-11-03
+
+### Fixed
+
+- **Building templates through the Xen Orchestra API no longer fills `/tmp`.**
+  qcow2 images were downloaded and converted in `/tmp`, which on Debian 13
+  is held in RAM and capped at half of it, so on a 6 GiB XO VM Ubuntu 26.04
+  failed with `No space left on device` while the disk had plenty of room.
+  The download and conversion now happen in `/var/tmp`, which is on disk,
+  and the free space there is checked before the download starts: if it is
+  short, the build stops and says how much is free, how much is needed, and
+  what to do. (#106)
+- **Building templates through the Xen Orchestra API no longer runs out of
+  memory on large images.** The image was handed to curl in a way that
+  makes it read the whole file into memory before sending any of it, and a
+  converted image is its full disk size (10 GiB for AlmaLinux). On the XO
+  VM the system killed curl part-way, which showed as `Killed` or as
+  `the image import failed (HTTP none)`. The image is now streamed, as the
+  SSH build method already did, and Debian's raw images are streamed the
+  same way whenever the mirror reports their size. The size shown before
+  the conversion is now the disk's real size rather than the downloaded
+  file's (it said 0.5 GiB for a 10 GiB disk), and a failed conversion now
+  shows qemu-img's own error message instead of only "could not convert
+  the image to raw." (#105)
+
 ## [0.9.8] - 2026-10-22
 
 ### Fixed
@@ -2746,7 +2771,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.9...HEAD
+[0.9.9]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.5...v0.9.6

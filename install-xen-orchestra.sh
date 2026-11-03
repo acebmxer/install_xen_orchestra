@@ -10748,6 +10748,16 @@ tpl_log_image_imported() {
 # A qcow2 image is converted to raw here before the upload, because XO's import
 # endpoint accepts raw and VHD only -- see tpl_api_import_image. That needs
 # qemu-img on this machine, where the SSH path needs it on the pool master.
+#
+# The qcow2 download and its raw conversion go in a directory under /var/tmp,
+# not in DEPLOY_WORKDIR: that one is made by `mktemp --tmpdir`, which is /tmp,
+# and on Debian 13 /tmp is a tmpfs capped at half the RAM. A 6 GiB XO VM had
+# about 3 GiB there, and Ubuntu 26.04 needs 2.9 GiB at once -- every byte of it
+# taken from the memory xo-server runs in. /var/tmp is on disk everywhere.
+# The directory is made once per run, on the first qcow2 image, so a raw-only
+# selection writes nothing there; tpl_cleanup removes it.
+TPL_API_STAGE_BASE="/var/tmp"
+TPL_API_STAGE_DIR=""
 tpl_api_import_image() {
     local name="$1" url="$2"
     local base resp rc=0
@@ -10790,8 +10800,18 @@ tpl_api_import_image() {
                 log_error "  which converts on the pool master instead."
                 return 1
             fi
-            local_file="${DEPLOY_WORKDIR}/image.qcow2"
-            converted="${DEPLOY_WORKDIR}/image.raw"
+            # mktemp -d, not a fixed name: /var/tmp is world-writable, and a
+            # predictable path there could be a symlink someone else planted.
+            if [[ -z "$TPL_API_STAGE_DIR" || ! -d "$TPL_API_STAGE_DIR" ]]; then
+                if ! TPL_API_STAGE_DIR=$(mktemp -d "${TPL_API_STAGE_BASE}/xo-templates-XXXXXX"); then
+                    TPL_API_STAGE_DIR=""
+                    log_error "  could not create a work directory in ${TPL_API_STAGE_BASE}."
+                    return 1
+                fi
+                chmod 700 "$TPL_API_STAGE_DIR"
+            fi
+            local_file="${TPL_API_STAGE_DIR}/image.qcow2"
+            converted="${TPL_API_STAGE_DIR}/image.raw"
             # Cleared rather than resumed: `curl -C -` would top a stale file
             # from a previous template up to a plausible length and hand it to
             # qemu-img, which fails in a way that reads as a bad mirror. The
@@ -10812,12 +10832,31 @@ tpl_api_import_image() {
             # the origin so there is a percentage to draw; without it the bar
             # falls back to a running byte count, which is still better than
             # silence.
-            log_info "    downloading the image..."
             local dl_size
             dl_size=$(curl -fsSLI "$url" 2>/dev/null | tr -d '\r' \
                 | grep -i '^content-length:' | tail -1 | awk '{print $2}')
             [[ "$dl_size" =~ ^[0-9]+$ ]] || dl_size=""
 
+            # Room for the download and its conversion, checked before either
+            # starts. The same budget as the SSH path's staging check
+            # (deploy_import_vdi_staged): the expanded size is not known until
+            # the file is here, so it is estimated at four times the download,
+            # plus the download itself, plus headroom; 4 GiB when the mirror
+            # gives no size. Numeric before (( )), as there.
+            local need_mb=4096 free_mb
+            if [[ -n "$dl_size" ]] && (( dl_size > 0 )); then
+                need_mb=$(( dl_size / 1048576 * 5 + 256 ))
+            fi
+            free_mb=$(df -BM --output=avail "$TPL_API_STAGE_DIR" 2>/dev/null | tail -1 | tr -d ' M')
+            if [[ "$free_mb" =~ ^[0-9]+$ ]] && (( free_mb < need_mb )); then
+                log_error "  not enough free space in ${TPL_API_STAGE_BASE} to download and convert"
+                log_error "  ${url##*/}: ${free_mb} MiB free, about ${need_mb} MiB needed."
+                log_error "  Free up space there and retry (check it with: df -h ${TPL_API_STAGE_BASE}),"
+                log_error "  or use TEMPLATE_BUILD_METHOD=ssh, which converts on the pool master."
+                return 1
+            fi
+
+            log_info "    downloading the image..."
             if ! deploy_curl_with_progress "$local_file" "$dl_size" \
                     -fL --no-progress-meter -o "$local_file" \
                     --retry 5 --retry-delay 3 --retry-all-errors \
@@ -10837,9 +10876,15 @@ tpl_api_import_image() {
             # qemu-img is silent and takes a minute or two on a 3.5 GiB
             # image, so the size is printed rather than leaving another
             # unexplained pause between two progress bars.
+            #
+            # The last "virtual-size", not the first: newer qemu-img lists the
+            # file's own size under "children" before the image's real one,
+            # so the first match is the 0.5 GiB qcow2 file, not its 10 GiB
+            # disk. Squashing the JSON onto one line lets the greedy match
+            # land on the last, as the SSH path does.
             local vsize
             vsize=$(qemu-img info --output=json "$local_file" 2>/dev/null \
-                | sed -n 's/.*"virtual-size":[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+                | tr -d ' \n' | sed -n 's/.*"virtual-size":\([0-9]*\).*/\1/p')
             if [[ "$vsize" =~ ^[0-9]+$ ]]; then
                 # One decimal place: bash does integer division, so a 3.5 GiB
                 # image printed as "0 GiB" and read as a failed size lookup
@@ -10849,8 +10894,13 @@ tpl_api_import_image() {
             else
                 log_info "    converting it to raw..."
             fi
-            if ! qemu-img convert -f qcow2 -O raw "$local_file" "$converted" 2>/dev/null; then
+            # qemu-img's own message is kept and shown on failure: "could not
+            # convert" alone does not say whether the disk filled or the
+            # download was bad.
+            local convert_err
+            if ! convert_err=$(qemu-img convert -f qcow2 -O raw "$local_file" "$converted" 2>&1); then
                 log_error "  could not convert the image to raw."
+                [[ -n "$convert_err" ]] && log_error "  qemu-img said: ${convert_err}"
                 rm -f "$local_file" "$converted"
                 return 1
             fi
@@ -10888,6 +10938,12 @@ tpl_api_import_image() {
         # The size is the file's own, which is what Content-Length has to be
         # anyway: a fifo has no length curl can discover, and XAPI refuses a
         # chunked body.
+        #
+        # -T -, never --data-binary @-: the latter reads the whole body into
+        # memory before sending, and a converted image is its full virtual
+        # size (10 GiB for AlmaLinux), so the kernel killed curl part-way.
+        # -T - streams. The empty Transfer-Encoding header stops curl adding
+        # "chunked" beside our Content-Length, as on the SSH path.
         local up_size
         up_size=$(stat -c %s "$upload_file" 2>/dev/null || echo 0)
         deploy_curl_upload_with_progress "$upload_file" "$up_size" http_code \
@@ -10895,7 +10951,7 @@ tpl_api_import_image() {
             --speed-limit 1024 --speed-time 120 \
             -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
-            --data-binary @- \
+            -T - -H 'Transfer-Encoding:' \
             --output "$resp_file" --write-out '%{http_code}' \
             "$target" || rc=$?
     else
@@ -10913,6 +10969,14 @@ tpl_api_import_image() {
             | grep -i '^content-length:' | tail -1 | awk '{print $2}')
         [[ "$stream_size" =~ ^[0-9]+$ ]] || stream_size=""
 
+        # Streamed with -T - when the origin gave a size, for the reason on
+        # the file upload above: --data-binary @- holds the whole image in
+        # memory first. XAPI needs a length, so a mirror that will not give
+        # one falls back to the buffering form, which does learn it.
+        local -a body_args=(--data-binary @-)
+        if [[ -n "$stream_size" ]]; then
+            body_args=(-T - -H "Content-Length: ${stream_size}" -H 'Transfer-Encoding:')
+        fi
         # Nothing lands on disk here, so the image is hashed as it streams
         # past and checked once XO has the disk; a mismatch fails the build
         # and tpl_api_cleanup_failed_build deletes the disk.
@@ -10923,7 +10987,7 @@ tpl_api_import_image() {
             --speed-limit 1024 --speed-time 120 \
             -K <(xo_cookie_config XO_API_TOKEN) \
             -H 'Content-Type: application/octet-stream' \
-            --data-binary @- \
+            "${body_args[@]}" \
             --output "$resp_file" --write-out '%{http_code}' \
             "$target" || rc=$?
     fi
@@ -11831,6 +11895,13 @@ tpl_cleanup() {
         fi
         rm -rf "$DEPLOY_WORKDIR"
     fi
+    # The API path's image staging directory (see tpl_api_import_image). A run
+    # stopped mid-download would otherwise leave gigabytes in /var/tmp, which
+    # nothing clears at boot.
+    if [[ -n "${TPL_API_STAGE_DIR:-}" && -d "$TPL_API_STAGE_DIR" ]]; then
+        rm -rf "$TPL_API_STAGE_DIR"
+    fi
+    TPL_API_STAGE_DIR=""
 }
 
 # Resolve the storage and network the build runs on.
