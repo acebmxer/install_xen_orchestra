@@ -10,6 +10,27 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **`NODE_VERSION=lts` follows the newest Node.js LTS line.** Xen
+  Orchestra's install docs ask for "always the latest LTS version", but
+  `NODE_VERSION` only took a number, so every new LTS line (Node.js 26 on
+  2026-10-28) meant editing the config by hand. Setting `NODE_VERSION=lts`
+  now makes the installer read nodejs.org's release list
+  (`https://nodejs.org/dist/index.json`) when it installs or updates
+  Node.js, pick the newest release that has an LTS codename, and install
+  that major version the same way a number would be installed. The update's
+  Node.js drift warning uses the same lookup. If nodejs.org cannot be
+  reached, the install stops with a message that says so and names the
+  alternative of setting a number; the drift check on an update only warns.
+  `lts` is also the new default, matching the install docs and the script's
+  own header, which already said "latest LTS by default". The default was a
+  fixed `24`, which stopped being the latest LTS when Node.js 26 became LTS.
+  An existing `xo-config.cfg` that sets `NODE_VERSION=24` keeps Node.js 24; a
+  new install, or a config with the line removed, gets the newest LTS, and an
+  update then moves Node.js to a new major version when a new LTS line is
+  out. (#110)
+
 ## [0.9.9] - 2026-11-03
 
 ### Fixed

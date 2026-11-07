@@ -502,7 +502,7 @@ load_config() {
     SNAPSHOT_KEEP=${SNAPSHOT_KEEP:-3}
     SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS:-14}
     TURBO_CACHE_ENABLED=${TURBO_CACHE_ENABLED:-true}
-    NODE_VERSION=${NODE_VERSION:-24.21.0}
+    NODE_VERSION=${NODE_VERSION:-lts}
     SERVICE_USER=${SERVICE_USER:-root}
     DEBUG_MODE=${DEBUG_MODE:-false}
     BIND_ADDRESS=${BIND_ADDRESS:-0.0.0.0}
@@ -623,9 +623,9 @@ validate_config() {
         errors+=("XO_PROXY_CHANNEL must be 'stable' or 'latest', got: ${XO_PROXY_CHANNEL:-}")
     fi
 
-    # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1)
-    if ! [[ "$NODE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-        errors+=("NODE_VERSION must be a valid version number (e.g. 22, 22.3), got: $NODE_VERSION")
+    # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1) or "lts"
+    if ! [[ "$NODE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] && [[ "${NODE_VERSION,,}" != "lts" ]]; then
+        errors+=("NODE_VERSION must be a valid version number (e.g. 22, 22.3) or lts, got: $NODE_VERSION")
     fi
 
     # Validate SSL_CERT_DAYS is a sane certificate lifetime
@@ -1305,12 +1305,43 @@ remove_existing_nodejs() {
     fi
 }
 
+# Print the major version of the newest Node.js LTS line, read from the release
+# index nodejs.org publishes (https://nodejs.org/dist/index.json). The index is
+# newest first, one release per line, and "lts" is false for a non-LTS release
+# and the codename (e.g. "Lithium") for an LTS one, so the first line with a
+# codename is the newest LTS release. Returns 1 if the index cannot be read.
+resolve_node_lts_major() {
+    local index major
+    index=$(curl -fsSL --max-time 30 https://nodejs.org/dist/index.json 2>/dev/null) || return 1
+    major=$(printf '%s\n' "$index" | grep -m1 '"lts":"' | sed -E 's/.*"version":"v([0-9]+)\..*/\1/')
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$major"
+}
+
+# Turn NODE_VERSION=lts into the major version of the newest Node.js LTS line,
+# so install_nodejs and detect_nodejs_drift work with a plain number. A numeric
+# NODE_VERSION is left untouched. Returns 1 if the LTS line cannot be looked up.
+resolve_node_version() {
+    [[ "${NODE_VERSION,,}" == "lts" ]] || return 0
+    local lts_major
+    if ! lts_major=$(resolve_node_lts_major); then
+        log_error "NODE_VERSION=lts needs the Node.js release list from nodejs.org, which could not be read."
+        log_error "  Check the network, or set NODE_VERSION to a number (e.g. 24) in xo-config.cfg."
+        return 1
+    fi
+    log_info "NODE_VERSION=lts resolved to Node.js ${lts_major} (newest LTS line on nodejs.org)"
+    NODE_VERSION="$lts_major"
+}
+
 # Install Node.js to satisfy NODE_VERSION from xo-config.cfg.
+#  - lts:                    resolves to the newest LTS major, then as below
 #  - Major-only (e.g. 22):   installs latest 22.x via NodeSource
 #  - Specific  (e.g. 22.3):  downloads exact v22.3.0 from nodejs.org;
 #                             falls back to latest 22.x via NodeSource
 #                             if that version doesn't exist
 install_nodejs() {
+    resolve_node_version || return 1
+
     log_info "Installing Node.js ${NODE_VERSION}..."
 
     NODE_MAJOR=${NODE_VERSION%%.*}
@@ -3460,6 +3491,13 @@ check_active_xo_tasks() {
 # heads-up that a runtime change is coming (install_nodejs handles the actual
 # upgrade/downgrade).
 detect_nodejs_drift() {
+    # An unreachable nodejs.org must not stop the update here; install_nodejs
+    # resolves again and fails with the real error if it still cannot.
+    if ! resolve_node_version 2>/dev/null; then
+        log_warning "Could not look up the newest Node.js LTS — skipping drift check"
+        return 0
+    fi
+
     local RUNNING_FULL
     RUNNING_FULL=$(node -v 2>/dev/null | sed 's/^v//')
     if [[ -z "$RUNNING_FULL" ]]; then

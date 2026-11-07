@@ -325,7 +325,7 @@ Key settings:
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days |
 | `GIT_BRANCH` | master | Git branch (tags are not supported) |
-| `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
+| `NODE_VERSION` | lts | Node.js version: `lts` for the newest LTS line, a major (e.g. `24`), or a pinned release (e.g. `24.15.0`) |
 | `SERVICE_USER` | root | Service user — root by default; any username runs XO non-root |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `TURBO_CACHE_ENABLED` | true | Reuse turbo's local build cache on `--update` instead of rebuilding every package (`--rebuild` always builds cold) |

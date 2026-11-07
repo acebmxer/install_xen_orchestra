@@ -15,7 +15,7 @@ Key settings:
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days (see below) |
 | `GIT_BRANCH` | master | Git branch (tags are not supported) |
-| `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
+| `NODE_VERSION` | lts | Node.js version: `lts` for the newest LTS line, a major (e.g. `24`), or a pinned release (e.g. `24.15.0`) |
 | `SERVICE_USER` | root | Service user (see below) |
 | `BACKUP_KEEP` | 5 | Number of backups to retain (see below) |
 | `SNAPSHOT_KEEP` | 3 | Number of pre-update/pre-rebuild VM snapshots to retain (see below) |
