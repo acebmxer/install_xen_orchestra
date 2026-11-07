@@ -28,6 +28,7 @@ Key settings:
 | `TEMPLATE_BUILD_METHOD` | auto | How `--build-templates` reaches the pool: `auto`, `api` or `ssh` (see below) |
 | `XO_URL` | *(unset)* | Base URL of the XO instance the API build path talks to; unset means localhost |
 | `XO_API_TOKEN` | *(unset)* | XO API token, used by the pre-update task check, `--build-templates` and the XO Proxy install (which uses it instead of asking for the XO login, and needs it if the XO account uses MFA) |
+| `TWINSTOR_VERSION` / `TWINSTOR_SHA256` | 0.7.4 / *(its published hash)* | The TwinStor bundle `--twinstor` installs on both hosts, and its SHA-256, which is checked on each host before anything is extracted (see [twinstor.md](twinstor.md)) |
 | `XO_PROXY_CHANNEL` | latest | Update channel `--proxy` tells you to put the XO Proxy on: `latest` or `stable` (see the README) |
 
 ## The config file is migrated automatically

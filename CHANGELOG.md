@@ -12,6 +12,44 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Added
 
+- **Deploy and manage TwinStor from the menu and with `--twinstor`.**
+  TwinStor is Vates' tech preview that turns the local disks of a two-host
+  XCP-ng pool into shared, replicated storage. Setting it up meant following
+  Vates' pages by hand, host by host. The new **TwinStor** menu entry and
+  `--twinstor` flag open a TwinStor sub-menu, shown before anything connects,
+  with Install (fate-shared or arbitrated), Update one host at a time
+  (`--twinstor-upgrade` goes straight there), Status and doctor on both hosts,
+  and a Support bundle collected from both hosts. It connects to the pool
+  master the way `--deploy` does, with the host key checked before the password
+  is sent, and reaches the second host with the same pinned-key check. Before
+  anything is installed it checks, read only, that the pool has two hosts on
+  XCP-ng 8.3 at the same patch level, that every SR is plugged, and that dom0
+  has the memory Vates asks for. It lists the free disks **and partitions** on
+  each host, following the reasons `twinstor setup` gives for refusing a
+  device (a disk that has partitions is not offered, its partitions are;
+  nothing mounted, used as swap, an LVM physical volume or under a RAID array;
+  on the system disk only a partition labelled `twinstor-data`), and passes the
+  device to setup by its stable `/dev/disk/by-id` name, as Vates asks, turning a
+  typed `/dev/sdb2` into one. The bundle is the one Vates publishes:
+  `TWINSTOR_VERSION` and `TWINSTOR_SHA256` in `xo-config.cfg` pin it (0.7.4), the
+  hash is checked on each host before anything is extracted, and a mismatch
+  deletes the download and stops the run, so a new Vates build is a config
+  change. Installing erases a disk or partition on each host and needs a typed
+  `WIPE`, and `--non-interactive` is refused, as it is for `--deploy`. Setup is
+  scripted the way Vates documents it for scripted installs: `twinstor setup
+  --peer-ip ... --backing-device ... --chap-password ... --yes` on the first
+  host, and once that host reports it is waiting, the same on the second, with
+  one CHAP password this run generates for both, plus `--direct-ip` for
+  arbitrated mode and `--ping-target` for extra tie-breakers. The command
+  `twinstor setup` prints for the second host contains a `<disk-on-peer>`
+  placeholder, which is why it does not work as printed; this script fills in
+  the peer's own device. When the flags are missing from `twinstor setup
+  --help`, or the arbitrated direct link has no address on the hosts yet, the
+  wizard is run by hand in this terminal instead, and the script says what to
+  answer. It refuses to start without a tie-breaker (a default gateway or a
+  `--ping-target`), as setup does. This is a new, additive feature: no existing
+  option or default changes. It has not been run against real hosts yet. (#109)
+
 - **`NODE_VERSION=lts` follows the newest Node.js LTS line.** Xen
   Orchestra's install docs ask for "always the latest LTS version", but
   `NODE_VERSION` only took a number, so every new LTS line (Node.js 26 on

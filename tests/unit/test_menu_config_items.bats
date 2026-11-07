@@ -35,7 +35,7 @@ stub_menu_operations() {
     menu_edit_config() { echo menu_edit_config >> "$CALLS"; return 0; }
     prompt_yes_no() { echo prompt_yes_no >> "$CALLS"; return 1; }
     MENU_SELECTED[1]=1   # Update
-    MENU_SELECTED[8]=1   # Edit xo-config.cfg
+    MENU_SELECTED[9]=1   # Edit xo-config.cfg
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -65,7 +65,7 @@ stub_menu_operations() {
     stub_menu_operations
     menu_edit_config() { echo menu_edit_config >> "$CALLS"; return 0; }
     prompt_yes_no() { echo prompt_yes_no >> "$CALLS"; return 1; }
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -77,7 +77,7 @@ stub_menu_operations() {
     menu_edit_config() { echo menu_edit_config >> "$CALLS"; return 1; }
     prompt_yes_no() { echo prompt_yes_no >> "$CALLS"; return 1; }
     MENU_SELECTED[1]=1
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -117,7 +117,7 @@ stub_preflight_only() {
     get_installed_commit() { echo 3923756ff5d5aaaa; }
     get_remote_commit() { echo 3923756ff5d5aaaa; }
     MENU_SELECTED[1]=1   # Update
-    MENU_SELECTED[8]=1   # Edit xo-config.cfg
+    MENU_SELECTED[9]=1   # Edit xo-config.cfg
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -131,8 +131,8 @@ stub_preflight_only() {
     install_dir_git() { echo master; }
     get_installed_commit() { echo 3923756ff5d5aaaa; }
     confirm_or_skip() { return 1; }
-    MENU_SELECTED[7]=1   # Rebuild
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[8]=1   # Rebuild
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -144,8 +144,8 @@ stub_preflight_only() {
     stub_preflight_only
     detect_legacy_system_state() { LEGACY_SYSTEM_CHANGES=(); }
     confirm_or_skip() { return 1; }
-    MENU_SELECTED[6]=1   # Reconfigure
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[7]=1   # Reconfigure
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -158,8 +158,8 @@ stub_preflight_only() {
     BACKUP_DIR="$BATS_TEST_TMPDIR/backups"
     mkdir -p "$BACKUP_DIR/xo-backup-20261022_000000"
     verify_backup_integrity() { return 0; }
-    MENU_SELECTED[9]=1   # Restore Backup
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[10]=1   # Restore Backup
+    MENU_SELECTED[9]=1
 
     run process_menu_selections <<< "q"
     [ "$status" -eq 0 ]
@@ -173,8 +173,8 @@ stub_preflight_only() {
     mkdir -p "$BACKUP_DIR/xo-backup-20261022_000000"
     verify_backup_integrity() { return 0; }
     confirm_or_skip() { return 1; }
+    MENU_SELECTED[10]=1
     MENU_SELECTED[9]=1
-    MENU_SELECTED[8]=1
 
     run process_menu_selections <<< "1"
     [ "$status" -eq 0 ]

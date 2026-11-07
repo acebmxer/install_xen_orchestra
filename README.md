@@ -71,6 +71,7 @@ Orchestra](https://xen-orchestra.com/) from source.
 | --- | --- |
 | Building the VM for you (`--deploy`) | [docs/deployment.md](docs/deployment.md) |
 | Building cloud-init VM templates (`--build-templates`) | [docs/templates.md](docs/templates.md) |
+| Replicated shared storage on a two-host pool (`--twinstor`, Vates tech preview) | [docs/twinstor.md](docs/twinstor.md) |
 | Optional plugins (NanoKVM power control, host power manager) (`--custom-plugins`) | [docs/custom-plugins.md](docs/custom-plugins.md) |
 | Every config option, and the environment variables | [docs/configuration.md](docs/configuration.md) |
 | Update-safety task detection and REST API auth | [docs/authentication.md](docs/authentication.md) |
@@ -143,6 +144,7 @@ backing.
 |----------|----------|-------------|
 | Deploy | `--deploy` | Create a Debian VM on a XenServer/XCP-ng pool and install XO into it |
 | Build Templates | `--build-templates` | Build cloud-init VM templates on a XenServer/XCP-ng pool |
+| TwinStor | `--twinstor`, `--twinstor-upgrade` | Install, update and check TwinStor, and collect its support bundle (Vates tech preview: replicated shared storage for a two-host pool) |
 | Install | `--install` | Fresh install of Xen Orchestra |
 | Update | `--update` | Update existing installation (with backup) |
 | Restore | `--restore` | Restore from a previous backup (verified for completeness first; add `--list-backups` to just list them) |
@@ -186,6 +188,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
     [ ] Install XO Proxy                        [ ] Restore Backup
     [ ] Deploy XO to a new VM (creates VM)      [ ] Adjust XO Memory Allocation
     [ ] VM Template Library                     [ ] Custom Plugins
+    [ ] TwinStor
 
   ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -248,6 +251,25 @@ filtered for by tag in XO's VM list. The full walkthrough —
 requirements, the admin account and SSH key handling, image verification, what
 it hardens on the way out, reading the deployment stamp back, and the pre-flight
 probe — is in [docs/deployment.md](docs/deployment.md).
+
+## TwinStor (`--twinstor`)
+
+TwinStor is Vates' tech preview for turning the local disks of a **two-host**
+XCP-ng pool into shared, replicated storage. `--twinstor` (or the **TwinStor**
+entry in the menu) deploys it and manages it afterwards, following Vates' own
+pages. It is for **lab pools**: Vates says not to run the preview in
+production, and setup erases a disk or partition on each host.
+
+```bash
+./install-xen-orchestra.sh --twinstor           # the TwinStor menu
+./install-xen-orchestra.sh --twinstor-upgrade   # update both hosts, one at a time
+```
+
+The TwinStor menu offers **Install** (either network mode), **Update**,
+**Status** and **Support bundle**. Installing erases a disk or partition on each host and
+needs a typed confirmation, and `--non-interactive` is refused. What each step
+does, what is checked first, and what was not tested is in
+[docs/twinstor.md](docs/twinstor.md).
 
 ## Building VM Templates (`--build-templates`)
 
@@ -333,6 +355,7 @@ Key settings:
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP (`loopback` is always trusted) |
 | `PUBLIC_URL` | *(unset)* | Public URL advertised to external entities (e.g. XO Lite) |
 | `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see below) |
+| `TWINSTOR_VERSION` / `TWINSTOR_SHA256` | 0.7.4 / *(its published hash)* | The TwinStor bundle `--twinstor` installs on both hosts, and its SHA-256, which is checked on each host before anything is extracted (see [docs/twinstor.md](docs/twinstor.md)) |
 
 Each of these is covered in full, along with the environment variables, in
 [docs/configuration.md](docs/configuration.md).
