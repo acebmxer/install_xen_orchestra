@@ -150,15 +150,16 @@ setup() {
     [[ "$output" != *CONNECTED* ]]
 }
 
-@test "TwinStor ends column 1, so every other item keeps its place in the grid" {
-    # 13 items: column 1 is the first 7, column 2 the last 6.
-    [ "$MENU_TOTAL" -eq 13 ]
+@test "TwinStor ends column 1 and XOSTOR ends column 2, so every other item keeps its place" {
+    # 14 items: column 1 is the first 7, column 2 the last 7.
+    [ "$MENU_TOTAL" -eq 14 ]
     [ "$MENU_LEFT_COUNT" -eq 7 ]
     [ "${MENU_NAMES[5]}" = "VM Template Library" ]
     [ "${MENU_NAMES[6]}" = "TwinStor" ]
-    # column 2 starts with Reconfigure and ends with Custom Plugins, as before
+    # column 2 starts with Reconfigure, as before, and ends with XOSTOR
     [ "${MENU_NAMES[7]}" = "Reconfigure Xen Orchestra" ]
     [ "${MENU_NAMES[12]}" = "Custom Plugins" ]
+    [ "${MENU_NAMES[13]}" = "XOSTOR *" ]
 }
 
 # --- pool discovery and preflight, against a faked pool --------------------------

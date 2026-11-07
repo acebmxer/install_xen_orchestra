@@ -12,6 +12,30 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Added
 
+- **Install XOSTOR from the menu.** XOSTOR is Vates' LINSTOR/DRBD replicated
+  storage for pools of three to seven hosts. XO's own XOSTOR page needs a
+  licence that only XOA provides, so on XO from sources it most likely cannot
+  create the SR. The new **XOSTOR \*** entry, at the bottom of the right-hand
+  column, opens a sub-menu with **Install** and **Status**. Install connects
+  to the pool master the way `--deploy` does, then checks, read only, that the
+  pool has 3 to 7 hosts on the same XCP-ng version, no existing XOSTOR SR and
+  no existing `linstor_group` volume group (it never removes one), and warns
+  about non-private management addresses and under 16 GiB of RAM. You choose
+  thin or thick provisioning, the disks on each host (a host may have none),
+  the replication (1 to 3, which cannot be changed later) and the SR name.
+  After a typed `yes` to the unsupported warning and a typed `WIPE` for the
+  disks, it turns pool HA off if it is on (and back on at the end with the same
+  heartbeat SR and timeout), installs `xcp-ng-release-linstor` and
+  `xcp-ng-linstor` on the workers and then the master, restarts the toolstack,
+  builds `linstor_group` (and the `thin_device` pool for thin) on each host
+  with disks, runs `xe sr-create type=linstor`, and shows the status. If a step
+  after the volume groups fails, it removes the ones it created. Status lists
+  the pool's LINSTOR SRs, finds the host running the controller and shows
+  `linstor node list`, `resource list`, `storage-pool list` and `advise
+  resource`. `--non-interactive` is refused. The \* means Vates does not
+  support XOSTOR for XO from sources and none of this has been run on a real
+  pool. Update, health plugin calls and destroy are not written yet.
+
 - **Deploy and manage TwinStor from the menu and with `--twinstor`.**
   TwinStor is Vates' tech preview that turns the local disks of a two-host
   XCP-ng pool into shared, replicated storage. Setting it up meant following

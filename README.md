@@ -188,7 +188,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
     [ ] Install XO Proxy                        [ ] Restore Backup
     [ ] Deploy XO to a new VM (creates VM)      [ ] Adjust XO Memory Allocation
     [ ] VM Template Library                     [ ] Custom Plugins
-    [ ] TwinStor
+    [ ] TwinStor                                [ ] XOSTOR *
 
   ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -251,6 +251,17 @@ filtered for by tag in XO's VM list. The full walkthrough —
 requirements, the admin account and SSH key handling, image verification, what
 it hardens on the way out, reading the deployment stamp back, and the pre-flight
 probe — is in [docs/deployment.md](docs/deployment.md).
+
+## XOSTOR (menu)
+
+XOSTOR is Vates' LINSTOR/DRBD replicated storage for pools of **three to seven**
+hosts. XO's own XOSTOR page needs a licence only XOA provides, so for XO from
+sources the **XOSTOR \*** menu entry sets it up from the command line instead.
+The \* means Vates does not support that and it has not been run on a real pool:
+use a lab pool. The sub-menu offers **Install** (thin or thick, replication 1-3,
+disks picked per host, typed `WIPE` before anything is erased) and **Status**
+(read only). Pool HA is turned off for the install and back on at the end.
+`--non-interactive` is refused.
 
 ## TwinStor (`--twinstor`)
 

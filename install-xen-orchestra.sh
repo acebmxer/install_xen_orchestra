@@ -9171,7 +9171,13 @@ ts_precheck() {
 # the pool and list its hosts.
 ts_session_start() {
     ts_precheck || return 1
+    ts_connect_pool
+}
 
+# The connection half of ts_session_start, shared with the XOSTOR sub-menu,
+# which has its own banner and checks: SSH tools, a work directory, the pool
+# master (host key checked before the password is sent), then the host list.
+ts_connect_pool() {
     local missing=() cmd
     for cmd in ssh ssh-keygen ssh-keyscan; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
@@ -10193,6 +10199,386 @@ twinstor_menu() {
         status)  ts_op_status ;;
         bundle)  ts_op_support_bundle ;;
         *)       log_error "Unknown TwinStor action: $action"; return 1 ;;
+    esac
+}
+
+# ============================================================================
+# XOSTOR (Vates' LINSTOR/DRBD storage, 3 or more hosts)
+#
+# Aimed at XO built from sources, where XO's own XOSTOR page most likely cannot
+# create the SR: its create call checks a licence that only XOA provides. This
+# sub-menu works on the hosts directly, with the commands XCP-ng documents
+# (https://docs.xcp-ng.org/xostor/). Install and read-only status exist; update
+# is next.
+# ============================================================================
+
+# Banner, and the checks that hold before anything connects. Returns 1 under
+# --dry-run (nothing to simulate); exits on --non-interactive.
+xs_precheck() {
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_error "XOSTOR operations cannot be combined with --non-interactive."
+        log_error "They connect to the pool and need answers that only exist at the prompts."
+        exit 1
+    fi
+
+    echo ""
+    echo "=============================================="
+    echo "  XOSTOR *"
+    echo "=============================================="
+    echo ""
+    echo "  * Unsupported by Vates for XO from sources, and untested here. XOSTOR"
+    echo "    creation in XO needs a licence that only XOA provides. Use a lab pool."
+    echo ""
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warning "[DRY-RUN] XOSTOR operations run on remote hosts and cannot be"
+        log_warning "[DRY-RUN] meaningfully simulated. No changes were made."
+        return 1
+    fi
+}
+
+# Status: the pool's LINSTOR SRs, then the four commands the XCP-ng docs use to
+# check a pool (nodes, resources, storage pools, advice). `linstor` only works
+# on the host running the controller, so each host is tried until one answers.
+# Read only.
+xs_op_status() {
+    local srs i ctl=-1
+    srs=$(dom0_exec 'xe sr-list type=linstor params=uuid,name-label,shared' 2>/dev/null | tr -d '\r' | sed -e '/^[[:space:]]*$/d') || srs=""
+    if [[ -z "$srs" ]]; then
+        log_warning "No XOSTOR (type linstor) storage repository found in this pool."
+        return 0
+    fi
+    echo "  XOSTOR storage repositories"
+    echo ""
+    echo "$srs" | sed 's/^/    /'
+
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        if ts_exec "${TS_HOST_IPS[$i]}" "linstor node list" >/dev/null 2>&1; then
+            ctl=$i
+            break
+        fi
+    done
+    if [[ $ctl -lt 0 ]]; then
+        log_error "'linstor node list' failed on every host: no LINSTOR controller answered."
+        log_error "Check that linstor-controller is running on one host (systemctl status linstor-controller)."
+        return 1
+    fi
+
+    echo ""
+    echo "  LINSTOR controller: $(ts_host_label "$ctl")"
+    local cmd
+    for cmd in "linstor node list" "linstor resource list" "linstor storage-pool list" "linstor advise resource"; do
+        echo ""
+        echo "---- ${cmd} ----"
+        ts_exec "${TS_HOST_IPS[$ctl]}" "$cmd" 2>&1 | tr -d '\r' || true
+    done
+}
+
+# XOSTOR names that reach a shell or an xe argument: letters, digits, space,
+# dot, underscore and dash only.
+xs_valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._\ -]{0,62}$ ]]; }
+
+# Wait for xapi to answer again after a toolstack restart. Arguments: seconds.
+xs_wait_xapi() {
+    local limit="${1:-180}" waited=0
+    while (( waited < limit )); do
+        if dom0_exec "xe host-list params=uuid --minimal" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    return 1
+}
+
+# Choose the disks a host contributes. Sets XS_DISKS[idx] to a space-separated
+# list of stable device names; empty means the host joins without a disk.
+xs_pick_disks() {
+    local idx="$1" ip="${TS_HOST_IPS[$1]}" raw
+    raw=$(ts_exec_script "$ip" "$(ts_disk_candidates_script)" 2>/dev/null | tr -d '\r') || raw=""
+
+    local -a devs=() labels=() chosen=()
+    local dev size byid model serial kind
+    while IFS='|' read -r dev size byid model serial kind; do
+        [[ -n "$dev" ]] || continue
+        devs+=("$byid")
+        labels+=("${kind}  ${dev}  $(( size / 1073741824 )) GiB  ${model}  serial ${serial}  (${byid})")
+    done <<< "$raw"
+
+    while true; do
+        local opts=() j c skip
+        for j in "${!devs[@]}"; do
+            skip=0
+            for c in ${chosen[@]+"${chosen[@]}"}; do [[ "$c" == "${devs[$j]}" ]] && skip=1; done
+            (( skip )) && continue
+            opts+=("${devs[$j]}|${labels[$j]}")
+        done
+        if [[ ${#chosen[@]} -eq 0 ]]; then
+            opts+=("__done__|No disk on this host (it joins as a diskless satellite)")
+        else
+            opts+=("__done__|Done with this host (${#chosen[@]} chosen)")
+        fi
+        deploy_choose "Disk for XOSTOR on $(ts_host_label "$idx") (erased; pick again to add more)" "${opts[@]}"
+        [[ "$DEPLOY_CHOICE" == "__done__" ]] && break
+        chosen+=("$DEPLOY_CHOICE")
+    done
+    XS_DISKS[idx]="${chosen[*]:-}"
+}
+
+# Read-only checks. Stops on what XOSTOR cannot work with, warns on what it can.
+xs_preflight() {
+    echo ""
+    log_info "Checking the pool (nothing is changed)..."
+    local n=${#TS_HOST_IPS[@]} i
+
+    if (( n < 3 )); then
+        log_error "This pool has ${n} host(s). XOSTOR needs at least 3: DRBD quorum needs three reachable machines."
+        return 1
+    fi
+    if (( n > 7 )); then
+        log_error "This pool has ${n} hosts. XOSTOR supports at most 7."
+        return 1
+    fi
+
+    local ver first="" v
+    for ((i = 0; i < n; i++)); do
+        v=$(dom0_xe "host-param-get uuid=${TS_HOST_UUIDS[$i]} param-name=software-version param-key=product_version" 2>/dev/null) || v=""
+        if [[ -z "$first" ]]; then first="$v"; fi
+        if [[ "$v" != "$first" ]]; then
+            log_error "Hosts run different XCP-ng versions ($(ts_host_label 0): ${first:-unknown}, $(ts_host_label "$i"): ${v:-unknown}). Update them to match first."
+            return 1
+        fi
+        # LINSTOR listens unauthenticated on 3366 on the management address.
+        if [[ ! "${TS_HOST_IPS[$i]}" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.) ]]; then
+            log_warning "$(ts_host_label "$i") has a management address that is not private."
+            log_warning "LINSTOR listens on TCP 3366 without authentication; XCP-ng says the management network must never be public."
+            prompt_yes_no "Continue anyway?" || return 1
+        fi
+    done
+    log_info "XCP-ng ${first} on all ${n} hosts."
+
+    local existing
+    existing=$(dom0_exec 'xe sr-list type=linstor params=uuid --minimal' 2>/dev/null | tr -d '\r') || existing=""
+    if [[ -n "$existing" ]]; then
+        log_error "This pool already has a XOSTOR (linstor) storage repository (${existing}). Not creating another."
+        return 1
+    fi
+
+    local mem_kb
+    for ((i = 0; i < n; i++)); do
+        if ts_exec "${TS_HOST_IPS[$i]}" "vgs --noheadings -o vg_name 2>/dev/null | tr -d ' ' | grep -qx linstor_group" >/dev/null 2>&1; then
+            log_error "$(ts_host_label "$i") already has a volume group named linstor_group. Remove it by hand if it is yours to remove; this script will not."
+            return 1
+        fi
+        mem_kb=$(ts_exec "${TS_HOST_IPS[$i]}" "awk '/^MemTotal:/{print \$2}' /proc/meminfo" 2>/dev/null | tr -d '\r') || mem_kb=0
+        if (( ${mem_kb:-0} < 16 * 1024 * 1024 )); then
+            log_warning "$(ts_host_label "$i") has $(( ${mem_kb:-0} / 1048576 )) GiB RAM. XCP-ng says dom0 needs about 16 GiB for ~100 volumes; LINSTOR can use a lot."
+        fi
+    done
+
+    local unplugged
+    unplugged=$(dom0_xe "pbd-list currently-attached=false params=sr-uuid --minimal" 2>/dev/null) || unplugged=""
+    if [[ -n "$unplugged" ]]; then
+        log_error "These SRs are not plugged on every host: ${unplugged}. Fix that first."
+        return 1
+    fi
+    log_success "Pool checks passed."
+}
+
+# Pool HA must be off while the packages go in. Remember how it was set so it
+# can be put back. Sets XS_HA_WAS_ON, XS_HA_SRS and XS_HA_TIMEOUT.
+xs_ha_off() {
+    XS_HA_WAS_ON=false; XS_HA_SRS=""; XS_HA_TIMEOUT=""
+    local pool enabled
+    pool=$(dom0_xe "pool-list --minimal") || return 1
+    enabled=$(dom0_xe "pool-param-get uuid=${pool} param-name=ha-enabled") || enabled=""
+    [[ "$enabled" == "true" ]] || return 0
+
+    local vdis v srs=()
+    vdis=$(dom0_xe "pool-param-get uuid=${pool} param-name=ha-statefiles" 2>/dev/null | tr ';,' '  ') || vdis=""
+    for v in $vdis; do
+        srs+=("$(dom0_xe "vdi-param-get uuid=${v} param-name=sr-uuid" 2>/dev/null)")
+    done
+    XS_HA_SRS=$(IFS=,; echo "${srs[*]:-}")
+    XS_HA_TIMEOUT=$(dom0_xe "pool-param-get uuid=${pool} param-name=ha-config param-key=timeout" 2>/dev/null) || XS_HA_TIMEOUT=""
+
+    echo ""
+    echo "  Pool HA is on. XOSTOR cannot be set up while it is. This script will turn it off now"
+    echo "  and turn it back on at the end with the same settings:"
+    echo "    xe pool-ha-enable heartbeat-sr-uuids=${XS_HA_SRS} ha-config:timeout=${XS_HA_TIMEOUT:-60}"
+    if [[ -z "$XS_HA_SRS" ]]; then
+        log_error "Could not read the HA heartbeat SR, so HA could not be turned back on. Turn it off yourself and run this again."
+        return 1
+    fi
+    prompt_yes_no "Turn pool HA off now?" || return 1
+    dom0_xe "pool-ha-disable" >/dev/null || { log_error "Could not turn HA off."; return 1; }
+    XS_HA_WAS_ON=true
+}
+
+xs_ha_restore() {
+    [[ "$XS_HA_WAS_ON" == "true" ]] || return 0
+    xs_wait_xapi 180 || true
+    if dom0_xe "pool-ha-enable heartbeat-sr-uuids=${XS_HA_SRS} ha-config:timeout=${XS_HA_TIMEOUT:-60}" >/dev/null 2>&1; then
+        log_success "Pool HA is back on."
+    else
+        log_warning "Could not turn pool HA back on. Run on the pool master:"
+        echo "    xe pool-ha-enable heartbeat-sr-uuids=${XS_HA_SRS} ha-config:timeout=${XS_HA_TIMEOUT:-60}"
+    fi
+}
+
+# Undo the volume groups this run created.
+xs_rollback_vgs() {
+    local i
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        [[ "${XS_VG_MADE[$i]:-}" == "1" ]] || continue
+        log_warning "Removing linstor_group from $(ts_host_label "$i")..."
+        ts_exec "${TS_HOST_IPS[$i]}" "vgremove -f linstor_group && pvremove -ff -y ${XS_DISKS[$i]}" 2>&1 | tr -d '\r' || true
+    done
+}
+
+# The install itself. The ordering follows the XCP-ng manual route: packages on
+# every host, LVM on every host with disks, then one SR.
+xs_do_install() {
+    local n=${#TS_HOST_IPS[@]} i order=() out
+
+    # Workers first, the master last: restarting it drops what the others wait on.
+    for ((i = 0; i < n; i++)); do [[ $i -ne $TS_MASTER_IDX ]] && order+=("$i"); done
+    order+=("$TS_MASTER_IDX")
+
+    for i in "${order[@]}"; do
+        log_info "Installing the XOSTOR packages on $(ts_host_label "$i")..."
+        out=$(ts_exec "${TS_HOST_IPS[$i]}" "yum install -y xcp-ng-release-linstor && yum install -y xcp-ng-linstor && modprobe drbd" 2>&1 | tr -d '\r') || {
+            log_error "Package install failed on $(ts_host_label "$i"):"
+            echo "$out" | tail -15
+            return 1
+        }
+    done
+
+    for i in "${order[@]}"; do
+        log_info "Restarting the toolstack on $(ts_host_label "$i")..."
+        ts_exec "${TS_HOST_IPS[$i]}" "xe-toolstack-restart" >/dev/null 2>&1 || true
+        if [[ $i -eq $TS_MASTER_IDX ]]; then
+            xs_wait_xapi 180 || { log_error "The pool master did not come back after the toolstack restart."; return 1; }
+        fi
+    done
+
+    XS_VG_MADE=()
+    for ((i = 0; i < n; i++)); do
+        [[ -n "${XS_DISKS[$i]:-}" ]] || continue
+        log_info "Creating linstor_group on $(ts_host_label "$i") (${XS_DISKS[$i]})..."
+        local cmd="pvcreate -y ${XS_DISKS[$i]} && vgcreate linstor_group ${XS_DISKS[$i]}"
+        XS_VG_MADE[i]=1
+        if [[ "$XS_PROVISIONING" == "thin" ]]; then
+            cmd+=" && lvcreate -l 100%FREE -T linstor_group/thin_device"
+        fi
+        out=$(ts_exec "${TS_HOST_IPS[$i]}" "$cmd" 2>&1 | tr -d '\r') || {
+            log_error "LVM setup failed on $(ts_host_label "$i"):"
+            echo "$out" | tail -10
+            xs_rollback_vgs
+            return 1
+        }
+    done
+
+    local group="linstor_group"
+    [[ "$XS_PROVISIONING" == "thin" ]] && group="linstor_group/thin_device"
+    log_info "Creating the XOSTOR storage repository '${XS_SR_NAME}'..."
+    out=$(dom0_exec "xe sr-create type=linstor shared=true name-label='${XS_SR_NAME}' device-config:group-name=${group} device-config:redundancy=${XS_REPLICATION} device-config:provisioning=${XS_PROVISIONING}" 2>&1 | tr -d '\r') || {
+        log_error "sr-create failed:"
+        echo "$out" | tail -15
+        xs_rollback_vgs
+        return 1
+    }
+    XS_SR_UUID=$(tail -1 <<< "$out")
+    log_success "Created ${XS_SR_NAME} (${XS_SR_UUID})."
+}
+
+xs_op_install() {
+    local n i
+    XS_DISKS=(); XS_VG_MADE=()
+    xs_preflight || return 1
+    n=${#TS_HOST_IPS[@]}
+
+    echo ""
+    echo "  * XOSTOR creation in XO needs a licence that only XOA provides. This script copies"
+    echo "    the manual steps instead. Vates does not support that for XO from sources, and it"
+    echo "    has not been run on a real pool. Use a lab pool."
+    echo -n "  Type yes to go on: "
+    local reply
+    read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+    [[ "$reply" == "yes" ]] || { log_info "Cancelled."; return 0; }
+
+    deploy_choose "Provisioning" \
+        "thin|Thin (LVM thin pool; snapshots, space used on demand)" \
+        "thick|Thick (plain LVM; space reserved up front)"
+    XS_PROVISIONING="$DEPLOY_CHOICE"
+
+    for ((i = 0; i < n; i++)); do xs_pick_disks "$i"; done
+    local with_disks=0
+    for ((i = 0; i < n; i++)); do [[ -n "${XS_DISKS[$i]:-}" ]] && with_disks=$((with_disks + 1)); done
+    if (( with_disks == 0 )); then
+        log_error "No disk was chosen on any host."
+        return 1
+    fi
+
+    local ropts=() r
+    for r in 1 2 3; do
+        (( r <= with_disks )) && ropts+=("${r}|${r} cop$([[ $r -eq 1 ]] && echo y || echo ies) of every volume")
+    done
+    deploy_choose "Replication (cannot be changed after the SR exists)" "${ropts[@]}"
+    XS_REPLICATION="$DEPLOY_CHOICE"
+    if (( XS_REPLICATION == 1 )); then
+        log_warning "Replication 1 keeps a single copy: losing one disk loses that data."
+    fi
+
+    deploy_read_validated "Storage repository name" '^.+$' "XOSTOR" XS_SR_NAME xs_valid_name
+
+    echo ""
+    echo "  About to set up XOSTOR (${XS_PROVISIONING}, ${XS_REPLICATION} replica(s)) as '${XS_SR_NAME}':"
+    for ((i = 0; i < n; i++)); do
+        echo "    $(ts_host_label "$i"): ${XS_DISKS[$i]:-no disk (diskless)}"
+    done
+    echo "  The disks above will be ERASED."
+    ts_typed_confirm "Type WIPE to erase them and continue:" "WIPE" || { log_info "Cancelled. Nothing was changed."; return 0; }
+
+    xs_ha_off || return 1
+    local rc=0
+    xs_do_install || rc=$?
+    xs_ha_restore
+
+    if (( rc != 0 )); then
+        log_error "XOSTOR setup did not finish. Packages that were installed stay installed."
+        return 1
+    fi
+    echo ""
+    log_info "Checking the result..."
+    xs_op_status || return 1
+    local attached
+    attached=$(dom0_xe "pbd-list sr-uuid=${XS_SR_UUID} currently-attached=false params=host-uuid --minimal" 2>/dev/null) || attached="?"
+    if [[ -n "$attached" ]]; then
+        log_warning "The SR is not plugged on every host (unplugged on: ${attached})."
+    else
+        log_success "XOSTOR is plugged on every host."
+    fi
+}
+
+# The XOSTOR sub-menu: the main menu's XOSTOR entry lands here. Shown before
+# anything connects, so choosing Back costs nothing.
+xostor_menu() {
+    xs_precheck || return 0
+
+    deploy_choose "XOSTOR * (unsupported for XO from sources, lab pools only)" \
+        "install|Install XOSTOR on a pool of 3-7 hosts (erases the disks you pick)" \
+        "status|Status of the LINSTOR nodes, resources and storage pools (read only)" \
+        "back|Back"
+    local action="$DEPLOY_CHOICE"
+    [[ "$action" == "back" ]] && return 0
+
+    ts_connect_pool || return 0
+
+    case "$action" in
+        install) xs_op_install ;;
+        status)  xs_op_status ;;
+        *)       log_error "Unknown XOSTOR action: $action"; return 1 ;;
     esac
 }
 
@@ -13997,6 +14383,7 @@ MENU_NAMES=(
     "Restore Backup"
     "Adjust Xen Orchestra Memory Allocation"
     "Custom Plugins"
+    "XOSTOR *"
 )
 MENU_HINTS=(
     ""
@@ -14012,6 +14399,7 @@ MENU_HINTS=(
     ""
     ""
     "(NanoKVM power control, host power manager, ...)"
+    "(LINSTOR/DRBD storage, 3+ hosts; * unsupported for XO from sources)"
 )
 
 MENU_TITLE="Install Xen Orchestra from Sources Setup and Update"
@@ -15212,6 +15600,15 @@ process_menu_operations() {
         check_sudo
         check_systemctl
         manage_custom_plugins
+    fi
+
+    # XOSTOR
+    # Targets the pool's hosts, not this machine: no sudo, no systemd.
+    if [[ ${MENU_SELECTED[13]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        load_config
+        xostor_menu
     fi
 }
 
