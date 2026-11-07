@@ -82,7 +82,7 @@ setup() {
     [ "$status" -eq 0 ]
     run openssl x509 -noout -subject -ext subjectAltName -in "$SSL_CERT_DIR/$SSL_CERT_FILE"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"CN = runnervm1"* ]]
+    [[ "$output" =~ CN\ ?=\ ?runnervm1 ]]
     [[ "$output" == *"DNS:${fqdn}"* ]]
 }
 
@@ -93,6 +93,6 @@ setup() {
     run generate_ssl_certificate
     [ "$status" -eq 0 ]
     run openssl x509 -noout -subject -ext subjectAltName -in "$SSL_CERT_DIR/$SSL_CERT_FILE"
-    [[ "$output" == *"CN = xo.example.lan"* ]]
+    [[ "$output" =~ CN\ ?=\ ?xo\.example\.lan ]]
     [[ "$output" == *"DNS:xo.example.lan"* ]]
 }
