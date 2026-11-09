@@ -95,6 +95,12 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Yarn install no longer fails after switching Node.js version.** Changing
+  `NODE_VERSION` (for example 24 to 26) removed the old global `node_modules`
+  but left a dangling `/usr/bin/yarn` link, so `npm install -g yarn` stopped
+  with `EEXIST` (Node 25+ has no corepack). Dangling `yarn` and `yarnpkg` links
+  are now removed before Yarn is installed.
+
 - **Every yes/no question now reads the terminal.** The installer had four
   different yes/no prompts, and the one behind Continue?, Restore, Rebuild,
   Uninstall and others read standard input, so

@@ -1366,6 +1366,7 @@ remove_existing_nodejs() {
     if [[ -d /usr/lib/node_modules ]]; then
         run_cmd sudo rm -rf /usr/lib/node_modules
     fi
+    remove_dangling_yarn_links
 
     # Remove NodeSource repository entries so the new version's repo is the only one
     if [[ "$PKG_MANAGER" == "apt" ]]; then
@@ -1490,9 +1491,27 @@ install_nodejs() {
     log_success "npm installed: $(npm -v)"
 }
 
+# Remove yarn/yarnpkg symlinks whose target no longer exists. Deleting the old
+# global node_modules leaves them behind, and `npm install -g yarn` then fails
+# with EEXIST. Working links are left alone.
+remove_dangling_yarn_links() {
+    local link dir
+    for dir in /usr/bin /usr/local/bin; do
+        for link in "$dir/yarn" "$dir/yarnpkg"; do
+            if [[ -L "$link" && ! -e "$link" ]]; then
+                log_info "Removing dangling link: $link"
+                run_cmd sudo rm -f "$link"
+            fi
+        done
+    done
+}
+
 # Install Yarn
 install_yarn() {
     log_info "Installing Yarn..."
+
+    # A dangling link makes `command -v yarn` fail and then blocks npm (EEXIST).
+    remove_dangling_yarn_links
 
     if command -v yarn >/dev/null 2>&1; then
         log_info "Yarn is already installed: $(yarn -v)"
@@ -1500,7 +1519,8 @@ install_yarn() {
     fi
 
     # npm 11+ (shipped with Node 22+) broke `npm install -g yarn` for yarn v1.
-    # Use corepack instead — it ships with Node.js >= 16 and is the recommended way.
+    # Use corepack when present (Node 16-24); Node 25+ no longer ships it, so
+    # those versions take the npm branch below.
     if command -v corepack >/dev/null 2>&1; then
         run_cmd sudo corepack enable
         run_cmd sudo corepack prepare yarn@stable --activate
