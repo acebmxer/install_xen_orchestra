@@ -215,6 +215,43 @@ const cfg = JSON.parse(fs.readFileSync(path.join(process.env.XO_REG_CFG_HOME, "x
     return "$rc"
 }
 
+# Cleanups to run when the script exits.
+#
+# bash keeps ONE EXIT trap: `trap a EXIT; trap b EXIT` runs only b, and
+# `trap - EXIT` drops everything. The lock release, the --proxy, --deploy,
+# TwinStor and template-build work directories each set their own, so when two
+# ran in one pass (the menu allows it) the earlier one's cleanup never ran and
+# its work directory, which holds the deploy key and pinned host key, stayed in
+# /tmp. Every cleanup is registered here instead: one EXIT trap runs them all,
+# last registered first. "Do not add a third" way of setting an EXIT trap: use
+# these. (The one in the expect helper's heredoc is a separate process.)
+EXIT_CLEANUPS=()
+
+run_exit_cleanups() {
+    local i
+    for ((i = ${#EXIT_CLEANUPS[@]} - 1; i >= 0; i--)); do
+        # One failing cleanup must not stop the ones before it.
+        eval "${EXIT_CLEANUPS[i]}" || true
+    done
+}
+
+# Run the command string $1 at exit. Registering the same string again moves
+# it to the end rather than running it twice.
+add_exit_cleanup() {
+    remove_exit_cleanup "$1"
+    EXIT_CLEANUPS+=("$1")
+    trap run_exit_cleanups EXIT
+}
+
+# Forget the command string $1, for a cleanup already done by hand.
+remove_exit_cleanup() {
+    local c keep=()
+    for c in ${EXIT_CLEANUPS[@]+"${EXIT_CLEANUPS[@]}"}; do
+        [[ "$c" == "$1" ]] || keep+=("$c")
+    done
+    EXIT_CLEANUPS=(${keep[@]+"${keep[@]}"})
+}
+
 # Acquire an exclusive lock on XO_LOCKFILE using flock.
 # The lock is held on file descriptor XO_LOCK_FD for the lifetime of the
 # process.  A trap ensures the lock is always released on exit/signal.
@@ -248,7 +285,7 @@ acquire_lock() {
     { echo "$$" >&"$XO_LOCK_FD"; } 2>/dev/null || true
 
     # Release the lock on any exit
-    trap 'flock -u '"$XO_LOCK_FD"' 2>/dev/null || true' EXIT
+    add_exit_cleanup "flock -u ${XO_LOCK_FD} 2>/dev/null || true"
 }
 
 # Explicitly release the lock (called just before exec-restart so the child
@@ -4211,7 +4248,7 @@ install_xo_proxy() {
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-proxy-work-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
     DEPLOY_POOL_KNOWN_HOSTS=""
-    trap 'rm -rf "$DEPLOY_WORKDIR"' EXIT
+    add_exit_cleanup 'rm -rf "$DEPLOY_WORKDIR"'
     deploy_verify_host_key
     pool_master_hostkey_opts
 
@@ -4302,7 +4339,7 @@ install_xo_proxy() {
     # Matches deploy_cleanup/tpl_cleanup elsewhere: an EXIT trap so a failure
     # between here and the explicit rm below (a signal, a parsing error under
     # set -euo pipefail) doesn't leave a copy of the helper script in /tmp.
-    trap 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"' EXIT
+    add_exit_cleanup 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"'
 
     # Run the expect script
     log_info "Starting XO Proxy installer on Pool Master..."
@@ -4331,7 +4368,8 @@ install_xo_proxy() {
     rm -rf "$DEPLOY_WORKDIR"
     DEPLOY_WORKDIR=""
     DEPLOY_POOL_KNOWN_HOSTS=""
-    trap - EXIT
+    remove_exit_cleanup 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"'
+    remove_exit_cleanup 'rm -rf "$DEPLOY_WORKDIR"'
 
     # Use user-specified IP if not captured
     if [[ -z "$ACTUAL_PROXY_IP" ]]; then
@@ -4387,7 +4425,7 @@ install_xo_proxy() {
     # Create a temporary expect script for xo-cli registration
     XO_CLI_SCRIPT=$(mktemp --tmpdir xo-cli-XXXXXX)
     chmod 700 "$XO_CLI_SCRIPT"
-    trap 'rm -f "$XO_CLI_SCRIPT"' EXIT
+    add_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
     cat > "$XO_CLI_SCRIPT" << 'XO_CLI_EXPECT_END'
 #!/usr/bin/expect -f
 
@@ -4435,7 +4473,7 @@ XO_CLI_EXPECT_END
             log_warning "Failed to register xo-cli with XO_API_TOKEN"
             log_info "Check the token in xo-config.cfg, or remove it to log in with a username and password."
             rm -f "$XO_CLI_SCRIPT"
-            trap - EXIT
+            remove_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
             exit 1
         fi
     # The password goes to the expect script through its environment, which
@@ -4448,12 +4486,12 @@ XO_CLI_EXPECT_END
         log_info "If this account uses MFA, set XO_API_TOKEN in xo-config.cfg and run again."
         log_info "Or run manually: xo-cli register --au $XO_REGISTER_URL $XO_USERNAME"
         rm -f "$XO_CLI_SCRIPT"
-        trap - EXIT
+        remove_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
         exit 1
     fi
 
     rm -f "$XO_CLI_SCRIPT"
-    trap - EXIT
+    remove_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
 
     # Register the proxy with Xen Orchestra
     log_info "Registering XO Proxy with Xen Orchestra..."
@@ -8251,7 +8289,7 @@ deploy_xo_vm() {
 
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-deploy-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
-    trap deploy_cleanup EXIT
+    add_exit_cleanup deploy_cleanup
 
     # Deploy whatever fork this checkout came from, so the VM ends up tracking
     # the same repository the user is running.
@@ -9232,7 +9270,7 @@ ts_connect_pool() {
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-twinstor-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
     DEPLOY_POOL_KNOWN_HOSTS=""
-    trap ts_cleanup EXIT
+    add_exit_cleanup ts_cleanup
 
     deploy_connect_pool_master
     ts_discover_hosts || exit 1
@@ -14314,7 +14352,7 @@ build_vm_templates() {
     # from ssh, which reads as a wrong password rather than a missing directory.
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-templates-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
-    trap tpl_cleanup EXIT
+    add_exit_cleanup tpl_cleanup
 
     # Decided here, before anything is created on the pool, so a fallback to
     # SSH happens while the only cost is a credentials prompt. See the comment

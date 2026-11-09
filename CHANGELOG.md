@@ -111,6 +111,14 @@ This installer builds Xen Orchestra from source and tracks the official
   cannot read. The command printed for a manual retry after a failure still
   shows the token, on the terminal only.
 
+- **Running two menu items in one pass no longer skips the first one's
+  cleanup.** The lock release, `--proxy`, `--deploy`, TwinStor and the template
+  build each set their own exit handler, and a shell keeps only one, so the
+  last one set replaced the others. Ticking, for example, Deploy and the
+  Template Library together left the Deploy work directory in `/tmp`, with the
+  deploy key and the pinned host key in it. Every cleanup is now registered and
+  all of them run when the script exits.
+
 ## [0.9.9] - 2026-11-03
 
 ### Fixed
