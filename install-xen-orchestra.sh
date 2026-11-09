@@ -4224,11 +4224,11 @@ install_xo_proxy() {
     echo "=============================================="
     echo ""
 
-    read -rp "IP address of Pool Master: " POOL_MASTER_IP
-    if [[ -z "$POOL_MASTER_IP" ]]; then
-        log_error "Pool Master IP address is required"
-        exit 1
-    fi
+    while true; do
+        read -rp "IP address of Pool Master: " POOL_MASTER_IP || { log_error "No input"; exit 1; }
+        is_ipv4 "$POOL_MASTER_IP" && break
+        log_warning "Please enter an IPv4 address such as 192.168.1.10."
+    done
 
     read -rp "Host username [root]: " HOST_USERNAME
     HOST_USERNAME=${HOST_USERNAME:-root}
@@ -4291,10 +4291,19 @@ install_xo_proxy() {
     echo "=============================================="
     echo ""
 
-    read -rp "IP address for proxy [dhcp]: " PROXY_IP
-    PROXY_IP=${PROXY_IP:-dhcp}
+    while true; do
+        read -rp "IP address for proxy [dhcp]: " PROXY_IP || { log_error "No input"; exit 1; }
+        PROXY_IP=${PROXY_IP:-dhcp}
+        is_ipv4_or_dhcp "$PROXY_IP" && break
+        log_warning "Please enter an IPv4 address, or press Enter for dhcp."
+    done
 
-    read -rp "Custom NTP server (leave blank for default): " NTP_SERVER
+    while true; do
+        read -rp "Custom NTP server (leave blank for default): " NTP_SERVER || { log_error "No input"; exit 1; }
+        [[ -z "$NTP_SERVER" ]] && break
+        is_host_or_ipv4 "$NTP_SERVER" && break
+        log_warning "Please enter a host name or IPv4 address, or leave blank."
+    done
 
     # With XO_API_TOKEN set, xo-cli is registered with the token, so the XO web
     # login is never used. Vates' deploy script still asks for an account and
@@ -4673,6 +4682,10 @@ xml_escape() {
     printf '%s' "$s"
 }
 
+# The one definition of an IPv4 address's shape. Every prompt and is_ipv4 use
+# this; do not write the pattern out again.
+IPV4_SHAPE_REGEX='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
 # Validate a dotted-quad IPv4 address, octet by octet.
 #
 # The shape regex used at the prompts accepts 999.999.999.999, which would go
@@ -4680,12 +4693,27 @@ xml_escape() {
 # comes up — and that we would then wait 10 minutes for.
 is_ipv4() {
     local addr="$1" octet
-    [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    [[ "$addr" =~ $IPV4_SHAPE_REGEX ]] || return 1
     local IFS='.'
     for octet in $addr; do
         (( 10#$octet <= 255 )) || return 1
     done
     return 0
+}
+
+# Accept a host name or an IPv4 address (for example an NTP server). Anything
+# made only of digits and dots must be a real IPv4 address, so 999.1.1.1 and
+# 10.0.0. are refused rather than treated as odd-looking names.
+is_host_or_ipv4() {
+    local v="$1"
+    [[ -n "$v" && ${#v} -le 253 ]] || return 1
+    [[ "$v" =~ ^[0-9.]+$ ]] && { is_ipv4 "$v"; return; }
+    [[ "$v" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && [[ "$v" != *..* ]]
+}
+
+# The proxy's address: an IPv4 address, or "dhcp" to let the network assign one.
+is_ipv4_or_dhcp() {
+    [[ "${1,,}" == "dhcp" ]] || is_ipv4 "$1"
 }
 
 # Validate a TCP port. The installer inside the VM rejects anything outside
@@ -7011,7 +7039,7 @@ deploy_prompt_repo_dir() {
 # image has no xe-guest-utilities, so the host cannot report a DHCP-assigned
 # address back to us and we would have no way to reach the VM afterwards.
 deploy_prompt_network_settings() {
-    local ipregex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    local ipregex="$IPV4_SHAPE_REGEX"
 
     echo ""
     echo "=============================================="
@@ -9625,7 +9653,7 @@ ts_offer_pool_join() {
     fi
 
     local ip
-    deploy_read_validated "IP address of the host to join" '^[0-9.]+$' "" ip is_ipv4
+    deploy_read_validated "IP address of the host to join" "$IPV4_SHAPE_REGEX" "" ip is_ipv4
     ts_pin_host_key "$ip" || return 1
     echo ""
     echo "  This asks for the host's CURRENT root password; the pool master's password replaces it."
@@ -9732,7 +9760,7 @@ ts_choose_topology() {
         echo "  two hosts, with an address on each end that is on neither host's other networks."
         local i ip
         for ((i = 0; i < 2; i++)); do
-            deploy_read_validated "Direct-link IP address for $(ts_host_label "$i")" '^[0-9.]+$' "" ip is_ipv4
+            deploy_read_validated "Direct-link IP address for $(ts_host_label "$i")" "$IPV4_SHAPE_REGEX" "" ip is_ipv4
             TS_DIRECT_IPS+=("$ip")
         done
     fi

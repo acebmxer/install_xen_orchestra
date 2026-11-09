@@ -95,6 +95,11 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **`--proxy` checks the addresses it asks for.** The pool master IP, the proxy
+  IP (an address or `dhcp`) and the NTP server (a host name or address) are now
+  checked at the prompt and asked again if they are not valid, instead of
+  failing minutes later at the SSH test. The IPv4 pattern is now written once.
+
 - **The installer's lock file is no longer world-writable.** The installer
   made `/var/lock/xo-install.lock` mode 666 so a non-root user could open it,
   which let any other local user take the lock and stop the installer with
