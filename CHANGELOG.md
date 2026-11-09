@@ -95,6 +95,14 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **The installer's lock file is no longer world-writable.** The installer
+  made `/var/lock/xo-install.lock` mode 666 so a non-root user could open it,
+  which let any other local user take the lock and stop the installer with
+  "Another instance of this script is already running", or overwrite the
+  process ID stored in it. The file now belongs to the user running the
+  installer with mode 600. An existing 666 file is corrected on the next run.
+  (#115)
+
 - **A backslash in a `--proxy` password or token is no longer dropped.** The
   prompts for the host password, the Xen Orchestra login password, the pool
   master and proxy addresses, the NTP server and the manual UUID and token

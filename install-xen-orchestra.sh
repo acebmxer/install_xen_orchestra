@@ -266,8 +266,11 @@ acquire_lock() {
         log_warning "Could not create $XO_LOCKFILE; proceeding without lock."
         return 0
     fi
-    # Ensure the current (non-root) user can open the lockfile for flock
-    sudo chmod 666 "$XO_LOCKFILE" 2>/dev/null || true
+    # Let only the invoking user (and root) open the lockfile for flock. It must
+    # not be world-writable: any local user could otherwise hold the lock and
+    # stop the installer, or overwrite the PID written into it.
+    sudo chown "$(id -u):$(id -g)" "$XO_LOCKFILE" 2>/dev/null || true
+    sudo chmod 600 "$XO_LOCKFILE" 2>/dev/null || true
 
     # Open the lockfile on fd XO_LOCK_FD
     eval "exec ${XO_LOCK_FD}>'${XO_LOCKFILE}'" 2>/dev/null || {
