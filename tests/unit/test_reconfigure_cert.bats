@@ -31,7 +31,7 @@ setup() {
     sudo() { "$@"; }
     systemctl() { :; }
     timeout() { shift; "$@"; }
-    confirm_or_skip() { return 0; }
+    prompt_yes_no() { return 0; }
     flush_redis_tokens() { :; }
     detect_legacy_system_state() { LEGACY_SYSTEM_CHANGES=(); }
     get_previous_service_user() { echo root; }

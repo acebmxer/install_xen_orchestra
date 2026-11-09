@@ -297,23 +297,11 @@ release_lock() {
     flock -u "$XO_LOCK_FD" 2>/dev/null || true
 }
 
-# In non-interactive mode auto-confirms and returns 0; otherwise prompts [y/N].
-# Usage: confirm_or_skip "Description" || { log_info "Cancelled."; exit 0; }
-confirm_or_skip() {
-    local message="$1"
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
-        log_info "Non-interactive: auto-confirming: $message"
-        return 0
-    fi
-    echo -n "${message} [y/N]: "
-    local reply
-    read -t 300 -r reply || { log_error "Input timeout"; exit 1; }
-    [[ "$reply" == [Yy] ]]
-}
-
-# Strict yes/no prompt: re-asks until the user types y/yes or n/no.
-# Unlike confirm_or_skip, blank or garbage input is rejected, not treated as "no".
+# The one yes/no prompt for the whole script: reads the terminal (/dev/tty),
+# never stdin, so piped input cannot answer it. Re-asks until the user types
+# y/yes or n/no; blank or garbage input is rejected, not treated as "no".
 # Returns 0 for yes, 1 for no. In non-interactive mode auto-answers yes.
+# Do not add a second yes/no helper or an inline `read` y/N test.
 # Usage: if prompt_yes_no "Do the thing?"; then ...; fi
 prompt_yes_no() {
     local message="$1"
@@ -477,7 +465,7 @@ self_update_script() {
         else
             log_warning "Local modifications detected in ${SCRIPT_DIR}."
         fi
-        # confirm_or_skip auto-confirms under --non-interactive, which would run
+        # prompt_yes_no auto-confirms under --non-interactive, which would run
         # reset --hard and clean -fd with nobody there to see the prompt. Never
         # discard local work unattended; leave the checkout alone instead.
         if [[ "$NON_INTERACTIVE" == "true" ]]; then
@@ -485,7 +473,7 @@ self_update_script() {
             log_warning "Self-update skipped. Continuing with current version."
             return 0
         fi
-        if ! confirm_or_skip "Reset to origin/${current_branch}? Local changes will be lost."; then
+        if ! prompt_yes_no "Reset to origin/${current_branch}? Local changes will be lost."; then
             log_warning "Self-update skipped. Continuing with current version."
             return 0
         fi
@@ -3166,7 +3154,7 @@ restore_xo() {
     echo ""
     log_warning "You are about to restore: $SELECTED_NAME"
     log_warning "This will replace the current installation at $INSTALL_DIR"
-    confirm_or_skip "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; return 0; }
+    prompt_yes_no "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
@@ -3804,7 +3792,7 @@ rebuild_xo() {
     log_warning "  3. Perform a clean rebuild"
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
-    confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; return 0; }
+    prompt_yes_no "Continue with rebuild?" || { log_info "Rebuild cancelled."; return 0; }
 
     # Snapshot while xo-server is still up -- it talks to the REST API on
     # localhost, so it must run before the service stops below or every
@@ -3943,7 +3931,7 @@ reconfigure_xo() {
     log_warning "Database and user data in /var/lib/xo-server will NOT be affected."
     log_warning "NFS/CIFS mounts and reverse proxy settings will continue to work."
     echo ""
-    confirm_or_skip "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; return 0; }
+    prompt_yes_no "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
@@ -6582,7 +6570,7 @@ deploy_verify_host_key() {
         log_warning "Set XO_DEPLOY_POOL_FINGERPRINT to have it verified instead."
         return 0
     fi
-    if ! confirm_or_skip "Does that fingerprint match?"; then
+    if ! prompt_yes_no "Does that fingerprint match?"; then
         log_error "Host key not confirmed. Nothing has been sent to ${POOL_MASTER_IP}."
         exit 1
     fi
@@ -6924,7 +6912,7 @@ deploy_prompt_admin_password() {
     fi
     pw1=""; pw2=""
 
-    if confirm_or_skip "Also allow SSH logins with this password?"; then
+    if prompt_yes_no "Also allow SSH logins with this password?"; then
         DEPLOY_ADMIN_SSH_PWAUTH="true"
     else
         log_info "SSH stays key-only; the password is for the console, su and sudo."
@@ -6998,7 +6986,7 @@ deploy_prompt_admin_ssh_key() {
             if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" != "true" ]]; then
                 log_warning "SSH password logins are off, so the console is the only way in."
             fi
-            confirm_or_skip "Continue without an SSH key?" && return 0
+            prompt_yes_no "Continue without an SSH key?" && return 0
             continue
         fi
 
@@ -7385,7 +7373,7 @@ deploy_edit_xo_config() {
     echo "The VM's xo-config.cfg is built from ${DEPLOY_CONFIG_BASE_LABEL}."
     echo ""
 
-    confirm_or_skip "Review it in an editor before the VM is created?" || return 0
+    prompt_yes_no "Review it in an editor before the VM is created?" || return 0
 
     # Prefer whatever the user actually uses; PREFERRED_EDITOR is the config's
     # own answer to the same question. Nothing is installed for this -- deploy
@@ -7452,7 +7440,7 @@ deploy_edit_xo_config() {
         for bad in "${invalid[@]}"; do
             log_warning "  ${bad}"
         done
-        confirm_or_skip "Open it again to fix them?" || {
+        prompt_yes_no "Open it again to fix them?" || {
             log_error "Deploy cancelled — nothing was created on the pool."
             exit 1
         }
@@ -8316,7 +8304,7 @@ deploy_xo_vm() {
         exit 1
     fi
 
-    confirm_or_skip "Continue?" || { log_info "Deploy cancelled."; return 0; }
+    prompt_yes_no "Continue?" || { log_info "Deploy cancelled."; return 0; }
 
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-deploy-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
@@ -8375,7 +8363,7 @@ deploy_xo_vm() {
     echo "  Clone into:   ${DEPLOY_REPO_DIR}"
     echo "  XO config:    from ${DEPLOY_CONFIG_BASE_LABEL}"
     echo ""
-    confirm_or_skip "Create this VM?" || { log_info "Deploy cancelled."; return 0; }
+    prompt_yes_no "Create this VM?" || { log_info "Deploy cancelled."; return 0; }
 
     deploy_build_config_drive
     deploy_create_vm
@@ -8437,7 +8425,7 @@ cleanup_xo() {
         echo ""
     fi
 
-    if ! confirm_or_skip "Proceed with uninstall? This cannot be undone."; then
+    if ! prompt_yes_no "Proceed with uninstall? This cannot be undone."; then
         log_info "Uninstall cancelled."
         return 0
     fi
@@ -8495,7 +8483,7 @@ cleanup_xo() {
     if [[ -n "${SERVICE_USER:-}" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if id "$SERVICE_USER" &>/dev/null; then
             echo ""
-            if confirm_or_skip "Also delete system user '${SERVICE_USER}'?"; then
+            if prompt_yes_no "Also delete system user '${SERVICE_USER}'?"; then
                 log_info "Removing service user: ${SERVICE_USER}..."
                 run_cmd sudo userdel -r "$SERVICE_USER" 2>/dev/null || \
                     run_cmd sudo userdel "$SERVICE_USER" 2>/dev/null || true
@@ -8505,7 +8493,7 @@ cleanup_xo() {
 
     # 8. Optionally remove Redis data
     echo ""
-    if confirm_or_skip "Also purge Redis data? (WARNING: removes all Redis databases on this host)"; then
+    if prompt_yes_no "Also purge Redis data? (WARNING: removes all Redis databases on this host)"; then
         log_info "Purging Redis data..."
         purge_redis_data /var/lib/redis /var/lib/valkey
     fi
@@ -8663,7 +8651,7 @@ adjust_xo_memory() {
     log_info "ExecStart will be updated to:"
     echo "    ExecStart=${node_path} --max-old-space-size=${heap_mb} <xo-server>"
     echo ""
-    if ! confirm_or_skip "Apply this change to ${service_file}?"; then
+    if ! prompt_yes_no "Apply this change to ${service_file}?"; then
         log_info "Skipping memory allocation adjustment."
         return 0
     fi
@@ -9173,7 +9161,7 @@ ts_pin_host_key() {
     echo "  The host password is sent to this address. To check, run on that host:"
     echo "    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
     echo ""
-    if ! confirm_or_skip "Does that fingerprint match?"; then
+    if ! prompt_yes_no "Does that fingerprint match?"; then
         log_error "Host key not confirmed. Nothing has been sent to ${ip}."
         return 1
     fi
@@ -14176,7 +14164,7 @@ tpl_api_ensure_xo_cli() {
         return 1
     fi
 
-    if ! confirm_or_skip "Install xo-cli now (npm i -g xo-cli)?"; then
+    if ! prompt_yes_no "Install xo-cli now (npm i -g xo-cli)?"; then
         TPL_API_UNAVAILABLE_REASON="xo-cli is not installed"
         return 1
     fi
@@ -14239,7 +14227,7 @@ tpl_api_ensure_qemu_img() {
     log_info "before uploading it to XO, which needs qemu-img."
     echo ""
 
-    if ! confirm_or_skip "Install ${pkg} now (${PKG_INSTALL} ${pkg})?"; then
+    if ! prompt_yes_no "Install ${pkg} now (${PKG_INSTALL} ${pkg})?"; then
         TPL_API_UNAVAILABLE_REASON="qemu-img is not installed"
         return 1
     fi
@@ -14413,7 +14401,7 @@ build_vm_templates() {
     echo ""
     local prompt="Build this template?"
     (( ${#TPL_SELECTED[@]} > 1 )) && prompt="Build these ${#TPL_SELECTED[@]} templates?"
-    confirm_or_skip "$prompt" || { log_info "Cancelled."; return 0; }
+    prompt_yes_no "$prompt" || { log_info "Cancelled."; return 0; }
 
     local built=0 failed=0 skipped=0
     for row in "${TPL_SELECTED[@]}"; do
@@ -15230,10 +15218,7 @@ menu_rename_config() {
     echo ""
     if [[ -f "$CONFIG_FILE" ]]; then
         log_warning "xo-config.cfg already exists!"
-        local overwrite
-        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Overwrite with sample? (y/N) " overwrite < /dev/tty
-        echo
-        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+        if ! prompt_yes_no "Overwrite with sample?"; then
             log_info "Skipping rename."
             # Nothing changed, so no reload is offered for it.
             return 1
@@ -15285,10 +15270,7 @@ menu_edit_config() {
     # Check if editor is installed
     if ! command -v "$editor" &>/dev/null; then
         log_warning "${editor} is not installed."
-        local install_editor
-        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Install ${editor}? (y/N) " install_editor < /dev/tty
-        echo
-        if [[ "$install_editor" =~ ^[Yy]$ ]]; then
+        if prompt_yes_no "Install ${editor}?"; then
             # Detect package manager if not already done
             if [[ -z "${PKG_INSTALL:-}" ]]; then
                 if command -v apt-get &>/dev/null; then

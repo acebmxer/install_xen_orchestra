@@ -20,7 +20,7 @@ setup() {
     check_systemctl() { :; }
     load_config() { :; }
     # Yes to the uninstall itself, no to the optional extras.
-    confirm_or_skip() { [[ "$1" == Proceed* ]]; }
+    prompt_yes_no() { [[ "$1" == Proceed* ]]; }
 
     # sudo runs systemctl (stubbed below) and only records anything else, so
     # nothing on the test machine is removed.
@@ -111,7 +111,7 @@ purge_setup() {
 }
 
 @test "uninstall: 'purge Redis data' purges both data dirs" {
-    confirm_or_skip() { [[ "$1" == Proceed* || "$1" == *"purge Redis data"* ]]; }
+    prompt_yes_no() { [[ "$1" == Proceed* || "$1" == *"purge Redis data"* ]]; }
     purge_redis_data() { echo "purge $*" >> "$CALLS"; }
     run cleanup_xo
     [ "$status" -eq 0 ]

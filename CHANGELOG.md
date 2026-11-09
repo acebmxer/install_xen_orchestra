@@ -95,6 +95,15 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **Every yes/no question now reads the terminal.** The installer had four
+  different yes/no prompts, and the one behind Continue?, Restore, Rebuild,
+  Uninstall and others read standard input, so
+  `echo y | ./install-xen-orchestra.sh --deploy` answered them by itself. All
+  of them now use one prompt that reads the terminal, accepts `y`/`yes` and
+  `n`/`no`, and asks again on anything else (a blank answer used to count as
+  "no"). The "Overwrite with sample?" and "Install the editor?" questions in
+  the menu no longer take a single key and now need Enter. (#117)
+
 - **`--proxy` checks the addresses it asks for.** The pool master IP, the proxy
   IP (an address or `dhcp`) and the NTP server (a host name or address) are now
   checked at the prompt and asked again if they are not valid, instead of

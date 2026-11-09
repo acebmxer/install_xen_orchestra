@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 # Tests for self_update_script() in install-xen-orchestra.sh. Regression: under
-# --non-interactive, confirm_or_skip auto-confirmed the "Reset to origin?"
+# --non-interactive, prompt_yes_no auto-confirmed the "Reset to origin?"
 # prompt after a failed fast-forward, so an unattended (cron) run ran
 # `reset --hard` and `clean -fd` and discarded local work in the checkout.
 
