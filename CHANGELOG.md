@@ -103,6 +103,14 @@ This installer builds Xen Orchestra from source and tracks the official
   the login failed as if the password were wrong. The answers are now used
   exactly as typed, like the other prompts in the script.
 
+- **The `--proxy` proxy token no longer appears on a command line.** The
+  installer registered the new proxy with `xo-cli proxy.register
+  authenticationToken=<token> ...`, so any other user on the machine could read
+  the proxy's token with `ps` while the command ran. The same call is now made
+  from node with the token passed through the environment, which other users
+  cannot read. The command printed for a manual retry after a failure still
+  shows the token, on the terminal only.
+
 ## [0.9.9] - 2026-11-03
 
 ### Fixed

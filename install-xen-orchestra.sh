@@ -174,6 +174,47 @@ fs.chmodSync(file, 0o600);
     return "$rc"
 }
 
+# Register an XO Proxy with Xen Orchestra: `xo-cli proxy.register`, but with
+# the proxy's authentication token kept off the command line.
+#
+# xo-cli takes a method's parameters only as <name>=<value> arguments, which
+# any local user can read in ps and /proc/<pid>/cmdline for as long as the
+# command runs. So the same call is made with xo-lib, the library xo-cli
+# itself uses, loaded from the xo-cli install and signed in with the token in
+# xo-cli's settings file. The token, address and VM UUID go in through the
+# environment, which other users cannot read. Arguments: the config home, the
+# address ("ip:443"), the VM UUID, and the name of the variable holding the
+# token. Exits non-zero, with XO's error on stderr, if the call fails.
+# "Do not add a third" way of calling xo-cli with a secret: use this.
+xo_cli_proxy_register() {
+    local -
+    set +x
+    local config_home="$1" address="$2" vm_uuid="$3" token_var="$4" cli_entry rc=0
+    cli_entry=$(readlink -f "$(command -v xo-cli)") || return 1
+    XO_REG_ENTRY="$cli_entry" XO_REG_CFG_HOME="$config_home" XO_REG_ADDRESS="$address" \
+        XO_REG_VM_UUID="$vm_uuid" XO_REG_TOKEN="${!token_var}" \
+        node -e '
+const fs = require("fs"), path = require("path");
+const Xo = require(require("module").createRequire(process.env.XO_REG_ENTRY).resolve("xo-lib")).default;
+const cfg = JSON.parse(fs.readFileSync(path.join(process.env.XO_REG_CFG_HOME, "xo-cli", "config.json"), "utf8"));
+(async () => {
+  const xo = new Xo({ rejectUnauthorized: !cfg.allowUnauthorized, url: cfg.server });
+  await xo.open();
+  try {
+    await xo.signIn({ token: cfg.token });
+    await xo.call("proxy.register", {
+      authenticationToken: process.env.XO_REG_TOKEN,
+      address: process.env.XO_REG_ADDRESS,
+      vmUuid: process.env.XO_REG_VM_UUID,
+    });
+  } finally {
+    await xo.close();
+  }
+})().catch(e => { console.error(e && e.message ? e.message : String(e)); process.exit(1); });
+' || rc=$?
+    return "$rc"
+}
+
 # Acquire an exclusive lock on XO_LOCKFILE using flock.
 # The lock is held on file descriptor XO_LOCK_FD for the lifetime of the
 # process.  A trap ensures the lock is always released on exit/signal.
@@ -4417,7 +4458,7 @@ XO_CLI_EXPECT_END
     # Register the proxy with Xen Orchestra
     log_info "Registering XO Proxy with Xen Orchestra..."
 
-    if xo-cli proxy.register authenticationToken="$AUTH_TOKEN" address="$ACTUAL_PROXY_IP:443" vmUuid="$PROXY_UUID"; then
+    if xo_cli_proxy_register "${XDG_CONFIG_HOME:-$HOME/.config}" "$ACTUAL_PROXY_IP:443" "$PROXY_UUID" AUTH_TOKEN; then
         log_success "XO Proxy registered successfully!"
     else
         log_error "Failed to register XO Proxy"
