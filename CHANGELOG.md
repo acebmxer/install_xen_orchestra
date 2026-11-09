@@ -93,6 +93,16 @@ This installer builds Xen Orchestra from source and tracks the official
   update then moves Node.js to a new major version when a new LTS line is
   out. (#110)
 
+### Fixed
+
+- **A backslash in a `--proxy` password or token is no longer dropped.** The
+  prompts for the host password, the Xen Orchestra login password, the pool
+  master and proxy addresses, the NTP server and the manual UUID and token
+  fallback read their answer without `-r`, so bash removed every `\`. A
+  password containing one reached the host and Xen Orchestra without it and
+  the login failed as if the password were wrong. The answers are now used
+  exactly as typed, like the other prompts in the script.
+
 ## [0.9.9] - 2026-11-03
 
 ### Fixed

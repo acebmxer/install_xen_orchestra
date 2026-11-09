@@ -4143,16 +4143,16 @@ install_xo_proxy() {
     echo "=============================================="
     echo ""
 
-    read -p "IP address of Pool Master: " POOL_MASTER_IP
+    read -rp "IP address of Pool Master: " POOL_MASTER_IP
     if [[ -z "$POOL_MASTER_IP" ]]; then
         log_error "Pool Master IP address is required"
         exit 1
     fi
 
-    read -p "Host username [root]: " HOST_USERNAME
+    read -rp "Host username [root]: " HOST_USERNAME
     HOST_USERNAME=${HOST_USERNAME:-root}
 
-    read -sp "Host password: " HOST_PASSWORD
+    read -rsp "Host password: " HOST_PASSWORD
     echo ""
     if [[ -z "$HOST_PASSWORD" ]]; then
         log_error "Host password is required"
@@ -4210,10 +4210,10 @@ install_xo_proxy() {
     echo "=============================================="
     echo ""
 
-    read -p "IP address for proxy [dhcp]: " PROXY_IP
+    read -rp "IP address for proxy [dhcp]: " PROXY_IP
     PROXY_IP=${PROXY_IP:-dhcp}
 
-    read -p "Custom NTP server (leave blank for default): " NTP_SERVER
+    read -rp "Custom NTP server (leave blank for default): " NTP_SERVER
 
     # With XO_API_TOKEN set, xo-cli is registered with the token, so the XO web
     # login is never used. Vates' deploy script still asks for an account and
@@ -4231,13 +4231,13 @@ install_xo_proxy() {
         echo "=============================================="
         echo ""
 
-        read -p "Xen Orchestra login username: " XO_USERNAME
+        read -rp "Xen Orchestra login username: " XO_USERNAME
         if [[ -z "$XO_USERNAME" ]]; then
             log_error "Xen Orchestra username is required"
             exit 1
         fi
 
-        read -sp "Xen Orchestra login password: " XO_PASSWORD
+        read -rsp "Xen Orchestra login password: " XO_PASSWORD
         echo ""
         if [[ -z "$XO_PASSWORD" ]]; then
             log_error "Xen Orchestra password is required"
@@ -4298,7 +4298,7 @@ install_xo_proxy() {
             ACTUAL_PROXY_IP="$PROXY_IP"
         else
             log_warning "Could not detect DHCP-assigned IP address"
-            read -p "Please enter the assigned IP address: " ACTUAL_PROXY_IP
+            read -rp "Please enter the assigned IP address: " ACTUAL_PROXY_IP
         fi
     fi
 
@@ -4307,11 +4307,11 @@ install_xo_proxy() {
         log_warning "Could not automatically extract UUID and/or authentication token"
 
         if [[ -z "$PROXY_UUID" ]]; then
-            read -p "Please enter the XO Proxy UUID: " PROXY_UUID
+            read -rp "Please enter the XO Proxy UUID: " PROXY_UUID
         fi
 
         if [[ -z "$AUTH_TOKEN" ]]; then
-            read -p "Please enter the authentication token: " AUTH_TOKEN
+            read -rp "Please enter the authentication token: " AUTH_TOKEN
         fi
     fi
 
