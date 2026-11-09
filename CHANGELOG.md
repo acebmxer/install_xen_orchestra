@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-09
+
 ### Added
 
 - **Install XOSTOR from the menu.** XOSTOR is Vates' LINSTOR/DRBD replicated
@@ -99,7 +101,7 @@ This installer builds Xen Orchestra from source and tracks the official
   `NODE_VERSION` (for example 24 to 26) removed the old global `node_modules`
   but left a dangling `/usr/bin/yarn` link, so `npm install -g yarn` stopped
   with `EEXIST` (Node 25+ has no corepack). Dangling `yarn` and `yarnpkg` links
-  are now removed before Yarn is installed.
+  are now removed before Yarn is installed. (#118)
 
 - **Every yes/no question now reads the terminal.** The installer had four
   different yes/no prompts, and the one behind Continue?, Restore, Rebuild,
@@ -113,7 +115,7 @@ This installer builds Xen Orchestra from source and tracks the official
 - **`--proxy` checks the addresses it asks for.** The pool master IP, the proxy
   IP (an address or `dhcp`) and the NTP server (a host name or address) are now
   checked at the prompt and asked again if they are not valid, instead of
-  failing minutes later at the SSH test. The IPv4 pattern is now written once.
+  failing minutes later at the SSH test. The IPv4 pattern is now written once. (#116)
 
 - **The installer's lock file is no longer world-writable.** The installer
   made `/var/lock/xo-install.lock` mode 666 so a non-root user could open it,
@@ -129,7 +131,7 @@ This installer builds Xen Orchestra from source and tracks the official
   fallback read their answer without `-r`, so bash removed every `\`. A
   password containing one reached the host and Xen Orchestra without it and
   the login failed as if the password were wrong. The answers are now used
-  exactly as typed, like the other prompts in the script.
+  exactly as typed, like the other prompts in the script. (#112)
 
 - **The `--proxy` proxy token no longer appears on a command line.** The
   installer registered the new proxy with `xo-cli proxy.register
@@ -137,7 +139,7 @@ This installer builds Xen Orchestra from source and tracks the official
   the proxy's token with `ps` while the command ran. The same call is now made
   from node with the token passed through the environment, which other users
   cannot read. The command printed for a manual retry after a failure still
-  shows the token, on the terminal only.
+  shows the token, on the terminal only. (#113)
 
 - **Running two menu items in one pass no longer skips the first one's
   cleanup.** The lock release, `--proxy`, `--deploy`, TwinStor and the template
@@ -145,7 +147,7 @@ This installer builds Xen Orchestra from source and tracks the official
   last one set replaced the others. Ticking, for example, Deploy and the
   Template Library together left the Deploy work directory in `/tmp`, with the
   deploy key and the pinned host key in it. Every cleanup is now registered and
-  all of them run when the script exits.
+  all of them run when the script exits. (#114)
 
 ## [0.9.9] - 2026-11-03
 
@@ -2908,7 +2910,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.9...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.9...v0.10.0
 [0.9.9]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...v0.9.7
