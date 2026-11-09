@@ -83,7 +83,7 @@ rebuild_setup() {
     SYSTEMCTL_LOG="$BATS_TEST_TMPDIR/systemctl.log"
     systemctl() { echo "$*" >> "$SYSTEMCTL_LOG"; }
     install_dir_git() { echo HEAD; }
-    confirm_or_skip() { return 0; }
+    prompt_yes_no() { return 0; }
     snapshot_xo_vm() { :; }
     flush_redis_tokens() { :; }
     create_backup() { :; }

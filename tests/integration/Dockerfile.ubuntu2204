@@ -1,6 +1,8 @@
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Retry transient mirror failures instead of failing the image build.
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "20";\n' > /etc/apt/apt.conf.d/80-retries \
+    && apt-get update && apt-get install -y --no-install-recommends \
     sudo git curl bash bats shellcheck ca-certificates \
     openssl genisoimage openssh-client python3-yaml \
     && rm -rf /var/lib/apt/lists/*

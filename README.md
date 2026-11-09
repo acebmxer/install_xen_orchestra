@@ -10,7 +10,7 @@
 [![Unique cloners](https://img.shields.io/badge/unique%20cloners-173-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-545%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-632%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-14-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -71,6 +71,7 @@ Orchestra](https://xen-orchestra.com/) from source.
 | --- | --- |
 | Building the VM for you (`--deploy`) | [docs/deployment.md](docs/deployment.md) |
 | Building cloud-init VM templates (`--build-templates`) | [docs/templates.md](docs/templates.md) |
+| Replicated shared storage on a two-host pool (`--twinstor`, Vates tech preview) | [docs/twinstor.md](docs/twinstor.md) |
 | Optional plugins (NanoKVM power control, host power manager) (`--custom-plugins`) | [docs/custom-plugins.md](docs/custom-plugins.md) |
 | Every config option, and the environment variables | [docs/configuration.md](docs/configuration.md) |
 | Update-safety task detection and REST API auth | [docs/authentication.md](docs/authentication.md) |
@@ -143,6 +144,7 @@ backing.
 |----------|----------|-------------|
 | Deploy | `--deploy` | Create a Debian VM on a XenServer/XCP-ng pool and install XO into it |
 | Build Templates | `--build-templates` | Build cloud-init VM templates on a XenServer/XCP-ng pool |
+| TwinStor | `--twinstor`, `--twinstor-upgrade` | Install, update and check TwinStor, and collect its support bundle (Vates tech preview: replicated shared storage for a two-host pool) |
 | Install | `--install` | Fresh install of Xen Orchestra |
 | Update | `--update` | Update existing installation (with backup) |
 | Restore | `--restore` | Restore from a previous backup (verified for completeness first; add `--list-backups` to just list them) |
@@ -186,6 +188,7 @@ Running the script with no arguments opens a two-column menu with keyboard navig
     [ ] Install XO Proxy                        [ ] Restore Backup
     [ ] Deploy XO to a new VM (creates VM)      [ ] Adjust XO Memory Allocation
     [ ] VM Template Library                     [ ] Custom Plugins
+    [ ] TwinStor                                [ ] XOSTOR *
 
   ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -248,6 +251,36 @@ filtered for by tag in XO's VM list. The full walkthrough —
 requirements, the admin account and SSH key handling, image verification, what
 it hardens on the way out, reading the deployment stamp back, and the pre-flight
 probe — is in [docs/deployment.md](docs/deployment.md).
+
+## XOSTOR (menu)
+
+XOSTOR is Vates' LINSTOR/DRBD replicated storage for pools of **three to seven**
+hosts. XO's own XOSTOR page needs a licence only XOA provides, so for XO from
+sources the **XOSTOR \*** menu entry sets it up from the command line instead.
+The \* means Vates does not support that and it has not been run on a real pool:
+use a lab pool. The sub-menu offers **Install** (thin or thick, replication 1-3,
+disks picked per host, typed `WIPE` before anything is erased) and **Status**
+(read only). Pool HA is turned off for the install and back on at the end.
+`--non-interactive` is refused.
+
+## TwinStor (`--twinstor`)
+
+TwinStor is Vates' tech preview for turning the local disks of a **two-host**
+XCP-ng pool into shared, replicated storage. `--twinstor` (or the **TwinStor**
+entry in the menu) deploys it and manages it afterwards, following Vates' own
+pages. It is for **lab pools**: Vates says not to run the preview in
+production, and setup erases a disk or partition on each host.
+
+```bash
+./install-xen-orchestra.sh --twinstor           # the TwinStor menu
+./install-xen-orchestra.sh --twinstor-upgrade   # update both hosts, one at a time
+```
+
+The TwinStor menu offers **Install** (either network mode), **Update**,
+**Status** and **Support bundle**. Installing erases a disk or partition on each host and
+needs a typed confirmation, and `--non-interactive` is refused. What each step
+does, what is checked first, and what was not tested is in
+[docs/twinstor.md](docs/twinstor.md).
 
 ## Building VM Templates (`--build-templates`)
 
@@ -325,7 +358,7 @@ Key settings:
 | `INSTALL_DIR` | /opt/xen-orchestra | Installation directory |
 | `SSL_CERT_DAYS` | 825 | Validity of the generated self-signed certificate, in days |
 | `GIT_BRANCH` | master | Git branch (tags are not supported) |
-| `NODE_VERSION` | 24 | Node.js version (latest LTS; use e.g. `24.15.0` to pin a patch) |
+| `NODE_VERSION` | lts | Node.js version: `lts` for the newest LTS line, a major (e.g. `24`), or a pinned release (e.g. `24.15.0`) |
 | `SERVICE_USER` | root | Service user — root by default; any username runs XO non-root |
 | `BACKUP_KEEP` | 5 | Number of backups to retain |
 | `TURBO_CACHE_ENABLED` | true | Reuse turbo's local build cache on `--update` instead of rebuilding every package (`--rebuild` always builds cold) |
@@ -333,6 +366,7 @@ Key settings:
 | `REVERSE_PROXY_TRUST` | false | Trust X-Forwarded headers from proxy IP (`loopback` is always trusted) |
 | `PUBLIC_URL` | *(unset)* | Public URL advertised to external entities (e.g. XO Lite) |
 | `ENCRYPT_REDIS_CREDENTIALS` | false | Encrypt Redis credentials at rest — XCP-ng guests only (see below) |
+| `TWINSTOR_VERSION` / `TWINSTOR_SHA256` | 0.7.4 / *(its published hash)* | The TwinStor bundle `--twinstor` installs on both hosts, and its SHA-256, which is checked on each host before anything is extracted (see [docs/twinstor.md](docs/twinstor.md)) |
 
 Each of these is covered in full, along with the environment variables, in
 [docs/configuration.md](docs/configuration.md).

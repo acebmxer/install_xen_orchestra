@@ -10,6 +10,145 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-09
+
+### Added
+
+- **Install XOSTOR from the menu.** XOSTOR is Vates' LINSTOR/DRBD replicated
+  storage for pools of three to seven hosts. XO's own XOSTOR page needs a
+  licence that only XOA provides, so on XO from sources it most likely cannot
+  create the SR. The new **XOSTOR \*** entry, at the bottom of the right-hand
+  column, opens a sub-menu with **Install** and **Status**. Install connects
+  to the pool master the way `--deploy` does, then checks, read only, that the
+  pool has 3 to 7 hosts on the same XCP-ng version, no existing XOSTOR SR and
+  no existing `linstor_group` volume group (it never removes one), and warns
+  about non-private management addresses and under 16 GiB of RAM. You choose
+  thin or thick provisioning, the disks on each host (a host may have none),
+  the replication (1 to 3, which cannot be changed later) and the SR name.
+  After a typed `yes` to the unsupported warning and a typed `WIPE` for the
+  disks, it turns pool HA off if it is on (and back on at the end with the same
+  heartbeat SR and timeout), installs `xcp-ng-release-linstor` and
+  `xcp-ng-linstor` on the workers and then the master, restarts the toolstack,
+  builds `linstor_group` (and the `thin_device` pool for thin) on each host
+  with disks, runs `xe sr-create type=linstor`, and shows the status. If a step
+  after the volume groups fails, it removes the ones it created. Status lists
+  the pool's LINSTOR SRs, finds the host running the controller and shows
+  `linstor node list`, `resource list`, `storage-pool list` and `advise
+  resource`. `--non-interactive` is refused. The \* means Vates does not
+  support XOSTOR for XO from sources and none of this has been run on a real
+  pool. Update, health plugin calls and destroy are not written yet.
+
+- **Deploy and manage TwinStor from the menu and with `--twinstor`.**
+  TwinStor is Vates' tech preview that turns the local disks of a two-host
+  XCP-ng pool into shared, replicated storage. Setting it up meant following
+  Vates' pages by hand, host by host. The new **TwinStor** menu entry and
+  `--twinstor` flag open a TwinStor sub-menu, shown before anything connects,
+  with Install (fate-shared or arbitrated), Update one host at a time
+  (`--twinstor-upgrade` goes straight there), Status and doctor on both hosts,
+  and a Support bundle collected from both hosts. It connects to the pool
+  master the way `--deploy` does, with the host key checked before the password
+  is sent, and reaches the second host with the same pinned-key check. Before
+  anything is installed it checks, read only, that the pool has two hosts on
+  XCP-ng 8.3 at the same patch level, that every SR is plugged, and that dom0
+  has the memory Vates asks for. It lists the free disks **and partitions** on
+  each host, following the reasons `twinstor setup` gives for refusing a
+  device (a disk that has partitions is not offered, its partitions are;
+  nothing mounted, used as swap, an LVM physical volume or under a RAID array;
+  on the system disk only a partition labelled `twinstor-data`), and passes the
+  device to setup by its stable `/dev/disk/by-id` name, as Vates asks, turning a
+  typed `/dev/sdb2` into one. The bundle is the one Vates publishes:
+  `TWINSTOR_VERSION` and `TWINSTOR_SHA256` in `xo-config.cfg` pin it (0.7.4), the
+  hash is checked on each host before anything is extracted, and a mismatch
+  deletes the download and stops the run, so a new Vates build is a config
+  change. Installing erases a disk or partition on each host and needs a typed
+  `WIPE`, and `--non-interactive` is refused, as it is for `--deploy`. Setup is
+  scripted the way Vates documents it for scripted installs: `twinstor setup
+  --peer-ip ... --backing-device ... --chap-password ... --yes` on the first
+  host, and once that host reports it is waiting, the same on the second, with
+  one CHAP password this run generates for both, plus `--direct-ip` for
+  arbitrated mode and `--ping-target` for extra tie-breakers. The command
+  `twinstor setup` prints for the second host contains a `<disk-on-peer>`
+  placeholder, which is why it does not work as printed; this script fills in
+  the peer's own device. When the flags are missing from `twinstor setup
+  --help`, or the arbitrated direct link has no address on the hosts yet, the
+  wizard is run by hand in this terminal instead, and the script says what to
+  answer. It refuses to start without a tie-breaker (a default gateway or a
+  `--ping-target`), as setup does. This is a new, additive feature: no existing
+  option or default changes. It has not been run against real hosts yet. (#109)
+
+- **`NODE_VERSION=lts` follows the newest Node.js LTS line.** Xen
+  Orchestra's install docs ask for "always the latest LTS version", but
+  `NODE_VERSION` only took a number, so every new LTS line (Node.js 26 on
+  2026-10-28) meant editing the config by hand. Setting `NODE_VERSION=lts`
+  now makes the installer read nodejs.org's release list
+  (`https://nodejs.org/dist/index.json`) when it installs or updates
+  Node.js, pick the newest release that has an LTS codename, and install
+  that major version the same way a number would be installed. The update's
+  Node.js drift warning uses the same lookup. If nodejs.org cannot be
+  reached, the install stops with a message that says so and names the
+  alternative of setting a number; the drift check on an update only warns.
+  `lts` is also the new default, matching the install docs and the script's
+  own header, which already said "latest LTS by default". The default was a
+  fixed `24`, which stopped being the latest LTS when Node.js 26 became LTS.
+  An existing `xo-config.cfg` that sets `NODE_VERSION=24` keeps Node.js 24; a
+  new install, or a config with the line removed, gets the newest LTS, and an
+  update then moves Node.js to a new major version when a new LTS line is
+  out. (#110)
+
+### Fixed
+
+- **Yarn install no longer fails after switching Node.js version.** Changing
+  `NODE_VERSION` (for example 24 to 26) removed the old global `node_modules`
+  but left a dangling `/usr/bin/yarn` link, so `npm install -g yarn` stopped
+  with `EEXIST` (Node 25+ has no corepack). Dangling `yarn` and `yarnpkg` links
+  are now removed before Yarn is installed. (#118)
+
+- **Every yes/no question now reads the terminal.** The installer had four
+  different yes/no prompts, and the one behind Continue?, Restore, Rebuild,
+  Uninstall and others read standard input, so
+  `echo y | ./install-xen-orchestra.sh --deploy` answered them by itself. All
+  of them now use one prompt that reads the terminal, accepts `y`/`yes` and
+  `n`/`no`, and asks again on anything else (a blank answer used to count as
+  "no"). The "Overwrite with sample?" and "Install the editor?" questions in
+  the menu no longer take a single key and now need Enter. (#117)
+
+- **`--proxy` checks the addresses it asks for.** The pool master IP, the proxy
+  IP (an address or `dhcp`) and the NTP server (a host name or address) are now
+  checked at the prompt and asked again if they are not valid, instead of
+  failing minutes later at the SSH test. The IPv4 pattern is now written once. (#116)
+
+- **The installer's lock file is no longer world-writable.** The installer
+  made `/var/lock/xo-install.lock` mode 666 so a non-root user could open it,
+  which let any other local user take the lock and stop the installer with
+  "Another instance of this script is already running", or overwrite the
+  process ID stored in it. The file now belongs to the user running the
+  installer with mode 600. An existing 666 file is corrected on the next run.
+  (#115)
+
+- **A backslash in a `--proxy` password or token is no longer dropped.** The
+  prompts for the host password, the Xen Orchestra login password, the pool
+  master and proxy addresses, the NTP server and the manual UUID and token
+  fallback read their answer without `-r`, so bash removed every `\`. A
+  password containing one reached the host and Xen Orchestra without it and
+  the login failed as if the password were wrong. The answers are now used
+  exactly as typed, like the other prompts in the script. (#112)
+
+- **The `--proxy` proxy token no longer appears on a command line.** The
+  installer registered the new proxy with `xo-cli proxy.register
+  authenticationToken=<token> ...`, so any other user on the machine could read
+  the proxy's token with `ps` while the command ran. The same call is now made
+  from node with the token passed through the environment, which other users
+  cannot read. The command printed for a manual retry after a failure still
+  shows the token, on the terminal only. (#113)
+
+- **Running two menu items in one pass no longer skips the first one's
+  cleanup.** The lock release, `--proxy`, `--deploy`, TwinStor and the template
+  build each set their own exit handler, and a shell keeps only one, so the
+  last one set replaced the others. Ticking, for example, Deploy and the
+  Template Library together left the Deploy work directory in `/tmp`, with the
+  deploy key and the pinned host key in it. Every cleanup is now registered and
+  all of them run when the script exits. (#114)
+
 ## [0.9.9] - 2026-11-03
 
 ### Fixed
@@ -2771,7 +2910,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.9...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.9...v0.10.0
 [0.9.9]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.6...v0.9.7

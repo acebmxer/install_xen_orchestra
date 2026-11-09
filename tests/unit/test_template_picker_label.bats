@@ -149,7 +149,7 @@ _picker_stubs() {
     tpl_api_resolve_targets() { :; }
     tpl_template_name() { echo "$1"; }
     tpl_field() { echo "$1"; }
-    confirm_or_skip() { return 0; }
+    prompt_yes_no() { return 0; }
     tpl_build_one() {
         if [[ "$1" == "row-skip" ]]; then TPL_SKIPPED=true; else TPL_SKIPPED=false; fi
         return 0
@@ -168,7 +168,7 @@ _picker_stubs() {
     tpl_api_resolve_targets() { :; }
     tpl_template_name() { echo "$1"; }
     tpl_field() { echo "$1"; }
-    confirm_or_skip() { return 0; }
+    prompt_yes_no() { return 0; }
     tpl_build_one() { TPL_SKIPPED=false; return 0; }
     run build_vm_templates
     [ "$status" -eq 0 ]

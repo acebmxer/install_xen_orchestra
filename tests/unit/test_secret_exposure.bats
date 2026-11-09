@@ -50,9 +50,9 @@ PY
 }
 
 @test "no curl call in the script puts the XO token on its command line" {
-    # The token reaches curl only through xo_cookie_config. The one remaining
-    # authenticationToken= on a command line is xo-cli proxy.register, which
-    # takes it no other way.
+    # The token reaches curl only through xo_cookie_config, and xo-cli's
+    # proxy.register is made by xo_cli_proxy_register, not with the token as an
+    # argument.
     run grep -nE '(-b|--cookie) +"?authenticationToken=' "$SCRIPT"
     [ "$status" -ne 0 ]
     run grep -nE 'authenticationToken=\$' "$SCRIPT"
@@ -220,4 +220,67 @@ EOF
         rm -f "$CONFIG_FILE"
     ' _ "$SCRIPT"
     [[ "$output" == *"TRACE_BACK_ON"* ]]
+}
+
+# A stand-in xo-cli install: index.mjs for the path lookup, and an xo-lib that
+# records what it was given instead of talking to a server.
+make_fake_xo_cli() {
+    FAKE_CLI="${TMPDIR_TEST}/fake/xo-cli"
+    mkdir -p "${FAKE_CLI}/node_modules/xo-lib" "${TMPDIR_TEST}/bin" "${TMPDIR_TEST}/xo-cli"
+    : > "${FAKE_CLI}/index.mjs"
+    printf '{"main":"index.js"}' > "${FAKE_CLI}/node_modules/xo-lib/package.json"
+    cat > "${FAKE_CLI}/node_modules/xo-lib/index.js" <<'JS'
+const fs = require("fs");
+class Xo {
+  constructor(o) { this.o = o; }
+  async open() {}
+  async signIn(c) { this.c = c; }
+  async call(m, p) {
+    fs.writeFileSync(process.env.FAKE_XO_LOG,
+      JSON.stringify({ o: this.o, c: this.c, m, p, argv: process.argv }));
+    if (process.env.FAKE_XO_FAIL) throw new Error("rejected by XO");
+  }
+  async close() {}
+}
+exports.default = Xo;
+JS
+    ln -s "${FAKE_CLI}/index.mjs" "${TMPDIR_TEST}/bin/xo-cli"
+    printf '{"server":"wss://xo.example.test","token":"api-tok","allowUnauthorized":true}' \
+        > "${TMPDIR_TEST}/xo-cli/config.json"
+    PATH="${TMPDIR_TEST}/bin:$PATH"
+    export FAKE_XO_LOG="${TMPDIR_TEST}/call.json"
+}
+
+@test "xo_cli_proxy_register sends proxy.register without the token in any argument" {
+    command -v node >/dev/null || skip "node not installed"
+    make_fake_xo_cli
+    local tok='proxy"tok\en'
+
+    xo_cli_proxy_register "$TMPDIR_TEST" "10.0.0.5:443" "vm-uuid-1" tok
+
+    run node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1]));
+        console.log([c.m, c.p.authenticationToken===process.argv[2], c.p.address, c.p.vmUuid,
+        c.c.token, c.o.url, c.o.rejectUnauthorized, c.argv.join(" ").includes(process.argv[2])].join(" "))' \
+        "$FAKE_XO_LOG" "$tok"
+    [ "$output" = "proxy.register true 10.0.0.5:443 vm-uuid-1 api-tok wss://xo.example.test false false" ]
+}
+
+@test "xo_cli_proxy_register fails and prints XO's error when the call is rejected" {
+    command -v node >/dev/null || skip "node not installed"
+    make_fake_xo_cli
+    local tok="secret-proxy-token"
+    export FAKE_XO_FAIL=1
+
+    run xo_cli_proxy_register "$TMPDIR_TEST" "10.0.0.5:443" "vm-uuid-1" tok
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"rejected by XO"* ]]
+    [[ "$output" != *"$tok"* ]]
+}
+
+@test "--proxy registers the proxy through xo_cli_proxy_register" {
+    # Only the manual-fallback line printed to the terminal may name it.
+    run bash -c "grep -nE '^[[:space:]]*[^#[:space:]].*xo-cli proxy\\.register' '$SCRIPT' | grep -v 'echo \"xo-cli proxy.register'"
+    [ "$status" -ne 0 ]
+    run grep -n 'if xo_cli_proxy_register ' "$SCRIPT"
+    [ "$status" -eq 0 ]
 }

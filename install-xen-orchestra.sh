@@ -174,6 +174,84 @@ fs.chmodSync(file, 0o600);
     return "$rc"
 }
 
+# Register an XO Proxy with Xen Orchestra: `xo-cli proxy.register`, but with
+# the proxy's authentication token kept off the command line.
+#
+# xo-cli takes a method's parameters only as <name>=<value> arguments, which
+# any local user can read in ps and /proc/<pid>/cmdline for as long as the
+# command runs. So the same call is made with xo-lib, the library xo-cli
+# itself uses, loaded from the xo-cli install and signed in with the token in
+# xo-cli's settings file. The token, address and VM UUID go in through the
+# environment, which other users cannot read. Arguments: the config home, the
+# address ("ip:443"), the VM UUID, and the name of the variable holding the
+# token. Exits non-zero, with XO's error on stderr, if the call fails.
+# "Do not add a third" way of calling xo-cli with a secret: use this.
+xo_cli_proxy_register() {
+    local -
+    set +x
+    local config_home="$1" address="$2" vm_uuid="$3" token_var="$4" cli_entry rc=0
+    cli_entry=$(readlink -f "$(command -v xo-cli)") || return 1
+    XO_REG_ENTRY="$cli_entry" XO_REG_CFG_HOME="$config_home" XO_REG_ADDRESS="$address" \
+        XO_REG_VM_UUID="$vm_uuid" XO_REG_TOKEN="${!token_var}" \
+        node -e '
+const fs = require("fs"), path = require("path");
+const Xo = require(require("module").createRequire(process.env.XO_REG_ENTRY).resolve("xo-lib")).default;
+const cfg = JSON.parse(fs.readFileSync(path.join(process.env.XO_REG_CFG_HOME, "xo-cli", "config.json"), "utf8"));
+(async () => {
+  const xo = new Xo({ rejectUnauthorized: !cfg.allowUnauthorized, url: cfg.server });
+  await xo.open();
+  try {
+    await xo.signIn({ token: cfg.token });
+    await xo.call("proxy.register", {
+      authenticationToken: process.env.XO_REG_TOKEN,
+      address: process.env.XO_REG_ADDRESS,
+      vmUuid: process.env.XO_REG_VM_UUID,
+    });
+  } finally {
+    await xo.close();
+  }
+})().catch(e => { console.error(e && e.message ? e.message : String(e)); process.exit(1); });
+' || rc=$?
+    return "$rc"
+}
+
+# Cleanups to run when the script exits.
+#
+# bash keeps ONE EXIT trap: `trap a EXIT; trap b EXIT` runs only b, and
+# `trap - EXIT` drops everything. The lock release, the --proxy, --deploy,
+# TwinStor and template-build work directories each set their own, so when two
+# ran in one pass (the menu allows it) the earlier one's cleanup never ran and
+# its work directory, which holds the deploy key and pinned host key, stayed in
+# /tmp. Every cleanup is registered here instead: one EXIT trap runs them all,
+# last registered first. "Do not add a third" way of setting an EXIT trap: use
+# these. (The one in the expect helper's heredoc is a separate process.)
+EXIT_CLEANUPS=()
+
+run_exit_cleanups() {
+    local i
+    for ((i = ${#EXIT_CLEANUPS[@]} - 1; i >= 0; i--)); do
+        # One failing cleanup must not stop the ones before it.
+        eval "${EXIT_CLEANUPS[i]}" || true
+    done
+}
+
+# Run the command string $1 at exit. Registering the same string again moves
+# it to the end rather than running it twice.
+add_exit_cleanup() {
+    remove_exit_cleanup "$1"
+    EXIT_CLEANUPS+=("$1")
+    trap run_exit_cleanups EXIT
+}
+
+# Forget the command string $1, for a cleanup already done by hand.
+remove_exit_cleanup() {
+    local c keep=()
+    for c in ${EXIT_CLEANUPS[@]+"${EXIT_CLEANUPS[@]}"}; do
+        [[ "$c" == "$1" ]] || keep+=("$c")
+    done
+    EXIT_CLEANUPS=(${keep[@]+"${keep[@]}"})
+}
+
 # Acquire an exclusive lock on XO_LOCKFILE using flock.
 # The lock is held on file descriptor XO_LOCK_FD for the lifetime of the
 # process.  A trap ensures the lock is always released on exit/signal.
@@ -188,8 +266,11 @@ acquire_lock() {
         log_warning "Could not create $XO_LOCKFILE; proceeding without lock."
         return 0
     fi
-    # Ensure the current (non-root) user can open the lockfile for flock
-    sudo chmod 666 "$XO_LOCKFILE" 2>/dev/null || true
+    # Let only the invoking user (and root) open the lockfile for flock. It must
+    # not be world-writable: any local user could otherwise hold the lock and
+    # stop the installer, or overwrite the PID written into it.
+    sudo chown "$(id -u):$(id -g)" "$XO_LOCKFILE" 2>/dev/null || true
+    sudo chmod 600 "$XO_LOCKFILE" 2>/dev/null || true
 
     # Open the lockfile on fd XO_LOCK_FD
     eval "exec ${XO_LOCK_FD}>'${XO_LOCKFILE}'" 2>/dev/null || {
@@ -207,7 +288,7 @@ acquire_lock() {
     { echo "$$" >&"$XO_LOCK_FD"; } 2>/dev/null || true
 
     # Release the lock on any exit
-    trap 'flock -u '"$XO_LOCK_FD"' 2>/dev/null || true' EXIT
+    add_exit_cleanup "flock -u ${XO_LOCK_FD} 2>/dev/null || true"
 }
 
 # Explicitly release the lock (called just before exec-restart so the child
@@ -216,23 +297,11 @@ release_lock() {
     flock -u "$XO_LOCK_FD" 2>/dev/null || true
 }
 
-# In non-interactive mode auto-confirms and returns 0; otherwise prompts [y/N].
-# Usage: confirm_or_skip "Description" || { log_info "Cancelled."; exit 0; }
-confirm_or_skip() {
-    local message="$1"
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
-        log_info "Non-interactive: auto-confirming: $message"
-        return 0
-    fi
-    echo -n "${message} [y/N]: "
-    local reply
-    read -t 300 -r reply || { log_error "Input timeout"; exit 1; }
-    [[ "$reply" == [Yy] ]]
-}
-
-# Strict yes/no prompt: re-asks until the user types y/yes or n/no.
-# Unlike confirm_or_skip, blank or garbage input is rejected, not treated as "no".
+# The one yes/no prompt for the whole script: reads the terminal (/dev/tty),
+# never stdin, so piped input cannot answer it. Re-asks until the user types
+# y/yes or n/no; blank or garbage input is rejected, not treated as "no".
 # Returns 0 for yes, 1 for no. In non-interactive mode auto-answers yes.
+# Do not add a second yes/no helper or an inline `read` y/N test.
 # Usage: if prompt_yes_no "Do the thing?"; then ...; fi
 prompt_yes_no() {
     local message="$1"
@@ -396,7 +465,7 @@ self_update_script() {
         else
             log_warning "Local modifications detected in ${SCRIPT_DIR}."
         fi
-        # confirm_or_skip auto-confirms under --non-interactive, which would run
+        # prompt_yes_no auto-confirms under --non-interactive, which would run
         # reset --hard and clean -fd with nobody there to see the prompt. Never
         # discard local work unattended; leave the checkout alone instead.
         if [[ "$NON_INTERACTIVE" == "true" ]]; then
@@ -404,7 +473,7 @@ self_update_script() {
             log_warning "Self-update skipped. Continuing with current version."
             return 0
         fi
-        if ! confirm_or_skip "Reset to origin/${current_branch}? Local changes will be lost."; then
+        if ! prompt_yes_no "Reset to origin/${current_branch}? Local changes will be lost."; then
             log_warning "Self-update skipped. Continuing with current version."
             return 0
         fi
@@ -502,7 +571,9 @@ load_config() {
     SNAPSHOT_KEEP=${SNAPSHOT_KEEP:-3}
     SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS:-14}
     TURBO_CACHE_ENABLED=${TURBO_CACHE_ENABLED:-true}
-    NODE_VERSION=${NODE_VERSION:-24.21.0}
+    TWINSTOR_VERSION=${TWINSTOR_VERSION:-0.7.4}
+    TWINSTOR_SHA256=${TWINSTOR_SHA256:-0122a43a1b07bb253a33e5ec1b947a0eb9490ecbc83347585eeed804c20679f4}
+    NODE_VERSION=${NODE_VERSION:-lts}
     SERVICE_USER=${SERVICE_USER:-root}
     DEBUG_MODE=${DEBUG_MODE:-false}
     BIND_ADDRESS=${BIND_ADDRESS:-0.0.0.0}
@@ -623,9 +694,9 @@ validate_config() {
         errors+=("XO_PROXY_CHANNEL must be 'stable' or 'latest', got: ${XO_PROXY_CHANNEL:-}")
     fi
 
-    # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1)
-    if ! [[ "$NODE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-        errors+=("NODE_VERSION must be a valid version number (e.g. 22, 22.3), got: $NODE_VERSION")
+    # Validate NODE_VERSION is a valid version (e.g. 22, 22.3, 22.3.1) or "lts"
+    if ! [[ "$NODE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] && [[ "${NODE_VERSION,,}" != "lts" ]]; then
+        errors+=("NODE_VERSION must be a valid version number (e.g. 22, 22.3) or lts, got: $NODE_VERSION")
     fi
 
     # Validate SSL_CERT_DAYS is a sane certificate lifetime
@@ -1295,6 +1366,7 @@ remove_existing_nodejs() {
     if [[ -d /usr/lib/node_modules ]]; then
         run_cmd sudo rm -rf /usr/lib/node_modules
     fi
+    remove_dangling_yarn_links
 
     # Remove NodeSource repository entries so the new version's repo is the only one
     if [[ "$PKG_MANAGER" == "apt" ]]; then
@@ -1305,12 +1377,43 @@ remove_existing_nodejs() {
     fi
 }
 
+# Print the major version of the newest Node.js LTS line, read from the release
+# index nodejs.org publishes (https://nodejs.org/dist/index.json). The index is
+# newest first, one release per line, and "lts" is false for a non-LTS release
+# and the codename (e.g. "Lithium") for an LTS one, so the first line with a
+# codename is the newest LTS release. Returns 1 if the index cannot be read.
+resolve_node_lts_major() {
+    local index major
+    index=$(curl -fsSL --max-time 30 https://nodejs.org/dist/index.json 2>/dev/null) || return 1
+    major=$(printf '%s\n' "$index" | grep -m1 '"lts":"' | sed -E 's/.*"version":"v([0-9]+)\..*/\1/')
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$major"
+}
+
+# Turn NODE_VERSION=lts into the major version of the newest Node.js LTS line,
+# so install_nodejs and detect_nodejs_drift work with a plain number. A numeric
+# NODE_VERSION is left untouched. Returns 1 if the LTS line cannot be looked up.
+resolve_node_version() {
+    [[ "${NODE_VERSION,,}" == "lts" ]] || return 0
+    local lts_major
+    if ! lts_major=$(resolve_node_lts_major); then
+        log_error "NODE_VERSION=lts needs the Node.js release list from nodejs.org, which could not be read."
+        log_error "  Check the network, or set NODE_VERSION to a number (e.g. 24) in xo-config.cfg."
+        return 1
+    fi
+    log_info "NODE_VERSION=lts resolved to Node.js ${lts_major} (newest LTS line on nodejs.org)"
+    NODE_VERSION="$lts_major"
+}
+
 # Install Node.js to satisfy NODE_VERSION from xo-config.cfg.
+#  - lts:                    resolves to the newest LTS major, then as below
 #  - Major-only (e.g. 22):   installs latest 22.x via NodeSource
 #  - Specific  (e.g. 22.3):  downloads exact v22.3.0 from nodejs.org;
 #                             falls back to latest 22.x via NodeSource
 #                             if that version doesn't exist
 install_nodejs() {
+    resolve_node_version || return 1
+
     log_info "Installing Node.js ${NODE_VERSION}..."
 
     NODE_MAJOR=${NODE_VERSION%%.*}
@@ -1388,9 +1491,27 @@ install_nodejs() {
     log_success "npm installed: $(npm -v)"
 }
 
+# Remove yarn/yarnpkg symlinks whose target no longer exists. Deleting the old
+# global node_modules leaves them behind, and `npm install -g yarn` then fails
+# with EEXIST. Working links are left alone.
+remove_dangling_yarn_links() {
+    local link dir
+    for dir in /usr/bin /usr/local/bin; do
+        for link in "$dir/yarn" "$dir/yarnpkg"; do
+            if [[ -L "$link" && ! -e "$link" ]]; then
+                log_info "Removing dangling link: $link"
+                run_cmd sudo rm -f "$link"
+            fi
+        done
+    done
+}
+
 # Install Yarn
 install_yarn() {
     log_info "Installing Yarn..."
+
+    # A dangling link makes `command -v yarn` fail and then blocks npm (EEXIST).
+    remove_dangling_yarn_links
 
     if command -v yarn >/dev/null 2>&1; then
         log_info "Yarn is already installed: $(yarn -v)"
@@ -1398,7 +1519,8 @@ install_yarn() {
     fi
 
     # npm 11+ (shipped with Node 22+) broke `npm install -g yarn` for yarn v1.
-    # Use corepack instead — it ships with Node.js >= 16 and is the recommended way.
+    # Use corepack when present (Node 16-24); Node 25+ no longer ships it, so
+    # those versions take the npm branch below.
     if command -v corepack >/dev/null 2>&1; then
         run_cmd sudo corepack enable
         run_cmd sudo corepack prepare yarn@stable --activate
@@ -3052,7 +3174,7 @@ restore_xo() {
     echo ""
     log_warning "You are about to restore: $SELECTED_NAME"
     log_warning "This will replace the current installation at $INSTALL_DIR"
-    confirm_or_skip "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; return 0; }
+    prompt_yes_no "Restore $SELECTED_NAME? This will replace $INSTALL_DIR" || { log_info "Restore cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
@@ -3460,6 +3582,13 @@ check_active_xo_tasks() {
 # heads-up that a runtime change is coming (install_nodejs handles the actual
 # upgrade/downgrade).
 detect_nodejs_drift() {
+    # An unreachable nodejs.org must not stop the update here; install_nodejs
+    # resolves again and fails with the real error if it still cannot.
+    if ! resolve_node_version 2>/dev/null; then
+        log_warning "Could not look up the newest Node.js LTS — skipping drift check"
+        return 0
+    fi
+
     local RUNNING_FULL
     RUNNING_FULL=$(node -v 2>/dev/null | sed 's/^v//')
     if [[ -z "$RUNNING_FULL" ]]; then
@@ -3683,7 +3812,7 @@ rebuild_xo() {
     log_warning "  3. Perform a clean rebuild"
     log_info "Settings in /etc/xo-server and /var/lib/xo-server will NOT be changed."
     echo ""
-    confirm_or_skip "Continue with rebuild?" || { log_info "Rebuild cancelled."; return 0; }
+    prompt_yes_no "Continue with rebuild?" || { log_info "Rebuild cancelled."; return 0; }
 
     # Snapshot while xo-server is still up -- it talks to the REST API on
     # localhost, so it must run before the service stops below or every
@@ -3822,7 +3951,7 @@ reconfigure_xo() {
     log_warning "Database and user data in /var/lib/xo-server will NOT be affected."
     log_warning "NFS/CIFS mounts and reverse proxy settings will continue to work."
     echo ""
-    confirm_or_skip "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; return 0; }
+    prompt_yes_no "Continue with reconfiguration?" || { log_info "Reconfiguration cancelled."; return 0; }
 
     # Stop the service
     log_info "Stopping xo-server service..."
@@ -4103,16 +4232,16 @@ install_xo_proxy() {
     echo "=============================================="
     echo ""
 
-    read -p "IP address of Pool Master: " POOL_MASTER_IP
-    if [[ -z "$POOL_MASTER_IP" ]]; then
-        log_error "Pool Master IP address is required"
-        exit 1
-    fi
+    while true; do
+        read -rp "IP address of Pool Master: " POOL_MASTER_IP || { log_error "No input"; exit 1; }
+        is_ipv4 "$POOL_MASTER_IP" && break
+        log_warning "Please enter an IPv4 address such as 192.168.1.10."
+    done
 
-    read -p "Host username [root]: " HOST_USERNAME
+    read -rp "Host username [root]: " HOST_USERNAME
     HOST_USERNAME=${HOST_USERNAME:-root}
 
-    read -sp "Host password: " HOST_PASSWORD
+    read -rsp "Host password: " HOST_PASSWORD
     echo ""
     if [[ -z "$HOST_PASSWORD" ]]; then
         log_error "Host password is required"
@@ -4130,7 +4259,7 @@ install_xo_proxy() {
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-proxy-work-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
     DEPLOY_POOL_KNOWN_HOSTS=""
-    trap 'rm -rf "$DEPLOY_WORKDIR"' EXIT
+    add_exit_cleanup 'rm -rf "$DEPLOY_WORKDIR"'
     deploy_verify_host_key
     pool_master_hostkey_opts
 
@@ -4170,10 +4299,19 @@ install_xo_proxy() {
     echo "=============================================="
     echo ""
 
-    read -p "IP address for proxy [dhcp]: " PROXY_IP
-    PROXY_IP=${PROXY_IP:-dhcp}
+    while true; do
+        read -rp "IP address for proxy [dhcp]: " PROXY_IP || { log_error "No input"; exit 1; }
+        PROXY_IP=${PROXY_IP:-dhcp}
+        is_ipv4_or_dhcp "$PROXY_IP" && break
+        log_warning "Please enter an IPv4 address, or press Enter for dhcp."
+    done
 
-    read -p "Custom NTP server (leave blank for default): " NTP_SERVER
+    while true; do
+        read -rp "Custom NTP server (leave blank for default): " NTP_SERVER || { log_error "No input"; exit 1; }
+        [[ -z "$NTP_SERVER" ]] && break
+        is_host_or_ipv4 "$NTP_SERVER" && break
+        log_warning "Please enter a host name or IPv4 address, or leave blank."
+    done
 
     # With XO_API_TOKEN set, xo-cli is registered with the token, so the XO web
     # login is never used. Vates' deploy script still asks for an account and
@@ -4191,13 +4329,13 @@ install_xo_proxy() {
         echo "=============================================="
         echo ""
 
-        read -p "Xen Orchestra login username: " XO_USERNAME
+        read -rp "Xen Orchestra login username: " XO_USERNAME
         if [[ -z "$XO_USERNAME" ]]; then
             log_error "Xen Orchestra username is required"
             exit 1
         fi
 
-        read -sp "Xen Orchestra login password: " XO_PASSWORD
+        read -rsp "Xen Orchestra login password: " XO_PASSWORD
         echo ""
         if [[ -z "$XO_PASSWORD" ]]; then
             log_error "Xen Orchestra password is required"
@@ -4221,7 +4359,7 @@ install_xo_proxy() {
     # Matches deploy_cleanup/tpl_cleanup elsewhere: an EXIT trap so a failure
     # between here and the explicit rm below (a signal, a parsing error under
     # set -euo pipefail) doesn't leave a copy of the helper script in /tmp.
-    trap 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"' EXIT
+    add_exit_cleanup 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"'
 
     # Run the expect script
     log_info "Starting XO Proxy installer on Pool Master..."
@@ -4250,7 +4388,8 @@ install_xo_proxy() {
     rm -rf "$DEPLOY_WORKDIR"
     DEPLOY_WORKDIR=""
     DEPLOY_POOL_KNOWN_HOSTS=""
-    trap - EXIT
+    remove_exit_cleanup 'rm -f "$TEMP_SCRIPT"; rm -rf "$DEPLOY_WORKDIR"'
+    remove_exit_cleanup 'rm -rf "$DEPLOY_WORKDIR"'
 
     # Use user-specified IP if not captured
     if [[ -z "$ACTUAL_PROXY_IP" ]]; then
@@ -4258,7 +4397,7 @@ install_xo_proxy() {
             ACTUAL_PROXY_IP="$PROXY_IP"
         else
             log_warning "Could not detect DHCP-assigned IP address"
-            read -p "Please enter the assigned IP address: " ACTUAL_PROXY_IP
+            read -rp "Please enter the assigned IP address: " ACTUAL_PROXY_IP
         fi
     fi
 
@@ -4267,11 +4406,11 @@ install_xo_proxy() {
         log_warning "Could not automatically extract UUID and/or authentication token"
 
         if [[ -z "$PROXY_UUID" ]]; then
-            read -p "Please enter the XO Proxy UUID: " PROXY_UUID
+            read -rp "Please enter the XO Proxy UUID: " PROXY_UUID
         fi
 
         if [[ -z "$AUTH_TOKEN" ]]; then
-            read -p "Please enter the authentication token: " AUTH_TOKEN
+            read -rp "Please enter the authentication token: " AUTH_TOKEN
         fi
     fi
 
@@ -4306,7 +4445,7 @@ install_xo_proxy() {
     # Create a temporary expect script for xo-cli registration
     XO_CLI_SCRIPT=$(mktemp --tmpdir xo-cli-XXXXXX)
     chmod 700 "$XO_CLI_SCRIPT"
-    trap 'rm -f "$XO_CLI_SCRIPT"' EXIT
+    add_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
     cat > "$XO_CLI_SCRIPT" << 'XO_CLI_EXPECT_END'
 #!/usr/bin/expect -f
 
@@ -4354,7 +4493,7 @@ XO_CLI_EXPECT_END
             log_warning "Failed to register xo-cli with XO_API_TOKEN"
             log_info "Check the token in xo-config.cfg, or remove it to log in with a username and password."
             rm -f "$XO_CLI_SCRIPT"
-            trap - EXIT
+            remove_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
             exit 1
         fi
     # The password goes to the expect script through its environment, which
@@ -4367,17 +4506,17 @@ XO_CLI_EXPECT_END
         log_info "If this account uses MFA, set XO_API_TOKEN in xo-config.cfg and run again."
         log_info "Or run manually: xo-cli register --au $XO_REGISTER_URL $XO_USERNAME"
         rm -f "$XO_CLI_SCRIPT"
-        trap - EXIT
+        remove_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
         exit 1
     fi
 
     rm -f "$XO_CLI_SCRIPT"
-    trap - EXIT
+    remove_exit_cleanup 'rm -f "$XO_CLI_SCRIPT"'
 
     # Register the proxy with Xen Orchestra
     log_info "Registering XO Proxy with Xen Orchestra..."
 
-    if xo-cli proxy.register authenticationToken="$AUTH_TOKEN" address="$ACTUAL_PROXY_IP:443" vmUuid="$PROXY_UUID"; then
+    if xo_cli_proxy_register "${XDG_CONFIG_HOME:-$HOME/.config}" "$ACTUAL_PROXY_IP:443" "$PROXY_UUID" AUTH_TOKEN; then
         log_success "XO Proxy registered successfully!"
     else
         log_error "Failed to register XO Proxy"
@@ -4551,6 +4690,10 @@ xml_escape() {
     printf '%s' "$s"
 }
 
+# The one definition of an IPv4 address's shape. Every prompt and is_ipv4 use
+# this; do not write the pattern out again.
+IPV4_SHAPE_REGEX='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
 # Validate a dotted-quad IPv4 address, octet by octet.
 #
 # The shape regex used at the prompts accepts 999.999.999.999, which would go
@@ -4558,12 +4701,27 @@ xml_escape() {
 # comes up — and that we would then wait 10 minutes for.
 is_ipv4() {
     local addr="$1" octet
-    [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    [[ "$addr" =~ $IPV4_SHAPE_REGEX ]] || return 1
     local IFS='.'
     for octet in $addr; do
         (( 10#$octet <= 255 )) || return 1
     done
     return 0
+}
+
+# Accept a host name or an IPv4 address (for example an NTP server). Anything
+# made only of digits and dots must be a real IPv4 address, so 999.1.1.1 and
+# 10.0.0. are refused rather than treated as odd-looking names.
+is_host_or_ipv4() {
+    local v="$1"
+    [[ -n "$v" && ${#v} -le 253 ]] || return 1
+    [[ "$v" =~ ^[0-9.]+$ ]] && { is_ipv4 "$v"; return; }
+    [[ "$v" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && [[ "$v" != *..* ]]
+}
+
+# The proxy's address: an IPv4 address, or "dhcp" to let the network assign one.
+is_ipv4_or_dhcp() {
+    [[ "${1,,}" == "dhcp" ]] || is_ipv4 "$1"
 }
 
 # Validate a TCP port. The installer inside the VM rejects anything outside
@@ -6432,7 +6590,7 @@ deploy_verify_host_key() {
         log_warning "Set XO_DEPLOY_POOL_FINGERPRINT to have it verified instead."
         return 0
     fi
-    if ! confirm_or_skip "Does that fingerprint match?"; then
+    if ! prompt_yes_no "Does that fingerprint match?"; then
         log_error "Host key not confirmed. Nothing has been sent to ${POOL_MASTER_IP}."
         exit 1
     fi
@@ -6774,7 +6932,7 @@ deploy_prompt_admin_password() {
     fi
     pw1=""; pw2=""
 
-    if confirm_or_skip "Also allow SSH logins with this password?"; then
+    if prompt_yes_no "Also allow SSH logins with this password?"; then
         DEPLOY_ADMIN_SSH_PWAUTH="true"
     else
         log_info "SSH stays key-only; the password is for the console, su and sudo."
@@ -6848,7 +7006,7 @@ deploy_prompt_admin_ssh_key() {
             if [[ "$DEPLOY_ADMIN_SSH_PWAUTH" != "true" ]]; then
                 log_warning "SSH password logins are off, so the console is the only way in."
             fi
-            confirm_or_skip "Continue without an SSH key?" && return 0
+            prompt_yes_no "Continue without an SSH key?" && return 0
             continue
         fi
 
@@ -6889,7 +7047,7 @@ deploy_prompt_repo_dir() {
 # image has no xe-guest-utilities, so the host cannot report a DHCP-assigned
 # address back to us and we would have no way to reach the VM afterwards.
 deploy_prompt_network_settings() {
-    local ipregex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    local ipregex="$IPV4_SHAPE_REGEX"
 
     echo ""
     echo "=============================================="
@@ -7235,7 +7393,7 @@ deploy_edit_xo_config() {
     echo "The VM's xo-config.cfg is built from ${DEPLOY_CONFIG_BASE_LABEL}."
     echo ""
 
-    confirm_or_skip "Review it in an editor before the VM is created?" || return 0
+    prompt_yes_no "Review it in an editor before the VM is created?" || return 0
 
     # Prefer whatever the user actually uses; PREFERRED_EDITOR is the config's
     # own answer to the same question. Nothing is installed for this -- deploy
@@ -7302,7 +7460,7 @@ deploy_edit_xo_config() {
         for bad in "${invalid[@]}"; do
             log_warning "  ${bad}"
         done
-        confirm_or_skip "Open it again to fix them?" || {
+        prompt_yes_no "Open it again to fix them?" || {
             log_error "Deploy cancelled — nothing was created on the pool."
             exit 1
         }
@@ -8166,11 +8324,11 @@ deploy_xo_vm() {
         exit 1
     fi
 
-    confirm_or_skip "Continue?" || { log_info "Deploy cancelled."; return 0; }
+    prompt_yes_no "Continue?" || { log_info "Deploy cancelled."; return 0; }
 
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-deploy-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
-    trap deploy_cleanup EXIT
+    add_exit_cleanup deploy_cleanup
 
     # Deploy whatever fork this checkout came from, so the VM ends up tracking
     # the same repository the user is running.
@@ -8225,7 +8383,7 @@ deploy_xo_vm() {
     echo "  Clone into:   ${DEPLOY_REPO_DIR}"
     echo "  XO config:    from ${DEPLOY_CONFIG_BASE_LABEL}"
     echo ""
-    confirm_or_skip "Create this VM?" || { log_info "Deploy cancelled."; return 0; }
+    prompt_yes_no "Create this VM?" || { log_info "Deploy cancelled."; return 0; }
 
     deploy_build_config_drive
     deploy_create_vm
@@ -8287,7 +8445,7 @@ cleanup_xo() {
         echo ""
     fi
 
-    if ! confirm_or_skip "Proceed with uninstall? This cannot be undone."; then
+    if ! prompt_yes_no "Proceed with uninstall? This cannot be undone."; then
         log_info "Uninstall cancelled."
         return 0
     fi
@@ -8345,7 +8503,7 @@ cleanup_xo() {
     if [[ -n "${SERVICE_USER:-}" ]] && [[ "$SERVICE_USER" != "root" ]]; then
         if id "$SERVICE_USER" &>/dev/null; then
             echo ""
-            if confirm_or_skip "Also delete system user '${SERVICE_USER}'?"; then
+            if prompt_yes_no "Also delete system user '${SERVICE_USER}'?"; then
                 log_info "Removing service user: ${SERVICE_USER}..."
                 run_cmd sudo userdel -r "$SERVICE_USER" 2>/dev/null || \
                     run_cmd sudo userdel "$SERVICE_USER" 2>/dev/null || true
@@ -8355,7 +8513,7 @@ cleanup_xo() {
 
     # 8. Optionally remove Redis data
     echo ""
-    if confirm_or_skip "Also purge Redis data? (WARNING: removes all Redis databases on this host)"; then
+    if prompt_yes_no "Also purge Redis data? (WARNING: removes all Redis databases on this host)"; then
         log_info "Purging Redis data..."
         purge_redis_data /var/lib/redis /var/lib/valkey
     fi
@@ -8513,7 +8671,7 @@ adjust_xo_memory() {
     log_info "ExecStart will be updated to:"
     echo "    ExecStart=${node_path} --max-old-space-size=${heap_mb} <xo-server>"
     echo ""
-    if ! confirm_or_skip "Apply this change to ${service_file}?"; then
+    if ! prompt_yes_no "Apply this change to ${service_file}?"; then
         log_info "Skipping memory allocation adjustment."
         return 0
     fi
@@ -8728,6 +8886,8 @@ show_help() {
     echo "  --proxy                Install XO Proxy on a Xen pool master"
     echo "  --deploy               Create a Debian VM on a XenServer/XCP-ng pool and install XO into it"
     echo "  --build-templates      Build cloud-init VM templates on a XenServer/XCP-ng pool"
+    echo "  --twinstor             Deploy and manage TwinStor (Vates tech preview, 2-host shared storage)"
+    echo "  --twinstor-upgrade     Update TwinStor on both hosts, one at a time (skips the TwinStor menu)"
     echo "  --adjust-memory        Adjust the heap memory allocated to the xo-server process"
     echo "  --flush-tokens         Clear stale Redis auth tokens (e.g. after restoring an XO config)"
     echo "  --uninstall            Remove XO service, install dir, certs, and sudoers (guided)"
@@ -8739,7 +8899,7 @@ show_help() {
     echo "  --help                 Show this help message"
     echo ""
     echo "Automation Flags (can be combined with any operation; --deploy and"
-    echo "--build-templates refuse --non-interactive and stop at once under --dry-run):"
+    echo "--build-templates, --twinstor refuse --non-interactive and stop at once under --dry-run):"
     echo "  --non-interactive      Bypass all interactive prompts; use config defaults"
     echo "  --yes                  Alias for --non-interactive"
     echo "  --backup-file NAME     With --restore: select specific backup by directory name"
@@ -8764,6 +8924,1780 @@ show_help() {
     echo "  If xo-config.cfg is not found, it will be created automatically."
     echo "  To switch branches, edit GIT_BRANCH in xo-config.cfg and run --update."
     echo ""
+}
+
+# ============================================================================
+# TwinStor (Vates tech preview): replicated shared storage for a two-host pool
+#
+# Deploys and manages TwinStor from the menu and with --twinstor, following
+# Vates' own pages:
+#   https://cdn.vates.tech/twinstor/deploy/
+#   https://docs.vates.tech/tech-preview/twinstor/
+#
+# Everything here runs on the pool's hosts over SSH, as root, using the same
+# connection code as --deploy (pool master address, password, host key
+# pinned before the password is sent). Nothing is installed on this machine.
+#
+# TwinStor is a Vates tech preview for lab pools. Setup erases a disk or
+# partition on each host, so the install needs a typed confirmation, and the
+# whole feature refuses --non-interactive.
+#
+# The bundle version and its SHA-256 come from TWINSTOR_VERSION and
+# TWINSTOR_SHA256 (xo-config.cfg), so a new Vates build is a config change.
+# The download URL is built from the version; the hash is checked on each host
+# before anything is extracted, and a mismatch stops the run.
+# ============================================================================
+
+# Filled in by ts_discover_hosts: parallel arrays, one entry per pool host.
+TS_HOST_UUIDS=()
+TS_HOST_NAMES=()
+TS_HOST_IPS=()
+TS_MASTER_IDX=0
+# Chosen by the deploy: "fate-shared" or "arbitrated".
+TS_TOPOLOGY="fate-shared"
+# Arbitrated only: the direct-link address for each host, same order as TS_HOST_IPS.
+TS_DIRECT_IPS=()
+# The data device chosen for each host, same order as TS_HOST_IPS.
+TS_DEVICES=()
+# True when the wizard has to be driven by hand because the flags needed to
+# script it are not there (see ts_choose_setup_mode).
+TS_ATTENDED="false"
+# Results of ts_pick_host and ts_pick_device.
+TS_PICK=""
+TS_PICKED_DEVICE=""
+# The CHAP password this run gives both hosts, kept only so it can be hidden
+# from anything printed (see ts_redact).
+TS_CHAP=""
+# Extra tie-breaker addresses, space separated.
+TS_PING_TARGETS=""
+
+# --- Pure helpers (no I/O; unit-tested) --------------------------------------
+
+ts_valid_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+ts_valid_sha256() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+# A block device path as it can be typed: /dev/..., including /dev/disk/by-id/
+# names and /dev/zvol/<pool>/<dataset>. No quotes, spaces or shell characters,
+# because the value ends up in a command run on the host.
+ts_valid_device() { [[ "$1" =~ ^/dev/[A-Za-z0-9._/:+-]+$ ]] && [[ "$1" != *..* ]]; }
+
+ts_bundle_name() { printf 'twinstor-test-%s.tar.gz' "$TWINSTOR_VERSION"; }
+ts_bundle_url() {
+    printf 'https://github.com/vatesfr/twinstor/releases/download/v%s/%s' \
+        "$TWINSTOR_VERSION" "$(ts_bundle_name)"
+}
+
+# The bundle pin must be well formed before it is used in a command on a host.
+ts_check_pin() {
+    if ! ts_valid_version "${TWINSTOR_VERSION:-}"; then
+        log_error "TWINSTOR_VERSION must look like 0.7.4, got: ${TWINSTOR_VERSION:-}"
+        return 1
+    fi
+    if ! ts_valid_sha256 "${TWINSTOR_SHA256:-}"; then
+        log_error "TWINSTOR_SHA256 must be 64 lowercase hex characters, got: ${TWINSTOR_SHA256:-}"
+        return 1
+    fi
+}
+
+# dom0 memory (MiB) Vates recommends for a pool with this many VMs:
+# 1 GiB + 16 MiB per VM, plus a 30% margin. Counts every VM, because after a
+# failover one host has to run the VMs of both.
+ts_dom0_required_mib() {
+    local vms="$1"
+    echo $(( (1024 + 16 * vms) * 130 / 100 ))
+}
+
+# True when `twinstor status` output says the pair is healthy and this host is
+# ready to serve. Accepts `status --plain` ("health<TAB>healthy",
+# "readiness<TAB>ready") and the two human layouts Vates' pages show
+# ("health: healthy", "● healthy:"). "unhealthy" matches none of them.
+ts_status_ok() {
+    local text="$1"
+    grep -qiE '(^|[^[:alnum:]_])health:?[[:space:]]+healthy([[:space:]]|$)|●[[:space:]]*healthy' <<< "$text" || return 1
+    grep -qiE '(^|[^[:alnum:]_])readiness:?[[:space:]]+ready([[:space:]]|$)' <<< "$text"
+}
+
+# Hide the CHAP password from anything printed: the one this run generated,
+# and any "--chap-password X" or "CHAP password: X" in output from the hosts.
+ts_redact() {
+    local extra=()
+    if [[ -n "${TS_CHAP:-}" ]]; then
+        extra=(-e "s/${TS_CHAP}/<hidden>/g")
+    fi
+    sed -E \
+        -e "s/(--chap-password[ =]+)['\"]?[^'\" ]+['\"]?/\1<hidden>/g" \
+        -e "s/((chap[^:]*(password|secret)[^:]*:)[[:space:]]*).*/\1<hidden>/I" \
+        ${extra[@]+"${extra[@]}"}
+}
+
+# A CHAP password for the pair: 16 hex characters, so nothing in it needs
+# quoting and it fits the 12-16 character range iSCSI CHAP targets accept.
+ts_new_chap_password() {
+    local raw
+    raw=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '%s' "${raw:0:16}"
+}
+
+# True when `twinstor setup --help` text mentions this flag.
+ts_help_has_flag() {
+    local help="$1" flag="$2"
+    grep -qE -- "(^|[^[:alnum:]_-])${flag}([^[:alnum:]_-]|$)" <<< "$help"
+}
+
+# The flags scripted setup needs, all documented by Vates for
+# `twinstor setup --peer-ip <IP> --backing-device <dev> --yes`.
+ts_setup_flags_present() {
+    local help="$1" f
+    for f in --peer-ip --backing-device --yes; do
+        ts_help_has_flag "$help" "$f" || return 1
+    done
+}
+
+# Notes printed before upgrading, from the installed version to the pinned one
+# (Vates' Updates page and deploy guide). Arguments: installed, target.
+ts_upgrade_notes() {
+    local from="$1" to="$2"
+    local fmaj="${from%%.*}" frest="${from#*.}"
+    local fmin="${frest%%.*}"
+    local tmin
+    tmin=$(cut -d. -f2 <<< "$to")
+    if [[ "$fmaj" == "0" && "$fmin" -le 6 && "$tmin" -ge 7 ]]; then
+        echo "From 0.6.x to 0.7.x: upgrade the two hosts back to back, with no network work in between."
+        echo "  Fate-shared freeze mode starts once both hosts run 0.7.0 or later, and it turns the pool's"
+        echo "  ha-reboot-vm-on-internal-shutdown off: a protected VM shut down from inside the guest is no"
+        echo "  longer restarted by HA."
+    fi
+    if [[ "$fmaj" == "0" && "$fmin" -eq 7 ]]; then
+        local fpatch="${frest#*.}"
+        if [[ "$fpatch" -le 1 ]]; then
+            echo "From 0.7.0/0.7.1: upgrade the two hosts back to back; the fixes only apply once both run the new build."
+        fi
+        if [[ "$fpatch" -le 2 ]]; then
+            echo "From 0.7.2 or older: scripts that run 'twinstor setup' with flags now need --yes."
+        fi
+    fi
+}
+
+# --- SSH to the pool's hosts ---------------------------------------------------
+
+# Run a command on a pool host other than the master. dom0_exec only reaches
+# the master, so this is the same call with its own control socket and the
+# host's own pinned key (see ts_pin_host_key). The password is the one for the
+# master: a host joins a pool with the master's root password.
+ts_ssh() {
+    # sshpass reads the password from the environment, which xtrace would print.
+    local -
+    set +x
+
+    local ip="$1"; shift
+    local rc=0
+    local common=(
+        -o ControlMaster=auto
+        -o ControlPath="${DEPLOY_WORKDIR}/ssh-ctl-${ip}"
+        -o ControlPersist=600
+        -o ConnectTimeout=15
+        -o UserKnownHostsFile="${DEPLOY_WORKDIR}/known_hosts_${ip}"
+        -o StrictHostKeyChecking=yes
+    )
+    if [[ "$DEPLOY_AUTH_MODE" == "sshpass" ]]; then
+        SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${common[@]}" \
+            "${HOST_USERNAME}@${ip}" "$@" || rc=$?
+    else
+        ssh "${common[@]}" "${HOST_USERNAME}@${ip}" "$@" || rc=$?
+    fi
+    return $rc
+}
+
+# Run a command on any pool host by address.
+ts_exec() {
+    local ip="$1"; shift
+    if [[ "$ip" == "$POOL_MASTER_IP" ]]; then
+        dom0_exec "$@"
+    else
+        ts_ssh "$ip" "$@"
+    fi
+}
+
+# Run a script on a host: the script goes in on stdin and the arguments are
+# quoted, so nothing in them is read as shell.
+# Usage: ts_exec_script <ip> '<script text>' [arg ...]
+ts_exec_script() {
+    local ip="$1" script="$2"; shift 2
+    local qargs="" a
+    for a in "$@"; do
+        qargs+=" $(printf '%q' "$a")"
+    done
+    printf '%s\n' "$script" | ts_exec "$ip" "bash -s --${qargs}"
+}
+
+# Like ts_exec but with a terminal, for the wizard. Foreground only.
+ts_exec_tty() {
+    local -
+    set +x
+
+    local ip="$1"; shift
+    local rc=0
+    local common=(-tt -o ConnectTimeout=15)
+    if [[ "$ip" == "$POOL_MASTER_IP" ]]; then
+        pool_master_hostkey_opts
+        common+=("${POOL_HOSTKEY_OPTS[@]}")
+    else
+        common+=(-o UserKnownHostsFile="${DEPLOY_WORKDIR}/known_hosts_${ip}" -o StrictHostKeyChecking=yes)
+    fi
+    if [[ "$DEPLOY_AUTH_MODE" == "sshpass" ]]; then
+        SSHPASS="$HOST_PASSWORD" sshpass -e ssh "${common[@]}" "${HOST_USERNAME}@${ip}" "$@" || rc=$?
+    else
+        ssh "${common[@]}" "${HOST_USERNAME}@${ip}" "$@" || rc=$?
+    fi
+    return $rc
+}
+
+# Show a pool member's SSH host key and pin it for this run. The master's key
+# is checked by deploy_verify_host_key; the other host has the same need,
+# because the same password goes to it.
+ts_pin_host_key() {
+    local ip="$1"
+    local scan="${DEPLOY_WORKDIR}/hostkey_${ip}"
+    local pinned="${DEPLOY_WORKDIR}/known_hosts_${ip}"
+    local one="${DEPLOY_WORKDIR}/hostkey_line_${ip}"
+
+    if ! ssh-keyscan -T 10 "$ip" > "$scan" 2>/dev/null || [[ ! -s "$scan" ]]; then
+        log_error "Could not read the SSH host key of ${ip}. Check that it is reachable on port 22."
+        return 1
+    fi
+    local fp_line fp
+    fp_line=$(ssh-keygen -lf "$scan" 2>/dev/null | grep -i 'ED25519' | head -1) || true
+    [[ -n "$fp_line" ]] || fp_line=$(ssh-keygen -lf "$scan" 2>/dev/null | head -1)
+    fp=$(awk '{print $2}' <<< "$fp_line")
+    if [[ -z "$fp" ]]; then
+        log_error "Could not fingerprint the host key of ${ip}."
+        return 1
+    fi
+
+    echo ""
+    log_warning "First connection to ${ip}: its SSH host key is not known yet."
+    echo ""
+    echo "  ${fp_line}"
+    echo ""
+    echo "  The host password is sent to this address. To check, run on that host:"
+    echo "    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
+    echo ""
+    if ! prompt_yes_no "Does that fingerprint match?"; then
+        log_error "Host key not confirmed. Nothing has been sent to ${ip}."
+        return 1
+    fi
+
+    : > "$pinned" && chmod 600 "$pinned"
+    local line lfp
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        printf '%s\n' "$line" > "$one"
+        lfp=$(ssh-keygen -lf "$one" 2>/dev/null | awk '{print $2}')
+        [[ "$lfp" == "$fp" ]] && printf '%s\n' "$line" >> "$pinned"
+    done < "$scan"
+    rm -f "$one"
+    if [[ ! -s "$pinned" ]]; then
+        log_error "Could not pin the checked host key of ${ip}."
+        return 1
+    fi
+}
+
+# --- Session -----------------------------------------------------------------
+
+ts_cleanup() {
+    deploy_xapi_logout
+    local ctl
+    for ctl in "${DEPLOY_WORKDIR:-/nonexistent}"/ssh-ctl-*; do
+        [[ -S "$ctl" ]] || continue
+        ssh -o ControlPath="$ctl" -O exit "${HOST_USERNAME:-root}@${ctl##*/ssh-ctl-}" 2>/dev/null || true
+    done
+    if [[ -n "${DEPLOY_SSH_CTL:-}" && -S "${DEPLOY_SSH_CTL}" ]]; then
+        ssh -o ControlPath="$DEPLOY_SSH_CTL" -O exit \
+            "${HOST_USERNAME:-root}@${POOL_MASTER_IP:-}" 2>/dev/null || true
+    fi
+    if [[ -n "${DEPLOY_WORKDIR:-}" && -d "$DEPLOY_WORKDIR" ]]; then
+        rm -rf "$DEPLOY_WORKDIR"
+    fi
+}
+
+# Read the pool's hosts: uuid, name and management address, and which is master.
+# Pins and tests the SSH key of every host that is not the master.
+ts_discover_hosts() {
+    local raw master_uuid line
+    raw=$(dom0_exec 'for u in $(xe host-list params=uuid --minimal | tr "," " "); do
+            n=$(xe host-param-get uuid=$u param-name=name-label 2>/dev/null)
+            a=$(xe host-param-get uuid=$u param-name=address 2>/dev/null)
+            echo "$u|$n|$a"
+        done' | tr -d '\r')
+    master_uuid=$(dom0_xe "pool-list params=master --minimal")
+
+    TS_HOST_UUIDS=(); TS_HOST_NAMES=(); TS_HOST_IPS=(); TS_MASTER_IDX=0
+    local u n a i=0
+    while IFS='|' read -r u n a; do
+        [[ -n "$u" ]] || continue
+        TS_HOST_UUIDS+=("$u"); TS_HOST_NAMES+=("$n"); TS_HOST_IPS+=("$a")
+        [[ "$u" == "$master_uuid" ]] && TS_MASTER_IDX=$i
+        i=$((i + 1))
+    done <<< "$raw"
+
+    if [[ ${#TS_HOST_UUIDS[@]} -eq 0 ]]; then
+        log_error "Could not read the pool's hosts."
+        return 1
+    fi
+    # Reach the master by the address that was typed, whatever the pool calls it.
+    TS_HOST_IPS[TS_MASTER_IDX]="$POOL_MASTER_IP"
+
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        [[ $i -eq $TS_MASTER_IDX ]] && continue
+        if [[ ! -s "${DEPLOY_WORKDIR}/known_hosts_${TS_HOST_IPS[$i]}" ]]; then
+            ts_pin_host_key "${TS_HOST_IPS[$i]}" || return 1
+        fi
+        if ! ts_ssh "${TS_HOST_IPS[$i]}" true; then
+            log_error "Could not connect to ${TS_HOST_NAMES[$i]} (${TS_HOST_IPS[$i]}) with the pool master's password."
+            return 1
+        fi
+    done
+}
+
+# What must hold before TwinStor asks anything: a terminal, a usable bundle pin,
+# and not --dry-run. Returns 1 under --dry-run (nothing to simulate); exits on
+# the others.
+ts_precheck() {
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_error "TwinStor operations cannot be combined with --non-interactive."
+        log_error "They erase disks and need answers that only exist at the prompts."
+        exit 1
+    fi
+    ts_check_pin || exit 1
+
+    echo ""
+    echo "=============================================="
+    echo "  TwinStor (Vates tech preview)"
+    echo "=============================================="
+    echo ""
+    echo "  TwinStor is a pre-release build for LAB pools. Vates says not to run it"
+    echo "  in production, and to keep backing up your VMs."
+    echo ""
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warning "[DRY-RUN] TwinStor operations run on remote hosts and cannot be"
+        log_warning "[DRY-RUN] meaningfully simulated. No changes were made."
+        return 1
+    fi
+}
+
+# Common start of every TwinStor operation: the checks above, then connect to
+# the pool and list its hosts.
+ts_session_start() {
+    ts_precheck || return 1
+    ts_connect_pool
+}
+
+# The connection half of ts_session_start, shared with the XOSTOR sub-menu,
+# which has its own banner and checks: SSH tools, a work directory, the pool
+# master (host key checked before the password is sent), then the host list.
+ts_connect_pool() {
+    local missing=() cmd
+    for cmd in ssh ssh-keygen ssh-keyscan; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required commands: ${missing[*]}"
+        log_error "Install your distribution's openssh-client package and retry."
+        exit 1
+    fi
+
+    DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-twinstor-XXXXXX)
+    chmod 700 "$DEPLOY_WORKDIR"
+    DEPLOY_POOL_KNOWN_HOSTS=""
+    add_exit_cleanup ts_cleanup
+
+    deploy_connect_pool_master
+    ts_discover_hosts || exit 1
+}
+
+# Prompt for a typed word. Anything else cancels. Used before every step that
+# erases a disk or removes TwinStor.
+ts_typed_confirm() {
+    local prompt="$1" expected="$2" reply
+    echo -n "${prompt} "
+    read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+    [[ "$reply" == "$expected" ]]
+}
+
+# Print "name (address)" for a host index.
+ts_host_label() { echo "${TS_HOST_NAMES[$1]} (${TS_HOST_IPS[$1]})"; }
+
+# Run a command on every host and show each one's output under its name.
+ts_each_host() {
+    local cmd="$1" i
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        echo ""
+        echo "---- $(ts_host_label "$i") ----"
+        ts_exec "${TS_HOST_IPS[$i]}" "$cmd" 2>&1 | tr -d '\r' | ts_redact || true
+    done
+}
+
+# Pick one host. Sets TS_PICK to its index. One host needs no question.
+ts_pick_host() {
+    local prompt="$1" i opts=()
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        opts+=("${i}|$(ts_host_label "$i")")
+    done
+    deploy_choose "$prompt" "${opts[@]}"
+    TS_PICK="$DEPLOY_CHOICE"
+}
+
+# Every host must have the twinstor command before a management step runs.
+ts_require_installed() {
+    local i
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        if ! ts_exec "${TS_HOST_IPS[$i]}" "command -v twinstor" >/dev/null 2>&1; then
+            log_error "TwinStor is not installed on $(ts_host_label "$i")."
+            log_error "Use Deploy first."
+            return 1
+        fi
+    done
+}
+
+# Poll `twinstor status` on a host until it reports healthy and ready.
+# Arguments: ip, timeout in seconds. Returns 1 on timeout.
+ts_wait_healthy() {
+    local ip="$1" limit="${2:-1200}" waited=0 out
+    while (( waited < limit )); do
+        out=$(ts_exec "$ip" "twinstor status --plain" 2>&1 | tr -d '\r') || true
+        if ts_status_ok "$out"; then
+            return 0
+        fi
+        sleep 15
+        waited=$((waited + 15))
+    done
+    return 1
+}
+
+# --- Preflight (read only) ---------------------------------------------------
+
+# Install-time facts about a host, one "key=value" per line.
+ts_host_facts_script() {
+    cat <<'TS_FACTS_EOF'
+echo "mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+echo "twinstor=$(twinstor --version 2>/dev/null | head -1)"
+echo "release=$(rpm -q xcp-ng-release 2>/dev/null | head -1)"
+echo "xapi=$(rpm -q xapi-core 2>/dev/null | head -1)"
+echo "xen=$(rpm -q xen-hypervisor 2>/dev/null | head -1)"
+TS_FACTS_EOF
+}
+
+# Print a fact from ts_host_facts_script output.
+ts_fact() {
+    local facts="$1" key="$2"
+    sed -n "s/^${key}=//p" <<< "$facts" | head -1
+}
+
+# Shell function, for a host: print the most stable /dev/disk/by-id name for a
+# device, or the device itself when there is none. Vates asks for the by-id path
+# because /dev/sdX can name a different disk after a reboot. Names that end in a
+# vendor-and-serial are preferred over wwn-/nvme-eui-/scsi-3 ones.
+ts_byid_fn() {
+    cat <<'TS_BYID_EOF'
+byid() {
+    d=$(readlink -f "$1"); best=""; any=""
+    for l in ${TS_BYID_DIR:-/dev/disk/by-id}/*; do
+        [ -L "$l" ] || continue
+        [ "$(readlink -f "$l")" = "$d" ] || continue
+        case "$l" in */dm-*|*/lvm-*) continue ;; esac
+        case "$l" in
+            */wwn-*|*/nvme-eui.*|*/scsi-3*) [ -n "$any" ] || any=$l ;;
+            *) [ -n "$best" ] || best=$l ;;
+        esac
+    done
+    echo "${best:-${any:-$1}}"
+}
+TS_BYID_EOF
+}
+
+# Free disks and partitions on a host, one "device|bytes|stable name|model|
+# serial|kind" per line, kind being disk or partition. Follows the reasons
+# `twinstor setup` gives for not offering a device, read from the 0.7.4 binary:
+#   - a disk that has partitions is not offered; its partitions are
+#   - nothing may be mounted, used as swap, an LVM physical volume, or have
+#     anything stacked on it (md RAID, LVM, multipath, DRBD)
+#   - nothing on the system disk, except a partition labelled twinstor-data
+# setup refuses anything it will not use, so this only keeps the list short.
+ts_disk_candidates_script() {
+    ts_byid_fn
+    cat <<'TS_DISKS_EOF'
+pvs_list=$(pvs --noheadings -o pv_name 2>/dev/null | tr -d ' ')
+swaps=$(awk 'NR>1{print $1}' /proc/swaps)
+sysdisks=$(lsblk -snr -o NAME,TYPE "$(findmnt -no SOURCE / 2>/dev/null)" 2>/dev/null | awk '$2=="disk"{print $1}')
+busy() {
+    lsblk -nr -o MOUNTPOINT "$1" | grep -q . && return 0
+    echo "$swaps" | grep -qx "$1" && return 0
+    echo "$pvs_list" | grep -qx "$1" && return 0
+    [ -n "$(lsblk -pnr -o NAME "$1" | tail -n +2)" ] && return 0
+    return 1
+}
+emit() {
+    size=$(blockdev --getsize64 "$1" 2>/dev/null)
+    echo "$1|${size:-0}|$(byid "$1")|${model:-?}|${serial:-?}|$2"
+}
+for dev in $(lsblk -dpnr -o NAME,TYPE | awk '$2=="disk"{print $1}'); do
+    base=${dev##*/}
+    [ "$(cat ${TS_SYS_BLOCK:-/sys/block}/$base/ro 2>/dev/null)" = "0" ] || continue
+    model=$(lsblk -dnr -o MODEL "$dev" 2>/dev/null | sed 's/\\x20/ /g')
+    serial=$(lsblk -dnr -o SERIAL "$dev" 2>/dev/null)
+    parts=$(lsblk -pnr -o NAME,TYPE "$dev" | awk 'NR>1 && $2=="part"{print $1}')
+    others=$(lsblk -pnr -o NAME,TYPE "$dev" | awk 'NR>1 && $2!="part"{print $1}')
+    [ -n "$others" ] && continue
+    if [ -n "$parts" ]; then
+        for p in $parts; do
+            busy "$p" && continue
+            if echo "$sysdisks" | grep -qx "$base"; then
+                [ "$(lsblk -dnr -o PARTLABEL "$p" 2>/dev/null)" = "twinstor-data" ] || continue
+            fi
+            emit "$p" partition
+        done
+    else
+        echo "$sysdisks" | grep -qx "$base" && continue
+        busy "$dev" && continue
+        emit "$dev" disk
+    fi
+done
+TS_DISKS_EOF
+}
+
+# Let the operator pick the data device for one host. Sets TS_PICKED_DEVICE to
+# its stable /dev/disk/by-id path where there is one. Offers the free disks and
+# partitions found on the host, and a way to type a path (a partition, an
+# md-RAID array, or a ZFS zvol).
+ts_pick_device() {
+    local idx="$1" ip="${TS_HOST_IPS[$1]}" raw
+    raw=$(ts_exec_script "$ip" "$(ts_disk_candidates_script)" 2>/dev/null | tr -d '\r') || raw=""
+
+    local opts=() dev size byid model serial kind gib
+    while IFS='|' read -r dev size byid model serial kind; do
+        [[ -n "$dev" ]] || continue
+        gib=$(( size / 1073741824 ))
+        opts+=("${byid}|${kind}  ${dev}  ${gib} GiB  ${model}  serial ${serial}  (${byid})")
+    done <<< "$raw"
+    opts+=("__manual__|Type a device path (partition, md-RAID array, or ZFS zvol)")
+
+    deploy_choose "Which disk or partition should hold the data on $(ts_host_label "$idx")?" "${opts[@]}"
+    TS_PICKED_DEVICE="$DEPLOY_CHOICE"
+    if [[ "$TS_PICKED_DEVICE" == "__manual__" ]]; then
+        deploy_read_validated "Device path on $(ts_host_label "$idx")" '^/dev/.+$' "" TS_PICKED_DEVICE ts_valid_device
+    fi
+
+    if ! ts_valid_device "$TS_PICKED_DEVICE"; then
+        log_error "Not a usable device path: $TS_PICKED_DEVICE"
+        return 1
+    fi
+    if ! ts_exec "$ip" "test -b '$TS_PICKED_DEVICE'" >/dev/null 2>&1; then
+        log_error "$TS_PICKED_DEVICE is not a block device on $(ts_host_label "$idx")."
+        return 1
+    fi
+
+    # A ZFS zvol must keep sync=standard (Vates' installation page).
+    if [[ "$TS_PICKED_DEVICE" == /dev/zvol/* ]]; then
+        local ds="${TS_PICKED_DEVICE#/dev/zvol/}" sync
+        sync=$(ts_exec "$ip" "zfs get -H -o value sync '$ds'" 2>/dev/null | tr -d '\r') || sync=""
+        if [[ "$sync" != "standard" ]]; then
+            log_error "The zvol ${ds} has sync=${sync:-unknown}. TwinStor needs sync=standard."
+            return 1
+        fi
+        log_info "ZFS zvol ${ds}: sync=standard. ZFS is community-supported by Vates."
+        return 0
+    fi
+
+    # twinstor setup asks for the stable by-id path. Turn a typed /dev/sdb2 or
+    # /dev/md0 into one, so the name still points at this disk after a reboot.
+    if [[ "$TS_PICKED_DEVICE" != /dev/disk/by-id/* ]]; then
+        local stable
+        stable=$(ts_exec_script "$ip" "$(ts_byid_fn)
+byid \"\$1\"" "$TS_PICKED_DEVICE" 2>/dev/null | tr -d '\r' | head -1) || stable=""
+        if [[ "$stable" == /dev/disk/by-id/* ]]; then
+            log_info "Using the stable name ${stable} for ${TS_PICKED_DEVICE}."
+            TS_PICKED_DEVICE="$stable"
+        else
+            log_warning "${TS_PICKED_DEVICE} has no /dev/disk/by-id name. Vates asks for one, because a"
+            log_warning "/dev/sdX or /dev/mdN name can point at a different disk after a reboot."
+            if ! prompt_yes_no "Use ${TS_PICKED_DEVICE} anyway?"; then
+                return 1
+            fi
+        fi
+    fi
+}
+
+# Count the VMs that would have to run on one host after a failover.
+ts_count_vms() {
+    local n
+    n=$(dom0_xe "vm-list is-control-domain=false is-a-template=false is-a-snapshot=false params=uuid --minimal" 2>/dev/null) || n=""
+    if [[ -z "$n" ]]; then echo 0; else tr ',' '\n' <<< "$n" | grep -c .; fi
+}
+
+# Read-only checks before anything is installed. Stops with a clear message on
+# anything TwinStor cannot work with; warns on what it can.
+ts_preflight() {
+    echo ""
+    log_info "Checking the pool (nothing is changed)..."
+    local i n=${#TS_HOST_IPS[@]}
+
+    if (( n > 2 )); then
+        log_error "This pool has ${n} hosts. TwinStor is for exactly two."
+        return 1
+    fi
+    if (( n < 2 )); then
+        ts_offer_pool_join || return 1
+        n=${#TS_HOST_IPS[@]}
+    fi
+
+    local versions=() facts
+    local -a FACTS=()
+    for ((i = 0; i < n; i++)); do
+        local v
+        v=$(dom0_xe "host-param-get uuid=${TS_HOST_UUIDS[$i]} param-name=software-version param-key=product_version" 2>/dev/null) || v=""
+        versions+=("$v")
+        facts=$(ts_exec_script "${TS_HOST_IPS[$i]}" "$(ts_host_facts_script)" 2>/dev/null | tr -d '\r') || facts=""
+        FACTS+=("$facts")
+        if [[ "$v" != 8.3* ]]; then
+            log_error "$(ts_host_label "$i") runs XCP-ng '${v:-unknown}'. TwinStor needs XCP-ng 8.3."
+            return 1
+        fi
+    done
+
+    # Same patch level on both: a mixed pool blocks HA configuration changes.
+    local key
+    for key in release xapi xen; do
+        if [[ "$(ts_fact "${FACTS[0]}" "$key")" != "$(ts_fact "${FACTS[1]}" "$key")" ]]; then
+            log_error "The two hosts are not at the same patch level (${key}):"
+            log_error "  $(ts_host_label 0): $(ts_fact "${FACTS[0]}" "$key")"
+            log_error "  $(ts_host_label 1): $(ts_fact "${FACTS[1]}" "$key")"
+            log_error "Update both hosts (yum update, then reboot) and try again."
+            return 1
+        fi
+    done
+    log_success "Both hosts run XCP-ng ${versions[0]} at the same patch level."
+
+    # A host whose SR fails to plug stays disabled after a reboot, and HA
+    # cannot restart VMs on a disabled host.
+    local unplugged
+    unplugged=$(dom0_xe "pbd-list currently-attached=false params=sr-uuid --minimal" 2>/dev/null) || unplugged=""
+    if [[ -n "$unplugged" ]]; then
+        log_error "Some storage repositories are not plugged on every host:"
+        log_error "  SR uuid(s): ${unplugged}"
+        log_error "Fix or forget them first. A host whose SR fails to plug stays disabled after a reboot."
+        return 1
+    fi
+    log_success "Every SR is plugged on every host."
+
+    local tolerate_updates=""
+    for ((i = 0; i < n; i++)); do
+        if [[ -n "$(ts_fact "${FACTS[$i]}" twinstor)" ]]; then
+            log_warning "$(ts_host_label "$i") already has TwinStor: $(ts_fact "${FACTS[$i]}" twinstor)"
+            tolerate_updates="yes"
+        fi
+    done
+    if [[ -n "$tolerate_updates" ]]; then
+        log_warning "Deploy would run on top of an existing install. Use Status, or Uninstall first."
+        if ! prompt_yes_no "Continue anyway (the install and setup can resume an unfinished setup)?"; then
+            return 1
+        fi
+    fi
+
+    # dom0 memory against Vates' rule of thumb.
+    local vms need have
+    vms=$(ts_count_vms)
+    need=$(ts_dom0_required_mib "$vms")
+    for ((i = 0; i < n; i++)); do
+        have=$(( $(ts_fact "${FACTS[$i]}" mem_kb) / 1024 ))
+        if (( have < need )); then
+            log_warning "$(ts_host_label "$i"): dom0 has ${have} MiB; Vates' rule of thumb for ${vms} VM(s) is ${need} MiB"
+            log_warning "  (1 GiB + 16 MiB per VM + 30%, counting the VMs of both hosts)."
+            ts_offer_dom0_memory "$i" "$need" || true
+        else
+            log_success "$(ts_host_label "$i"): dom0 memory ${have} MiB is enough for ${vms} VM(s) (needs ${need} MiB)."
+        fi
+    done
+
+    echo ""
+    echo "  Not checkable from here, but required by Vates:"
+    echo "    - 'Restore on AC power loss' set to 'Power On' in the BIOS of both hosts."
+    echo "    - A network of at least 1 Gbit/s between the hosts (10 Gbit/s for write-heavy loads)."
+    echo "    - Both hosts fully updated (yum update, then reboot)."
+    echo ""
+}
+
+# Offer to raise dom0 memory. Needs a reboot, so it only sets it and says so.
+ts_offer_dom0_memory() {
+    local idx="$1" need="$2"
+    echo ""
+    if prompt_yes_no "Set dom0 memory to ${need} MiB on $(ts_host_label "$idx") now? (takes effect after a reboot you do yourself)"; then
+        ts_exec "${TS_HOST_IPS[$idx]}" "/opt/xensource/libexec/xen-cmdline --set-xen dom0_mem=${need}M,max:${need}M" 2>&1 | tr -d '\r' || {
+            log_error "Setting dom0 memory failed."
+            return 1
+        }
+        log_warning "dom0 memory is set for the next boot on $(ts_host_label "$idx"). Reboot it when convenient."
+    fi
+}
+
+# The pool has one host. Join a second one, after a confirmation, because a
+# pool join replaces the joining host's root password with the master's and
+# discards its VMs and configuration.
+ts_offer_pool_join() {
+    log_warning "This pool has only one host. TwinStor needs two."
+    echo ""
+    echo "  The second host can join this pool now. A pool join:"
+    echo "    - replaces that host's root password with this pool master's,"
+    echo "    - requires it to have no running VMs and no shared storage, and"
+    echo "    - discards its local VM and network configuration."
+    echo ""
+    if ! command -v sshpass >/dev/null 2>&1; then
+        log_error "Joining a host needs sshpass on this machine to log in to it."
+        log_error "Join the second host to the pool yourself (xe pool-join on that host) and run this again."
+        return 1
+    fi
+    if ! prompt_yes_no "Join a second host to this pool now?"; then
+        log_error "Add the second host to the pool and run this again."
+        return 1
+    fi
+
+    local ip
+    deploy_read_validated "IP address of the host to join" "$IPV4_SHAPE_REGEX" "" ip is_ipv4
+    ts_pin_host_key "$ip" || return 1
+    echo ""
+    echo "  This asks for the host's CURRENT root password; the pool master's password replaces it."
+    echo -n "Current root password of ${ip}: "
+    local cur
+    read -rs cur < /dev/tty
+    echo ""
+    if ! ts_typed_confirm "Type JOIN to join ${ip} to this pool:" "JOIN"; then
+        log_info "Cancelled."
+        return 1
+    fi
+
+    local rc=0
+    SSHPASS="$cur" sshpass -e ssh -o ConnectTimeout=15 \
+        -o UserKnownHostsFile="${DEPLOY_WORKDIR}/known_hosts_${ip}" -o StrictHostKeyChecking=yes \
+        "${HOST_USERNAME}@${ip}" "bash -s" <<JOIN_EOF || rc=$?
+xe pool-join master-address=$(printf '%q' "$POOL_MASTER_IP") master-username=$(printf '%q' "$HOST_USERNAME") master-password=$(printf '%q' "$HOST_PASSWORD")
+JOIN_EOF
+    cur=""
+    if (( rc != 0 )); then
+        log_error "The pool join failed (exit ${rc})."
+        return 1
+    fi
+    log_info "Waiting for the pool to list the new host..."
+    local tries=0
+    while (( tries < 30 )); do
+        ts_discover_hosts 2>/dev/null && (( ${#TS_HOST_IPS[@]} == 2 )) && break
+        sleep 10
+        tries=$((tries + 1))
+    done
+    if (( ${#TS_HOST_IPS[@]} != 2 )); then
+        log_error "The pool did not show a second host in time."
+        return 1
+    fi
+    log_success "The pool now has two hosts."
+}
+
+# --- Install the bundle ------------------------------------------------------
+
+ts_install_script() {
+    cat <<'TS_INSTALL_EOF'
+set -eu
+ver=$1; url=$2; sha=$3
+name="twinstor-test-${ver}.tar.gz"
+dir=${TS_INSTALL_DIR:-/root/twinstor-install}
+mkdir -p "$dir"
+cd "$dir"
+free=$(df -Pm "$dir" | awk 'NR==2{print $4}')
+if [ "${free:-0}" -lt 500 ]; then
+    echo "ts-error: only ${free} MiB free in $dir; the bundle needs about 500 MiB to unpack" >&2
+    exit 20
+fi
+command -v wget >/dev/null 2>&1 || { echo "ts-error: wget is not installed on this host" >&2; exit 21; }
+wget -q -O "$name" "$url" || { echo "ts-error: could not download $url" >&2; rm -f "$name"; exit 22; }
+if ! echo "${sha}  ${name}" | sha256sum -c - >/dev/null 2>&1; then
+    got=$(sha256sum "$name" | cut -d' ' -f1)
+    echo "ts-error: SHA-256 mismatch for $name: expected ${sha}, got ${got}" >&2
+    rm -f "$name"
+    exit 23
+fi
+echo "sha256 ok: $name"
+rm -rf "twinstor-test-${ver}"
+tar xzf "$name"
+cd "twinstor-test-${ver}"
+./install.sh
+TS_INSTALL_EOF
+}
+
+# Download, verify and run install.sh on one host. Stops on a hash mismatch.
+ts_install_bundle() {
+    local idx="$1" rc=0
+    log_info "Installing TwinStor ${TWINSTOR_VERSION} on $(ts_host_label "$idx")..."
+    ts_exec_script "${TS_HOST_IPS[$idx]}" "$(ts_install_script)" \
+        "$TWINSTOR_VERSION" "$(ts_bundle_url)" "$TWINSTOR_SHA256" 2>&1 | tr -d '\r' || rc=${PIPESTATUS[0]}
+    if (( rc != 0 )); then
+        case "$rc" in
+            23) log_error "The bundle did not match the published SHA-256 and was deleted. Nothing was installed." ;;
+            *)  log_error "The install on $(ts_host_label "$idx") failed (exit ${rc})." ;;
+        esac
+        return 1
+    fi
+    local ver
+    ver=$(ts_exec "${TS_HOST_IPS[$idx]}" "twinstor --version" 2>/dev/null | tr -d '\r' | head -1) || ver=""
+    if [[ "$ver" != *"$TWINSTOR_VERSION"* ]]; then
+        log_error "twinstor --version on $(ts_host_label "$idx") says '${ver}', expected ${TWINSTOR_VERSION}."
+        return 1
+    fi
+    log_success "$(ts_host_label "$idx"): ${ver}"
+}
+
+# --- Deploy ------------------------------------------------------------------
+
+# Ask for the network mode, which cannot be changed later without a
+# maintenance window, and for the direct-link addresses when it is arbitrated.
+ts_choose_topology() {
+    deploy_choose "Which network mode? (cannot be changed later without a maintenance window)" \
+        "fate-shared|Fate-shared (default): hosts and gateway on the same network or switch pair" \
+        "arbitrated|Arbitrated: dedicated storage network, plus a direct cable between the two hosts"
+    TS_TOPOLOGY="$DEPLOY_CHOICE"
+    TS_DIRECT_IPS=()
+    if [[ "$TS_TOPOLOGY" == "arbitrated" ]]; then
+        echo ""
+        echo "  Arbitrated mode needs a back-to-back cable (DAC or crossover) between the"
+        echo "  two hosts, with an address on each end that is on neither host's other networks."
+        local i ip
+        for ((i = 0; i < 2; i++)); do
+            deploy_read_validated "Direct-link IP address for $(ts_host_label "$i")" "$IPV4_SHAPE_REGEX" "" ip is_ipv4
+            TS_DIRECT_IPS+=("$ip")
+        done
+    fi
+}
+
+# Optional extra tie-breaker addresses (a second router, a switch management
+# address). Never the direct-link address. Returns the list, space separated.
+ts_ask_ping_targets() {
+    local reply targets="" t
+    echo "" >&2
+    echo -n "Extra tie-breaker IP addresses, separated by spaces (blank for none): " >&2
+    read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+    for t in $reply; do
+        if ! is_ipv4 "$t"; then
+            log_warning "Skipping '${t}': not an IPv4 address." >&2
+            continue
+        fi
+        local d
+        for d in "${TS_DIRECT_IPS[@]}"; do
+            if [[ "$t" == "$d" ]]; then
+                log_warning "Skipping ${t}: the direct-link address must never be a tie-breaker." >&2
+                continue 2
+            fi
+        done
+        targets+="${targets:+ }${t}"
+    done
+    printf '%s' "$targets"
+}
+
+# True when this address is configured on the host (the arbitrated direct link
+# must already have its static address before setup is given --direct-ip).
+ts_ip_configured_on() {
+    local idx="$1" ip="$2"
+    ts_exec "${TS_HOST_IPS[$idx]}" "ip -o -4 addr show | awk '{print \$4}' | cut -d/ -f1 | grep -qx '$ip'" >/dev/null 2>&1
+}
+
+# Decide how to run the setup wizard. It is scripted with the flags Vates
+# documents (`twinstor setup --peer-ip ... --backing-device ... --chap-password
+# ... --yes`, plus --direct-ip and --ping-target) when the first host's
+# `twinstor setup --help` lists them. Otherwise the wizard runs by hand, with
+# this script doing every other step. Arbitrated mode is scripted only when the
+# direct link already has its static address on both hosts, which setup
+# requires with --direct-ip.
+ts_choose_setup_mode() {
+    TS_ATTENDED="false"
+    local help need f
+    help=$(ts_exec "${TS_HOST_IPS[0]}" "twinstor setup --help" 2>&1 | tr -d '\r') || help=""
+
+    need="--peer-ip --backing-device --chap-password --yes"
+    [[ "$TS_TOPOLOGY" == "arbitrated" ]] && need+=" --direct-ip"
+    [[ -n "$TS_PING_TARGETS" ]] && need+=" --ping-target"
+    for f in $need; do
+        if ! ts_help_has_flag "$help" "$f"; then
+            log_warning "This build's 'twinstor setup --help' does not list ${f}, so the wizard will be run by hand."
+            TS_ATTENDED="true"
+            return 0
+        fi
+    done
+
+    if [[ "$TS_TOPOLOGY" == "arbitrated" ]]; then
+        local i
+        for ((i = 0; i < 2; i++)); do
+            if ! ts_ip_configured_on "$i" "${TS_DIRECT_IPS[$i]}"; then
+                log_warning "${TS_DIRECT_IPS[$i]} is not configured on $(ts_host_label "$i") yet. Setup needs the"
+                log_warning "direct link to have its static address before it can be scripted, so the"
+                log_warning "wizard will be run by hand."
+                TS_ATTENDED="true"
+                return 0
+            fi
+        done
+    fi
+}
+
+# The command that sets up host $1 (0 = first, 1 = second). The same CHAP
+# password goes to both, so nothing has to be read back from the first host.
+# --direct-ip is the PEER's end of the direct link.
+ts_setup_command() {
+    local idx="$1" peer=$((1 - $1)) t
+    local cmd
+    cmd="twinstor setup --peer-ip $(printf '%q' "${TS_HOST_IPS[$peer]}")"
+    cmd+=" --backing-device $(printf '%q' "${TS_DEVICES[$idx]}")"
+    cmd+=" --chap-password $(printf '%q' "$TS_CHAP") --yes"
+    if [[ "$TS_TOPOLOGY" == "arbitrated" ]]; then
+        cmd+=" --direct-ip $(printf '%q' "${TS_DIRECT_IPS[$peer]}")"
+    fi
+    for t in $TS_PING_TARGETS; do
+        cmd+=" --ping-target $(printf '%q' "$t")"
+    done
+    printf '%s' "$cmd"
+}
+
+# Scripted setup, as Vates documents it for scripted installs: setup on the
+# first host (it waits for the second), then on the second host with the same
+# CHAP password. The first host is given time to finish its own disk and print
+# "Action required" before the second is started, because a second host that
+# starts early sets itself up as the first.
+ts_run_setup_scripted() {
+    TS_CHAP=$(ts_new_chap_password)
+    local ip0="${TS_HOST_IPS[0]}" ip1="${TS_HOST_IPS[1]}"
+    local log0="${DEPLOY_WORKDIR}/setup_host0.log"
+
+    log_info "Starting setup on $(ts_host_label 0). Setup erases ${TS_DEVICES[0]} there..."
+    ts_exec "$ip0" "$(ts_setup_command 0)" > "$log0" 2>&1 &
+    local pid0=$!
+
+    log_info "Waiting for $(ts_host_label 0) to be ready for the second host (this can take hours for a large disk)..."
+    local waited=0 shown=0
+    while ! grep -q 'Action required' "$log0" 2>/dev/null; do
+        if ! kill -0 "$pid0" 2>/dev/null; then
+            wait "$pid0" || true
+            log_error "Setup on $(ts_host_label 0) stopped before it was ready for the second host:"
+            echo ""
+            tr -d '\r' < "$log0" | ts_redact
+            return 1
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        if (( waited - shown >= 60 )); then
+            shown=$waited
+            log_info "  still setting up $(ts_host_label 0) ($((waited / 60)) min)..."
+        fi
+        if (( waited > 43200 )); then
+            kill "$pid0" 2>/dev/null || true
+            log_error "Setup on $(ts_host_label 0) did not get ready within 12 hours."
+            return 1
+        fi
+    done
+    log_success "$(ts_host_label 0) is waiting for the second host."
+
+    log_info "Running setup on $(ts_host_label 1). Setup erases ${TS_DEVICES[1]} there..."
+    local rc=0
+    ts_exec "$ip1" "$(ts_setup_command 1)" 2>&1 | tr -d '\r' | ts_redact || rc=${PIPESTATUS[0]}
+    if (( rc != 0 )); then
+        log_error "Setup on $(ts_host_label 1) ended with exit ${rc}."
+        kill "$pid0" 2>/dev/null || true
+        return 1
+    fi
+
+    log_info "Waiting for $(ts_host_label 0) to finish..."
+    local rc0=0
+    wait "$pid0" || rc0=$?
+    echo ""
+    tr -d '\r' < "$log0" | ts_redact
+    if (( rc0 != 0 )); then
+        log_error "Setup on $(ts_host_label 0) ended with exit ${rc0}."
+        return 1
+    fi
+    TS_CHAP=""
+}
+
+# Attended setup: the wizard runs in this terminal on the first host while the
+# operator runs it on the second in another terminal. Vates' wizard is the
+# supported path, and this is what runs when scripting it is not possible.
+ts_run_setup_attended() {
+    local ip1="${TS_HOST_IPS[1]}"
+    echo ""
+    echo "=============================================="
+    echo "  Run the setup wizard by hand"
+    echo "=============================================="
+    echo ""
+    echo "  The wizard runs on the first host in THIS terminal now. It waits up to 30"
+    echo "  minutes for the second host, so open a second terminal and run it there:"
+    echo ""
+    echo "    ssh ${HOST_USERNAME}@${ip1}"
+    echo "    twinstor setup"
+    echo ""
+    echo "  Answers to give on both hosts:"
+    echo "    network mode:  ${TS_TOPOLOGY}"
+    if [[ "$TS_TOPOLOGY" == "arbitrated" ]]; then
+        echo "    direct link:   $(ts_host_label 0) -> ${TS_DIRECT_IPS[0]}"
+        echo "                   $(ts_host_label 1) -> ${TS_DIRECT_IPS[1]}"
+    fi
+    echo "    data device:   $(ts_host_label 0) -> ${TS_DEVICES[0]}"
+    echo "                   $(ts_host_label 1) -> ${TS_DEVICES[1]}"
+    [[ -n "$TS_PING_TARGETS" ]] && echo "    tie-breakers:  ${TS_PING_TARGETS}"
+    echo "  On the first host, press Enter at the CHAP password question to generate one;"
+    echo "  paste it when the second host asks."
+    echo ""
+    if ! prompt_yes_no "Start the wizard on $(ts_host_label 0) now?"; then
+        return 1
+    fi
+    local rc=0
+    ts_exec_tty "${TS_HOST_IPS[0]}" "twinstor setup" || rc=$?
+    if (( rc != 0 )); then
+        log_warning "The wizard on $(ts_host_label 0) ended with exit ${rc}."
+    fi
+    echo ""
+    if ! prompt_yes_no "Has the wizard finished on BOTH hosts?"; then
+        log_info "Stopped. 'twinstor setup' resumes an unfinished setup, or offers to uninstall."
+        return 1
+    fi
+}
+
+# After a wizard run: write the extra tie-breaker addresses on both hosts,
+# adding only the ones that are not already there. (Scripted setup passes them
+# as --ping-target instead.)
+ts_write_ping_targets() {
+    local targets="$1" i t
+    [[ -n "$targets" ]] || return 0
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        for t in $targets; do
+            ts_exec "${TS_HOST_IPS[$i]}" "mkdir -p /etc/twinstor && touch /etc/twinstor/ping-targets && (grep -qx '$t' /etc/twinstor/ping-targets || echo '$t' >> /etc/twinstor/ping-targets)" >/dev/null 2>&1 || {
+                log_warning "Could not write ${t} to /etc/twinstor/ping-targets on $(ts_host_label "$i")."
+            }
+        done
+    done
+    log_success "Extra tie-breaker addresses written to /etc/twinstor/ping-targets: ${targets}"
+}
+
+# After setup: wait for a healthy pair, then check the pool's HA settings.
+ts_verify_deploy() {
+    echo ""
+    log_info "Waiting for both hosts to report healthy and ready (this can take a while while the disks sync)..."
+    local i bad=0
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        if ts_wait_healthy "${TS_HOST_IPS[$i]}" 1800; then
+            log_success "$(ts_host_label "$i"): healthy, ready"
+        else
+            log_error "$(ts_host_label "$i"): not healthy and ready after 30 minutes."
+            bad=1
+        fi
+    done
+    ts_each_host "twinstor status"
+    if (( bad )); then
+        log_error "Run Status again later, and 'twinstor doctor' on the host that is not ready."
+        return 1
+    fi
+    ts_check_ha
+}
+
+# HA must be on and keep room for one host failure.
+ts_check_ha() {
+    local out enabled tolerate
+    out=$(dom0_xe "pool-list params=ha-enabled,ha-host-failures-to-tolerate,ha-overcommitted") || out=""
+    echo ""
+    echo "Pool HA:"
+    echo "$out" | sed 's/^/  /'
+    enabled=$(sed -n 's/^ha-enabled[^:]*: *//p' <<< "$out" | head -1)
+    tolerate=$(sed -n 's/^ha-host-failures-to-tolerate[^:]*: *//p' <<< "$out" | head -1)
+    if [[ "$enabled" != "true" ]]; then
+        log_warning "Pool HA is not enabled. Setup normally enables it."
+    fi
+    if [[ "$tolerate" != "1" ]]; then
+        log_warning "ha-host-failures-to-tolerate is '${tolerate}', Vates asks for 1."
+        if prompt_yes_no "Set ha-host-failures-to-tolerate=1 now?"; then
+            dom0_xe "pool-param-set uuid=\$(xe pool-list --minimal) ha-host-failures-to-tolerate=1" >/dev/null || {
+                log_error "Could not set it."
+                return 1
+            }
+            log_success "ha-host-failures-to-tolerate set to 1."
+        fi
+    fi
+}
+
+ts_print_operating_rules() {
+    echo ""
+    echo "=============================================="
+    echo "  Operating rules (from Vates' pages)"
+    echo "=============================================="
+    echo ""
+    echo "  - HA can stay on for work on ONE host that comes back at the same version"
+    echo "    (reboot, firmware, hardware swap): xe host-evacuate it first."
+    echo "  - Turn HA off for anything that touches both hosts, and for any update:"
+    echo "      xe pool-ha-disable"
+    echo "      xe pool-ha-enable heartbeat-sr-uuids=<TwinStor SR uuid> ha-config:timeout=120"
+    echo "    (use timeout 90 in arbitrated mode)."
+    echo "  - Switch maintenance: HA off first. XCP-ng updates: Rolling Pool Update, HA off."
+    echo "  - Do not rename a host after setup: the renamed host boots without storage."
+    echo "  - A VM with PCI passthrough must not be HA-protected; use auto power-on instead."
+    echo "  - Setup opened 7789/tcp (replication) and 3260/tcp (iSCSI) on each host."
+    echo "  - Keep backing up your VMs. Two copies are not a backup."
+    echo ""
+}
+
+ts_deploy() {
+    ts_preflight || return 1
+
+    ts_choose_topology
+
+    TS_DEVICES=()
+    local i
+    for ((i = 0; i < 2; i++)); do
+        ts_pick_device "$i" || return 1
+        TS_DEVICES+=("$TS_PICKED_DEVICE")
+    done
+
+    TS_PING_TARGETS=$(ts_ask_ping_targets)
+
+    # setup refuses a pair with no tie-breaker at all (no default gateway and
+    # no --ping-target), because any replication interruption would freeze
+    # storage. Say so before anything is erased rather than after.
+    if [[ -z "$TS_PING_TARGETS" ]]; then
+        for ((i = 0; i < 2; i++)); do
+            if ! ts_exec "${TS_HOST_IPS[$i]}" "ip route | grep -q '^default'" >/dev/null 2>&1; then
+                log_error "$(ts_host_label "$i") has no default gateway, and no extra tie-breaker address was given."
+                log_error "TwinStor needs at least one always-on address to probe (a gateway, a managed"
+                log_error "switch, a router). Run this again and give one."
+                return 1
+            fi
+        done
+    fi
+
+    echo ""
+    echo "=============================================="
+    echo "  Summary"
+    echo "=============================================="
+    echo ""
+    echo "  TwinStor ${TWINSTOR_VERSION} (SHA-256 ${TWINSTOR_SHA256:0:16}...)"
+    echo "  Network mode:   ${TS_TOPOLOGY}"
+    for ((i = 0; i < 2; i++)); do
+        echo "  $(ts_host_label "$i"): data device ${TS_DEVICES[$i]}${TS_DIRECT_IPS[$i]:+, direct link ${TS_DIRECT_IPS[$i]}}"
+    done
+    [[ -n "$TS_PING_TARGETS" ]] && echo "  Extra tie-breakers: ${TS_PING_TARGETS}"
+    echo ""
+    echo "  !! THE DISKS OR PARTITIONS ABOVE WILL BE ERASED. THIS CANNOT BE UNDONE. !!"
+    echo "  !! TwinStor is a lab-only tech preview.                                  !!"
+    echo ""
+    if ! ts_typed_confirm "Type WIPE to erase those devices and continue:" "WIPE"; then
+        log_info "Cancelled. Nothing was changed."
+        return 0
+    fi
+
+    for ((i = 0; i < 2; i++)); do
+        ts_install_bundle "$i" || return 1
+    done
+
+    ts_choose_setup_mode
+    if [[ "$TS_ATTENDED" == "true" ]]; then
+        ts_run_setup_attended || return 1
+        ts_write_ping_targets "$TS_PING_TARGETS"
+    else
+        ts_run_setup_scripted || return 1
+    fi
+
+    ts_verify_deploy || return 1
+    ts_print_operating_rules
+    log_success "TwinStor is deployed."
+}
+
+# --- Status, upgrade and the other operations --------------------------------
+
+ts_op_status() {
+    ts_require_installed || return 1
+    ts_each_host "twinstor --version; echo; twinstor status; echo; twinstor doctor"
+    ts_check_ha
+}
+
+# Upgrade one host at a time: new bundle, then upgrade-apply, then wait until
+# that host is healthy before touching the next. Never both at once.
+ts_op_upgrade() {
+    ts_require_installed || return 1
+    local i installed=""
+    installed=$(ts_exec "${TS_HOST_IPS[0]}" "twinstor --version" 2>/dev/null | tr -d '\r' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || installed=""
+
+    echo ""
+    echo "  Installed: ${installed:-unknown}    Pinned bundle: ${TWINSTOR_VERSION}"
+    if [[ "$installed" == "$TWINSTOR_VERSION" ]]; then
+        log_info "Both match. Nothing to upgrade unless you pinned a rebuilt bundle."
+    fi
+    [[ -n "$installed" ]] && ts_upgrade_notes "$installed" "$TWINSTOR_VERSION"
+    echo ""
+    echo "  Guests keep running. Hosts are upgraded one at a time, and the second only"
+    echo "  starts once the first is healthy again."
+    echo ""
+    if ! prompt_yes_no "Upgrade TwinStor to ${TWINSTOR_VERSION} on both hosts, one at a time?"; then
+        return 0
+    fi
+
+    # Non-master first, so the master (and this connection) goes last.
+    local order=() j
+    for ((j = 0; j < ${#TS_HOST_IPS[@]}; j++)); do
+        [[ $j -ne $TS_MASTER_IDX ]] && order+=("$j")
+    done
+    order+=("$TS_MASTER_IDX")
+
+    for i in "${order[@]}"; do
+        ts_install_bundle "$i" || return 1
+        log_info "Checking that $(ts_host_label "$i") can upgrade now..."
+        if ! ts_exec "${TS_HOST_IPS[$i]}" "twinstor upgrade-apply --check" 2>&1 | tr -d '\r'; then
+            log_error "upgrade-apply --check refused on $(ts_host_label "$i"). Stopping; the other host is untouched."
+            return 1
+        fi
+        log_info "Applying on $(ts_host_label "$i")..."
+        ts_exec "${TS_HOST_IPS[$i]}" "twinstor upgrade-apply --yes" 2>&1 | tr -d '\r' || {
+            log_error "upgrade-apply failed on $(ts_host_label "$i"). Stopping."
+            return 1
+        }
+        if ! ts_wait_healthy "${TS_HOST_IPS[$i]}" 1800; then
+            log_error "$(ts_host_label "$i") is not healthy and ready 30 minutes after the upgrade. Stopping."
+            return 1
+        fi
+        log_success "$(ts_host_label "$i") upgraded and healthy."
+    done
+    ts_each_host "twinstor --version"
+    log_success "Both hosts are on the same version."
+}
+
+# Replace a data disk: a full resync from the other host starts.
+ts_op_replace_disk() {
+    ts_require_installed || return 1
+    ts_pick_host "Which host got the new disk?"
+    local idx="$TS_PICK"
+    ts_pick_device "$idx" || return 1
+    local dev="$TS_PICKED_DEVICE"
+    echo ""
+    echo "  This starts a full resync from the other host (about 90 minutes for 500 GB on"
+    echo "  1 Gbit/s). Run the VMs on the healthy host until it finishes."
+    echo "  !! ${dev} on $(ts_host_label "$idx") WILL BE ERASED. !!"
+    echo ""
+    if ! ts_typed_confirm "Type WIPE to erase ${dev} and continue:" "WIPE"; then
+        log_info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    ts_exec "${TS_HOST_IPS[$idx]}" "twinstor replace-backing --yes '$dev'" 2>&1 | tr -d '\r' || {
+        log_error "replace-backing failed."
+        return 1
+    }
+    ts_exec "${TS_HOST_IPS[$idx]}" "twinstor status" 2>&1 | tr -d '\r'
+}
+
+# Arbitrated only: move replication back to the direct cable after a fallback.
+ts_op_failback() {
+    ts_require_installed || return 1
+    echo ""
+    echo "  Use this after a 'twinstor_replication_fallback' alert, once the direct cable or"
+    echo "  NIC is fixed. It only applies in arbitrated mode."
+    ts_each_host "twinstor status"
+    echo ""
+    ts_pick_host "Run failback-replication on which host?"
+    local idx="$TS_PICK"
+    if ! prompt_yes_no "Run 'twinstor failback-replication' on $(ts_host_label "$idx")?"; then
+        return 0
+    fi
+    ts_exec "${TS_HOST_IPS[$idx]}" "twinstor failback-replication" 2>&1 | tr -d '\r' || {
+        log_error "failback-replication failed."
+        return 1
+    }
+}
+
+# Regenerate the persisted config on one host. Vates asks for a maintenance
+# window and a reboot of that host afterwards; the reboot is left to the
+# operator, because evacuating and rebooting a pool host is their decision.
+ts_op_regenerate_config() {
+    ts_require_installed || return 1
+    echo ""
+    echo "  Run this only to clear a 'config:' line in 'twinstor status', in a maintenance"
+    echo "  window. Then reboot that host, wait for 'ready', and do the other host."
+    ts_pick_host "Regenerate the config on which host?"
+    local idx="$TS_PICK"
+    if ! prompt_yes_no "Run 'twinstor regenerate-config --persist-only --yes' on $(ts_host_label "$idx")?"; then
+        return 0
+    fi
+    ts_exec "${TS_HOST_IPS[$idx]}" "twinstor regenerate-config --persist-only --yes" 2>&1 | tr -d '\r' || {
+        log_error "regenerate-config failed."
+        return 1
+    }
+    echo ""
+    echo "  Next: xe host-evacuate uuid=${TS_HOST_UUIDS[$idx]}, reboot $(ts_host_label "$idx"),"
+    echo "  wait until 'twinstor status' shows 'ready', then repeat for the other host."
+}
+
+# Collect `twinstor support-bundle` from each host into the current directory.
+# The bundle is written to a path chosen here (-o), copied back over SSH, and
+# removed from the host.
+ts_op_support_bundle() {
+    ts_require_installed || return 1
+    local i out remote file stamp
+    stamp=$(date +%Y%m%d-%H%M%S)
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        remote="/root/twinstor-support-${TS_HOST_NAMES[$i]}-${stamp}.tar.gz"
+        file="twinstor-support-${TS_HOST_NAMES[$i]}-${stamp}.tar.gz"
+        log_info "Collecting the bundle on $(ts_host_label "$i")..."
+        out=$(ts_exec "${TS_HOST_IPS[$i]}" "twinstor support-bundle -o '$remote'" 2>&1 | tr -d '\r') || {
+            log_error "support-bundle failed on $(ts_host_label "$i")."
+            echo "$out"
+            continue
+        }
+        if ts_exec "${TS_HOST_IPS[$i]}" "cat '$remote'" > "$file" && [[ -s "$file" ]]; then
+            log_success "Saved $(pwd)/${file}"
+            ts_exec "${TS_HOST_IPS[$i]}" "rm -f '$remote'" >/dev/null 2>&1 || true
+        else
+            log_error "Could not copy ${remote} from $(ts_host_label "$i"); it is still on the host."
+            rm -f "$file"
+        fi
+    done
+    echo ""
+    echo "  Post both bundles, what you did in order, and 'twinstor --version' on the TwinStor"
+    echo "  thread: https://xcp-ng.org/forum/topic/12323/twinstor-next-gen-2-nodes-hci"
+}
+
+# Remove TwinStor from a host. It refuses while VMs still use the SR.
+ts_op_uninstall() {
+    ts_require_installed || return 1
+    ts_pick_host "Uninstall TwinStor from which host?"
+    local idx="$TS_PICK" flags=""
+    echo ""
+    echo "  'twinstor uninstall' refuses while VMs still use the SR. It leaves the network"
+    echo "  settings of a direct link and any md-RAID array in place."
+    if prompt_yes_no "Keep the data on the data device (--keep-data)?"; then
+        flags+=" --keep-data"
+    else
+        echo "  !! The data device on $(ts_host_label "$idx") WILL BE WIPED. !!"
+    fi
+    if prompt_yes_no "Go ahead even if it cannot check that the SR is unused (--force)? Say no unless you know why"; then
+        flags+=" --force"
+    fi
+    if ! ts_typed_confirm "Type UNINSTALL to remove TwinStor from $(ts_host_label "$idx"):" "UNINSTALL"; then
+        log_info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    ts_exec_tty "${TS_HOST_IPS[$idx]}" "twinstor uninstall${flags}" || {
+        log_error "uninstall ended with an error."
+        return 1
+    }
+}
+
+# --- Entry ---------------------------------------------------------------------
+
+# The TwinStor sub-menu: --twinstor and the main menu's TwinStor entry both land
+# here. It is shown before anything connects, so choosing Back costs nothing.
+# Arguments: an optional action to run directly (update, for --twinstor-upgrade).
+#
+# ts_op_replace_disk, ts_op_failback, ts_op_regenerate_config and ts_op_uninstall
+# are written but not offered here: the menu is install, update, status and the
+# support bundle. They are what to add if the menu grows.
+twinstor_menu() {
+    local action="${1:-}"
+    ts_precheck || return 0
+
+    if [[ -z "$action" ]]; then
+        deploy_choose "TwinStor (Vates tech preview, lab pools only)" \
+            "install|Install TwinStor on a two-host pool (erases a disk or partition on each host)" \
+            "update|Update TwinStor, one host at a time" \
+            "status|Status and doctor on both hosts" \
+            "bundle|Collect a support bundle from both hosts" \
+            "back|Back"
+        action="$DEPLOY_CHOICE"
+    fi
+    [[ "$action" == "back" ]] && return 0
+
+    ts_session_start || return 0
+
+    case "$action" in
+        install) ts_deploy ;;
+        update)  ts_op_upgrade ;;
+        status)  ts_op_status ;;
+        bundle)  ts_op_support_bundle ;;
+        *)       log_error "Unknown TwinStor action: $action"; return 1 ;;
+    esac
+}
+
+# ============================================================================
+# XOSTOR (Vates' LINSTOR/DRBD storage, 3 or more hosts)
+#
+# Aimed at XO built from sources, where XO's own XOSTOR page most likely cannot
+# create the SR: its create call checks a licence that only XOA provides. This
+# sub-menu works on the hosts directly, with the commands XCP-ng documents
+# (https://docs.xcp-ng.org/xostor/). Install and read-only status exist; update
+# is next.
+# ============================================================================
+
+# Banner, and the checks that hold before anything connects. Returns 1 under
+# --dry-run (nothing to simulate); exits on --non-interactive.
+xs_precheck() {
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_error "XOSTOR operations cannot be combined with --non-interactive."
+        log_error "They connect to the pool and need answers that only exist at the prompts."
+        exit 1
+    fi
+
+    echo ""
+    echo "=============================================="
+    echo "  XOSTOR *"
+    echo "=============================================="
+    echo ""
+    echo "  * Unsupported by Vates for XO from sources, and untested here. XOSTOR"
+    echo "    creation in XO needs a licence that only XOA provides. Use a lab pool."
+    echo ""
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warning "[DRY-RUN] XOSTOR operations run on remote hosts and cannot be"
+        log_warning "[DRY-RUN] meaningfully simulated. No changes were made."
+        return 1
+    fi
+}
+
+# Status: the pool's LINSTOR SRs, then the four commands the XCP-ng docs use to
+# check a pool (nodes, resources, storage pools, advice). `linstor` only works
+# on the host running the controller, so each host is tried until one answers.
+# Read only.
+xs_op_status() {
+    local srs i ctl=-1
+    srs=$(dom0_exec 'xe sr-list type=linstor params=uuid,name-label,shared' 2>/dev/null | tr -d '\r' | sed -e '/^[[:space:]]*$/d') || srs=""
+    if [[ -z "$srs" ]]; then
+        log_warning "No XOSTOR (type linstor) storage repository found in this pool."
+        return 0
+    fi
+    echo "  XOSTOR storage repositories"
+    echo ""
+    echo "$srs" | sed 's/^/    /'
+
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        if ts_exec "${TS_HOST_IPS[$i]}" "linstor node list" >/dev/null 2>&1; then
+            ctl=$i
+            break
+        fi
+    done
+    if [[ $ctl -lt 0 ]]; then
+        log_error "'linstor node list' failed on every host: no LINSTOR controller answered."
+        log_error "Check that linstor-controller is running on one host (systemctl status linstor-controller)."
+        return 1
+    fi
+
+    echo ""
+    echo "  LINSTOR controller: $(ts_host_label "$ctl")"
+    local cmd
+    for cmd in "linstor node list" "linstor resource list" "linstor storage-pool list" "linstor advise resource"; do
+        echo ""
+        echo "---- ${cmd} ----"
+        ts_exec "${TS_HOST_IPS[$ctl]}" "$cmd" 2>&1 | tr -d '\r' || true
+    done
+}
+
+# XOSTOR names that reach a shell or an xe argument: letters, digits, space,
+# dot, underscore and dash only.
+xs_valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._\ -]{0,62}$ ]]; }
+
+# Wait for xapi to answer again after a toolstack restart. Arguments: seconds.
+xs_wait_xapi() {
+    local limit="${1:-180}" waited=0
+    while (( waited < limit )); do
+        if dom0_exec "xe host-list params=uuid --minimal" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    return 1
+}
+
+# Choose the disks a host contributes. Sets XS_DISKS[idx] to a space-separated
+# list of stable device names; empty means the host joins without a disk.
+xs_pick_disks() {
+    local idx="$1" ip="${TS_HOST_IPS[$1]}" raw
+    raw=$(ts_exec_script "$ip" "$(ts_disk_candidates_script)" 2>/dev/null | tr -d '\r') || raw=""
+
+    local -a devs=() labels=() chosen=()
+    local dev size byid model serial kind
+    while IFS='|' read -r dev size byid model serial kind; do
+        [[ -n "$dev" ]] || continue
+        devs+=("$byid")
+        labels+=("${kind}  ${dev}  $(( size / 1073741824 )) GiB  ${model}  serial ${serial}  (${byid})")
+    done <<< "$raw"
+
+    while true; do
+        local opts=() j c skip
+        for j in "${!devs[@]}"; do
+            skip=0
+            for c in ${chosen[@]+"${chosen[@]}"}; do [[ "$c" == "${devs[$j]}" ]] && skip=1; done
+            (( skip )) && continue
+            opts+=("${devs[$j]}|${labels[$j]}")
+        done
+        if [[ ${#chosen[@]} -eq 0 ]]; then
+            opts+=("__done__|No disk on this host (it joins as a diskless satellite)")
+        else
+            opts+=("__done__|Done with this host (${#chosen[@]} chosen)")
+        fi
+        deploy_choose "Disk for XOSTOR on $(ts_host_label "$idx") (erased; pick again to add more)" "${opts[@]}"
+        [[ "$DEPLOY_CHOICE" == "__done__" ]] && break
+        chosen+=("$DEPLOY_CHOICE")
+    done
+    XS_DISKS[idx]="${chosen[*]:-}"
+}
+
+# Read-only checks. Stops on what XOSTOR cannot work with, warns on what it can.
+xs_preflight() {
+    echo ""
+    log_info "Checking the pool (nothing is changed)..."
+    local n=${#TS_HOST_IPS[@]} i
+
+    if (( n < 3 )); then
+        log_error "This pool has ${n} host(s). XOSTOR needs at least 3: DRBD quorum needs three reachable machines."
+        return 1
+    fi
+    if (( n > 7 )); then
+        log_error "This pool has ${n} hosts. XOSTOR supports at most 7."
+        return 1
+    fi
+
+    local ver first="" v
+    for ((i = 0; i < n; i++)); do
+        v=$(dom0_xe "host-param-get uuid=${TS_HOST_UUIDS[$i]} param-name=software-version param-key=product_version" 2>/dev/null) || v=""
+        if [[ -z "$first" ]]; then first="$v"; fi
+        if [[ "$v" != "$first" ]]; then
+            log_error "Hosts run different XCP-ng versions ($(ts_host_label 0): ${first:-unknown}, $(ts_host_label "$i"): ${v:-unknown}). Update them to match first."
+            return 1
+        fi
+        # LINSTOR listens unauthenticated on 3366 on the management address.
+        if [[ ! "${TS_HOST_IPS[$i]}" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.) ]]; then
+            log_warning "$(ts_host_label "$i") has a management address that is not private."
+            log_warning "LINSTOR listens on TCP 3366 without authentication; XCP-ng says the management network must never be public."
+            prompt_yes_no "Continue anyway?" || return 1
+        fi
+    done
+    log_info "XCP-ng ${first} on all ${n} hosts."
+
+    local existing
+    existing=$(dom0_exec 'xe sr-list type=linstor params=uuid --minimal' 2>/dev/null | tr -d '\r') || existing=""
+    if [[ -n "$existing" ]]; then
+        log_error "This pool already has a XOSTOR (linstor) storage repository (${existing}). Not creating another."
+        return 1
+    fi
+
+    local mem_kb
+    for ((i = 0; i < n; i++)); do
+        if ts_exec "${TS_HOST_IPS[$i]}" "vgs --noheadings -o vg_name 2>/dev/null | tr -d ' ' | grep -qx linstor_group" >/dev/null 2>&1; then
+            log_error "$(ts_host_label "$i") already has a volume group named linstor_group. Remove it by hand if it is yours to remove; this script will not."
+            return 1
+        fi
+        mem_kb=$(ts_exec "${TS_HOST_IPS[$i]}" "awk '/^MemTotal:/{print \$2}' /proc/meminfo" 2>/dev/null | tr -d '\r') || mem_kb=0
+        if (( ${mem_kb:-0} < 16 * 1024 * 1024 )); then
+            log_warning "$(ts_host_label "$i") has $(( ${mem_kb:-0} / 1048576 )) GiB RAM. XCP-ng says dom0 needs about 16 GiB for ~100 volumes; LINSTOR can use a lot."
+        fi
+    done
+
+    local unplugged
+    unplugged=$(dom0_xe "pbd-list currently-attached=false params=sr-uuid --minimal" 2>/dev/null) || unplugged=""
+    if [[ -n "$unplugged" ]]; then
+        log_error "These SRs are not plugged on every host: ${unplugged}. Fix that first."
+        return 1
+    fi
+    log_success "Pool checks passed."
+}
+
+# Pool HA must be off while the packages go in. Remember how it was set so it
+# can be put back. Sets XS_HA_WAS_ON, XS_HA_SRS and XS_HA_TIMEOUT.
+xs_ha_off() {
+    XS_HA_WAS_ON=false; XS_HA_SRS=""; XS_HA_TIMEOUT=""
+    local pool enabled
+    pool=$(dom0_xe "pool-list --minimal") || return 1
+    enabled=$(dom0_xe "pool-param-get uuid=${pool} param-name=ha-enabled") || enabled=""
+    [[ "$enabled" == "true" ]] || return 0
+
+    local vdis v srs=()
+    vdis=$(dom0_xe "pool-param-get uuid=${pool} param-name=ha-statefiles" 2>/dev/null | tr ';,' '  ') || vdis=""
+    for v in $vdis; do
+        srs+=("$(dom0_xe "vdi-param-get uuid=${v} param-name=sr-uuid" 2>/dev/null)")
+    done
+    XS_HA_SRS=$(IFS=,; echo "${srs[*]:-}")
+    XS_HA_TIMEOUT=$(dom0_xe "pool-param-get uuid=${pool} param-name=ha-config param-key=timeout" 2>/dev/null) || XS_HA_TIMEOUT=""
+
+    echo ""
+    echo "  Pool HA is on. XOSTOR cannot be set up while it is. This script will turn it off now"
+    echo "  and turn it back on at the end with the same settings:"
+    echo "    xe pool-ha-enable heartbeat-sr-uuids=${XS_HA_SRS} ha-config:timeout=${XS_HA_TIMEOUT:-60}"
+    if [[ -z "$XS_HA_SRS" ]]; then
+        log_error "Could not read the HA heartbeat SR, so HA could not be turned back on. Turn it off yourself and run this again."
+        return 1
+    fi
+    prompt_yes_no "Turn pool HA off now?" || return 1
+    dom0_xe "pool-ha-disable" >/dev/null || { log_error "Could not turn HA off."; return 1; }
+    XS_HA_WAS_ON=true
+}
+
+xs_ha_restore() {
+    [[ "$XS_HA_WAS_ON" == "true" ]] || return 0
+    xs_wait_xapi 180 || true
+    if dom0_xe "pool-ha-enable heartbeat-sr-uuids=${XS_HA_SRS} ha-config:timeout=${XS_HA_TIMEOUT:-60}" >/dev/null 2>&1; then
+        log_success "Pool HA is back on."
+    else
+        log_warning "Could not turn pool HA back on. Run on the pool master:"
+        echo "    xe pool-ha-enable heartbeat-sr-uuids=${XS_HA_SRS} ha-config:timeout=${XS_HA_TIMEOUT:-60}"
+    fi
+}
+
+# Undo the volume groups this run created.
+xs_rollback_vgs() {
+    local i
+    for ((i = 0; i < ${#TS_HOST_IPS[@]}; i++)); do
+        [[ "${XS_VG_MADE[$i]:-}" == "1" ]] || continue
+        log_warning "Removing linstor_group from $(ts_host_label "$i")..."
+        ts_exec "${TS_HOST_IPS[$i]}" "vgremove -f linstor_group && pvremove -ff -y ${XS_DISKS[$i]}" 2>&1 | tr -d '\r' || true
+    done
+}
+
+# The install itself. The ordering follows the XCP-ng manual route: packages on
+# every host, LVM on every host with disks, then one SR.
+xs_do_install() {
+    local n=${#TS_HOST_IPS[@]} i order=() out
+
+    # Workers first, the master last: restarting it drops what the others wait on.
+    for ((i = 0; i < n; i++)); do [[ $i -ne $TS_MASTER_IDX ]] && order+=("$i"); done
+    order+=("$TS_MASTER_IDX")
+
+    for i in "${order[@]}"; do
+        log_info "Installing the XOSTOR packages on $(ts_host_label "$i")..."
+        out=$(ts_exec "${TS_HOST_IPS[$i]}" "yum install -y xcp-ng-release-linstor && yum install -y xcp-ng-linstor && modprobe drbd" 2>&1 | tr -d '\r') || {
+            log_error "Package install failed on $(ts_host_label "$i"):"
+            echo "$out" | tail -15
+            return 1
+        }
+    done
+
+    for i in "${order[@]}"; do
+        log_info "Restarting the toolstack on $(ts_host_label "$i")..."
+        ts_exec "${TS_HOST_IPS[$i]}" "xe-toolstack-restart" >/dev/null 2>&1 || true
+        if [[ $i -eq $TS_MASTER_IDX ]]; then
+            xs_wait_xapi 180 || { log_error "The pool master did not come back after the toolstack restart."; return 1; }
+        fi
+    done
+
+    XS_VG_MADE=()
+    for ((i = 0; i < n; i++)); do
+        [[ -n "${XS_DISKS[$i]:-}" ]] || continue
+        log_info "Creating linstor_group on $(ts_host_label "$i") (${XS_DISKS[$i]})..."
+        local cmd="pvcreate -y ${XS_DISKS[$i]} && vgcreate linstor_group ${XS_DISKS[$i]}"
+        XS_VG_MADE[i]=1
+        if [[ "$XS_PROVISIONING" == "thin" ]]; then
+            cmd+=" && lvcreate -l 100%FREE -T linstor_group/thin_device"
+        fi
+        out=$(ts_exec "${TS_HOST_IPS[$i]}" "$cmd" 2>&1 | tr -d '\r') || {
+            log_error "LVM setup failed on $(ts_host_label "$i"):"
+            echo "$out" | tail -10
+            xs_rollback_vgs
+            return 1
+        }
+    done
+
+    local group="linstor_group"
+    [[ "$XS_PROVISIONING" == "thin" ]] && group="linstor_group/thin_device"
+    log_info "Creating the XOSTOR storage repository '${XS_SR_NAME}'..."
+    out=$(dom0_exec "xe sr-create type=linstor shared=true name-label='${XS_SR_NAME}' device-config:group-name=${group} device-config:redundancy=${XS_REPLICATION} device-config:provisioning=${XS_PROVISIONING}" 2>&1 | tr -d '\r') || {
+        log_error "sr-create failed:"
+        echo "$out" | tail -15
+        xs_rollback_vgs
+        return 1
+    }
+    XS_SR_UUID=$(tail -1 <<< "$out")
+    log_success "Created ${XS_SR_NAME} (${XS_SR_UUID})."
+}
+
+xs_op_install() {
+    local n i
+    XS_DISKS=(); XS_VG_MADE=()
+    xs_preflight || return 1
+    n=${#TS_HOST_IPS[@]}
+
+    echo ""
+    echo "  * XOSTOR creation in XO needs a licence that only XOA provides. This script copies"
+    echo "    the manual steps instead. Vates does not support that for XO from sources, and it"
+    echo "    has not been run on a real pool. Use a lab pool."
+    echo -n "  Type yes to go on: "
+    local reply
+    read -t 300 -r reply < /dev/tty || { log_error "Input timeout"; exit 1; }
+    [[ "$reply" == "yes" ]] || { log_info "Cancelled."; return 0; }
+
+    deploy_choose "Provisioning" \
+        "thin|Thin (LVM thin pool; snapshots, space used on demand)" \
+        "thick|Thick (plain LVM; space reserved up front)"
+    XS_PROVISIONING="$DEPLOY_CHOICE"
+
+    for ((i = 0; i < n; i++)); do xs_pick_disks "$i"; done
+    local with_disks=0
+    for ((i = 0; i < n; i++)); do [[ -n "${XS_DISKS[$i]:-}" ]] && with_disks=$((with_disks + 1)); done
+    if (( with_disks == 0 )); then
+        log_error "No disk was chosen on any host."
+        return 1
+    fi
+
+    local ropts=() r
+    for r in 1 2 3; do
+        (( r <= with_disks )) && ropts+=("${r}|${r} cop$([[ $r -eq 1 ]] && echo y || echo ies) of every volume")
+    done
+    deploy_choose "Replication (cannot be changed after the SR exists)" "${ropts[@]}"
+    XS_REPLICATION="$DEPLOY_CHOICE"
+    if (( XS_REPLICATION == 1 )); then
+        log_warning "Replication 1 keeps a single copy: losing one disk loses that data."
+    fi
+
+    deploy_read_validated "Storage repository name" '^.+$' "XOSTOR" XS_SR_NAME xs_valid_name
+
+    echo ""
+    echo "  About to set up XOSTOR (${XS_PROVISIONING}, ${XS_REPLICATION} replica(s)) as '${XS_SR_NAME}':"
+    for ((i = 0; i < n; i++)); do
+        echo "    $(ts_host_label "$i"): ${XS_DISKS[$i]:-no disk (diskless)}"
+    done
+    echo "  The disks above will be ERASED."
+    ts_typed_confirm "Type WIPE to erase them and continue:" "WIPE" || { log_info "Cancelled. Nothing was changed."; return 0; }
+
+    xs_ha_off || return 1
+    local rc=0
+    xs_do_install || rc=$?
+    xs_ha_restore
+
+    if (( rc != 0 )); then
+        log_error "XOSTOR setup did not finish. Packages that were installed stay installed."
+        return 1
+    fi
+    echo ""
+    log_info "Checking the result..."
+    xs_op_status || return 1
+    local attached
+    attached=$(dom0_xe "pbd-list sr-uuid=${XS_SR_UUID} currently-attached=false params=host-uuid --minimal" 2>/dev/null) || attached="?"
+    if [[ -n "$attached" ]]; then
+        log_warning "The SR is not plugged on every host (unplugged on: ${attached})."
+    else
+        log_success "XOSTOR is plugged on every host."
+    fi
+}
+
+# The XOSTOR sub-menu: the main menu's XOSTOR entry lands here. Shown before
+# anything connects, so choosing Back costs nothing.
+xostor_menu() {
+    xs_precheck || return 0
+
+    deploy_choose "XOSTOR * (unsupported for XO from sources, lab pools only)" \
+        "install|Install XOSTOR on a pool of 3-7 hosts (erases the disks you pick)" \
+        "status|Status of the LINSTOR nodes, resources and storage pools (read only)" \
+        "back|Back"
+    local action="$DEPLOY_CHOICE"
+    [[ "$action" == "back" ]] && return 0
+
+    ts_connect_pool || return 0
+
+    case "$action" in
+        install) xs_op_install ;;
+        status)  xs_op_status ;;
+        *)       log_error "Unknown XOSTOR action: $action"; return 1 ;;
+    esac
 }
 
 # ============================================================================
@@ -12250,7 +14184,7 @@ tpl_api_ensure_xo_cli() {
         return 1
     fi
 
-    if ! confirm_or_skip "Install xo-cli now (npm i -g xo-cli)?"; then
+    if ! prompt_yes_no "Install xo-cli now (npm i -g xo-cli)?"; then
         TPL_API_UNAVAILABLE_REASON="xo-cli is not installed"
         return 1
     fi
@@ -12313,7 +14247,7 @@ tpl_api_ensure_qemu_img() {
     log_info "before uploading it to XO, which needs qemu-img."
     echo ""
 
-    if ! confirm_or_skip "Install ${pkg} now (${PKG_INSTALL} ${pkg})?"; then
+    if ! prompt_yes_no "Install ${pkg} now (${PKG_INSTALL} ${pkg})?"; then
         TPL_API_UNAVAILABLE_REASON="qemu-img is not installed"
         return 1
     fi
@@ -12457,7 +14391,7 @@ build_vm_templates() {
     # from ssh, which reads as a wrong password rather than a missing directory.
     DEPLOY_WORKDIR=$(mktemp -d --tmpdir xo-templates-XXXXXX)
     chmod 700 "$DEPLOY_WORKDIR"
-    trap tpl_cleanup EXIT
+    add_exit_cleanup tpl_cleanup
 
     # Decided here, before anything is created on the pool, so a fallback to
     # SSH happens while the only cost is a credentials prompt. See the comment
@@ -12487,7 +14421,7 @@ build_vm_templates() {
     echo ""
     local prompt="Build this template?"
     (( ${#TPL_SELECTED[@]} > 1 )) && prompt="Build these ${#TPL_SELECTED[@]} templates?"
-    confirm_or_skip "$prompt" || { log_info "Cancelled."; return 0; }
+    prompt_yes_no "$prompt" || { log_info "Cancelled."; return 0; }
 
     local built=0 failed=0 skipped=0
     for row in "${TPL_SELECTED[@]}"; do
@@ -12560,12 +14494,14 @@ MENU_NAMES=(
     "Install XO Proxy"
     "Deploy Xen Orchestra to a new VM"
     "VM Template Library"
+    "TwinStor"
     "Reconfigure Xen Orchestra"
     "Rebuild Xen Orchestra"
     "Edit xo-config.cfg"
     "Restore Backup"
     "Adjust Xen Orchestra Memory Allocation"
     "Custom Plugins"
+    "XOSTOR *"
 )
 MENU_HINTS=(
     ""
@@ -12574,12 +14510,14 @@ MENU_HINTS=(
     ""
     "(creates the VM for you)"
     "(cloud-init templates for New VM)"
+    "(2-host replicated shared storage, tech preview)"
     "(made changes to config)"
     "(wipe & reinstall maintain settings)"
     ""
     ""
     ""
     "(NanoKVM power control, host power manager, ...)"
+    "(LINSTOR/DRBD storage, 3+ hosts; * unsupported for XO from sources)"
 )
 
 MENU_TITLE="Install Xen Orchestra from Sources Setup and Update"
@@ -13300,10 +15238,7 @@ menu_rename_config() {
     echo ""
     if [[ -f "$CONFIG_FILE" ]]; then
         log_warning "xo-config.cfg already exists!"
-        local overwrite
-        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Overwrite with sample? (y/N) " overwrite < /dev/tty
-        echo
-        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+        if ! prompt_yes_no "Overwrite with sample?"; then
             log_info "Skipping rename."
             # Nothing changed, so no reload is offered for it.
             return 1
@@ -13355,10 +15290,7 @@ menu_edit_config() {
     # Check if editor is installed
     if ! command -v "$editor" &>/dev/null; then
         log_warning "${editor} is not installed."
-        local install_editor
-        read -n 1 -rp "$(echo -e "${YELLOW}[WARNING]${NC}") Install ${editor}? (y/N) " install_editor < /dev/tty
-        echo
-        if [[ "$install_editor" =~ ^[Yy]$ ]]; then
+        if prompt_yes_no "Install ${editor}?"; then
             # Detect package manager if not already done
             if [[ -z "${PKG_INSTALL:-}" ]]; then
                 if command -v apt-get &>/dev/null; then
@@ -13626,7 +15558,7 @@ process_menu_selections() {
         menu_rename_config && config_changed=true
     fi
 
-    if [[ ${MENU_SELECTED[8]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[9]} -eq 1 ]]; then
         menu_edit_config && config_changed=true
     fi
 
@@ -13664,7 +15596,7 @@ process_menu_selections() {
 menu_other_items_selected() {
     local i
     for ((i = 0; i < MENU_TOTAL; i++)); do
-        [[ $i -eq 2 || $i -eq 8 ]] && continue
+        [[ $i -eq 2 || $i -eq 9 ]] && continue
         [[ ${MENU_SELECTED[$i]} -eq 1 ]] && return 0
     done
     return 1
@@ -13691,7 +15623,7 @@ process_menu_operations() {
     fi
 
     # Reconfigure Xen Orchestra
-    if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -13701,7 +15633,7 @@ process_menu_operations() {
     fi
 
     # Rebuild Xen Orchestra
-    if [[ ${MENU_SELECTED[7]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[8]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -13723,7 +15655,7 @@ process_menu_operations() {
     fi
 
     # Restore Backup
-    if [[ ${MENU_SELECTED[9]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[10]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -13742,7 +15674,7 @@ process_menu_operations() {
     fi
 
     # Adjust Xen Orchestra Memory Allocation
-    if [[ ${MENU_SELECTED[10]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[11]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
@@ -13764,13 +15696,31 @@ process_menu_operations() {
         build_vm_templates
     fi
 
+    # TwinStor
+    # Targets the pool's hosts, not this machine: no sudo, no systemd.
+    if [[ ${MENU_SELECTED[6]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        load_config
+        twinstor_menu
+    fi
+
     # Custom Plugins
-    if [[ ${MENU_SELECTED[11]} -eq 1 ]]; then
+    if [[ ${MENU_SELECTED[12]} -eq 1 ]]; then
         check_required_commands
         check_not_root
         check_sudo
         check_systemctl
         manage_custom_plugins
+    fi
+
+    # XOSTOR
+    # Targets the pool's hosts, not this machine: no sudo, no systemd.
+    if [[ ${MENU_SELECTED[13]} -eq 1 ]]; then
+        check_required_commands
+        check_not_root
+        load_config
+        xostor_menu
     fi
 }
 
@@ -14066,7 +16016,7 @@ main() {
                 show_version
                 exit 0
                 ;;
-            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--adjust-memory|--flush-tokens|--uninstall|--status|--custom-plugins|--help)
+            --install|--update|--restore|--rebuild|--reconfigure|--proxy|--deploy|--build-templates|--twinstor|--twinstor-upgrade|--adjust-memory|--flush-tokens|--uninstall|--status|--custom-plugins|--help)
                 OPERATION="$1"
                 ;;
             *)
@@ -14119,13 +16069,22 @@ main() {
         exit 1
     fi
 
+    # TwinStor erases disks on the pool's hosts and asks for typed confirmations,
+    # so it needs a terminal.
+    if [[ "$NON_INTERACTIVE" == "true" ]] && [[ "$OPERATION" == "--twinstor" || "$OPERATION" == "--twinstor-upgrade" ]]; then
+        log_error "${OPERATION} cannot be combined with --non-interactive."
+        log_error "It erases disks on the pool's hosts and needs typed confirmations."
+        exit 1
+    fi
+
     # Acquire exclusive lock for all mutating operations (not --help).
     # --deploy is excluded: it changes nothing on this machine, and holding the
     # install lock for the length of a remote deploy would block unrelated
     # local operations for no reason. --status is excluded for the same
     # reason: it only reads state to report it, so it should never have to
     # wait on -- or block -- a real install/update/rebuild in progress.
-    if [[ "$OPERATION" != "--help" ]] && [[ "$OPERATION" != "--deploy" ]] && [[ "$OPERATION" != "--status" ]]; then
+    if [[ "$OPERATION" != "--help" ]] && [[ "$OPERATION" != "--deploy" ]] && [[ "$OPERATION" != "--status" ]] \
+        && [[ "$OPERATION" != "--twinstor" ]] && [[ "$OPERATION" != "--twinstor-upgrade" ]]; then
         acquire_lock
     fi
 
@@ -14197,6 +16156,18 @@ main() {
             check_not_root
             load_config
             build_vm_templates
+            ;;
+        --twinstor|--twinstor-upgrade)
+            # Targets the pool's hosts, not this machine: no sudo, no systemd.
+            # load_config for TWINSTOR_VERSION and TWINSTOR_SHA256.
+            check_required_commands
+            check_not_root
+            load_config
+            if [[ "$OPERATION" == "--twinstor-upgrade" ]]; then
+                twinstor_menu update
+            else
+                twinstor_menu
+            fi
             ;;
         --adjust-memory)
             check_required_commands

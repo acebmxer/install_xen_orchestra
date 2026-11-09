@@ -35,7 +35,7 @@ stub_menu_operations() {
     menu_edit_config() { echo menu_edit_config >> "$CALLS"; return 0; }
     prompt_yes_no() { echo prompt_yes_no >> "$CALLS"; return 1; }
     MENU_SELECTED[1]=1   # Update
-    MENU_SELECTED[8]=1   # Edit xo-config.cfg
+    MENU_SELECTED[9]=1   # Edit xo-config.cfg
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -65,7 +65,7 @@ stub_menu_operations() {
     stub_menu_operations
     menu_edit_config() { echo menu_edit_config >> "$CALLS"; return 0; }
     prompt_yes_no() { echo prompt_yes_no >> "$CALLS"; return 1; }
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -77,7 +77,7 @@ stub_menu_operations() {
     menu_edit_config() { echo menu_edit_config >> "$CALLS"; return 1; }
     prompt_yes_no() { echo prompt_yes_no >> "$CALLS"; return 1; }
     MENU_SELECTED[1]=1
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -117,7 +117,7 @@ stub_preflight_only() {
     get_installed_commit() { echo 3923756ff5d5aaaa; }
     get_remote_commit() { echo 3923756ff5d5aaaa; }
     MENU_SELECTED[1]=1   # Update
-    MENU_SELECTED[8]=1   # Edit xo-config.cfg
+    MENU_SELECTED[9]=1   # Edit xo-config.cfg
 
     run process_menu_selections
     [ "$status" -eq 0 ]
@@ -130,27 +130,27 @@ stub_preflight_only() {
     stub_preflight_only
     install_dir_git() { echo master; }
     get_installed_commit() { echo 3923756ff5d5aaaa; }
-    confirm_or_skip() { return 1; }
-    MENU_SELECTED[7]=1   # Rebuild
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[8]=1   # Rebuild
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
     [[ "$output" == *"Rebuild cancelled."* ]]
-    [ "$(tail -1 "$CALLS")" = "prompt_yes_no" ]
+    # The confirmation was asked and declined, then the reload was offered.
+    [ "$(grep -c prompt_yes_no "$CALLS")" -eq 2 ]
 }
 
 @test "Edit + Reconfigure cancelled: the reload is still offered" {
     stub_preflight_only
     detect_legacy_system_state() { LEGACY_SYSTEM_CHANGES=(); }
-    confirm_or_skip() { return 1; }
-    MENU_SELECTED[6]=1   # Reconfigure
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[7]=1   # Reconfigure
+    MENU_SELECTED[9]=1
 
     run process_menu_selections
     [ "$status" -eq 0 ]
     [[ "$output" == *"Reconfiguration cancelled."* ]]
-    [ "$(tail -1 "$CALLS")" = "prompt_yes_no" ]
+    # The confirmation was asked and declined, then the reload was offered.
+    [ "$(grep -c prompt_yes_no "$CALLS")" -eq 2 ]
 }
 
 @test "Edit + Restore quit at the backup list: the reload is still offered" {
@@ -158,8 +158,8 @@ stub_preflight_only() {
     BACKUP_DIR="$BATS_TEST_TMPDIR/backups"
     mkdir -p "$BACKUP_DIR/xo-backup-20261022_000000"
     verify_backup_integrity() { return 0; }
-    MENU_SELECTED[9]=1   # Restore Backup
-    MENU_SELECTED[8]=1
+    MENU_SELECTED[10]=1   # Restore Backup
+    MENU_SELECTED[9]=1
 
     run process_menu_selections <<< "q"
     [ "$status" -eq 0 ]
@@ -172,14 +172,14 @@ stub_preflight_only() {
     BACKUP_DIR="$BATS_TEST_TMPDIR/backups"
     mkdir -p "$BACKUP_DIR/xo-backup-20261022_000000"
     verify_backup_integrity() { return 0; }
-    confirm_or_skip() { return 1; }
+    MENU_SELECTED[10]=1
     MENU_SELECTED[9]=1
-    MENU_SELECTED[8]=1
 
     run process_menu_selections <<< "1"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Restore cancelled."* ]]
-    [ "$(tail -1 "$CALLS")" = "prompt_yes_no" ]
+    # The confirmation was asked and declined, then the reload was offered.
+    [ "$(grep -c prompt_yes_no "$CALLS")" -eq 2 ]
 }
 
 # The rename and edit prompts read /dev/tty, so these run the function
@@ -201,7 +201,7 @@ EOF
 @test "declining the rename's overwrite does not count as a change" {
     echo 'OLD=1' > "$BATS_TEST_TMPDIR/xo-config.cfg"
     echo 'NEW=1' > "$BATS_TEST_TMPDIR/sample-xo-config.cfg"
-    run_on_pty "n" 'rc=0; menu_rename_config || rc=$?'
+    run_on_pty "n"$'\n' 'rc=0; menu_rename_config || rc=$?'
     [[ "$output" == *"Skipping rename."* ]]
     [[ "$output" == *"rc=1"* ]]
     [ "$(cat "$BATS_TEST_TMPDIR/xo-config.cfg")" = "OLD=1" ]

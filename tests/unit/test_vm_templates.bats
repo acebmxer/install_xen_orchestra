@@ -668,7 +668,7 @@ teardown() {
 @test "the build installs a cleanup trap for its working directory" {
     local body
     body=$(declare -f build_vm_templates)
-    [[ "$body" == *"trap tpl_cleanup EXIT"* ]]
+    [[ "$body" == *"add_exit_cleanup tpl_cleanup"* ]]
     declare -F tpl_cleanup > /dev/null
 }
 

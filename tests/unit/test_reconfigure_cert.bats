@@ -31,7 +31,7 @@ setup() {
     sudo() { "$@"; }
     systemctl() { :; }
     timeout() { shift; "$@"; }
-    confirm_or_skip() { return 0; }
+    prompt_yes_no() { return 0; }
     flush_redis_tokens() { :; }
     detect_legacy_system_state() { LEGACY_SYSTEM_CHANGES=(); }
     get_previous_service_user() { echo root; }
@@ -82,7 +82,7 @@ setup() {
     [ "$status" -eq 0 ]
     run openssl x509 -noout -subject -ext subjectAltName -in "$SSL_CERT_DIR/$SSL_CERT_FILE"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"CN = runnervm1"* ]]
+    [[ "$output" =~ CN\ ?=\ ?runnervm1 ]]
     [[ "$output" == *"DNS:${fqdn}"* ]]
 }
 
@@ -93,6 +93,6 @@ setup() {
     run generate_ssl_certificate
     [ "$status" -eq 0 ]
     run openssl x509 -noout -subject -ext subjectAltName -in "$SSL_CERT_DIR/$SSL_CERT_FILE"
-    [[ "$output" == *"CN = xo.example.lan"* ]]
+    [[ "$output" =~ CN\ ?=\ ?xo\.example\.lan ]]
     [[ "$output" == *"DNS:xo.example.lan"* ]]
 }

@@ -133,7 +133,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build integration image (${{ matrix.distro }})
-        run: docker build -f ${{ matrix.dockerfile }} -t xo-test-${{ matrix.distro }} .
+        # Retried: the distro package mirrors time out from the runners now
+        # and then, and that is not a defect in the code under test.
+        run: |
+          for attempt in 1 2 3; do
+            docker build -f ${{ matrix.dockerfile }} -t xo-test-${{ matrix.distro }} . && exit 0
+            echo "Image build failed (attempt $attempt of 3)"; sleep 30
+          done
+          exit 1
 
       - name: Run integration tests (${{ matrix.distro }})
         run: docker run --rm xo-test-${{ matrix.distro }}
