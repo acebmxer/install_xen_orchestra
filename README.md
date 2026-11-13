@@ -7,10 +7,10 @@
 [![Issues](https://img.shields.io/github/issues/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/issues)
 [![Stars](https://img.shields.io/github/stars/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/stargazers)
 [![Forks](https://img.shields.io/github/forks/acebmxer/install_xen_orchestra)](https://github.com/acebmxer/install_xen_orchestra/forks)
-[![Unique cloners](https://img.shields.io/badge/unique%20cloners-173-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
+[![Unique cloners](https://img.shields.io/badge/unique%20cloners-102-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/graphs/traffic)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](install-xen-orchestra.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-operating-systems)
-[![Tests](https://img.shields.io/badge/tests-632%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-655%20unit-informational)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 [![Distros tested](https://img.shields.io/badge/distros%20tested-14-informational)](#supported-operating-systems)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen)](https://github.com/acebmxer/install_xen_orchestra/actions/workflows/ci.yml)
 
@@ -305,6 +305,7 @@ template uses:
   ▸ [ ] AlmaLinux 8 (login: almalinux)
     [ ] AlmaLinux 9 (login: almalinux)
     [ ] AlmaLinux 10 (login: almalinux)
+    [ ] Alpine Linux 3.24 (login: alpine)
     [ ] CentOS Stream 9 (login: cloud-user)
     [ ] CentOS Stream 10 (login: cloud-user)
     [ ] Debian 12 (Bookworm) (login: debian)
@@ -325,8 +326,9 @@ template uses:
 
 When the build goes through the XO API (an `XO_API_TOKEN` is set and
 `TEMPLATE_BUILD_METHOD` is not `ssh`), a row that is already built on the pool
-says `already on this pool` beneath it, so a re-run is not a guess about what a
-build would do; if XO manages several pools, it asks which pool first. The SSH
+says `already on this pool` at the end of its line, so a re-run is not a guess
+about what a build would do; if XO manages several pools, it asks which pool
+first. The SSH
 build shows no label, since it would need the pool master's password before the
 list opens. Either way, a template that already exists is skipped, not rebuilt.
 
@@ -337,9 +339,9 @@ built they appear in Xen Orchestra under **New → VM**, alongside any Hub
 templates you already have.
 
 Every distribution in the catalogue is buildable: AlmaLinux 8, 9 and 10,
-CentOS Stream 9 and 10, Debian 12 (Bookworm) and 13 (Trixie), Fedora 43 and 44,
-Rocky Linux 8, 9 and 10, and the three Ubuntu LTS releases — 22.04 (Jammy),
-24.04 (Noble) and 26.04 (Resolute). The full walkthrough — what each
+Alpine Linux 3.24, CentOS Stream 9 and 10, Debian 12 (Bookworm) and 13
+(Trixie), Fedora 43 and 44, Rocky Linux 8, 9 and 10, and the three Ubuntu LTS
+releases — 22.04 (Jammy), 24.04 (Noble) and 26.04 (Resolute). The full walkthrough — what each
 template contains, how the boot firmware is chosen, requirements, and what to do
 when a build fails — is in [docs/templates.md](docs/templates.md).
 

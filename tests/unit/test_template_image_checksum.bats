@@ -55,6 +55,30 @@ teardown() {
     [ "$DEPLOY_IMAGE_VERIFIED" = "false" ]
 }
 
+@test "a per-image file holding only the digest verifies that image" {
+    # Alpine's "<image>.sha512": the hash and nothing else, no filename.
+    deploy_checksum_source() { printf 'image.qcow2.sha512 512'; }
+    printf '%s\n' "$(sha512sum "$S/origin/image.qcow2" | awk '{print $1}')" \
+        > "$S/origin/image.qcow2.sha512"
+    deploy_verify_image_checksum "$QCOW_URL" "$S/origin/image.qcow2" local > "$S/out" 2>&1
+    grep -q "image checksum verified" "$S/out"
+    [ "$DEPLOY_IMAGE_VERIFIED" = "true" ]
+
+    head -c 300000 /dev/urandom > "$S/bad.qcow2"
+    run deploy_verify_image_checksum "$QCOW_URL" "$S/bad.qcow2" local
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"does not match its published checksum"* ]]
+}
+
+@test "a bare digest in a shared sums file is never taken as this image's" {
+    # A shared file names each image; a line with no name could be anyone's.
+    printf '%s\n' "$(sha512sum "$S/origin/image.raw" | awk '{print $1}')" \
+        > "$S/origin/SHA512SUMS"
+    deploy_verify_image_checksum "$RAW_URL" "$S/origin/image.raw" local > "$S/out" 2>&1
+    grep -q "cannot be verified" "$S/out"
+    [ "$DEPLOY_IMAGE_VERIFIED" = "false" ]
+}
+
 @test "digest mode: the right digest passes, a wrong one is refused" {
     run deploy_verify_image_checksum "$RAW_URL" "$GOOD_RAW" digest
     [ "$status" -eq 0 ]

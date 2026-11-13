@@ -32,14 +32,15 @@ prompt.
 
 A sealed VM template that appears in Xen Orchestra under **New → VM**, sitting
 alongside any Hub templates you already have. Set the name, CPU, memory, disk
-size and network there; cloud-init's growpart expands the filesystem to
-whatever disk size you ask for on first boot.
+size and network there; cloud-init expands the filesystem to whatever disk
+size you ask for on first boot.
 
 Each template ships with:
 
 - **cloud-init**, so you can supply an SSH key or a full cloud-config at VM
   creation time.
-- **XCP-ng guest tools**, installed from `guest-tools.iso` on the pool. Without
+- **XCP-ng guest tools**, installed from `guest-tools.iso` on the pool (Alpine
+  takes its own `xe-guest-utilities` package instead; see below). Without
   these XO never reports a VM's IP address, so a build fails rather than
   producing a template that looks fine and is quietly useless.
 - **A shipped login** — the account named in the template's description, with
@@ -52,7 +53,8 @@ Each template ships with:
   partition table is read: if it carries an EFI system partition the template is
   published as UEFI, otherwise as BIOS. The Debian and Ubuntu images all carry
   an ESP *and* a BIOS boot partition, so either choice works from XO's "Boot
-  firmware" dropdown — the template just gives you the right default.
+  firmware" dropdown — the template just gives you the right default. Alpine's
+  image is the exception: it is BIOS-only, and its template says so.
 
 Defaults are 2 vCPUs, 2 GiB of RAM and a 4 GiB disk — 6 GiB for Ubuntu 24.04
 and 26.04, 5 GiB for the Fedora entries, and 10 GiB for the AlmaLinux, CentOS
@@ -67,6 +69,7 @@ limits.
 | AlmaLinux 8 | `AlmaLinux-8-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
 | AlmaLinux 9 | `AlmaLinux-9-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
 | AlmaLinux 10 | `AlmaLinux-10-GenericCloud-latest.x86_64.qcow2` from `repo.almalinux.org` | `almalinux` |
+| Alpine Linux 3.24 | `generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2` from `dl-cdn.alpinelinux.org` | `alpine` |
 | CentOS Stream 9 | `CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2` from `cloud.centos.org` | `cloud-user` |
 | CentOS Stream 10 | `CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2` from `cloud.centos.org` | `cloud-user` |
 | Debian 12 (Bookworm) | `debian-12-generic-amd64.raw` from `cloud.debian.org` | `debian` |
@@ -197,6 +200,33 @@ Fedora's root filesystem is btrfs with subvolumes, unlike every other entry
 here. Nothing in the build reads the filesystem — the import is block-level and
 growpart works on the partition — so it changes nothing in practice.
 
+Alpine Linux 3.24 has a preparation script of its own, `tpl_prep_alpine`,
+because almost nothing from the others applies: the image has no bash, no
+systemd, and neither `apt` nor `dnf`. Everything below was read off the image
+itself and checked by booting it with the build's own preparation drive:
+
+- **The BIOS image, published as BIOS.** Alpine publishes separate BIOS and
+  UEFI images rather than one that does both. The build's preparation boot
+  always runs under BIOS, so the BIOS image is the one that can be built, and
+  the template offers BIOS as its firmware. Choosing UEFI in XO's New VM form
+  will not boot it.
+- **No partition table.** The whole disk is one ext4 filesystem, so there is
+  nothing for growpart to grow; cloud-init's resizefs grows the filesystem to
+  whatever disk size you set instead. The image is a 200 MiB disk, so the
+  4 GiB default holds it many times over.
+- **Guest tools from Alpine's own package**, `xe-guest-utilities` from the
+  `community` repository, with its OpenRC service enabled. The ISO's
+  `install.sh` is a bash script that does not recognise Alpine.
+- **`doas`, not `sudo`.** The image ships `doas` only, so the template gives the
+  `alpine` account password-free `doas` in `/etc/doas.d/99-xo-template.conf`,
+  the equivalent of the `sudo` rule the other templates carry.
+- **The DHCP identity is scrubbed too.** `dhcpcd` keeps a DUID and sends it as
+  its client id, so a clone that kept the build VM's would ask for the same
+  lease.
+- **The point release is in the image's filename**, and Alpine publishes no
+  "latest" name for cloud images, so a newer 3.24 image (or 3.25, once its
+  cloud images appear) means editing the catalogue row.
+
 ## Adding a distribution
 
 Every distribution in the catalogue is buildable today — nothing is marked
@@ -213,7 +243,9 @@ per-distribution work are all solved generically:
    image's own URL, and the two shapes those files come in are both parsed:
    coreutils' `<hash>  <file>` (Debian's `SHA512SUMS`, Ubuntu's `SHA256SUMS`,
    AlmaLinux's `CHECKSUM`) and the BSD tag `SHA256 (<file>) = <hash>` (CentOS
-   Stream's and Rocky Linux's `CHECKSUM`, all releases).
+   Stream's and Rocky Linux's `CHECKSUM`, all releases). Alpine publishes a
+   third: a `<image>.sha512` beside each image holding the digest alone, which
+   is read only from a file named for the image being checked.
 
    The shape is not a property of the distribution family, which is why it is
    tried both ways rather than selected by origin: `repo.almalinux.org`,
@@ -232,7 +264,8 @@ per-distribution work are all solved generically:
    `tpl_prep_debian` and serves the RHEL rebuilds — AlmaLinux, CentOS Stream
    and Rocky Linux, all releases. Both Fedora entries have their own,
    `tpl_prep_fedora`, because their guest tools do not come from the ISO the way
-   the rebuilds' do.
+   the rebuilds' do. Alpine has `tpl_prep_alpine`, written for its `sh`, `apk`
+   and OpenRC.
 
 A new row whose image has not been read yet can land with a `-` in its
 prep-function field: the menu then shows it as **Coming Soon...** and refuses
@@ -242,11 +275,12 @@ Images come from the distribution's own mirror, so nothing is redistributed and
 you can see exactly what you are installing. Checksums are not pinned in the
 script: every origin publishes a checksum file beside its image — `SHA512SUMS`
 for Debian, `SHA256SUMS` for Ubuntu, `CHECKSUM` for AlmaLinux, CentOS Stream and
-Rocky Linux, and a release-stamped `Fedora-Cloud-<release>-<compose>-x86_64-CHECKSUM`
-for Fedora — which is fetched and verified at build time, so a new upstream release
-is picked up without anyone editing the catalogue. Which file and which algorithm
-is worked out from the image's URL, so adding an image does not mean declaring
-its checksum format alongside it.
+Rocky Linux, a release-stamped `Fedora-Cloud-<release>-<compose>-x86_64-CHECKSUM`
+for Fedora, and `<image>.sha512` for Alpine — which is fetched and verified at
+build time, so where the origin publishes a fixed "latest" name, a new upstream
+release is picked up without anyone editing the catalogue. Which file and which
+algorithm is worked out from the image's URL, so adding an image does not mean
+declaring its checksum format alongside it.
 
 ## What a build does
 
@@ -262,9 +296,10 @@ its checksum format alongside it.
    a raw image (Debian) is streamed straight to XO and hashed on the way, and
    a mismatch fails the build and deletes the disk it was written to.
 3. **Imports it into the disk** over XAPI's HTTP endpoint, then confirms the
-   disk actually holds a partition table before going further.
+   disk actually holds a partition table (for Alpine, which has none, its boot
+   sector) before going further.
 4. **Boots the VM once.** A cloud-init drive installs the guest tools, adds
-   cloud-init and growroot, sets the shipped login, then scrubs the machine
+   cloud-init and growroot where the image lacks them, sets the shipped login, then scrubs the machine
    identity a clone must not inherit — machine-id, SSH host keys, the build's
    temporary SSH key, hostname, saved network connections, cloud-init state,
    logs and shell history — and

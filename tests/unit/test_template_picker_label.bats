@@ -119,8 +119,21 @@ _picker_stubs() {
     run tpl_prompt_selection
     [ "$status" -eq 0 ]
     [ "$(grep -c 'already on this pool' <<< "$output")" -eq 1 ]
-    # The label sits under the Debian 13 row.
+    # The label sits beside the Debian 13 row.
     grep -A1 'Debian 13 (Trixie)' <<< "$output" | grep -q 'already on this pool'
+}
+
+@test "the pool label is on the template's own line, not a line of its own" {
+    # #121: on a line of its own the label sat a column left of the names and
+    # made the list uneven.
+    _picker_stubs
+    TPL_EXISTING_KNOWN=true
+    TPL_EXISTING_NAMES="Debian 13 (Trixie) Cloud-init"
+    run tpl_prompt_selection
+    [ "$status" -eq 0 ]
+    grep 'Debian 13 (Trixie)' <<< "$output" | grep -q '(login: debian).*already on this pool'
+    run grep -E '^[[:space:]]*(\x1b\[[0-9;]*m)*already on this pool' <<< "$output"
+    [ "$status" -eq 1 ]
 }
 
 @test "the picker makes no pool calls of its own" {

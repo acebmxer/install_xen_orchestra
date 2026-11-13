@@ -10,6 +10,25 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+### Added
+
+- **Alpine Linux 3.24 in the VM Template Library.** `--build-templates` can now
+  build an "Alpine Linux 3.24 Cloud-init" template from Alpine's own BIOS cloud
+  image, with login `alpine` / `alpine`. The image is checked against the
+  `.sha512` file Alpine publishes beside it, the guest tools come from Alpine's
+  `xe-guest-utilities` package, the `alpine` account gets password-free `doas`
+  (Alpine has no `sudo`), and the build clears the DHCP client identity along
+  with the rest of the machine identity. The image is BIOS-only, so the
+  template is published as BIOS and its description says so.
+
+### Fixed
+
+- **The template picker's "already on this pool" note is on the template's own
+  line** instead of a line of its own below it, where it sat a column left of
+  the template names and made the list uneven. (#121)
+- **Q in the VM Template Library goes back to the main menu** instead of
+  ending the script, the same as Q in Custom Plugins. (#122)
+
 ## [0.10.0] - 2026-11-09
 
 ### Added

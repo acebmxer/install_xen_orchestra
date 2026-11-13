@@ -31,9 +31,16 @@ teardown() {
 # build carries on with an empty URL or an empty prep function name.
 
 @test "every catalogue row has all seven fields" {
-    local row
+    # Seven, or eight when the row declares its firmware for the API path
+    # (Alpine's BIOS-only image). An eighth field is only ever uefi or bios:
+    # anything else would be silently read as uefi.
+    local row nf
     for row in "${TPL_CATALOG[@]}"; do
-        [ "$(awk -F'|' '{print NF}' <<< "$row")" -eq 7 ]
+        nf=$(awk -F'|' '{print NF}' <<< "$row")
+        [ "$nf" -eq 7 ] || [ "$nf" -eq 8 ]
+        if [ "$nf" -eq 8 ]; then
+            [[ "$(tpl_field "$row" 8)" == "uefi" || "$(tpl_field "$row" 8)" == "bios" ]]
+        fi
     done
 }
 
@@ -619,6 +626,122 @@ teardown() {
     done
 }
 
+# --- Alpine -------------------------------------------------------------------
+#
+# Alpine shares nothing with the other prep scripts' tooling: no bash, no
+# systemd, no apt or dnf, busybox in place of coreutils. Each point below was
+# read off the 3.24 bios cloudinit image.
+
+@test "the Alpine row is buildable, BIOS-only, and has its own prep script" {
+    local row
+    row=$(tpl_row_for_key alpine324)
+    [ -n "$row" ]
+    ! tpl_is_placeholder "$row"
+    [ "$(tpl_field "$row" 6)" = "tpl_prep_alpine" ]
+    # From the image's /etc/cloud/cloud.cfg, system_info.default_user.name.
+    [ "$(tpl_field "$row" 5)" = "alpine" ]
+    # The bios image: the build boot runs under BIOS, and the disk has no ESP,
+    # so the API path has to be told rather than defaulting to uefi.
+    [[ "$(tpl_field "$row" 4)" == *-bios-cloudinit-*.qcow2 ]]
+    [ "$(tpl_row_firmware "$row")" = "bios" ]
+    # A 200 MiB image: the default disk clears it, so no override.
+    [ -z "$(tpl_field "$row" 7)" ]
+}
+
+@test "the alpine prep script is POSIX sh, since the image has no bash" {
+    tpl_prep_alpine alpine > "${TMPDIR_TEST}/prep.sh"
+    [ "$(head -1 "${TMPDIR_TEST}/prep.sh")" = "#!/bin/sh" ]
+    sh -n "${TMPDIR_TEST}/prep.sh"
+    if command -v busybox >/dev/null; then
+        busybox sh -n "${TMPDIR_TEST}/prep.sh"
+    fi
+    # No bash-only syntax in the commands themselves.
+    run grep -nE '\[\[|^[[:space:]]*local |\$\{[A-Za-z_]+//|<<<' "${TMPDIR_TEST}/prep.sh"
+    [ "$status" -eq 1 ]
+}
+
+@test "the alpine prep script substitutes the account name" {
+    run tpl_prep_alpine someuser
+    [[ "$output" == *"someuser:someuser"* ]]
+    [[ "$output" == *"permit nopass someuser"* ]]
+    [[ "$output" != *"__TPL_USER__"* ]]
+}
+
+@test "the alpine prep script ends by powering the VM off with a command busybox has" {
+    # Busybox ships poweroff and no shutdown; a script ending in a command
+    # that does not exist leaves the VM running and the build waiting out its
+    # timeout.
+    run tpl_prep_alpine alpine
+    [[ "$(grep -v '^\s*#' <<< "$output" | grep . | tail -1)" == "poweroff" ]]
+    run grep -nE '^[[:space:]]*shutdown' <<< "$output"
+    [ "$status" -eq 1 ]
+}
+
+@test "the alpine prep script installs the guest agent from apk and starts it" {
+    # The ISO's install.sh is a bash script that does not recognise Alpine.
+    # The agent has to run during this boot: the build reads the os-version
+    # it reports before sealing.
+    run tpl_prep_alpine alpine
+    [[ "$output" == *"apk add xe-guest-utilities"* ]]
+    [[ "$output" == *"rc-update add xe-guest-utilities default"* ]]
+    [[ "$output" == *"rc-service xe-guest-utilities start"* ]]
+    run grep -nE 'install\.sh|apt-get|dnf |systemctl' <<< "$(tpl_prep_alpine alpine | grep -v '^\s*#')"
+    [ "$status" -eq 1 ]
+}
+
+@test "the alpine prep script scrubs every piece of machine identity" {
+    run tpl_prep_alpine alpine
+    [[ "$output" == *"cloud-init clean"* ]]
+    [[ "$output" == *"/etc/machine-id"* ]]
+    [[ "$output" == *"rm -f /etc/ssh/ssh_host_*"* ]]
+    [[ "$output" == *"/var/lib/cloud/instances"* ]]
+    # Back to the image's own name, not the build VM's.
+    [[ "$output" == *"printf 'localhost\n' > /etc/hostname"* ]]
+    # dhcpcd sends its DUID as the client id; a shared one shares a lease.
+    [[ "$output" == *"/var/lib/dhcpcd/*"* ]]
+}
+
+@test "the alpine prep script removes the build key from authorized_keys" {
+    command -v ssh-keygen >/dev/null || skip "ssh-keygen not installed"
+    DEPLOY_WORKDIR="$TMPDIR_TEST"
+    local pubkey line root="${TMPDIR_TEST}/alpine"
+    pubkey=$(tpl_build_ssh_key)
+    [ -n "$pubkey" ]
+    mkdir -p "${root}/root/.ssh" "${root}/home/someuser/.ssh"
+    printf 'ssh-ed25519 AAAAown operator@laptop\n%s\n' "$pubkey" \
+        > "${root}/home/someuser/.ssh/authorized_keys"
+    printf 'no-port-forwarding,command="echo login as someuser" %s\n' "$pubkey" \
+        > "${root}/root/.ssh/authorized_keys"
+
+    line=$(tpl_prep_alpine someuser | grep 'authorized_keys' | grep -v '^\s*#')
+    [ -n "$line" ]
+    line=${line//\/root\//${root}\/root\/}
+    line=${line//\/home\//${root}\/home\/}
+    # sh, not bash: this is the shell that runs it in the guest.
+    sh -c "$line"
+
+    run grep -qF "xo template build (temporary)" "${root}/home/someuser/.ssh/authorized_keys"
+    [ "$status" -eq 1 ]
+    run grep -qF "xo template build (temporary)" "${root}/root/.ssh/authorized_keys"
+    [ "$status" -eq 1 ]
+    grep -qF "operator@laptop" "${root}/home/someuser/.ssh/authorized_keys"
+}
+
+@test "a BIOS-only template's description does not promise UEFI" {
+    # Stop the build right after the description is set.
+    tpl_template_exists_dispatch() { return 1; }
+    tpl_create_build_vm_dispatch() { echo "DESC:${TPL_DESCRIPTION}"; return 1; }
+    tpl_cleanup_failed_build_dispatch() { :; }
+    TPL_BUILD_METHOD=api
+
+    run tpl_build_one "$(tpl_row_for_key alpine324)"
+    [[ "$output" == *"DESC:Alpine Linux 3.24 with cloud-init"*"Boots under BIOS. Default login: alpine / alpine."* ]]
+    [[ "$output" != *"UEFI"* ]]
+
+    run tpl_build_one "$(tpl_row_for_key debian13)"
+    [[ "$output" == *"Boots under BIOS or UEFI."* ]]
+}
+
 # --- menu wiring -----------------------------------------------------------
 #
 # The dispatch in process_menu_selections indexes MENU_SELECTED by number, so
@@ -645,6 +768,33 @@ teardown() {
 
     run tpl_prompt_selection
     [ "$status" -eq 0 ]
+}
+
+@test "Q in the library goes back to the main menu instead of ending the script" {
+    # #122: run_menu redisplays the menu only when a submenu asks it to.
+    clear() { :; }
+    menu_hide_cursor() { :; }
+    menu_show_cursor() { :; }
+    stty() { :; }
+    menu_read_key() { MENU_KEY="QUIT"; }
+
+    MENU_REOPEN_MAIN=false
+    tpl_prompt_selection > /dev/null
+    [ "$MENU_REOPEN_MAIN" = "true" ]
+    [ "${#TPL_SELECTED[@]}" -eq 0 ]
+}
+
+@test "confirming the library with ENTER does not reopen the main menu" {
+    # Only Q backs out; a confirmed selection goes on to build.
+    clear() { :; }
+    menu_hide_cursor() { :; }
+    menu_show_cursor() { :; }
+    stty() { :; }
+    menu_read_key() { MENU_KEY="ENTER"; }
+
+    MENU_REOPEN_MAIN=false
+    tpl_prompt_selection > /dev/null
+    [ "$MENU_REOPEN_MAIN" = "false" ]
 }
 
 @test "the build creates a working directory before it connects" {
@@ -1463,6 +1613,19 @@ teardown() {
         [[ "$url" == *dl.rockylinux.org* ]] || continue
         [ "$(deploy_checksum_source "$url")" = "CHECKSUM 256" ]
     done
+}
+
+@test "Alpine images are verified against the .sha512 file beside each one" {
+    # dl-cdn.alpinelinux.org publishes no shared sums file for its cloud
+    # images, only "<image>.sha512" holding the bare SHA-512 digest.
+    local row url found=0
+    for row in "${TPL_CATALOG[@]}"; do
+        url=$(tpl_field "$row" 4)
+        [[ "$url" == *dl-cdn.alpinelinux.org* ]] || continue
+        found=$((found + 1))
+        [ "$(deploy_checksum_source "$url")" = "${url##*/}.sha512 512" ]
+    done
+    [ "$found" -ge 1 ]
 }
 
 @test "a BSD-tag CHECKSUM yields the digest for the Rocky 8 image" {
