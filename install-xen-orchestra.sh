@@ -11684,6 +11684,15 @@ echo "__TPL_USER__:__TPL_USER__" | chpasswd
 mkdir -p /etc/ssh/sshd_config.d
 printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-xo-template.conf
 
+# Alpine ships no sudo, so a cloud-config's "sudo:" line for its own user
+# (written to /etc/sudoers.d by cloud-init) would do nothing. The real package
+# makes that line work as it does on the other templates.
+apk add sudo || echo "WARNING: sudo not installed; cloud-config sudo: lines will not work"
+# The image has no /bin/bash and /etc/shells lists only sh and ash, so an
+# account whose cloud-config says "shell: /bin/bash" (as the other templates'
+# do) is refused at login. Install it so one cloud-config works everywhere.
+apk add bash || echo "WARNING: bash not installed; accounts with shell /bin/bash cannot log in"
+
 # The equivalent of the other templates' NOPASSWD sudo rule.
 mkdir -p /etc/doas.d
 printf 'permit nopass __TPL_USER__\n' > /etc/doas.d/99-xo-template.conf

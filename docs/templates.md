@@ -217,9 +217,11 @@ itself and checked by booting it with the build's own preparation drive:
 - **Guest tools from Alpine's own package**, `xe-guest-utilities` from the
   `community` repository, with its OpenRC service enabled. The ISO's
   `install.sh` is a bash script that does not recognise Alpine.
-- **`doas`, not `sudo`.** The image ships `doas` only, so the template gives the
+- **`doas` and `sudo`.** The image ships `doas` only, so the template gives the
   `alpine` account password-free `doas` in `/etc/doas.d/99-xo-template.conf`,
-  the equivalent of the `sudo` rule the other templates carry.
+  the equivalent of the `sudo` rule the other templates carry, and installs the
+  `sudo` and `bash` packages so a `sudo:` line and `shell: /bin/bash` in your
+  own cloud-config work for the account it creates.
 - **The DHCP identity is scrubbed too.** `dhcpcd` keeps a DUID and sends it as
   its client id, so a clone that kept the build VM's would ask for the same
   lease.

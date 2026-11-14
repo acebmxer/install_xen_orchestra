@@ -26,6 +26,10 @@ This installer builds Xen Orchestra from source and tracks the official
 - **The template picker's "already on this pool" note is on the template's own
   line** instead of a line of its own below it, where it sat a column left of
   the template names and made the list uneven. (#121)
+- **Alpine template installs `sudo` and `bash`.** Alpine ships neither, so a
+  cloud-config for your own user with `sudo:` did nothing, and one with
+  `shell: /bin/bash` left the account unable to log in at all. Rebuild the
+  Alpine template to pick it up.
 - **Q in the VM Template Library goes back to the main menu** instead of
   ending the script, the same as Q in Custom Plugins. (#122)
 
