@@ -23,6 +23,19 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ### Fixed
 
+- **A failed `--update` or `--rebuild` now says XO is stopped and how to get it
+  back.** When the run failed after `xo-server` was stopped (a broken build, a
+  failed Node.js or yarn install, a git error, anything else), the script ended
+  with only the error and no word that XO was down or that a backup had just
+  been made. It now ends with a message that says XO is stopped, names the
+  backup made at the start of that run, and gives the `--restore --backup-file`
+  command that puts it back, then lists what a bug report needs (installer
+  version, system, Node.js version, branch, and the XO commit before and after)
+  so it can be copied with the error. If the failure came before the backup, it
+  says nothing was changed and to start the service again. The old "run: sudo
+  systemctl start xo-server" advice is no longer printed in the case where it
+  would start a half-updated install. A `--rebuild` whose clone fails still
+  starts XO again, and does not say it is stopped. (#123)
 - **The template picker's "already on this pool" note is on the template's own
   line** instead of a line of its own below it, where it sat a column left of
   the template names and made the list uneven. (#121)

@@ -15,7 +15,7 @@ if [[ "${XO_DEBUG:-0}" == "1" ]]; then
     export PS4='+ '
 fi
 
-trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
+trap 'on_script_error "$LINENO" "$BASH_COMMAND"' ERR
 #
 # Xen Orchestra Installation Script
 # Based on: https://docs.xen-orchestra.com/install-from-sources
@@ -44,6 +44,16 @@ RESTORE_BACKUP_FILE=""
 LIST_BACKUPS_ONLY=false
 DRY_RUN=false
 ALLOW_EOL_DISTRO=false
+
+# Set by begin_service_downtime while --update or --rebuild has xo-server
+# stopped ("update" or "rebuild"), cleared again once the service is back up.
+# LAST_BACKUP_PATH is the backup create_backup made in this run. The two commits
+# are the XO commit before the run and the one it was moving to. All are read
+# by report_failed_downtime at exit.
+STOPPED_FOR=""
+LAST_BACKUP_PATH=""
+DOWNTIME_FROM_COMMIT=""
+DOWNTIME_TO_COMMIT=""
 
 # Logging flags (set via CLI flags in main())
 LOG_FILE=""
@@ -113,6 +123,19 @@ log_warning() {
 
 log_error() {
     _log "ERROR" "$1"
+}
+
+# The script's ERR trap. Without `set -E` it fires only for a failure at the
+# top level, not inside a function, so it rarely sees an update or rebuild
+# fail; report_failed_downtime covers those at exit. While xo-server is
+# stopped for one of them, "start the service" is the wrong advice (the
+# install may be half updated), so it is left out.
+on_script_error() {
+    if [[ -n "$STOPPED_FOR" ]]; then
+        log_error "Script failed at line $1: $2."
+    else
+        log_error "Script failed at line $1: $2. If the service was stopped, run: sudo systemctl start xo-server"
+    fi
 }
 
 # Print the value of the variable named by $1, escaped for a double-quoted
@@ -226,8 +249,12 @@ const cfg = JSON.parse(fs.readFileSync(path.join(process.env.XO_REG_CFG_HOME, "x
 # last registered first. "Do not add a third" way of setting an EXIT trap: use
 # these. (The one in the expect helper's heredoc is a separate process.)
 EXIT_CLEANUPS=()
+EXIT_STATUS=0
 
 run_exit_cleanups() {
+    # The script's exit status, kept before any cleanup runs: a cleanup that
+    # needs to know whether the script failed (report_failed_downtime) reads it.
+    EXIT_STATUS=$?
     local i
     for ((i = ${#EXIT_CLEANUPS[@]} - 1; i >= 0; i--)); do
         # One failing cleanup must not stop the ones before it.
@@ -250,6 +277,65 @@ remove_exit_cleanup() {
         [[ "$c" == "$1" ]] || keep+=("$c")
     done
     EXIT_CLEANUPS=(${keep[@]+"${keep[@]}"})
+}
+
+# --update and --rebuild stop xo-server, back the install up, then change it.
+# A failure after the stop leaves XO down, and the functions they call run
+# under `set -e` without an ERR trap, so nothing said so. Call
+# begin_service_downtime (kind, XO commit before, XO commit it moves to) right
+# after the stop and end_service_downtime once the service is running again;
+# if the script exits non-zero in between, report_failed_downtime says that XO
+# is stopped and how to get it back.
+# (--restore stops the service too, but its own steps are the recovery.)
+begin_service_downtime() {
+    # A dry run stops nothing.
+    [[ "$DRY_RUN" == "true" ]] && return 0
+    STOPPED_FOR="$1"
+    DOWNTIME_FROM_COMMIT="${2:-}"
+    DOWNTIME_TO_COMMIT="${3:-}"
+    # Only a backup made in this run counts.
+    LAST_BACKUP_PATH=""
+    add_exit_cleanup report_failed_downtime
+}
+
+end_service_downtime() {
+    STOPPED_FOR=""
+}
+
+# The facts a bug report needs, printed under the failure report so the user
+# can copy them with it. Every value falls back to "unknown": this runs while
+# the script is already failing.
+print_failure_details() {
+    local installer node
+    installer=$(show_version 2>/dev/null | sed -n 's/^  Version: //p') || installer=""
+    node=$(node --version 2>/dev/null) || node=""
+    # --update and --rebuild never read the distro themselves.
+    detect_os >/dev/null 2>&1 || true
+    log_info "Include this when you report the problem:"
+    log_info "  Installer:         ${installer:-unknown}"
+    log_info "  System:            ${OS_ID:-unknown}${OS_VERSION_ID:+ ${OS_VERSION_ID}}"
+    log_info "  Node.js:           ${node:-unknown}"
+    log_info "  Branch:            ${GIT_BRANCH:-unknown}"
+    log_info "  XO commit before:  ${DOWNTIME_FROM_COMMIT:0:12}"
+    if [[ -n "$DOWNTIME_TO_COMMIT" ]]; then
+        log_info "  XO commit target:  ${DOWNTIME_TO_COMMIT:0:12}"
+    fi
+    log_info "  Also copy the error printed above this message."
+}
+
+report_failed_downtime() {
+    [[ -n "$STOPPED_FOR" && "$EXIT_STATUS" -ne 0 ]] || return 0
+    log_error "The ${STOPPED_FOR} failed, and Xen Orchestra is stopped."
+    if [[ -n "$LAST_BACKUP_PATH" ]]; then
+        log_error "A backup of the install as it was before this run is at: ${LAST_BACKUP_PATH}"
+        # Full path: works from any directory and however the script was started.
+        log_error "To go back to it, run: ${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}") --restore --backup-file $(basename "$LAST_BACKUP_PATH") --non-interactive"
+        log_error "Do not just start the service: the install may be half updated."
+    else
+        log_error "It failed before the backup was made, so the installation has not been changed."
+        log_error "Start it again with: sudo systemctl start xo-server"
+    fi
+    print_failure_details
 }
 
 # Acquire an exclusive lock on XO_LOCKFILE using flock.
@@ -2972,6 +3058,8 @@ create_backup() {
     run_cmd sudo rm -rf "${BACKUP_PATH}/node_modules"
 
     log_success "Backup created: $BACKUP_PATH"
+    # Remembered so a later failure can name it (report_failed_downtime).
+    LAST_BACKUP_PATH="$BACKUP_PATH"
 
     # This backup copies $INSTALL_DIR only. Neither half of the credential
     # encryption key lives there (one half is in XenStore, the other in
@@ -3672,6 +3760,7 @@ update_xo() {
     # Stop service
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
+    begin_service_downtime "update" "$INSTALLED_COMMIT" "$REMOTE_COMMIT"
 
     # Flush stale auth tokens — the new version may have a different token
     # schema and cannot deserialize tokens written by the old version
@@ -3766,6 +3855,7 @@ update_xo() {
     # Start service
     log_info "Starting xo-server service..."
     run_cmd sudo systemctl start xo-server
+    end_service_downtime
     wait_for_xo_ready
 
     log_success "Update completed successfully!"
@@ -3823,6 +3913,7 @@ rebuild_xo() {
     # Stop the service before touching anything
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
+    begin_service_downtime "rebuild" "$CURRENT_COMMIT"
 
     # Flush stale auth tokens before the fresh build takes over
     flush_redis_tokens
@@ -3842,7 +3933,11 @@ rebuild_xo() {
         run_cmd sudo rm -rf "$NEW_DIR"
         log_error "Clone failed. The current installation was left in place."
         log_info "Starting xo-server service..."
-        run_cmd sudo systemctl start xo-server || true
+        # Running again, so the exit report must not say it is stopped. If the
+        # start itself fails it still is, and the report says so.
+        if run_cmd sudo systemctl start xo-server; then
+            end_service_downtime
+        fi
         exit 1
     fi
 
@@ -3887,6 +3982,7 @@ rebuild_xo() {
     # Restart the service
     log_info "Starting xo-server service..."
     run_cmd sudo systemctl start xo-server
+    end_service_downtime
     wait_for_xo_ready
 
     local NEW_COMMIT
@@ -16112,7 +16208,7 @@ menu_interactive_pick() {
 
     # Re-assert the script's top-level ERR trap, same as before this was
     # split out of run_menu
-    trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
+    trap 'on_script_error "$LINENO" "$BASH_COMMAND"' ERR
 }
 
 # Run the interactive menu
