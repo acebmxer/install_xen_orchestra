@@ -10,6 +10,8 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-19
+
 ### Added
 
 - **Alpine Linux 3.24 in the VM Template Library.** `--build-templates` can now
@@ -2946,7 +2948,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.9...v0.10.0
 [0.9.9]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...v0.9.8
