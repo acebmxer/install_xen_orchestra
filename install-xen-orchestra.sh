@@ -15,7 +15,7 @@ if [[ "${XO_DEBUG:-0}" == "1" ]]; then
     export PS4='+ '
 fi
 
-trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
+trap 'on_script_error "$LINENO" "$BASH_COMMAND"' ERR
 #
 # Xen Orchestra Installation Script
 # Based on: https://docs.xen-orchestra.com/install-from-sources
@@ -44,6 +44,16 @@ RESTORE_BACKUP_FILE=""
 LIST_BACKUPS_ONLY=false
 DRY_RUN=false
 ALLOW_EOL_DISTRO=false
+
+# Set by begin_service_downtime while --update or --rebuild has xo-server
+# stopped ("update" or "rebuild"), cleared again once the service is back up.
+# LAST_BACKUP_PATH is the backup create_backup made in this run. The two commits
+# are the XO commit before the run and the one it was moving to. All are read
+# by report_failed_downtime at exit.
+STOPPED_FOR=""
+LAST_BACKUP_PATH=""
+DOWNTIME_FROM_COMMIT=""
+DOWNTIME_TO_COMMIT=""
 
 # Logging flags (set via CLI flags in main())
 LOG_FILE=""
@@ -113,6 +123,19 @@ log_warning() {
 
 log_error() {
     _log "ERROR" "$1"
+}
+
+# The script's ERR trap. Without `set -E` it fires only for a failure at the
+# top level, not inside a function, so it rarely sees an update or rebuild
+# fail; report_failed_downtime covers those at exit. While xo-server is
+# stopped for one of them, "start the service" is the wrong advice (the
+# install may be half updated), so it is left out.
+on_script_error() {
+    if [[ -n "$STOPPED_FOR" ]]; then
+        log_error "Script failed at line $1: $2."
+    else
+        log_error "Script failed at line $1: $2. If the service was stopped, run: sudo systemctl start xo-server"
+    fi
 }
 
 # Print the value of the variable named by $1, escaped for a double-quoted
@@ -226,8 +249,12 @@ const cfg = JSON.parse(fs.readFileSync(path.join(process.env.XO_REG_CFG_HOME, "x
 # last registered first. "Do not add a third" way of setting an EXIT trap: use
 # these. (The one in the expect helper's heredoc is a separate process.)
 EXIT_CLEANUPS=()
+EXIT_STATUS=0
 
 run_exit_cleanups() {
+    # The script's exit status, kept before any cleanup runs: a cleanup that
+    # needs to know whether the script failed (report_failed_downtime) reads it.
+    EXIT_STATUS=$?
     local i
     for ((i = ${#EXIT_CLEANUPS[@]} - 1; i >= 0; i--)); do
         # One failing cleanup must not stop the ones before it.
@@ -250,6 +277,65 @@ remove_exit_cleanup() {
         [[ "$c" == "$1" ]] || keep+=("$c")
     done
     EXIT_CLEANUPS=(${keep[@]+"${keep[@]}"})
+}
+
+# --update and --rebuild stop xo-server, back the install up, then change it.
+# A failure after the stop leaves XO down, and the functions they call run
+# under `set -e` without an ERR trap, so nothing said so. Call
+# begin_service_downtime (kind, XO commit before, XO commit it moves to) right
+# after the stop and end_service_downtime once the service is running again;
+# if the script exits non-zero in between, report_failed_downtime says that XO
+# is stopped and how to get it back.
+# (--restore stops the service too, but its own steps are the recovery.)
+begin_service_downtime() {
+    # A dry run stops nothing.
+    [[ "$DRY_RUN" == "true" ]] && return 0
+    STOPPED_FOR="$1"
+    DOWNTIME_FROM_COMMIT="${2:-}"
+    DOWNTIME_TO_COMMIT="${3:-}"
+    # Only a backup made in this run counts.
+    LAST_BACKUP_PATH=""
+    add_exit_cleanup report_failed_downtime
+}
+
+end_service_downtime() {
+    STOPPED_FOR=""
+}
+
+# The facts a bug report needs, printed under the failure report so the user
+# can copy them with it. Every value falls back to "unknown": this runs while
+# the script is already failing.
+print_failure_details() {
+    local installer node
+    installer=$(show_version 2>/dev/null | sed -n 's/^  Version: //p') || installer=""
+    node=$(node --version 2>/dev/null) || node=""
+    # --update and --rebuild never read the distro themselves.
+    detect_os >/dev/null 2>&1 || true
+    log_info "Include this when you report the problem:"
+    log_info "  Installer:         ${installer:-unknown}"
+    log_info "  System:            ${OS_ID:-unknown}${OS_VERSION_ID:+ ${OS_VERSION_ID}}"
+    log_info "  Node.js:           ${node:-unknown}"
+    log_info "  Branch:            ${GIT_BRANCH:-unknown}"
+    log_info "  XO commit before:  ${DOWNTIME_FROM_COMMIT:0:12}"
+    if [[ -n "$DOWNTIME_TO_COMMIT" ]]; then
+        log_info "  XO commit target:  ${DOWNTIME_TO_COMMIT:0:12}"
+    fi
+    log_info "  Also copy the error printed above this message."
+}
+
+report_failed_downtime() {
+    [[ -n "$STOPPED_FOR" && "$EXIT_STATUS" -ne 0 ]] || return 0
+    log_error "The ${STOPPED_FOR} failed, and Xen Orchestra is stopped."
+    if [[ -n "$LAST_BACKUP_PATH" ]]; then
+        log_error "A backup of the install as it was before this run is at: ${LAST_BACKUP_PATH}"
+        # Full path: works from any directory and however the script was started.
+        log_error "To go back to it, run: ${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}") --restore --backup-file $(basename "$LAST_BACKUP_PATH") --non-interactive"
+        log_error "Do not just start the service: the install may be half updated."
+    else
+        log_error "It failed before the backup was made, so the installation has not been changed."
+        log_error "Start it again with: sudo systemctl start xo-server"
+    fi
+    print_failure_details
 }
 
 # Acquire an exclusive lock on XO_LOCKFILE using flock.
@@ -2972,6 +3058,8 @@ create_backup() {
     run_cmd sudo rm -rf "${BACKUP_PATH}/node_modules"
 
     log_success "Backup created: $BACKUP_PATH"
+    # Remembered so a later failure can name it (report_failed_downtime).
+    LAST_BACKUP_PATH="$BACKUP_PATH"
 
     # This backup copies $INSTALL_DIR only. Neither half of the credential
     # encryption key lives there (one half is in XenStore, the other in
@@ -3672,6 +3760,7 @@ update_xo() {
     # Stop service
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
+    begin_service_downtime "update" "$INSTALLED_COMMIT" "$REMOTE_COMMIT"
 
     # Flush stale auth tokens — the new version may have a different token
     # schema and cannot deserialize tokens written by the old version
@@ -3766,6 +3855,7 @@ update_xo() {
     # Start service
     log_info "Starting xo-server service..."
     run_cmd sudo systemctl start xo-server
+    end_service_downtime
     wait_for_xo_ready
 
     log_success "Update completed successfully!"
@@ -3823,6 +3913,7 @@ rebuild_xo() {
     # Stop the service before touching anything
     log_info "Stopping xo-server service..."
     run_cmd sudo systemctl stop xo-server || true
+    begin_service_downtime "rebuild" "$CURRENT_COMMIT"
 
     # Flush stale auth tokens before the fresh build takes over
     flush_redis_tokens
@@ -3842,7 +3933,11 @@ rebuild_xo() {
         run_cmd sudo rm -rf "$NEW_DIR"
         log_error "Clone failed. The current installation was left in place."
         log_info "Starting xo-server service..."
-        run_cmd sudo systemctl start xo-server || true
+        # Running again, so the exit report must not say it is stopped. If the
+        # start itself fails it still is, and the report says so.
+        if run_cmd sudo systemctl start xo-server; then
+            end_service_downtime
+        fi
         exit 1
     fi
 
@@ -3887,6 +3982,7 @@ rebuild_xo() {
     # Restart the service
     log_info "Starting xo-server service..."
     run_cmd sudo systemctl start xo-server
+    end_service_downtime
     wait_for_xo_ready
 
     local NEW_COMMIT
@@ -4994,6 +5090,8 @@ STREAM_EOF
 #   coreutils   "<hash>  <file>", optionally "*<file>" for binary mode.
 #               Debian, Ubuntu and AlmaLinux.
 #   BSD tag     "SHA256 (<file>) = <hash>". CentOS Stream, Rocky and Fedora.
+#   bare digest the hash alone, in a file named for the one image it covers
+#               ("<image>.sha512"). Alpine.
 #
 # Fedora wraps its file in a PGP clearsigned envelope. That costs the parse
 # nothing -- the digest lines inside are ordinary BSD tag lines and the awk
@@ -5027,6 +5125,14 @@ deploy_checksum_source() {
         *//repo.almalinux.org/*)      printf 'CHECKSUM 256' ;;
         *//cloud.centos.org/*)        printf 'CHECKSUM 256' ;;
         *//dl.rockylinux.org/*)       printf 'CHECKSUM 256' ;;
+        *//dl-cdn.alpinelinux.org/*)
+            # Alpine publishes no shared sums file for its cloud images: each
+            # one has its own "<image>.sha512" beside it, holding the SHA-512
+            # digest and nothing else -- no filename. Read off the mirror for
+            # the 3.24 image this catalogue requests.
+            local alpine_base="${url##*/}"; alpine_base="${alpine_base%%\?*}"
+            printf '%s.sha512 512' "$alpine_base"
+            ;;
         *//dl.fedoraproject.org/*)
             # Fedora is the one origin here that does not publish a fixed
             # filename: the sums file carries the release and compose in its
@@ -5597,6 +5703,15 @@ deploy_verify_image_checksum() {
             # rejects that either way.
             if [[ -z "$want" ]]; then
                 want=$(awk -v f="($base)" '$2 == f && $3 == "=" { print $4; exit }' <<< "$sums")
+            fi
+
+            # A bare digest, the shape of Alpine's per-image "<image>.sha512".
+            # Read only from a file named for this one image: a shared sums
+            # file never holds a line with no filename, and taking one from it
+            # would be taking some other image's hash. The digest is still
+            # checked for length and hex below like any other.
+            if [[ -z "$want" && "$sums_file" == "${base}".* ]]; then
+                want=$(awk 'NF == 1 { print $1; exit }' <<< "$sums")
             fi
         fi
 
@@ -10764,11 +10879,15 @@ xostor_menu() {
 # needs block access to the VDI, and no XO endpoint exposes one.
 #
 # So a row may declare `uefi` or `bios` here for the API path to use. Left
-# empty it defaults to uefi, which is correct for every current entry: they all
-# ship an ESP alongside a BIOS boot partition, so a VM created from them boots
-# either way. A future BIOS-only image needs `bios` written here, and the way
-# to find out which it is remains reading the disk -- either by building it
-# once over SSH, or with `qemu-img`/`fdisk` on the downloaded image.
+# empty it defaults to uefi, which is correct for every entry but Alpine: the
+# others all ship an ESP alongside a BIOS boot partition, so a VM created from
+# them boots either way. Alpine's image is BIOS-only and says `bios` here. The
+# way to find out which an image is remains reading the disk -- either by
+# building it once over SSH, or with `qemu-img`/`fdisk` on the downloaded
+# image.
+#
+# A row that sets field 8 and wants the default disk leaves field 7 empty
+# ("...|tpl_prep_x||bios"), so every row has seven or eight fields.
 #
 # ---------------------------------------------------------------------------
 # Placeholder rows: prep function "-"
@@ -10806,7 +10925,9 @@ xostor_menu() {
 #      BSD tag shape too, but under a name carrying the release and compose
 #      rather than a fixed one, so it is the origin that made the filename
 #      derived instead of constant -- see deploy_checksum_source. Rocky matches
-#      CentOS Stream on all three releases.
+#      CentOS Stream on all three releases. Alpine publishes a third shape, a
+#      per-image "<image>.sha512" holding only the digest, read only when the
+#      sums file is named for the image being checked.
 #   3. Guest preparation. tpl_prep_debian is apt-based, and Ubuntu shares it.
 #      Confirmed rather than assumed: Ubuntu packages xe-guest-utilities (which
 #      Debian 13 does not), so there both the ISO path and the apt fallback
@@ -10815,13 +10936,16 @@ xostor_menu() {
 #      have their own, tpl_prep_fedora: install.sh does not recognise Fedora
 #      and refuses, so its guest tools come from the documented -d/-m override,
 #      the ISO tarball, or Fedora's own package -- the tiers linux_util's
-#      installer already uses.
+#      installer already uses. Alpine has its own, tpl_prep_alpine: no bash,
+#      no systemd, and guest tools from its own apk package, since the ISO's
+#      install.sh is a bash script that does not know Alpine.
 #
 # Version coverage below is deliberate: current supported releases only.
 # Ubuntu is the LTS line (interim releases are nine-month lifespans and would
 # be stale before a template built from one was retired). Fedora carries its
 # two supported releases. The RHEL rebuilds carry 8/9/10, matching what their
-# mirrors publish today.
+# mirrors publish today. Alpine carries the newest stable branch that has a
+# cloud image published.
 #
 # ---------------------------------------------------------------------------
 # Pick the variant with a full kernel, not the "cloud" one
@@ -10891,6 +11015,27 @@ TPL_CATALOG=(
     "almalinux8|AlmaLinux 8|8|https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
     "almalinux9|AlmaLinux 9|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
     "almalinux10|AlmaLinux 10|10|https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2|almalinux|tpl_prep_rhel|10"
+    # Alpine Linux 3.24, the newest stable branch with a cloud image published
+    # (3.25's releases/cloud directory is still empty). Every point below was
+    # read off generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2 itself:
+    #
+    #   - The bios variant, not the uefi one. The build boot always runs under
+    #     BIOS (see tpl_create_build_vm), so a UEFI-only image would never
+    #     finish its preparation. This image has no partition table at all:
+    #     the whole disk is one ext4 filesystem with syslinux in its boot
+    #     sector, so there is no ESP and the template is published as BIOS.
+    #     Field 8 says `bios` because the API path cannot read the disk.
+    #   - A 200 MiB virtual disk, so the 4 GiB default (field 7 left empty)
+    #     clears it many times over. With no partition, cloud-init's growpart
+    #     has nothing to grow; its resizefs grows the filesystem to the disk.
+    #   - alpine, from the image's /etc/cloud/cloud.cfg
+    #     (system_info.default_user.name), with lock_passwd: False and shell
+    #     /bin/ash -- there is no bash in the image.
+    #   - The virt kernel builds in Xen's block and network front-ends, so it
+    #     boots on XCP-ng with no initramfs change.
+    #   - The point release is in the filename and Alpine publishes no
+    #     "latest" name, so a newer 3.24 image means editing this URL.
+    "alpine324|Alpine Linux 3.24|3.24|https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2|alpine|tpl_prep_alpine||bios"
     # Both CentOS Stream rows: 10 GiB for the same reason as the AlmaLinux rows
     # above, read off `qemu-img info`'s "virtual size" -- 9 downloads as
     # 1.19 GiB and 10 as 1.00 GiB, and both expand to the same 10 GiB.
@@ -11574,6 +11719,125 @@ shutdown -h now
 PREP_EOF
 }
 
+# Emit the in-guest preparation script for Alpine Linux.
+#
+# Its own function, not a branch in another, because almost nothing carries
+# over: Alpine has no bash, no systemd and no dnf or apt. Every point here was
+# read off the 3.24 cloud image rather than assumed:
+#
+#   - POSIX sh, not bash. The image has busybox ash and nothing else, so a
+#     "#!/bin/bash" script would never start and the build would wait out its
+#     full timeout. The "shell: /bin/bash" in the shared cloud-config does no
+#     harm: Alpine's cloud-init creates the account with /bin/sh whatever it
+#     is asked for (seen on a boot of the image with that cloud-config).
+#   - Guest tools from Alpine's own package, xe-guest-utilities in the
+#     community repository (enabled in the image), with its OpenRC service
+#     added to the default runlevel and started so the agent reports during
+#     this boot. The ISO is still attached by the build but not used: its
+#     install.sh is a bash script that recognises Debian, CentOS, RHEL, SLES
+#     and Ubuntu, and its tarball carries systemd units.
+#   - poweroff, not shutdown. Busybox ships no shutdown command.
+#   - doas, not sudo. The image has doas and no sudo, so the sudo rule in the
+#     build's cloud-config does nothing here; a doas.d rule gives the account
+#     the same password-free root the other templates ship.
+#   - dhcpcd keeps a DUID in /var/lib/dhcpcd and its configuration sends it as
+#     the client id, so a clone carrying the build VM's DUID asks for the build
+#     VM's lease. Removed with the rest of the identity.
+#   - /etc/hostname goes back to "localhost", what the image shipped, rather
+#     than empty: OpenRC's hostname service reads that file at boot.
+#   - sshd reads sshd_config.d (the Include line is there), so the drop-in
+#     works. The image's cloud.cfg says ssh_pwauth: false, which cloud-init
+#     applies to sshd_config on a clone's first boot; the drop-in is read
+#     first and wins, and the cloud.cfg.d file below says True as well.
+tpl_prep_alpine() {
+    local user="$1"
+    # Quoted heredoc for the same reason as the other paths: the guest script
+    # is emitted verbatim and only the account name is substituted.
+    cat <<'PREP_EOF' | sed "s/__TPL_USER__/${user}/g"
+#!/bin/sh
+# Prepares a cloud image for use as an XCP-ng template. Runs once, inside the
+# guest, then powers the VM off.
+exec > /var/log/xo-template-prep.log 2>&1
+set -x
+
+# --- guest tools ---
+# Alpine's own package; see tpl_prep_alpine's header for why not the ISO.
+# Checked by looking for xe-daemon rather than trusting apk's exit status, and
+# a missing agent is written to the log rather than silently skipped.
+apk update || true
+apk add xe-guest-utilities || true
+if [ -x /usr/sbin/xe-daemon ]; then
+    rc-update add xe-guest-utilities default || true
+    rc-service xe-guest-utilities start || true
+else
+    echo "WARNING: guest tools not installed; template will not report an IP"
+fi
+
+# --- shipped login ---
+# A known password so a freshly deployed VM is reachable before the operator
+# supplies a cloud-config.
+echo "__TPL_USER__:__TPL_USER__" | chpasswd
+mkdir -p /etc/ssh/sshd_config.d
+printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-xo-template.conf
+
+# Alpine ships no sudo, so a cloud-config's "sudo:" line for its own user
+# (written to /etc/sudoers.d by cloud-init) would do nothing. The real package
+# makes that line work as it does on the other templates.
+apk add sudo || echo "WARNING: sudo not installed; cloud-config sudo: lines will not work"
+# The image has no /bin/bash and /etc/shells lists only sh and ash, so an
+# account whose cloud-config says "shell: /bin/bash" (as the other templates'
+# do) is refused at login. Install it so one cloud-config works everywhere.
+apk add bash || echo "WARNING: bash not installed; accounts with shell /bin/bash cannot log in"
+
+# The equivalent of the other templates' NOPASSWD sudo rule.
+mkdir -p /etc/doas.d
+printf 'permit nopass __TPL_USER__\n' > /etc/doas.d/99-xo-template.conf
+chmod 0600 /etc/doas.d/99-xo-template.conf
+
+# The image already leaves the default user unlocked; written anyway, so the
+# shipped login does not depend on the next image keeping that default. Remove
+# this file once you have installed your own SSH keys.
+mkdir -p /etc/cloud/cloud.cfg.d
+cat > /etc/cloud/cloud.cfg.d/99-xo-template-login.cfg <<'CLOUDCFG_EOF'
+# Written by the XO template build. Ships a usable password login on first
+# boot; remove this file once you have installed your own SSH keys.
+system_info:
+  default_user:
+    lock_passwd: False
+ssh_pwauth: True
+CLOUDCFG_EOF
+
+# --- scrub machine identity ---
+# Everything below this line exists so that clones do not share an identity.
+cloud-init clean --logs --seed
+rm -rf /var/lib/cloud/instances /var/lib/cloud/instance
+rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
+# Plain redirections and globs, not truncate or find -delete: those are
+# busybox build options, and the shell's own forms need nothing.
+if [ -f /etc/machine-id ]; then
+    : > /etc/machine-id
+fi
+rm -f /etc/ssh/ssh_host_*
+# The build's temporary key was installed by cloud-init for the default user
+# (and for root, behind a "log in as" prefix). Remove it so the template does
+# not carry an entry for a key generated on the build machine.
+sed -i '/xo template build (temporary)/d' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null || true
+# The build gave this VM the hostname "xo-template-build" from the prep drive.
+# Put back the image's own "localhost" so each clone takes its name from
+# cloud-init or DHCP instead of inheriting the build VM's.
+printf 'localhost\n' > /etc/hostname
+# dhcpcd's DUID, lease and secret: a clone reusing them asks for the build
+# VM's lease.
+rm -rf /var/lib/dhcpcd/* /etc/dhcpcd.duid /etc/dhcpcd.secret 2>/dev/null || true
+
+rm -rf /var/cache/apk/*
+rm -f /root/.ash_history /home/*/.ash_history
+
+# The build watches for the VM to halt. This must be the last thing that runs.
+poweroff
+PREP_EOF
+}
+
 # Decide whether a VDI actually holds a disk image, by reading its first sector.
 #
 # This replaces a check on physical-utilisation, which cannot answer the
@@ -11591,6 +11855,9 @@ PREP_EOF
 # Every image in the catalogue is a whole-disk image, so sector 0 carries either
 # an MBR (the 0x55AA signature at offset 510) or a protective MBR in front of a
 # GPT ("EFI PART" at offset 512). Absence of both means nothing usable landed.
+# Alpine's image has no partition table, but its sector 0 is syslinux's boot
+# sector, which carries the same 0x55AA signature -- read off the image -- so
+# it passes the same check.
 tpl_disk_has_partition_table() {
     local vdi="$1"
     local vdi_ref sig=""
@@ -13452,8 +13719,8 @@ tpl_os_version_dispatch() {
 # The SSH path reads the imported disk and decides from what is on it, which is
 # the right way round and stays. The API path cannot -- no XO endpoint gives
 # block access to a VDI -- so it takes the catalogue's eighth field, defaulting
-# to uefi, which is correct for every image in the catalogue today. See the
-# note on field 8 above TPL_CATALOG.
+# to uefi, which is correct for every image in the catalogue except Alpine's,
+# whose row says bios. See the note on field 8 above TPL_CATALOG.
 tpl_row_firmware() {
     local fw
     fw=$(tpl_field "$1" 8)
@@ -13532,7 +13799,10 @@ tpl_build_one() {
 
     # Shown in XO under the template name. Says what the operator needs to know
     # to actually log in to a VM built from it.
-    TPL_DESCRIPTION="${display} with cloud-init and XCP-ng guest tools. Boots under BIOS or UEFI. Default login: ${user} / ${user}. Supply an SSH key or your own cloud-config at VM creation."
+    # A row whose image is BIOS-only (field 8) must not promise UEFI.
+    local boots="Boots under BIOS or UEFI."
+    [[ "$(tpl_row_firmware "$row")" == "bios" ]] && boots="Boots under BIOS."
+    TPL_DESCRIPTION="${display} with cloud-init and XCP-ng guest tools. ${boots} Default login: ${user} / ${user}. Supply an SSH key or your own cloud-config at VM creation."
     TPL_VM_NAME="$name"
 
     TPL_VM_UUID=""; TPL_ROOT_VDI=""; TPL_CIDATA_VDI=""; TPL_BUILD_STARTED="false"
@@ -13752,16 +14022,18 @@ tpl_prompt_selection() {
                 label="${M_BOLD}${display}${M_RESET}"
             fi
 
-            printf '  %s%s %s %s(login: %s)%s\n' \
-                "$pointer" "$mark" "$label" "$M_DIM" "$user" "$M_RESET"
-
             # Say plainly which of these already exist, so a re-run is not a
             # guess about what a build would actually do. Read from the list
             # tpl_api_prefetch_existing fetched: there is no pool connection
-            # yet, so a per-row check here could never answer.
+            # yet, so a per-row check here could never answer. On the row's
+            # own line, so every template is one line and the list stays even.
+            local existing=""
             if tpl_existing_label "$(tpl_template_name "$display")"; then
-                printf '       %salready on this pool%s\n' "$M_DIM" "$M_RESET"
+                existing="  already on this pool"
             fi
+
+            printf '  %s%s %s %s(login: %s)%s%s\n' \
+                "$pointer" "$mark" "$label" "$M_DIM" "$user" "$existing" "$M_RESET"
         done
 
         echo ""
@@ -13794,9 +14066,15 @@ tpl_prompt_selection() {
                 # Backing out is a normal outcome, not a failure: returning
                 # non-zero here would be caught by the script's ERR trap and
                 # printed as an error. The empty selection is the signal.
+                #
+                # Back to the main menu, as Q in Custom Plugins does (#122):
+                # without MENU_REOPEN_MAIN, run_menu's loop ends and so does
+                # the script. Ignored when run as --build-templates, where
+                # there is no menu to go back to.
                 _tpl_restore_term
                 clear
                 TPL_SELECTED=()
+                MENU_REOPEN_MAIN=true
                 return 0
                 ;;
         esac
@@ -15930,7 +16208,7 @@ menu_interactive_pick() {
 
     # Re-assert the script's top-level ERR trap, same as before this was
     # split out of run_menu
-    trap 'log_error "Script failed at line $LINENO: $BASH_COMMAND. If the service was stopped, run: sudo systemctl start xo-server"' ERR
+    trap 'on_script_error "$LINENO" "$BASH_COMMAND"' ERR
 }
 
 # Run the interactive menu

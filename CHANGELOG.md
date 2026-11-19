@@ -10,6 +10,44 @@ This installer builds Xen Orchestra from source and tracks the official
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-19
+
+### Added
+
+- **Alpine Linux 3.24 in the VM Template Library.** `--build-templates` can now
+  build an "Alpine Linux 3.24 Cloud-init" template from Alpine's own BIOS cloud
+  image, with login `alpine` / `alpine`. The image is checked against the
+  `.sha512` file Alpine publishes beside it, the guest tools come from Alpine's
+  `xe-guest-utilities` package, the `alpine` account gets password-free `doas`
+  (Alpine has no `sudo`), and the build clears the DHCP client identity along
+  with the rest of the machine identity. The image is BIOS-only, so the
+  template is published as BIOS and its description says so.
+
+### Fixed
+
+- **A failed `--update` or `--rebuild` now says XO is stopped and how to get it
+  back.** When the run failed after `xo-server` was stopped (a broken build, a
+  failed Node.js or yarn install, a git error, anything else), the script ended
+  with only the error and no word that XO was down or that a backup had just
+  been made. It now ends with a message that says XO is stopped, names the
+  backup made at the start of that run, and gives the `--restore --backup-file`
+  command that puts it back, then lists what a bug report needs (installer
+  version, system, Node.js version, branch, and the XO commit before and after)
+  so it can be copied with the error. If the failure came before the backup, it
+  says nothing was changed and to start the service again. The old "run: sudo
+  systemctl start xo-server" advice is no longer printed in the case where it
+  would start a half-updated install. A `--rebuild` whose clone fails still
+  starts XO again, and does not say it is stopped. (#123)
+- **The template picker's "already on this pool" note is on the template's own
+  line** instead of a line of its own below it, where it sat a column left of
+  the template names and made the list uneven. (#121)
+- **Alpine template installs `sudo` and `bash`.** Alpine ships neither, so a
+  cloud-config for your own user with `sudo:` did nothing, and one with
+  `shell: /bin/bash` left the account unable to log in at all. Rebuild the
+  Alpine template to pick it up.
+- **Q in the VM Template Library goes back to the main menu** instead of
+  ending the script, the same as Q in Custom Plugins. (#122)
+
 ## [0.10.0] - 2026-11-09
 
 ### Added
@@ -2910,7 +2948,8 @@ This installer builds Xen Orchestra from source and tracks the official
   from source with a self-signed certificate and a systemd service;
   configurable service user.
 
-[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.9...v0.10.0
 [0.9.9]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/acebmxer/install_xen_orchestra/compare/v0.9.7...v0.9.8

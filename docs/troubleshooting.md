@@ -14,6 +14,32 @@ If the build is broken, rebuild (takes a backup first):
 ./install-xen-orchestra.sh --rebuild
 ```
 
+## An update or rebuild failed and XO is stopped
+
+`--update` and `--rebuild` stop `xo-server`, back the install up, then change
+it. If the run fails after the stop, the script ends with a message that says
+so. It names the backup it made at the start of that run and the command that
+puts it back:
+
+```bash
+./install-xen-orchestra.sh --restore --backup-file xo-backup-20261119_105347 --non-interactive
+```
+
+The backup name carries the time of that run, so use the one the message
+prints. `--non-interactive` is part of the command because `--backup-file` only
+picks a backup in that mode; without it the script asks you to choose from the
+list.
+
+Under that, the message lists what to include in a bug report: the installer
+version, your system and Node.js version, the branch, and the XO commit the run
+started from and was moving to. Copy it together with the error printed above
+the message.
+
+If the failure came before the backup was made, the message says nothing was
+changed and to start the service again with `sudo systemctl start xo-server`.
+Do not start it that way after a failure that came later: the install may be
+half updated, and restoring the backup is the way back.
+
 ## Build fails with OOM / out-of-memory error
 
 The Yarn build is memory-intensive. On hosts with less than 2 GB RAM the
